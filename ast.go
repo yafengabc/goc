@@ -4,14 +4,26 @@ package main
 
 type Node interface{}
 
+// CType is the type of a value. Everything is 8 bytes on the stack; the only
+// distinction is whether an expression lives in a GP register (int) or an XMM
+// register (double) and how clib / the ABI treat it.
+type CType int
+
+const (
+	TInt CType = iota
+	TDouble
+)
+
 type Program struct {
 	Funcs []*FuncDecl
 }
 
 type FuncDecl struct {
-	Name   string
-	Params []string
-	Body   *Block
+	Name       string
+	Ret        CType
+	Params     []string
+	ParamTypes []CType
+	Body       *Block
 }
 
 type Block struct {
@@ -22,6 +34,7 @@ type Stmt interface{}
 
 type DeclStmt struct {
 	Name string
+	Typ  CType
 	Init Expr // may be nil
 }
 
@@ -52,7 +65,9 @@ type WhileStmt struct {
 type Expr interface{}
 
 type NumLit struct {
-	Val int64
+	Val  int64
+	Kind CType
+	Fval float64
 }
 
 type StrLit struct {

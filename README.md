@@ -107,14 +107,31 @@ __clib_ch db 0
 两者都会被自动展开。
 
 已知限制：`printf` 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界
-检查（缓冲区归调用方管）；格式化只认 `%d %s %c %x %%`（不支持宽度/精度/`%f`）。
+检查（缓冲区归调用方管）；格式化只认 `%d %s %c %x %f %%`（不支持宽度/精度；
+`%f` 固定 6 位小数，相当于 C 的 `%.6f`）。
 
 ## 支持的语言子集
 
-- 类型只有 `int`（8 字节栈槽），函数参数最多 8 个（前 4 个走寄存器，其余压栈）
+- 类型：`int` 与 `double`（都是 8 字节栈槽），函数参数最多 8 个（前 4 个走
+  寄存器，其余压栈）
 - `if` / `else` / `while` / `return`、块作用域
-- 运算符：`+ - * / %`、`< > <= >= == !=`、`&& ||`、`!`、一元 `-`
-- 字符串字面量、`printf` 调用
+- 运算符：`+ - * / %`、`< > <= >= == !=`、`&& ||`、`!`、一元 `-`；操作数含
+  `double` 时 `+ - * /` 与比较自动提升，结果类型随操作数
+- 字符串字面量、`printf` 调用（`%d %s %c %x %f %%`）
+
+## double 支持
+
+`double` 走 SSE2 标量指令：参数放在 xmm0..xmm3（Windows）或 xmm0..xmm7（SysV），
+算术用 `addsd` / `subsd` / `mulsd` / `divsd`，整型↔浮点转换用 `cvtsi2sd` /
+`cvttsd2si`（截断），比较用 `ucomisd` 再跟无符号跳转（jb/ja/jbe/jae/je/jne）。
+常量落在 `.data` 的 `dq` 里，RIP 相对寻址读取。
+
+clib 的 `%f` 用「取整 + 小数部分循环乘 10」输出固定 6 位小数：`cvttsd2si` 截出
+整数位，`cvtsi2sd` 转回去 `subsd` 减掉，剩下的小数部分循环 6 次乘 10 逐位压出；
+`%f` 的变参槽位传的是 8 字节 IEEE-754 位模式（`movq rax, xmm0`）。
+
+Windows 上没法直接执行 SSE2 验证编码，所以 elfcheck 解释器补了 F2/66 前缀解析和
+这套指令的解释执行 —— Linux 目标的 fp 用例与 Windows 输出逐字节一致。
 
 ## 调用约定
 
@@ -133,8 +150,8 @@ Windows 下变参从 rdx 起、栈上在 `[rbp+48]`；Linux 下从 rsi 起、栈
 ## 测试
 
 ```bash
-bash run_tests.sh           # c0 端到端 16/16（8 个 Windows + 8 个 Linux）
-cd asm && bash run_tests.sh # a0 自己的用例，13/13（10 Windows + 3 Linux）+ 1 个 GUI
+bash run_tests.sh           # c0 端到端 18/18（9 个 Windows + 9 个 Linux）
+cd asm && bash run_tests.sh # a0 自己的用例，14/14（11 Windows + 3 Linux）+ 1 个 GUI
 ```
 
 `examples/clib.c` 把整个库跑一遍，两个平台的输出与同一份 golden 逐字节比对。

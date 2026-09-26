@@ -47,8 +47,23 @@ func (p *Parser) expectKeyword(kw string) error {
 	return nil
 }
 
+func (p *Parser) parseType() (CType, error) {
+	t := p.cur()
+	if t.Kind == TKeyword && (t.Text == "int" || t.Text == "double") {
+		p.next()
+		if t.Text == "double" {
+			return TDouble, nil
+		}
+		return TInt, nil
+	}
+	// No explicit type keyword: default to int (keeps `int main` and older
+	// single-type programs working).
+	return TInt, nil
+}
+
 func (p *Parser) parseFunc() (*FuncDecl, error) {
-	if err := p.expectKeyword("int"); err != nil {
+	ret, err := p.parseType()
+	if err != nil {
 		return nil, err
 	}
 	if p.cur().Kind != TIdent {
@@ -59,15 +74,18 @@ func (p *Parser) parseFunc() (*FuncDecl, error) {
 		return nil, err
 	}
 	var params []string
+	var paramTypes []CType
 	if p.cur().Text != ")" {
 		for {
-			if err := p.expectKeyword("int"); err != nil {
+			pt, err := p.parseType()
+			if err != nil {
 				return nil, err
 			}
 			if p.cur().Kind != TIdent {
 				return nil, fmt.Errorf("line %d: expected parameter name", p.cur().Line)
 			}
 			params = append(params, p.next().Text)
+			paramTypes = append(paramTypes, pt)
 			if p.cur().Text == "," {
 				p.next()
 				continue
@@ -82,7 +100,7 @@ func (p *Parser) parseFunc() (*FuncDecl, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &FuncDecl{Name: name, Params: params, Body: body}, nil
+	return &FuncDecl{Name: name, Ret: ret, Params: params, ParamTypes: paramTypes, Body: body}, nil
 }
 
 func (p *Parser) parseBlock() (*Block, error) {
@@ -163,8 +181,8 @@ func (p *Parser) parseStmt() (Stmt, error) {
 			return nil, err
 		}
 		return &WhileStmt{Cond: cond, Body: body}, nil
-	case t.Kind == TKeyword && t.Text == "int":
-		p.next()
+	case t.Kind == TKeyword && (t.Text == "int" || t.Text == "double"):
+		typ, _ := p.parseType()
 		if p.cur().Kind != TIdent {
 			return nil, fmt.Errorf("line %d: expected variable name", p.cur().Line)
 		}
@@ -181,7 +199,7 @@ func (p *Parser) parseStmt() (Stmt, error) {
 		if err := p.expect(";"); err != nil {
 			return nil, err
 		}
-		return &DeclStmt{Name: name, Init: init}, nil
+		return &DeclStmt{Name: name, Typ: typ, Init: init}, nil
 	case t.Kind == TIdent:
 		name := t.Text
 		if p.peek().Text == "=" {
@@ -325,6 +343,9 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	switch {
 	case t.Kind == TNum:
 		p.next()
+		if t.IsDbl {
+			return &NumLit{Kind: TDouble, Fval: t.Fval}, nil
+		}
 		return &NumLit{Val: t.Num}, nil
 	case t.Kind == TStr:
 		p.next()

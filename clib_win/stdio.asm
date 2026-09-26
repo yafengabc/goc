@@ -31,6 +31,8 @@ section .data
 __clib_va     dq 0, 0, 0, 0, 0, 0, 0, 0
 __clib_digits db 32 dup(0)       ; reversed digits while converting
 __clib_buf    db 512 dup(0)      ; printf() output buffer
+__clib_f10    dq 10.0            ; %f: fractional-digit scaling factor
+__clib_fneg   dq -0.0            ; %f: sign bit (0x8000000000000000)
 ; @end
 
 ; @func __clib_write
@@ -66,7 +68,8 @@ __clib_write_have:
 section .text
 __clib_vfmt:
     ; rcx = dst, rdx = fmt, r8 = va array, r9 = limit -> rax = chars written
-    ; Supports %d %s %c %x %%. Stops as soon as the buffer is full.
+    ; Supports %d %s %c %x %f %%. Stops as soon as the buffer is full.
+    ; %f prints a fixed 6 fractional digits, like C's default %.6f.
     push rbp
     mov rbp, rsp
     push rbx
@@ -111,6 +114,8 @@ __clib_vfmt_pct:
     je __clib_vfmt_chr
     cmp rax, 0x78                ; 'x'
     je __clib_vfmt_hex
+    cmp rax, 0x66                ; 'f'
+    je __clib_vfmt_flt
     cmp rax, 0x25                ; '%'
     je __clib_vfmt_esc
     mov bl, 0x25                 ; unknown spec: emit it verbatim
@@ -208,6 +213,69 @@ __clib_vfmt_hsto:
     cmp rax, 0
     jne __clib_vfmt_hv
     jmp __clib_vfmt_em
+__clib_vfmt_flt:
+    ; 8-byte va slot holds the IEEE-754 bits of the double
+    mov rax, [r13]
+    add r13, 8
+    movq xmm0, rax
+    cmp rax, 0                   ; sign bit set?
+    jl __clib_vfmt_flt_neg
+__clib_vfmt_flt_pos:
+    cvttsd2si rax, xmm0          ; integer part (truncated toward zero)
+    cvtsi2sd xmm1, rax
+    subsd xmm0, xmm1             ; xmm0 = fractional part, 0 <= frac < 1
+    lea r15, [rip+__clib_digits]
+    xor rcx, rcx                 ; digit count
+__clib_vfmt_flt_dv:
+    xor rdx, rdx
+    mov rbx, 10
+    idiv rbx
+    add rdx, 0x30
+    mov [r15+rcx], dl
+    inc rcx
+    cmp rax, 0
+    jne __clib_vfmt_flt_dv
+__clib_vfmt_flt_em:
+    cmp rcx, 0
+    je __clib_vfmt_flt_dot
+    dec rcx
+    mov dl, [r15+rcx]
+    mov [rdi+r12], dl
+    inc r12
+    cmp r12, r14
+    jge __clib_vfmt_done
+    jmp __clib_vfmt_flt_em
+__clib_vfmt_flt_dot:
+    mov bl, 0x2e                 ; '.'
+    mov [rdi+r12], bl
+    inc r12
+    cmp r12, r14
+    jge __clib_vfmt_done
+    mov r9, 6                    ; six fractional digits
+__clib_vfmt_flt_fr:
+    mulsd xmm0, [rip+__clib_f10]
+    cvttsd2si rcx, xmm0          ; next digit
+    cvtsi2sd xmm1, rcx
+    subsd xmm0, xmm1
+    mov rdx, 0x30
+    add rdx, rcx
+    mov [rdi+r12], dl
+    inc r12
+    cmp r12, r14
+    jge __clib_vfmt_done
+    dec r9
+    jne __clib_vfmt_flt_fr
+    jmp __clib_vfmt_next
+__clib_vfmt_flt_neg:
+    mov bl, 0x2d                 ; '-'
+    mov [rdi+r12], bl
+    inc r12
+    cmp r12, r14
+    jge __clib_vfmt_done
+    mov rax, [rip+__clib_fneg]   ; clear the sign bit: |x| = x xor sign
+    movq xmm1, rax
+    xorpd xmm0, xmm1
+    jmp __clib_vfmt_flt_pos
 __clib_vfmt_next:
     inc rsi
     jmp __clib_vfmt_loop

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -17,15 +18,17 @@ const (
 )
 
 var keywords = map[string]bool{
-	"int": true, "if": true, "else": true, "while": true, "return": true,
+	"int": true, "double": true, "if": true, "else": true, "while": true, "return": true,
 }
 
 type Token struct {
-	Kind TokKind
-	Text string
-	Num  int64
-	Str  []byte
-	Line int
+	Kind  TokKind
+	Text  string
+	Num   int64
+	Fval  float64
+	IsDbl bool
+	Str   []byte
+	Line  int
 }
 
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
@@ -71,9 +74,23 @@ func Lex(src string) ([]Token, error) {
 			for i < n && isDigit(src[i]) {
 				i++
 			}
-			var v int64
-			fmt.Sscanf(src[start:i], "%d", &v)
-			toks = append(toks, Token{Kind: TNum, Text: src[start:i], Num: v, Line: line})
+			isDbl := false
+			if i < n && src[i] == '.' {
+				isDbl = true
+				i++
+				for i < n && isDigit(src[i]) {
+					i++
+				}
+			}
+			text := src[start:i]
+			if isDbl {
+				f, _ := strconv.ParseFloat(text, 64)
+				toks = append(toks, Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, Line: line})
+			} else {
+				var v int64
+				fmt.Sscanf(text, "%d", &v)
+				toks = append(toks, Token{Kind: TNum, Text: text, Num: v, Line: line})
+			}
 		case isAlpha(c):
 			start := i
 			for i < n && (isAlpha(src[i]) || isDigit(src[i])) {

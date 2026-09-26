@@ -16,6 +16,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 )
 
@@ -193,6 +194,7 @@ const (
 
 type cpu struct {
 	regs [16]uint64
+	xmm  [16][2]uint64 // 128-bit XMM registers (low/high halves)
 	rip  uint64
 	img  *image
 	// writable copy of the image
@@ -338,6 +340,16 @@ func (c *cpu) step() {
 	pc := c.rip
 	op := c.fetch8()
 
+	// Legacy prefixes: 0x66 / 0xF2 / 0xF3. In a0's output these are always
+	// the mandatory prefixes of the SSE2 instructions (there are no REP or
+	// operand-size-override forms -- clib has no string ops), so we remember
+	// the last one and only apply it inside the 0F two-byte opcode switch.
+	legacy := byte(0)
+	for op == 0x66 || op == 0xf2 || op == 0xf3 {
+		legacy = op
+		op = c.fetch8()
+	}
+
 	// REX prefix (only REX.W / .R / .B matter for what a0 emits).
 	rex := byte(0)
 	if op >= 0x40 && op <= 0x4f {
@@ -440,16 +452,137 @@ func (c *cpu) step() {
 	case 0x0f:
 		op2 := c.fetch8()
 		switch {
-		case op2 == 0x05:
+		case op2 == 0x05 && legacy == 0:
 			c.syscall()
-		case op2 == 0xaf: // imul r64, r/m64
+		case op2 == 0xaf && legacy == 0: // imul r64, r/m64
 			reg, o := modrm()
 			c.regs[reg] = uint64(int64(c.regs[reg]) * int64(getRM(o)))
 			c.cf, c.of = false, false
-		case op2 >= 0x80 && op2 <= 0x8f:
+		case op2 >= 0x80 && op2 <= 0x8f && legacy == 0:
 			rel := int64(int32(c.fetch32()))
 			if c.cond(op2) {
 				c.rip = c.rip + uint64(rel)
+			}
+		case legacy == 0xf2 || legacy == 0x66:
+			// ---- SSE2 (the scalar double / quadword set a0 emits) ----
+			// XMM and GP registers share the ModRM field convention: REX.R
+			// extends the reg field, REX.B the rm register field. The XMM
+			// operand sits in the reg field for every form except cvttsd2si
+			// and movq r64,xmm (where the GP operand takes it), exactly as
+			// a0 encodes them.
+			//
+			// getSse reads the rm operand as the low 64 bits of an XMM
+			// register or 8 bytes of memory (a double).
+			getSse := func(o rmOperand) uint64 {
+				if !o.isMem {
+					return c.xmm[o.reg][0]
+				}
+				v, ok := c.readMem(o.addr, 8)
+				if !ok {
+					die("SSE read of unmapped memory 0x%x at 0x%x", o.addr, pc)
+				}
+				return v
+			}
+			switch op2 {
+			case 0x10, 0x11: // movsd xmm, xmm/m64 / movsd xmm/m64, xmm
+				reg, o := modrm()
+				if op2 == 0x10 {
+					bits := getSse(o)
+					if o.isMem {
+						c.xmm[reg][1] = 0 // a memory source zeroes the upper half
+					}
+					c.xmm[reg][0] = bits
+				} else {
+					bits := c.xmm[reg][0]
+					if !o.isMem {
+						c.xmm[o.reg][0] = bits
+					} else if !c.writeMem(o.addr, 8, bits) {
+						die("SSE write to unmapped memory 0x%x at 0x%x", o.addr, pc)
+					}
+				}
+			case 0x58, 0x59, 0x5c, 0x5e, 0x51: // addsd/mulsd/subsd/divsd/sqrtsd
+				reg, o := modrm()
+				a := c.xmmF(reg)
+				b := math.Float64frombits(getSse(o))
+				switch op2 {
+				case 0x58:
+					a += b
+				case 0x59:
+					a *= b
+				case 0x5c:
+					a -= b
+				case 0x5e:
+					a /= b
+				case 0x51:
+					a = math.Sqrt(b)
+				}
+				c.xmm[reg][0] = math.Float64bits(a)
+			case 0x2a: // cvtsi2sd xmm, r/m64 (REX.W required)
+				if !w {
+					die("unsupported cvtsi2sd without REX.W at 0x%x", pc)
+				}
+				reg, o := modrm()
+				var raw uint64
+				if o.isMem {
+					raw = getSse(o)
+				} else {
+					raw = c.regs[o.reg] // rm field holds the GP source
+				}
+				c.xmm[reg][0] = math.Float64bits(float64(int64(raw)))
+			case 0x2c: // cvttsd2si r64, xmm/m64 (REX.W required); GP dst in reg
+				if !w {
+					die("unsupported cvttsd2si without REX.W at 0x%x", pc)
+				}
+				reg, o := modrm()
+				c.regs[reg] = uint64(int64(math.Float64frombits(getSse(o))))
+			case 0x57: // xorpd xmm, xmm/m128
+				reg, o := modrm()
+				var lo, hi uint64
+				if !o.isMem {
+					lo, hi = c.xmm[o.reg][0], c.xmm[o.reg][1]
+				} else {
+					s := c.slice(o.addr, 16)
+					if s == nil {
+						die("SSE read of unmapped memory 0x%x at 0x%x", o.addr, pc)
+					}
+					lo, hi = binary.LittleEndian.Uint64(s), binary.LittleEndian.Uint64(s[8:])
+				}
+				c.xmm[reg][0] ^= lo
+				c.xmm[reg][1] ^= hi
+			case 0x2e: // ucomisd xmm, xmm/m64
+				reg, o := modrm()
+				a := c.xmmF(reg)
+				b := math.Float64frombits(getSse(o))
+				// ZF=equal, CF=below, OF/SF/AF clear. PF (unordered/NaN) is
+				// not tracked -- a0 never compares NaN.
+				c.zf = a == b
+				c.cf = a < b
+				c.sf, c.of = false, false
+			case 0x6e: // movq xmm, r/m64 (66 REX.W 0F 6E)
+				if !w {
+					die("unsupported 66 0F 6E without REX.W (movd) at 0x%x", pc)
+				}
+				reg, o := modrm()
+				var raw uint64
+				if o.isMem {
+					raw = getSse(o)
+				} else {
+					raw = c.regs[o.reg] // rm field holds the GP source
+				}
+				c.xmm[reg][0], c.xmm[reg][1] = raw, 0
+			case 0x7e: // movq r/m64, xmm (66 REX.W 0F 7E); XMM src in reg field
+				if !w {
+					die("unsupported 66 0F 7E without REX.W (movd) at 0x%x", pc)
+				}
+				reg, o := modrm()
+				bits := c.xmm[reg][0]
+				if !o.isMem {
+					c.regs[o.reg] = bits
+				} else if !c.writeMem(o.addr, 8, bits) {
+					die("SSE write to unmapped memory 0x%x at 0x%x", o.addr, pc)
+				}
+			default:
+				die("unsupported opcode %02x 0F %02x at 0x%x", legacy, op2, pc)
 			}
 		default:
 			die("unsupported opcode 0F %02x at 0x%x", op2, pc)
@@ -752,6 +885,11 @@ func uint128(lo, hi uint64) uint64 {
 		die("div with a dividend wider than 64 bits is not supported")
 	}
 	return lo
+}
+
+// xmmF reads the low 64 bits of an XMM register as a double.
+func (c *cpu) xmmF(i int) float64 {
+	return math.Float64frombits(c.xmm[i][0])
 }
 
 func (c *cpu) setFlagsAdd(a, b, v uint64) {

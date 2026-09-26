@@ -4,6 +4,7 @@ import (
 	"embed"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -13,18 +14,30 @@ import (
 // The generated code follows the Windows x64 ABI: integer args in RCX/RDX/R8/R9,
 // a 32-byte shadow space reserved by the caller, and RSP kept 16-byte aligned
 // at every call site.
+// varInfo records a variable's stack slot and type.
+type varInfo struct {
+	off int
+	typ CType
+}
+
 type CG struct {
-	sb       strings.Builder
-	strs     []StrLit
-	strLab   map[*StrLit]string
-	label    int
-	varOff   map[string]int  // per-function: param = +off, local = -off
-	localCnt int             // number of locals in current function
-	tmpDepth int             // live expression-temporary slots
-	funcs    map[string]bool // user-defined functions
-	calls    map[string]bool // functions called that are not defined here
-	need     map[string]bool // clib functions this program actually uses
-	linux    bool            // true -> SysV ABI + ELF output
+	sb        strings.Builder
+	strs      []StrLit
+	strLab    map[*StrLit]string
+	doubles   []float64
+	doubleLab map[float64]string
+	label     int
+	vars      map[string]varInfo // per-function: param = +off, local = -off
+	localCnt  int                // number of locals in current function
+	tmpDepth  int                // live expression-temporary slots
+	funcs     map[string]bool    // user-defined functions (by name)
+	funcDefs  map[string]*FuncDecl
+	calls     map[string]bool // functions called that are not defined here
+	need      map[string]bool // clib functions this program actually uses
+	linux     bool            // true -> SysV ABI + ELF output
+	curRet    CType           // return type of the function being generated
+	curParam  []CType         // parameter types of the current function
+	resTyp    CType           // type of the value left by the last genExprT
 }
 
 // argRegs returns the integer argument registers for the target ABI.
@@ -33,6 +46,14 @@ func (c *CG) argRegs() []string {
 		return []string{"rdi", "rsi", "rdx", "rcx", "r8", "r9"} // SysV AMD64
 	}
 	return []string{"rcx", "rdx", "r8", "r9"} // Windows x64
+}
+
+// argXMM returns the XMM argument registers for the target ABI.
+func (c *CG) argXMM() []string {
+	if c.linux {
+		return []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
+	}
+	return []string{"xmm0", "xmm1", "xmm2", "xmm3"}
 }
 
 // stackArgOff returns the rsp offset of the k-th stack argument (0-based),
@@ -357,6 +378,102 @@ func (c *CG) emit(format string, a ...any) {
 	c.sb.WriteString("\t" + fmt.Sprintf(format, a...) + "\n")
 }
 
+// loadVar emits code that loads variable vi's value into rax (int) or xmm0
+// (double), and records the resulting type in c.resTyp.
+// movsd (not movq) is used for the XMM <-> memory moves: a0 only knows the
+// GP <-> XMM forms of movq.
+func (c *CG) loadVar(vi varInfo) {
+	if vi.typ == TDouble {
+		c.emit("movsd xmm0, [rbp%+d]", vi.off)
+		c.resTyp = TDouble
+	} else {
+		c.emit("mov rax, [rbp%+d]", vi.off)
+		c.resTyp = TInt
+	}
+}
+
+// storeVar emits code that stores the value currently in rax (int) or xmm0
+// (double) into variable vi's slot.
+func (c *CG) storeVar(vi varInfo) {
+	if vi.typ == TDouble {
+		c.emit("movsd [rbp%+d], xmm0", vi.off)
+	} else {
+		c.emit("mov [rbp%+d], rax", vi.off)
+	}
+}
+
+// ensureType converts the value currently in rax/xmm0 to the requested type
+// (if they differ) and updates c.resTyp.
+func (c *CG) ensureType(want CType) error {
+	if c.resTyp == want {
+		return nil
+	}
+	switch {
+	case c.resTyp == TDouble && want == TInt:
+		c.emit("cvttsd2si rax, xmm0")
+		c.resTyp = TInt
+	case c.resTyp == TInt && want == TDouble:
+		c.emit("cvtsi2sd xmm0, rax")
+		c.resTyp = TDouble
+	default:
+		return fmt.Errorf("type mismatch: cannot convert %v to %v", c.resTyp, want)
+	}
+	return nil
+}
+
+// genExpr is the entry point for emitting an expression. The integer/double
+// type of the result is returned so callers can route it to the right
+// register.
+func (c *CG) genExprT(e Expr) (CType, error) {
+	switch n := e.(type) {
+	case *NumLit:
+		if n.Kind == TDouble {
+			lab, ok := c.doubleLab[n.Fval]
+			if !ok {
+				lab = fmt.Sprintf("LD%dx", len(c.doubles))
+				c.doubles = append(c.doubles, n.Fval)
+				c.doubleLab[n.Fval] = lab
+			}
+			c.emit("movsd xmm0, [rip+%s]", lab)
+			c.resTyp = TDouble
+			return TDouble, nil
+		}
+		c.emit("mov rax, %d", n.Val)
+		c.resTyp = TInt
+		return TInt, nil
+	case *StrLit:
+		lab, ok := c.strLab[n]
+		if !ok {
+			lab = fmt.Sprintf("LC%d", len(c.strs))
+			c.strs = append(c.strs, *n)
+			c.strLab[n] = lab
+		}
+		c.emit("lea rax, [rip+%s]", lab)
+		c.resTyp = TInt
+		return TInt, nil
+	case *Ident:
+		vi, ok := c.vars[n.Name]
+		if !ok {
+			return TInt, fmt.Errorf("undefined variable %q", n.Name)
+		}
+		c.loadVar(vi)
+		return c.resTyp, nil
+	case *Unary:
+		return c.genUnary(n)
+	case *Binary:
+		return c.genBinary(n)
+	case *Call:
+		return c.genCallExpr(n)
+	}
+	return TInt, fmt.Errorf("unknown expression")
+}
+
+// genExpr emits an expression and discards its type (for statement context).
+func (c *CG) genExpr(e Expr) error {
+	_, err := c.genExprT(e)
+	return err
+}
+
 // Gen produces the full assembly source for a program. linux selects the
 // SysV ABI and the Linux clib; otherwise Windows x64 conventions are used.
 func Gen(prog *Program, linux bool) (string, error) {
@@ -364,14 +481,18 @@ func Gen(prog *Program, linux bool) (string, error) {
 		return "", clibErr
 	}
 	c := &CG{
-		strLab: map[*StrLit]string{},
-		funcs:  map[string]bool{},
-		calls:  map[string]bool{},
-		need:   map[string]bool{},
-		linux:  linux,
+		strLab:    map[*StrLit]string{},
+		doubleLab: map[float64]string{},
+		vars:      map[string]varInfo{},
+		funcs:     map[string]bool{},
+		funcDefs:  map[string]*FuncDecl{},
+		calls:     map[string]bool{},
+		need:      map[string]bool{},
+		linux:     linux,
 	}
 	for _, f := range prog.Funcs {
 		c.funcs[f.Name] = true
+		c.funcDefs[f.Name] = f
 	}
 
 	var body strings.Builder
@@ -473,13 +594,22 @@ func Gen(prog *Program, linux bool) (string, error) {
 			out.WriteString(fmt.Sprintf("%s db \"%s\", 0\n", lab, encodeStr(c.strs[i].Bytes)))
 		}
 	}
+	if len(c.doubles) > 0 {
+		out.WriteString("\nsection .rdata\n")
+		for _, v := range c.doubles {
+			lab := c.doubleLab[v]
+			out.WriteString(fmt.Sprintf("%s dq %s\n", lab, formatDouble(v)))
+		}
+	}
 	return out.String(), nil
 }
 
 func (c *CG) genFunc(f *FuncDecl) error {
-	c.varOff = map[string]int{}
+	c.vars = map[string]varInfo{}
+	c.curRet = f.Ret
+	c.curParam = f.ParamTypes
 	for i, p := range f.Params {
-		c.varOff[p] = 16 + 8*i // [rbp+16], [rbp+24], ...
+		c.vars[p] = varInfo{off: 16 + 8*i, typ: f.ParamTypes[i]} // [rbp+16], ...
 	}
 
 	// Pre-assign stack slots to every local declaration (including
@@ -498,9 +628,9 @@ func (c *CG) genFunc(f *FuncDecl) error {
 				collect(st)
 			}
 		case *DeclStmt:
-			if _, ok := c.varOff[n.Name]; !ok {
+			if _, ok := c.vars[n.Name]; !ok {
 				localCount++
-				c.varOff[n.Name] = -(40 + 8*localCount)
+				c.vars[n.Name] = varInfo{off: -(40 + 8*localCount), typ: n.Typ}
 			}
 		case *IfStmt:
 			collect(n.Then)
@@ -535,10 +665,17 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	c.emit("mov [rbp-32], r14")
 
 	// Spill the register arguments into this function's frame so the rest of
-	// the code can read params from the stack like normal locals.
+	// the code can read params from the stack like normal locals. Double
+	// parameters arrive in XMM registers and are stored as 8 bytes (movsd).
 	argRegs := c.argRegs()
+	argXMM := c.argXMM()
 	for i := 0; i < len(f.Params) && i < len(argRegs); i++ {
-		c.emit("mov [rbp+%d], %s", 16+8*i, argRegs[i])
+		off := 16 + 8*i
+		if f.ParamTypes[i] == TDouble && i < len(argXMM) {
+			c.emit("movsd [rbp+%d], %s", off, argXMM[i])
+		} else {
+			c.emit("mov [rbp+%d], %s", off, argRegs[i])
+		}
 	}
 
 	for _, st := range f.Body.Stmts {
@@ -572,28 +709,37 @@ func (c *CG) genStmt(s Stmt) error {
 			}
 		}
 	case *DeclStmt:
-		off := c.varOff[n.Name]
+		vi := c.vars[n.Name]
 		if n.Init != nil {
-			if err := c.genExpr(n.Init); err != nil {
+			if _, err := c.genExprT(n.Init); err != nil {
 				return err
 			}
-			c.emit("mov [rbp%+d], rax", off)
+			if err := c.ensureType(vi.typ); err != nil {
+				return err
+			}
+			c.storeVar(vi)
 		} else {
-			c.emit("mov [rbp%+d], 0", off)
+			c.emit("mov [rbp%+d], 0", vi.off)
 		}
 	case *AssignStmt:
-		off := c.varOff[n.Name]
-		if err := c.genExpr(n.E); err != nil {
+		vi := c.vars[n.Name]
+		if _, err := c.genExprT(n.E); err != nil {
 			return err
 		}
-		c.emit("mov [rbp%+d], rax", off)
+		if err := c.ensureType(vi.typ); err != nil {
+			return err
+		}
+		c.storeVar(vi)
 	case *ExprStmt:
-		if err := c.genExpr(n.E); err != nil {
+		if _, err := c.genExprT(n.E); err != nil {
 			return err
 		}
 	case *ReturnStmt:
 		if n.E != nil {
-			if err := c.genExpr(n.E); err != nil {
+			if _, err := c.genExprT(n.E); err != nil {
+				return err
+			}
+			if err := c.ensureType(c.curRet); err != nil {
 				return err
 			}
 		} else {
@@ -603,7 +749,10 @@ func (c *CG) genStmt(s Stmt) error {
 	case *IfStmt:
 		lElse := c.newLabel("else")
 		lEnd := c.newLabel("endif")
-		if err := c.genExpr(n.Cond); err != nil {
+		if _, err := c.genExprT(n.Cond); err != nil {
+			return err
+		}
+		if err := c.ensureType(TInt); err != nil {
 			return err
 		}
 		c.emit("cmp rax, 0")
@@ -625,7 +774,10 @@ func (c *CG) genStmt(s Stmt) error {
 		lTop := c.newLabel("while")
 		lEnd := c.newLabel("wend")
 		c.sb.WriteString(lTop + ":\n")
-		if err := c.genExpr(n.Cond); err != nil {
+		if _, err := c.genExprT(n.Cond); err != nil {
+			return err
+		}
+		if err := c.ensureType(TInt); err != nil {
 			return err
 		}
 		c.emit("cmp rax, 0")
@@ -639,47 +791,36 @@ func (c *CG) genStmt(s Stmt) error {
 	return nil
 }
 
-func (c *CG) genExpr(e Expr) error {
-	switch n := e.(type) {
-	case *NumLit:
-		c.emit("mov rax, %d", n.Val)
-	case *StrLit:
-		lab, ok := c.strLab[n]
-		if !ok {
-			lab = fmt.Sprintf("LC%d", len(c.strs))
-			c.strs = append(c.strs, *n)
-			c.strLab[n] = lab
-		}
-		c.emit("lea rax, [rip+%s]", lab)
-	case *Ident:
-		off, ok := c.varOff[n.Name]
-		if !ok {
-			return fmt.Errorf("undefined variable %q", n.Name)
-		}
-		c.emit("mov rax, [rbp%+d]", off)
-	case *Unary:
-		if err := c.genExpr(n.E); err != nil {
-			return err
-		}
-		if n.Op == "-" {
-			c.emit("neg rax")
-		} else { // "!"
-			lTrue := c.newLabel("nott")
-			lEnd := c.newLabel("note")
-			c.emit("cmp rax, 0")
-			c.emit("je %s", lTrue)
-			c.emit("mov rax, 0")
-			c.emit("jmp %s", lEnd)
-			c.sb.WriteString(lTrue + ":\n")
-			c.emit("mov rax, 1")
-			c.sb.WriteString(lEnd + ":\n")
-		}
-	case *Binary:
-		return c.genBinary(n)
-	case *Call:
-		return c.genCall(n)
+func (c *CG) genUnary(n *Unary) (CType, error) {
+	t, err := c.genExprT(n.E)
+	if err != nil {
+		return TInt, err
 	}
-	return nil
+	if n.Op == "-" {
+		if t == TDouble {
+			// xmm0 = -xmm0  => 0.0 - xmm0
+			c.emit("xorpd xmm1, xmm1")
+			c.emit("subsd xmm1, xmm0")
+			c.emit("movsd xmm0, xmm1")
+		} else {
+			c.emit("neg rax")
+		}
+		return t, nil
+	}
+	// "!" -- force the operand to int, then rax = (rax == 0)
+	if err := c.ensureType(TInt); err != nil {
+		return TInt, err
+	}
+	lTrue := c.newLabel("nott")
+	lEnd := c.newLabel("note")
+	c.emit("cmp rax, 0")
+	c.emit("je %s", lTrue)
+	c.emit("mov rax, 0")
+	c.emit("jmp %s", lEnd)
+	c.sb.WriteString(lTrue + ":\n")
+	c.emit("mov rax, 1")
+	c.sb.WriteString(lEnd + ":\n")
+	return TInt, nil
 }
 
 // setcc emits "rax = (left OP right)" using a conditional branch, because a0
@@ -695,18 +836,24 @@ func (c *CG) emitCompare(jmpIfTrue string) {
 	c.sb.WriteString(lEnd + ":\n")
 }
 
-func (c *CG) genBinary(n *Binary) error {
+func (c *CG) genBinary(n *Binary) (CType, error) {
 	switch n.Op {
 	case "&&":
 		lFalse := c.newLabel("andf")
 		lEnd := c.newLabel("andd")
-		if err := c.genExpr(n.L); err != nil {
-			return err
+		if _, err := c.genExprT(n.L); err != nil {
+			return TInt, err
+		}
+		if err := c.ensureType(TInt); err != nil {
+			return TInt, err
 		}
 		c.emit("cmp rax, 0")
 		c.emit("je %s", lFalse)
-		if err := c.genExpr(n.R); err != nil {
-			return err
+		if _, err := c.genExprT(n.R); err != nil {
+			return TInt, err
+		}
+		if err := c.ensureType(TInt); err != nil {
+			return TInt, err
 		}
 		c.emit("cmp rax, 0")
 		c.emit("je %s", lFalse)
@@ -715,16 +862,24 @@ func (c *CG) genBinary(n *Binary) error {
 		c.sb.WriteString(lFalse + ":\n")
 		c.emit("mov rax, 0")
 		c.sb.WriteString(lEnd + ":\n")
+		c.resTyp = TInt
+		return TInt, nil
 	case "||":
 		lTrue := c.newLabel("ort")
 		lEnd := c.newLabel("ore")
-		if err := c.genExpr(n.L); err != nil {
-			return err
+		if _, err := c.genExprT(n.L); err != nil {
+			return TInt, err
+		}
+		if err := c.ensureType(TInt); err != nil {
+			return TInt, err
 		}
 		c.emit("cmp rax, 0")
 		c.emit("jne %s", lTrue)
-		if err := c.genExpr(n.R); err != nil {
-			return err
+		if _, err := c.genExprT(n.R); err != nil {
+			return TInt, err
+		}
+		if err := c.ensureType(TInt); err != nil {
+			return TInt, err
 		}
 		c.emit("cmp rax, 0")
 		c.emit("jne %s", lTrue)
@@ -733,23 +888,67 @@ func (c *CG) genBinary(n *Binary) error {
 		c.sb.WriteString(lTrue + ":\n")
 		c.emit("mov rax, 1")
 		c.sb.WriteString(lEnd + ":\n")
-	default:
-		// Spill the left operand into a frame-local temporary slot instead
-		// of using push/pop: push/pop would leave RSP 8 bytes off whenever
-		// a call happens while an operand is saved, breaking the Windows
-		// x64 requirement that RSP be 16-byte aligned at every call.
-		c.tmpDepth++
-		k := c.tmpDepth
-		off := c.tmpSlot(k)
-		if err := c.genExpr(n.L); err != nil {
-			return err
-		}
+		c.resTyp = TInt
+		return TInt, nil
+	}
+
+	// Numeric / comparison operators. The left operand is evaluated first and
+	// spilled into a frame temporary (push/pop would break the 16-byte RSP
+	// alignment at call sites). When either side is a double, both operands
+	// are promoted to double and the SSE2 scalar instructions take over.
+	c.tmpDepth++
+	k := c.tmpDepth
+	off := c.tmpSlot(k)
+	lt, err := c.genExprT(n.L)
+	if err != nil {
+		return TInt, err
+	}
+	if lt == TDouble {
+		c.emit("movsd [rbp%+d], xmm0", off)
+	} else {
 		c.emit("mov [rbp%+d], rax", off)
-		if err := c.genExpr(n.R); err != nil {
-			return err
+	}
+	rt, err := c.genExprT(n.R)
+	if err != nil {
+		return TInt, err
+	}
+	c.tmpDepth--
+
+	// The right operand is now in rax (int) or xmm0 (double).
+	isDbl := lt == TDouble || rt == TDouble
+
+	// loadLeftDbl puts the spilled left operand into xmm0 as a double.
+	loadLeftDbl := func() {
+		if lt == TDouble {
+			c.emit("movsd xmm0, [rbp%+d]", off)
+		} else {
+			c.emit("mov rax, [rbp%+d]", off)
+			c.emit("cvtsi2sd xmm0, rax")
+		}
+	}
+
+	switch n.Op {
+	case "+", "-", "*", "/":
+		if isDbl {
+			if err := c.ensureType(TDouble); err != nil { // right -> xmm0
+				return TInt, err
+			}
+			c.emit("movsd xmm1, xmm0") // right -> xmm1
+			loadLeftDbl()              // xmm0 = left (as double)
+			switch n.Op {
+			case "+":
+				c.emit("addsd xmm0, xmm1")
+			case "-":
+				c.emit("subsd xmm0, xmm1")
+			case "*":
+				c.emit("mulsd xmm0, xmm1")
+			case "/":
+				c.emit("divsd xmm0, xmm1")
+			}
+			c.resTyp = TDouble
+			return TDouble, nil
 		}
 		c.emit("mov r10, [rbp%+d]", off) // left -> r10, right -> rax
-		c.tmpDepth--
 		switch n.Op {
 		case "+":
 			c.emit("add rax, r10")
@@ -763,50 +962,106 @@ func (c *CG) genBinary(n *Binary) error {
 			c.emit("mov rax, r10") // dividend
 			c.emit("cqo")
 			c.emit("idiv r11")
-		case "%":
-			c.emit("mov r11, rax")
-			c.emit("mov rax, r10")
-			c.emit("cqo")
-			c.emit("idiv r11")
-			c.emit("mov rax, rdx")
-		case "<":
-			c.emit("cmp r10, rax")
-			c.emitCompare("jl")
-		case ">":
-			c.emit("cmp r10, rax")
-			c.emitCompare("jg")
-		case "<=":
-			c.emit("cmp r10, rax")
-			c.emitCompare("jle")
-		case ">=":
-			c.emit("cmp r10, rax")
-			c.emitCompare("jge")
-		case "==":
-			c.emit("cmp r10, rax")
-			c.emitCompare("je")
-		case "!=":
-			c.emit("cmp r10, rax")
-			c.emitCompare("jne")
-		default:
-			return fmt.Errorf("unsupported operator %q", n.Op)
 		}
+		c.resTyp = TInt
+		return TInt, nil
+	case "%":
+		if isDbl {
+			return TInt, fmt.Errorf("%% requires integer operands")
+		}
+		c.emit("mov r10, [rbp%+d]", off)
+		c.emit("mov r11, rax") // divisor
+		c.emit("mov rax, r10") // dividend
+		c.emit("cqo")
+		c.emit("idiv r11")
+		c.emit("mov rax, rdx")
+		c.resTyp = TInt
+		return TInt, nil
+	case "<", ">", "<=", ">=", "==", "!=":
+		var jmp string
+		if isDbl {
+			if err := c.ensureType(TDouble); err != nil {
+				return TInt, err
+			}
+			c.emit("movsd xmm1, xmm0") // right -> xmm1
+			loadLeftDbl()              // xmm0 = left
+			c.emit("ucomisd xmm0, xmm1")
+			// ucomisd sets CF for `<` and ZF for `==`; the unsigned jumps
+			// read those flags directly, which is the canonical way to
+			// compare ordered doubles.
+			switch n.Op {
+			case "<":
+				jmp = "jb"
+			case ">":
+				jmp = "ja"
+			case "<=":
+				jmp = "jbe"
+			case ">=":
+				jmp = "jae"
+			case "==":
+				jmp = "je"
+			case "!=":
+				jmp = "jne"
+			}
+		} else {
+			c.emit("mov r10, [rbp%+d]", off)
+			c.emit("cmp r10, rax")
+			switch n.Op {
+			case "<":
+				jmp = "jl"
+			case ">":
+				jmp = "jg"
+			case "<=":
+				jmp = "jle"
+			case ">=":
+				jmp = "jge"
+			case "==":
+				jmp = "je"
+			case "!=":
+				jmp = "jne"
+			}
+		}
+		c.emitCompare(jmp)
+		c.resTyp = TInt
+		return TInt, nil
 	}
-	return nil
+	return TInt, fmt.Errorf("unsupported operator %q", n.Op)
 }
 
-// genCall follows the Windows x64 calling convention: integer args go in
-// RCX, RDX, R8, R9; the 32-byte shadow space is already part of the
-// function's reserved frame, and RSP is 16-byte aligned at the call.
+// argSlot remembers a call argument's frame temporary slot and its type.
+type argSlot struct {
+	slot int
+	typ  CType
+}
+
+// variadicFn reports whether a clib function takes printf-style varargs.
+// For those, c0 passes every argument in an 8-byte "general-purpose slot"
+// (doubles are moved bitwise into rax first), so the __clib_va array lines
+// up positionally with the format string: the %d/%f/%s consumers all walk
+// the same 8-byte cursor, exactly like the clib prologue expects.
+func variadicFn(name string) bool {
+	return name == "printf" || name == "sprintf"
+}
+
+// genCallExpr emits a call and returns the callee's result type.
 //
-// Each argument is evaluated and spilled to a frame temporary slot, and
-// only loaded into the argument registers right before the call. This is
-// required because an argument may itself be a function call whose own
-// argument setup would otherwise clobber the values of earlier arguments.
-func (c *CG) genCall(n *Call) error {
+// Calling conventions:
+//   - Typed calls (user functions): each argument goes to the register of
+//     its position and type -- doubles to xmm0-3 (Win) / xmm0-7 (SysV),
+//     everything else to rcx/rdx/r8/r9 (Win) / rdi/rsi/... (SysV).
+//   - Varargs (printf/sprintf): every argument rides in an 8-byte GP slot,
+//     double bit patterns included, so __clib_va needs no XMM handling.
+//
+// Each argument is evaluated and spilled to a frame temporary slot, and only
+// loaded into the argument registers right before the call. This is required
+// because an argument may itself be a function call whose own argument setup
+// would otherwise clobber the values of earlier arguments.
+func (c *CG) genCallExpr(n *Call) (CType, error) {
 	argRegs := c.argRegs()
+	argXMM := c.argXMM()
 	nargs := len(n.Args)
 	if nargs > maxArgs {
-		return fmt.Errorf("%s: too many arguments (max %d)", n.Name, maxArgs)
+		return TInt, fmt.Errorf("%s: too many arguments (max %d)", n.Name, maxArgs)
 	}
 	// Anything past the register arguments goes on the stack: at [rsp+32]
 	// and up on Windows (above the 32-byte shadow space), at [rsp] and up on
@@ -840,24 +1095,64 @@ func (c *CG) genCall(n *Call) error {
 		}
 	}
 
-	slots := make([]int, nargs)
+	varargs := variadicFn(n.Name)
+	slots := make([]argSlot, nargs)
 	for i := 0; i < nargs; i++ {
-		if err := c.genExpr(n.Args[i]); err != nil {
-			return err
+		t, err := c.genExprT(n.Args[i])
+		if err != nil {
+			return TInt, err
+		}
+		// C's usual conversion at call sites: an int argument passed to a
+		// declared double parameter is widened before it is spilled, so the
+		// callee (which reads double params from an XMM register) sees the
+		// right value.
+		if !varargs && t == TInt {
+			if fd, ok := c.funcDefs[n.Name]; ok && i < len(fd.ParamTypes) && fd.ParamTypes[i] == TDouble {
+				c.emit("cvtsi2sd xmm0, rax")
+				t = TDouble
+				c.resTyp = TDouble
+			}
 		}
 		c.tmpDepth++
-		slots[i] = c.tmpDepth
-		c.emit("mov [rbp%+d], rax", c.tmpSlot(c.tmpDepth))
+		if t == TDouble && !varargs {
+			c.emit("movsd [rbp%+d], xmm0", c.tmpSlot(c.tmpDepth))
+		} else {
+			if t == TDouble { // varargs: double bits ride in a GP slot
+				c.emit("movq rax, xmm0")
+			}
+			c.emit("mov [rbp%+d], rax", c.tmpSlot(c.tmpDepth))
+		}
+		slots[i] = argSlot{slot: c.tmpDepth, typ: t}
 	}
 	if extra > 0 {
 		c.emit("sub rsp, %d", extra)
 	}
 	for i := 0; i < nargs; i++ {
-		if i < len(argRegs) {
-			c.emit("mov %s, [rbp%+d]", argRegs[i], c.tmpSlot(slots[i]))
+		s := slots[i]
+		if varargs {
+			if i < len(argRegs) {
+				c.emit("mov %s, [rbp%+d]", argRegs[i], c.tmpSlot(s.slot))
+				continue
+			}
+			c.emit("mov rax, [rbp%+d]", c.tmpSlot(s.slot))
+			c.emit("mov [rsp+%d], rax", c.stackArgOff(i-len(argRegs)))
 			continue
 		}
-		c.emit("mov rax, [rbp%+d]", c.tmpSlot(slots[i]))
+		if s.typ == TDouble {
+			if i < len(argRegs) && i < len(argXMM) {
+				c.emit("movsd %s, [rbp%+d]", argXMM[i], c.tmpSlot(s.slot))
+				continue
+			}
+			c.emit("movsd xmm0, [rbp%+d]", c.tmpSlot(s.slot))
+			c.emit("movq rax, xmm0")
+			c.emit("mov [rsp+%d], rax", c.stackArgOff(i-len(argRegs)))
+			continue
+		}
+		if i < len(argRegs) {
+			c.emit("mov %s, [rbp%+d]", argRegs[i], c.tmpSlot(s.slot))
+			continue
+		}
+		c.emit("mov rax, [rbp%+d]", c.tmpSlot(s.slot))
 		c.emit("mov [rsp+%d], rax", c.stackArgOff(i-len(argRegs)))
 	}
 	c.emit("call %s", target)
@@ -865,7 +1160,14 @@ func (c *CG) genCall(n *Call) error {
 		c.emit("add rsp, %d", extra)
 	}
 	c.tmpDepth -= nargs
-	return nil
+
+	// Result type: user functions declare it; clib and extern calls return int.
+	ret := TInt
+	if f, ok := c.funcDefs[n.Name]; ok {
+		ret = f.Ret
+	}
+	c.resTyp = ret
+	return ret, nil
 }
 
 // encodeStr renders decoded string bytes as a double-quoted literal with
@@ -893,4 +1195,19 @@ func encodeStr(b []byte) string {
 		}
 	}
 	return sb.String()
+}
+
+// formatDouble renders a float64 as a Go-syntax literal that a0's `dq`
+// directive can parse back into IEEE-754 bits ("1.5", "0x1.2p3", ...).
+//
+// 'g' formatting would print integral doubles as bare integers ("10"), and a0
+// parses those via ParseInt -> the integer bit pattern (0xa) instead of the
+// double (0x4024000000000000). Force a trailing ".0" so a0's ParseFloat path
+// is taken.
+func formatDouble(v float64) string {
+	s := strconv.FormatFloat(v, 'g', -1, 64)
+	if !strings.ContainsAny(s, ".eE") {
+		s += ".0"
+	}
+	return s
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ type Operand struct {
 	kind       int
 	reg        int    // register index 0..15 (K_REG, K_MEM reg-indirect)
 	isByte     bool   // register is an 8-bit register (al/cl/dl/bl/...b)
+	isXMM      bool   // register is an XMM register (xmm0..xmm15)
 	imm        int64  // K_IMM
 	memReg     int    // K_MEM register-indirect register index ([reg] form)
 	memSym     string // K_MEM rip-relative symbol ([rip+sym] form)
@@ -155,6 +157,13 @@ func regIndex(s string) (int, bool) {
 var byteRegMap = map[string]int{
 	"al": 0, "cl": 1, "dl": 2, "bl": 3, "spl": 4, "bpl": 5, "sil": 6, "dil": 7,
 	"r8b": 8, "r9b": 9, "r10b": 10, "r11b": 11, "r12b": 12, "r13b": 13, "r14b": 14, "r15b": 15,
+}
+
+// xmm register table. Index 0..15 matches the low 3 bits of the XMM register
+// number, and the REX.R / REX.B bits extend an XMM just like a GP register.
+var xmmRegMap = map[string]int{
+	"xmm0": 0, "xmm1": 1, "xmm2": 2, "xmm3": 3, "xmm4": 4, "xmm5": 5, "xmm6": 6, "xmm7": 7,
+	"xmm8": 8, "xmm9": 9, "xmm10": 10, "xmm11": 11, "xmm12": 12, "xmm13": 13, "xmm14": 14, "xmm15": 15,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +463,9 @@ func (a *Assembler) parseOperand(tok string) (Operand, error) {
 	}
 	if ri, ok := byteRegMap[tok]; ok {
 		return Operand{kind: K_REG, reg: ri, isByte: true}, nil
+	}
+	if ri, ok := xmmRegMap[tok]; ok {
+		return Operand{kind: K_REG, reg: ri, isXMM: true}, nil
 	}
 	if ri, ok := regIndex(tok); ok {
 		return Operand{kind: K_REG, reg: ri}, nil
@@ -904,6 +916,9 @@ func (a *Assembler) encode(mnem string, ops []Operand, ln string) error {
 		a.emitByte(0x0F)
 		a.emitByte(0x05)
 		return nil
+	case "movsd", "movss", "addsd", "subsd", "mulsd", "divsd", "sqtsd",
+		"xorpd", "ucomisd", "cvtsi2sd", "cvttsd2si", "movq":
+		return a.encodeSSE(mnem, ops, ln)
 	}
 	return fmt.Errorf("unknown instruction: %q (line %q)", mnem, ln)
 }
@@ -985,10 +1000,17 @@ func (a *Assembler) emitDQ(rest string) error {
 			continue
 		}
 		v, err := strconv.ParseInt(t, 0, 64)
-		if err != nil {
-			return fmt.Errorf("bad dq operand %q", t)
+		if err == nil {
+			a.emitInt64(v)
+			continue
 		}
-		a.emitInt64(v)
+		// floating-point literal -> IEEE-754 double bits (little-endian)
+		f, err2 := strconv.ParseFloat(t, 64)
+		if err2 == nil {
+			a.emitInt64(int64(math.Float64bits(f)))
+			continue
+		}
+		return fmt.Errorf("bad dq operand %q", t)
 	}
 	return nil
 }
@@ -1434,6 +1456,194 @@ func (a *Assembler) encodeImul(ops []Operand, ln string) error {
 	a.emitByte(0xAF)
 	a.emitByte(modrmRegReg(ops[0].reg, ops[1].reg)) // reg=dst, rm=src
 	return nil
+}
+
+// ---- SSE2 (scalar double / quadword moves) --------------------------------
+
+// sseSpec describes a two-operand SSE2 instruction. `prefix` is the legacy
+// prefix (0x66 / 0xF2 / 0xF3); `op` is the opcode byte after 0F; `w` asks for
+// REX.W (needed by the movq/cvtsi2sd/cvttsd2si conversions). `sdx` marks
+// movsd/movss, whose store form (xmm -> mem) uses op|1.
+var sseSpec = map[string]struct {
+	prefix byte
+	op     byte
+	w      bool
+	sdx    bool
+}{
+	"movsd":     {0xF2, 0x10, false, true},
+	"movss":     {0xF3, 0x10, false, true},
+	"addsd":     {0xF2, 0x58, false, false},
+	"subsd":     {0xF2, 0x5C, false, false},
+	"mulsd":     {0xF2, 0x59, false, false},
+	"divsd":     {0xF2, 0x5E, false, false},
+	"sqtsd":     {0xF2, 0x51, false, false},
+	"xorpd":     {0x66, 0x57, false, false},
+	"ucomisd":   {0x66, 0x2E, false, false},
+	"cvtsi2sd":  {0xF2, 0x2A, true, false},
+	"cvttsd2si": {0xF2, 0x2C, true, false},
+}
+
+// emitSSE emits the REX prefix for an SSE instruction: W + R (reg field) + B
+// (rm field). No X bit -- XMM instructions never use an index register.
+func (a *Assembler) emitSSE(w bool, regExt, rmExt int) {
+	v := byte(0x40)
+	if w {
+		v |= 0x08
+	}
+	if regExt >= 8 {
+		v |= 0x04
+	}
+	if rmExt >= 8 {
+		v |= 0x01
+	}
+	if v != 0x40 {
+		a.emitByte(v)
+	}
+}
+
+// emitSSEmem is like emitSSE but takes the extension bits from a planned
+// memory encoding (so REX.R/B come from the XMM reg field and the base/index).
+func (a *Assembler) emitSSEmem(w bool, e memEnc) {
+	v := byte(0x40)
+	if w {
+		v |= 0x08
+	}
+	if e.rexR {
+		v |= 0x04
+	}
+	if e.rexX {
+		v |= 0x02
+	}
+	if e.rexB {
+		v |= 0x01
+	}
+	if v != 0x40 {
+		a.emitByte(v)
+	}
+}
+
+func (a *Assembler) encodeSSE(mnem string, ops []Operand, ln string) error {
+	if mnem == "movq" {
+		return a.encodeMovQ(ops, ln)
+	}
+	spec, ok := sseSpec[mnem]
+	if !ok {
+		return fmt.Errorf("unknown SSE: %q", mnem)
+	}
+	if len(ops) != 2 {
+		return fmt.Errorf("%s needs 2 operands: %q", mnem, ln)
+	}
+	// cvttsd2si is the one SSE2 form whose destination is a GP register: the
+	// GP dst lives in ModRM.reg and the XMM/mem source in ModRM.rm. The
+	// generic path below assumes the XMM operand is always the reg field,
+	// which would swap the two and silently produce e.g. "cvttsd2si rax,xmm1"
+	// for "cvttsd2si rcx,xmm0".
+	if mnem == "cvttsd2si" {
+		gp, src := ops[0], ops[1]
+		if gp.isXMM || src.kind != K_REG && src.kind != K_MEM {
+			return fmt.Errorf("cvttsd2si needs GP dst: %q", ln)
+		}
+		a.emitByte(spec.prefix)
+		if src.kind == K_MEM {
+			if src.isRip {
+				a.emitSSE(spec.w, gp.reg, 0)
+				a.emitByte(0x0F)
+				a.emitByte(spec.op)
+				a.emitByte(modrmRip(gp.reg))
+				off := a.curOff()
+				a.emitInt32(0)
+				a.fixup(off, src.memSym)
+				return nil
+			}
+			e, err := a.planMem(gp.reg, src)
+			if err != nil {
+				return err
+			}
+			a.emitSSEmem(spec.w, e)
+			a.emitByte(0x0F)
+			a.emitByte(spec.op)
+			a.emitMemEnc(e)
+			return nil
+		}
+		a.emitSSE(spec.w, gp.reg, src.reg)
+		a.emitByte(0x0F)
+		a.emitByte(spec.op)
+		a.emitByte(modrmRegReg(gp.reg, src.reg))
+		return nil
+	}
+	// The XMM operand is always the ModRM reg field; the other operand is the
+	// rm field (a GP register, an XMM, or memory).
+	var xmmOp, other Operand
+	if ops[0].isXMM {
+		xmmOp, other = ops[0], ops[1]
+	} else {
+		xmmOp, other = ops[1], ops[0]
+	}
+	op := spec.op
+	if spec.sdx && xmmOp != ops[0] {
+		op |= 1 // movsd/movss store form: xmm is the source, mem is the dest
+	}
+
+	// REX planning for the rm operand (memory uses the planned extension bits).
+	var e memEnc
+	if other.kind == K_MEM && !other.isRip {
+		var err error
+		e, err = a.planMem(xmmOp.reg, other)
+		if err != nil {
+			return err
+		}
+	}
+
+	a.emitByte(spec.prefix)
+	if other.kind == K_MEM && !other.isRip {
+		a.emitSSEmem(spec.w, e)
+	} else {
+		a.emitSSE(spec.w, xmmOp.reg, other.reg)
+	}
+	a.emitByte(0x0F)
+	a.emitByte(op)
+
+	if other.kind == K_MEM {
+		if other.isRip {
+			a.emitByte(modrmRip(xmmOp.reg))
+			off := a.curOff()
+			a.emitInt32(0)
+			a.fixup(off, other.memSym)
+		} else {
+			a.emitMemEnc(e)
+		}
+	} else {
+		a.emitByte(modrmRegReg(xmmOp.reg, other.reg))
+	}
+	return nil
+}
+
+// encodeMovQ implements the two GP <-> XMM moves:
+//
+//	movq xmm, r64   => 66 REX.W 0F 6E   (reg=xmm, rm=r64)   GP -> XMM
+//	movq r64, xmm   => 66 REX.W 0F 7E   (reg=xmm, rm=r64)   XMM -> GP
+func (a *Assembler) encodeMovQ(ops []Operand, ln string) error {
+	if len(ops) != 2 {
+		return fmt.Errorf("movq needs 2 operands: %q", ln)
+	}
+	dst, src := ops[0], ops[1]
+	if dst.isXMM && src.kind == K_REG && !src.isXMM {
+		a.emitByte(0x66)
+		a.emitSSE(true, dst.reg, src.reg)
+		a.emitByte(0x0F)
+		a.emitByte(0x6E)
+		a.emitByte(modrmRegReg(dst.reg, src.reg))
+		return nil
+	}
+	if src.isXMM && dst.kind == K_REG && !dst.isXMM {
+		a.emitByte(0x66)
+		a.emitSSE(true, src.reg, dst.reg)
+		a.emitByte(0x0F)
+		a.emitByte(0x7E)
+		a.emitByte(modrmRegReg(src.reg, dst.reg))
+		return nil
+	}
+	return fmt.Errorf("movq: unsupported operands: %q", ln)
 }
 
 // ---- unary (idiv / inc / dec / neg) ---------------------------------------
