@@ -7,6 +7,9 @@
 // and confirm the program took the right branch and exits cleanly.
 //
 // Usage: msgboxcheck <path-to-msgbox.exe>
+//
+//go:build windows
+
 package main
 
 import (
