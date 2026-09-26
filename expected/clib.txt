@@ -1,0 +1,21 @@
+== stdio ==
+d=42 s=str c=A x=ff pct=%
+puts: hello
+J
+neg=-1234 zero=0
+four varargs: 1 2 3 4
+five varargs: 1 2 3 4 5
+== string ==
+strlen=5
+strcmp same=0
+strcmp less=-1
+strcmp more=1
+== stdlib ==
+atoi=-456
+abs=7
+== heap ==
+malloc ok=1
+copied len=13 s=into the heap
+memset len=13 s=AAAAAthe heap
+memcpy s=abcdef
+done

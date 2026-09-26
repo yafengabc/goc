@@ -1,0 +1,7 @@
+fib(10) = 55
+max3(7, 42, 13) = 42
+expr = 6
+div=-2 mod=-2
+nested: 8 13 34
+cmp: 1 1 1
+even sum 0..9 = 20

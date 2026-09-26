@@ -1,0 +1,156 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+// c0: a tiny C compiler.
+//
+// Pipeline: lex -> parse -> generate x86-64 assembly (Intel syntax) ->
+// a0 assembles it straight into a native executable. No gcc, no libc.
+//
+//   - default (Windows): PE32+, kernel32 only
+//   - -target linux:     static ELF64, raw syscalls only
+//
+// Usage:
+//
+//	c0 file.c                 compile and run
+//	c0 -c file.c              compile only (produce file.exe / file)
+//	c0 -S file.c              emit assembly only (produce file.asm)
+//	c0 -target linux file.c   produce a Linux ELF64 instead
+func main() {
+	args := os.Args[1:]
+	mode := "run" // run | compile | asm
+	linux := false
+	var files []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-c":
+			mode = "compile"
+		case a == "-S":
+			mode = "asm"
+		case a == "-target" || a == "-f" || a == "--format":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "c0: -target needs an argument (windows or linux)")
+				os.Exit(1)
+			}
+			i++
+			linux = args[i] == "linux" || args[i] == "elf"
+		case strings.HasPrefix(a, "-target="):
+			v := strings.TrimPrefix(a, "-target=")
+			linux = v == "linux" || v == "elf"
+		default:
+			files = append(files, a)
+		}
+	}
+	if len(files) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: c0 [-c|-S] [-target linux] <file.c>")
+		os.Exit(1)
+	}
+	srcPath := files[0]
+	src, err := os.ReadFile(srcPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	toks, err := Lex(string(src))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "lex error:", err)
+		os.Exit(1)
+	}
+	prog, err := Parse(toks)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "parse error:", err)
+		os.Exit(1)
+	}
+	asm, err := Gen(prog, linux)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "codegen error:", err)
+		os.Exit(1)
+	}
+
+	base := strings.TrimSuffix(srcPath, filepath.Ext(srcPath))
+	sfile := base + ".asm"
+	if err := os.WriteFile(sfile, []byte(asm), 0644); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	if mode == "asm" {
+		fmt.Printf("assembly written to %s\n", sfile)
+		return
+	}
+
+	// Hand the assembly to a0, our own assembler. No gcc involved.
+	a0, err := findA0()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cannot find a0.exe:", err)
+		fmt.Fprintln(os.Stderr, "build it with: cd asm && go build -o a0.exe .")
+		fmt.Fprintln(os.Stderr, "or set A0=<path to a0.exe>")
+		os.Exit(1)
+	}
+
+	out := base + ".exe"
+	if linux {
+		out = base // Linux executables carry no suffix
+	}
+	var cmd *exec.Cmd
+	if linux {
+		cmd = exec.Command(a0, "-f", "elf", sfile, out)
+	} else {
+		cmd = exec.Command(a0, sfile, out)
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "a0 failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("compiled %s -> %s\n", srcPath, out)
+
+	if mode == "compile" {
+		return
+	}
+
+	if linux {
+		// The output cannot run here; elfcheck loads and interprets it so the
+		// result is still verified rather than merely hoped for.
+		fmt.Println("(ELF binary: run it on Linux)")
+		return
+	}
+
+	abs, err := filepath.Abs(out)
+	if err != nil {
+		abs = out
+	}
+	rcmd := exec.Command(abs)
+	rcmd.Stdout = os.Stdout
+	rcmd.Stderr = os.Stderr
+	if err := rcmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			fmt.Printf("(program exited with code %d)\n", ee.ExitCode())
+		} else {
+			fmt.Fprintln(os.Stderr, "run failed:", err)
+		}
+	}
+}
+
+// findA0 locates the a0 assembler: $A0 if set, then next to c0.exe, then PATH.
+func findA0() (string, error) {
+	if v := os.Getenv("A0"); v != "" {
+		return v, nil
+	}
+	if self, err := os.Executable(); err == nil {
+		cand := filepath.Join(filepath.Dir(self), "a0.exe")
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			return cand, nil
+		}
+	}
+	return exec.LookPath("a0.exe")
+}

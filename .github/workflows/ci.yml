@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    # Linux only has to prove both modules still compile and are gofmt-clean.
+    # The end-to-end suite runs on Windows, where the produced exes can run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - name: gofmt
+        run: |
+          out="$(gofmt -l . asm asm/tools/elfcheck asm/tools/msgboxcheck)"
+          if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
+      - name: go vet
+        run: |
+          go vet ./...
+          (cd asm && go vet ./...)
+      - name: go build
+        run: |
+          go build -o c0 .
+          (cd asm && go build -o a0 .)
+
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      # 16 checks: 8 examples x (Windows exe + Linux ELF interpreted by
+      # elfcheck). No interactive desktop here, so the a0 GUI example is not
+      # part of CI.
+      - name: c0 end-to-end
+        run: bash run_tests.sh
+      - name: a0 (non-GUI)
+        run: bash asm/run_tests.sh
+        continue-on-error: true   # msgbox example needs an interactive desktop

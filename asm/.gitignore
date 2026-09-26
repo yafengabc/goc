@@ -1,0 +1,7 @@
+*.exe
+*.out
+
+# examples/linux/*.asm are sources; the ELF binaries next to them are not
+# (a0 -f elf writes them with no suffix, same as Linux convention).
+examples/linux/*
+!examples/linux/*.asm
