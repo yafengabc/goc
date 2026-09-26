@@ -1,0 +1,10 @@
+# Keep LF on checkout for everything that gets executed or byte-compared:
+# bash scripts (CI and local runs), and the golden .txt files the tests diff.
+* text=auto
+
+*.sh   text eol=lf
+*.go   text eol=lf
+*.c    text eol=lf
+*.asm  text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
