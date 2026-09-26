@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -90,9 +91,9 @@ func main() {
 	// Hand the assembly to a0, our own assembler. No gcc involved.
 	a0, err := findA0()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "cannot find a0.exe:", err)
-		fmt.Fprintln(os.Stderr, "build it with: cd asm && go build -o a0.exe .")
-		fmt.Fprintln(os.Stderr, "or set A0=<path to a0.exe>")
+		fmt.Fprintln(os.Stderr, "cannot find a0:", err)
+		fmt.Fprintln(os.Stderr, "build it with: cd asm && go build .")
+		fmt.Fprintln(os.Stderr, "or set A0=<path to a0>")
 		os.Exit(1)
 	}
 
@@ -141,16 +142,21 @@ func main() {
 	}
 }
 
-// findA0 locates the a0 assembler: $A0 if set, then next to c0.exe, then PATH.
+// findA0 locates the a0 assembler: $A0 if set, then next to the c0
+// executable, then PATH. The binary is a0.exe on Windows and a0 elsewhere.
 func findA0() (string, error) {
 	if v := os.Getenv("A0"); v != "" {
 		return v, nil
 	}
+	name := "a0"
+	if runtime.GOOS == "windows" {
+		name = "a0.exe"
+	}
 	if self, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(self), "a0.exe")
+		cand := filepath.Join(filepath.Dir(self), name)
 		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
 			return cand, nil
 		}
 	}
-	return exec.LookPath("a0.exe")
+	return exec.LookPath(name)
 }

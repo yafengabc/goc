@@ -6,8 +6,9 @@ on:
 
 jobs:
   build:
-    # Linux only has to prove both modules still compile and are gofmt-clean.
-    # The end-to-end suite runs on Windows, where the produced exes can run.
+    # Linux: prove both modules compile and are gofmt-clean, then RUN the
+    # Linux ELF targets on the real kernel (run_tests_linux.sh) -- the only
+    # true check for the SSE2 double codegen, no elfcheck interpreter.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +27,8 @@ jobs:
         run: |
           go build -o c0 .
           (cd asm && go build -o a0 .)
+      - name: native Linux e2e (real kernel, real SSE2)
+        run: bash run_tests_linux.sh
 
   test:
     runs-on: windows-latest

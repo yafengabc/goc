@@ -32,8 +32,8 @@ syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 ├── clib_win/                                         # C 库，Windows 版（只靠 kernel32）
 ├── clib_linux/                                       # C 库，Linux 版（只靠 syscall）
 ├── examples/*.c   expected/*.txt                     # c0 的用例与 golden
-├── build.sh  run_tests.sh                            # 构建 / 测试
-└── .github/workflows/ci.yml                          # CI：Linux 编译检查 + Windows 端到端
+├── build.sh  run_tests.sh  run_tests_linux.sh          # 构建 / 测试（Win 解释 / Linux 原生）
+└── .github/workflows/ci.yml                            # CI：Linux 原生端到端 + Windows 端到端
 ```
 
 `asm/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
@@ -54,11 +54,13 @@ syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 所以 clib 里的 `exit` 函数必须改名 `__clib_exit`（否则会覆盖桩的符号并无限递归），
 由 c0 在生成调用时做一次别名映射（`clibAliasLinux`）。
 
-Windows 上没法 exec ELF，所以测试用 `asm/tools/elfcheck` 加载并解释执行
+Windows 上没法 exec ELF，所以本机测试用 `asm/tools/elfcheck` 加载并解释执行
 （校验 ELF 头/程序头，然后真的解释指令、模拟 write/exit/brk）。同一份 golden
 文件：Linux 后端的输出必须和 Windows 逐字节一致。
 
-**仍建议在有 Linux 的机器上真跑一次** —— 解释器能验证指令语义，替代不了真实内核。
+真正的内核验证交给 CI：`.github/workflows/ci.yml` 的 Ubuntu job 会用
+`run_tests_linux.sh` **直接执行**所有 Linux ELF 目标（不走解释器），真实内核 +
+真实 SSE2，这才是 double 支持最硬的证明。
 
 ## clib：自带的 C 库
 
@@ -131,7 +133,9 @@ clib 的 `%f` 用「取整 + 小数部分循环乘 10」输出固定 6 位小数
 `%f` 的变参槽位传的是 8 字节 IEEE-754 位模式（`movq rax, xmm0`）。
 
 Windows 上没法直接执行 SSE2 验证编码，所以 elfcheck 解释器补了 F2/66 前缀解析和
-这套指令的解释执行 —— Linux 目标的 fp 用例与 Windows 输出逐字节一致。
+这套指令的解释执行 —— Linux 目标的 fp 用例与 Windows 输出逐字节一致。CI 的
+Ubuntu job 还会把 `fp` 的 Linux ELF **直接跑在真实内核上**再比一次，覆盖
+解释器验证不到的地方（真实 syscall、栈对齐、16 字节 xorpd 等）。
 
 ## 调用约定
 
@@ -150,7 +154,8 @@ Windows 下变参从 rdx 起、栈上在 `[rbp+48]`；Linux 下从 rsi 起、栈
 ## 测试
 
 ```bash
-bash run_tests.sh           # c0 端到端 18/18（9 个 Windows + 9 个 Linux）
+bash run_tests.sh           # c0 端到端 18/18（9 个 Windows + 9 个 Linux，后者用 elfcheck 解释）
+bash run_tests_linux.sh     # 真机版：在 Linux 上直接执行 ELF（CI 的 Ubuntu job 也跑它）
 cd asm && bash run_tests.sh # a0 自己的用例，14/14（11 Windows + 3 Linux）+ 1 个 GUI
 ```
 
