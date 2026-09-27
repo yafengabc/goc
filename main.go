@@ -60,9 +60,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	toks, err := Lex(string(src))
+	toks, err := Preprocess(string(src), srcPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "lex error:", err)
+		fmt.Fprintln(os.Stderr, "preprocess error:", err)
 		os.Exit(1)
 	}
 	prog, err := Parse(toks)

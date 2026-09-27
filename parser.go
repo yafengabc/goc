@@ -348,8 +348,18 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		}
 		return &NumLit{Val: t.Num}, nil
 	case t.Kind == TStr:
+		// Adjacent string literals concatenate (C translation phase 6), e.g.
+		// "a" "b" becomes "ab". This is what lets a pasting macro like
+		//   #define GREET(x) "hi " x
+		//   GREET("there")   ->   "hi " "there"   ->   "hi there"
+		// produce a single usable string.
+		b := append([]byte(nil), t.Str...)
 		p.next()
-		return &StrLit{Bytes: t.Str}, nil
+		for p.cur().Kind == TStr {
+			b = append(b, p.cur().Str...)
+			p.next()
+		}
+		return &StrLit{Bytes: b}, nil
 	case t.Kind == TIdent:
 		p.next()
 		if p.cur().Text == "(" {
