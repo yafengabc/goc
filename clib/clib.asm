@@ -467,6 +467,88 @@ exit:
     ret                          ; never reached
 ; @end
 
+; --- platform primitives carved out for the C version (clib/c0lib.c) ---------
+; These mirror the inline heap/IO logic already used by malloc/getchar but are
+; exposed under the __clib_ prefix so clib/c0lib.c can call them directly.
+
+; @func __clib_exit
+; @extern ExitProcess
+section .text
+__clib_exit:
+    sub rsp, 40                  ; shadow space for ExitProcess
+    call ExitProcess             ; rcx already holds the exit code
+    ret                          ; never reached
+; @end
+
+; @func __clib_heap_alloc
+; @extern GetProcessHeap HeapAlloc
+section .text
+__clib_heap_alloc:
+    push rbx
+    sub rsp, 32
+    mov rbx, rcx                 ; size
+    call GetProcessHeap
+    mov rcx, rax                 ; heap
+    mov rdx, 0                   ; flags
+    mov r8, rbx                  ; size
+    call HeapAlloc
+    add rsp, 32
+    pop rbx
+    ret
+; @end
+
+; @func __clib_heap_free
+; @extern GetProcessHeap HeapFree
+section .text
+__clib_heap_free:
+    push rbx
+    sub rsp, 32
+    mov rbx, rcx                 ; pointer
+    call GetProcessHeap
+    mov rcx, rax                 ; heap
+    mov rdx, 0                   ; flags
+    mov r8, rbx                  ; pointer
+    call HeapFree
+    add rsp, 32
+    pop rbx
+    ret
+; @end
+
+; @data __clib_read
+section .data
+__clib_rdh    dq 0               ; stdin handle, lazily initialised
+__clib_rdn    dq 0               ; bytes-read scratch
+; @end
+
+; @func __clib_read
+; @extern GetStdHandle ReadFile
+section .text
+__clib_read:
+    push r12
+    push r13
+    sub rsp, 32
+    mov r12, rcx                 ; buf
+    mov r13, rdx                 ; len
+    mov rdx, [rip+__clib_rdh]
+    cmp rdx, 0
+    jne __clib_read_have
+    mov rcx, -10                 ; STD_INPUT_HANDLE
+    call GetStdHandle
+    mov [rip+__clib_rdh], rax
+__clib_read_have:
+    mov rcx, [rip+__clib_rdh]
+    mov rdx, r12                 ; buf
+    mov r8, r13                  ; len
+    lea r9, [rip+__clib_rdn]
+    mov [rsp+32], 0              ; lpOverlapped = NULL
+    call ReadFile
+    mov rax, [rip+__clib_rdn]
+    add rsp, 32
+    pop r13
+    pop r12
+    ret
+; @end
+
 ; @func malloc
 ; @extern GetProcessHeap HeapAlloc
 section .text
@@ -1418,11 +1500,81 @@ __clib_exit:
     ret                          ; never reached
 ; @end
 
-; @func malloc
-; @extern brk
+; --- platform primitives carved out for the C version (clib/c0lib.c) ---------
+; These mirror the inline heap/IO logic already used by malloc/getchar but are
+; exposed under the __clib_ prefix so clib/c0lib.c can call them directly.
+
+; @data __clib_heap_alloc,malloc
 section .data
 __clib_brk    dq 0              ; cached program break (0 = not initialised)
+; @end
+
+; @func __clib_heap_alloc
+; @extern brk
 section .text
+__clib_heap_alloc:
+    ; rdi = size -> rax = pointer (or 0 on failure)
+    push rbx
+    push r12
+    sub rsp, 8
+    mov rbx, rdi                 ; size
+    mov rax, [rip+__clib_brk]
+    cmp rax, 0
+    jne __clib_ha_have
+    xor rdi, rdi
+    call brk                     ; brk(0) -> current break
+    mov [rip+__clib_brk], rax
+__clib_ha_have:
+    mov r12, [rip+__clib_brk]    ; this block starts here
+    mov rax, r12
+    add rax, rbx                 ; new break
+    add rax, 15
+    and rax, -16                 ; keep blocks 16-byte aligned
+    mov rdi, rax
+    call brk
+    cmp rax, 0
+    jl __clib_ha_fail
+    mov [rip+__clib_brk], rax
+    mov rax, r12
+    jmp __clib_ha_done
+__clib_ha_fail:
+    xor rax, rax
+__clib_ha_done:
+    add rsp, 8
+    pop r12
+    pop rbx
+    ret
+; @end
+
+; @func __clib_heap_free
+section .text
+__clib_heap_free:
+    ; Bump allocator: nothing to reclaim.
+    ret
+; @end
+
+; @func __clib_read
+; @extern read
+section .text
+__clib_read:
+    ; rdi = buf, rsi = len -> rax = bytes read (or <=0 on error)
+    push rbx
+    push r12
+    sub rsp, 8
+    mov rbx, rdi                 ; buf
+    mov r12, rsi                 ; len
+    mov rdi, 0                   ; fd = stdin
+    mov rsi, rbx                 ; buf
+    mov rdx, r12                 ; len
+    call read
+    add rsp, 8
+    pop r12
+    pop rbx
+    ret
+; @end
+
+; @func malloc
+; @extern brk
 malloc:
     ; rdi = size -> rax = pointer (or 0 on failure)
     push rbx

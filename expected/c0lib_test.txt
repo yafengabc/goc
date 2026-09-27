@@ -1,0 +1,16 @@
+hello world count=42 char=A big=123456789 uns=255 hex=ff pi=3.141592
+strlen(hello)=5
+strcpy -> copied! (p==heap:1)
+strcmp(abc,abc)=0 strcmp(abc,abd)=-1
+strcat -> foo-bar
+strchr X -> Xme
+memcpy -> abc
+memset z0=7 z2=0
+memcmp eq=0 diff=-23
+strncpy -> hi
+sprintf(19): sprintf x=100 y=200
+atoi(12345)=12345 strtol(0xff,0,0)=255 strtol(-42,0,10)=-42
+abs(-9)=9 abs(9)=9
+rand=16838 rand=5758 rand=10113
+puts-line
+PQ

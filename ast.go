@@ -61,6 +61,16 @@ type AssignStmt struct {
 	Rhs Expr
 }
 
+// AssignExpr is an assignment used in expression position: "(a = b)" yields the
+// value of b. It is produced by the parser wherever an assignment appears inside
+// a larger expression (e.g. "while ((*d++ = *src++) != 0)"). Statement-level
+// "a = b;" is likewise wrapped as ExprStmt{AssignExpr} so both share one
+// code path.
+type AssignExpr struct {
+	Lhs Expr // must be an lvalue
+	Rhs Expr
+}
+
 type ExprStmt struct {
 	E Expr
 }
@@ -155,4 +165,12 @@ type IncDecExpr struct {
 	Op      string // "++" or "--"
 	E       Expr
 	Prefix  bool
+}
+
+// VaArgExpr is the va_arg(ap, Type) builtin of <stdarg.h>. The second "argument"
+// is a type, not an expression, so the parser builds this dedicated node instead
+// of a Call. Ap is the va_list cursor; Typ is the requested element type.
+type VaArgExpr struct {
+	Ap  Expr
+	Typ *Type
 }

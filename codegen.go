@@ -48,6 +48,8 @@ type CG struct {
 	resSigned bool            // signedness of the last genExprT result (int-class only)
 	tmpSgn    []bool          // signedness of each expression-temporary slot
 	loops     []loopLabels    // active loop targets for break/continue
+	saveBaseOff int           // rbp offset of the variadic save area (0 if none)
+	nFixed    int             // number of named params before "..." in the current fn
 }
 
 // loopLabels records the break/continue targets of the innermost loop.
@@ -108,6 +110,7 @@ const scratchSlots = 32
 var externDLL = map[string]string{
 	"GetStdHandle":   "kernel32",
 	"WriteFile":      "kernel32",
+	"ReadFile":       "kernel32",
 	"ExitProcess":    "kernel32",
 	"GetProcessHeap": "kernel32",
 	"HeapAlloc":      "kernel32",
@@ -780,6 +783,57 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		return c.genIncDec(n)
 	case *Call:
 		return c.genCallExpr(n)
+	case *AssignExpr:
+		// Fast path: a simple scalar local/param on the left can be stored
+		// directly from its home register/stack slot, with no address needed.
+		if id, ok := n.Lhs.(*Ident); ok {
+			if vi, ok2 := c.vars[id.Name]; ok2 {
+				rt, err := c.genExprT(n.Rhs)
+				if err != nil {
+					return rt, err
+				}
+				if err := c.ensureType(vi.typ.Class()); err != nil {
+					return rt, err
+				}
+				c.storeVar(vi)
+				return vi.typ.Class(), nil
+			}
+		}
+		// General case (deref / element lvalues): evaluate the right side, take
+		// the left side's address, store width-aware, and leave the assigned
+		// value in rax so "(a = b)" yields b.
+		//
+		// IMPORTANT: genLValue(n.Lhs) computes the destination address and is
+		// free to clobber rax (it must, e.g. when indexing a pointer with an
+		// expression). So the right-hand value is spilled to a frame temporary
+		// first and reloaded after the address is known; otherwise a store like
+		// "out[n] = *p" would write whatever garbage rax held at that point.
+		rt, err := c.genExprT(n.Rhs)
+		if err != nil {
+			return rt, err
+		}
+		c.tmpDepth++
+		rslot := c.tmpSlot(c.tmpDepth)
+		if rt == TDouble {
+			c.emit("movsd [rbp%+d], xmm0", rslot)
+		} else {
+			c.emit("mov [rbp%+d], rax", rslot)
+		}
+		if err := c.genLValue(n.Lhs); err != nil {
+			return rt, err
+		}
+		width := c.lvalueWidth(n.Lhs)
+		class := c.lvalueClass(n.Lhs)
+		if rt == TDouble {
+			c.emit("movsd xmm0, [rbp%+d]", rslot)
+		} else {
+			c.emit("mov rax, [rbp%+d]", rslot)
+		}
+		c.genStoreElem("r10", width, class)
+		c.tmpDepth--
+		return rt, nil
+	case *VaArgExpr:
+		return c.genVaArg(n)
 	}
 	return TInt, fmt.Errorf("unknown expression")
 }
@@ -988,9 +1042,26 @@ func (c *CG) findAddressTaken(f *FuncDecl) map[string]bool {
 			walkExpr(n.Base)
 			walkExpr(n.Idx)
 		case *Call:
+			// va_start(ap, ...) and va_end(ap) both require ap's address
+			// (va_start writes the cursor into it), and va_arg needs it too.
+			if n.Name == "va_start" || n.Name == "va_end" {
+				if len(n.Args) > 0 {
+					if id, ok := n.Args[0].(*Ident); ok {
+						taken[id.Name] = true
+					}
+				}
+			}
 			for _, a := range n.Args {
 				walkExpr(a)
 			}
+		case *AssignExpr:
+			walkExpr(n.Lhs)
+			walkExpr(n.Rhs)
+		case *VaArgExpr:
+			if id, ok := n.Ap.(*Ident); ok {
+				taken[id.Name] = true
+			}
+			walkExpr(n.Ap)
 		}
 	}
 	var walkStmt func(s Stmt)
@@ -1145,12 +1216,41 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	c.localBytes = localBytes
 	c.tmpDepth = 0
 
+	// A variadic function spills every incoming argument (register args and
+	// caller-stack args) into a contiguous save area so va_arg can walk a
+	// single cursor. nFixed is the number of named params before "...".
+	c.saveBaseOff = 0
+	c.nFixed = 0
+	varargSave := 0
+	if f.Variadic {
+		varargSave = 8 * maxArgs
+		c.nFixed = len(f.Params)
+	}
+
 	// shadow space (Windows only) + callee-save save area + locals +
-	// expression temporaries, all kept 16-byte aligned.
-	frame := c.shadowSpace() + regArea + localBytes + 8*scratchSlots
+	// expression temporaries + variadic save area, all kept 16-byte aligned.
+	//
+	// On SysV there is no shadow space, so a callee's register-argument
+	// spill slots ([rbp+16+8k] of the callee, i.e. [rsp+0+8k] of the
+	// caller) physically land on top of the caller's frame bottom. A
+	// variadic caller keeps its va_list save area right at that bottom,
+	// so a callee spilling 6 register args would clobber the first
+	// vararg slots (observed as printf printing 512 instead of 10 on
+	// Linux). Reserve 8*len(argRegs) bytes at the frame bottom on SysV
+	// so the save area sits above the callee's clobber zone.
+	pad := c.shadowSpace()
+	if c.linux && f.Variadic {
+		pad = 8 * len(c.argRegs())
+	}
+	frame := pad + regArea + localBytes + 8*scratchSlots + varargSave
 	if frame%16 != 0 {
 		frame += 16 - frame%16
 	}
+	// saveBaseOff points at save-area slot 0, which sits just below the
+	// expression temporaries. The ABI pad added to frame above pushes it up
+	// so the callee's argument-spill slots ([rsp+0..8*len(argRegs)) of the
+	// caller) stay below it.
+	c.saveBaseOff = -(regArea + localBytes + 8*scratchSlots + varargSave)
 
 	c.sb.WriteString(f.Name + ":\n")
 	c.emit("push rbp")
@@ -1166,12 +1266,38 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// parameters arrive in XMM registers and are stored as 8 bytes (movsd).
 	argRegs := c.argRegs()
 	argXMM := c.argXMM()
+
+	// A variadic callee must copy the caller's STACK arguments into its save
+	// area BEFORE the register-argument spill below. On SysV the spill slots
+	// [rbp+16+8i] physically overlap the caller's stack-argument slots
+	// ([rsp+0+8i] of the caller -- no shadow space to absorb them), so
+	// spilling first would clobber the very values va_arg must read later.
+	if f.Variadic {
+		vaStackBase := 16
+		if !c.linux {
+			vaStackBase = 48
+		}
+		for i := len(argRegs); i < maxArgs; i++ {
+			c.emit("mov rax, [rbp+%d]", vaStackBase+8*(i-len(argRegs)))
+			c.emit("mov [rbp%+d], rax", c.saveBaseOff+8*i)
+		}
+	}
+
 	for i := 0; i < len(f.Params) && i < len(argRegs); i++ {
 		off := 16 + 8*i
 		if f.ParamTypes[i].Kind == KDouble && i < len(argXMM) {
 			c.emit("movsd [rbp+%d], %s", off, argXMM[i])
 		} else {
 			c.emit("mov [rbp+%d], %s", off, argRegs[i])
+		}
+	}
+
+	// Variadic: copy the register args into the save area. The caller-stack
+	// args were copied above, before the register spill clobbered the
+	// caller's stack-argument zone.
+	if f.Variadic {
+		for i := 0; i < len(argRegs); i++ {
+			c.emit("mov [rbp%+d], %s", c.saveBaseOff+8*i, argRegs[i])
 		}
 	}
 
@@ -1316,9 +1442,15 @@ func (c *CG) genStmt(s Stmt) error {
 		}
 		c.emit("cmp rax, 0")
 		c.emit("je %s", lEnd)
+		// Register break/continue targets so a break/continue inside the body
+		// (or a nested loop) resolves to this loop. continue re-checks the
+		// condition at lTop.
+		c.loops = append(c.loops, loopLabels{breakLbl: lEnd, contLbl: lTop})
 		if err := c.genStmt(n.Body); err != nil {
+			c.loops = c.loops[:len(c.loops)-1]
 			return err
 		}
+		c.loops = c.loops[:len(c.loops)-1]
 		c.emit("jmp %s", lTop)
 		c.sb.WriteString(lEnd + ":\n")
 	case *ForStmt:
@@ -1714,6 +1846,48 @@ func (c *CG) lvalueWidth(e Expr) int {
 	return c.elemWidthOf(e)
 }
 
+// lvalueClass returns the storage class (int vs double) of the value held at
+// the lvalue e, used to pick the right store instruction for an assignment.
+func (c *CG) lvalueClass(e Expr) CType {
+	if id, ok := e.(*Ident); ok {
+		if vi, ok2 := c.vars[id.Name]; ok2 {
+			return vi.typ.Class()
+		}
+		if c.globals[id.Name] {
+			return TInt
+		}
+		return TInt
+	}
+	return c.elemClassOf(e)
+}
+
+// genVaArg implements va_arg(ap, T): read 8 bytes at the cursor held in ap,
+// advance the cursor by 8, and leave the value in rax (int-class) or xmm0
+// (double). The cursor is a va_list = char* = an address stored in an int
+// slot, so reading and writing it are ordinary integer operations. Doubles are
+// stored bitwise in the 8-byte slot (the caller spilled them with movq), so we
+// reload the bits into xmm0 with movq xmm0, rax.
+func (c *CG) genVaArg(n *VaArgExpr) (CType, error) {
+	if err := c.genLValue(n.Ap); err != nil {
+		return TInt, err
+	}
+	c.emit("mov rcx, [r10]") // rcx = current cursor
+	if n.Typ.Class() == TDouble {
+		c.emit("mov rax, [rcx]")
+		c.emit("movq xmm0, rax")
+		c.emit("add rcx, 8")
+		c.emit("mov [r10], rcx")
+		c.resTyp = TDouble
+		return TDouble, nil
+	}
+	c.emit("mov rax, [rcx]")
+	c.emit("add rcx, 8")
+	c.emit("mov [r10], rcx")
+	c.resTyp = n.Typ.Class()
+	c.resSigned = n.Typ.Kind == KInt && n.Typ.Signed
+	return c.resTyp, nil
+}
+
 // loadDoubleConst materialises a double constant into xmm0, reusing the
 // program-level constant pool so e.g. the 1.0 used by ++/-- on a double is
 // emitted once, exactly like NumLit doubles.
@@ -1976,7 +2150,7 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 				c.emit("cqo")
 				c.emit("idiv r11")
 			} else {
-				c.emit("xor edx, edx")
+				c.emit("xor rdx, rdx")
 				c.emit("div r11")
 			}
 		}
@@ -1993,7 +2167,7 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 			c.emit("cqo")
 			c.emit("idiv r11")
 		} else {
-			c.emit("xor edx, edx")
+			c.emit("xor rdx, rdx")
 			c.emit("div r11")
 		}
 		c.emit("mov rax, rdx")
@@ -2134,6 +2308,23 @@ func variadicFn(name string) bool {
 // because an argument may itself be a function call whose own argument setup
 // would otherwise clobber the values of earlier arguments.
 func (c *CG) genCallExpr(n *Call) (CType, error) {
+	// va_start / va_end are compiler builtins, not real functions. va_start
+	// seeds the va_list cursor with the address of the first variadic slot;
+	// va_end is a no-op in c0's flat-cursor model.
+	if n.Name == "va_start" || n.Name == "va_end" {
+		if n.Name == "va_start" {
+			if len(n.Args) < 1 {
+				return TInt, fmt.Errorf("va_start requires at least the va_list argument")
+			}
+			if err := c.genLValue(n.Args[0]); err != nil {
+				return TInt, err
+			}
+			c.emit("lea rax, [rbp%+d]", c.saveBaseOff+8*c.nFixed)
+			c.emit("mov [r10], rax")
+		}
+		c.resTyp = TInt
+		return TInt, nil
+	}
 	argRegs := c.argRegs()
 	argXMM := c.argXMM()
 	nargs := len(n.Args)

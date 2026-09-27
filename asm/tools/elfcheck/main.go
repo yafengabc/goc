@@ -209,6 +209,10 @@ type cpu struct {
 	code    int
 	steps   int
 	verbose bool
+	// trace: ring buffer of recently executed addresses
+	trace    [32]uint64
+	traceIdx int
+	traceCnt int
 }
 
 var regNames = [16]string{
@@ -316,6 +320,25 @@ func die(format string, a ...any) {
 	os.Exit(1)
 }
 
+func (c *cpu) dumpRegs() {
+	fmt.Fprintf(os.Stderr, "  rip=0x%x\n", c.rip)
+	for i := 0; i < 16; i++ {
+		fmt.Fprintf(os.Stderr, "  %-3s=0x%x", regNames[i], c.regs[i])
+		if i%4 == 3 {
+			fmt.Fprintln(os.Stderr)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "  last instructions:")
+	start := c.traceIdx - c.traceCnt
+	if start < 0 {
+		start += len(c.trace)
+	}
+	for i := 0; i < c.traceCnt; i++ {
+		fmt.Fprintf(os.Stderr, " 0x%x", c.trace[(start+i)%len(c.trace)])
+	}
+	fmt.Fprintln(os.Stderr)
+}
+
 // run interprets until exit or step limit. Returns the exit status.
 func (c *cpu) run() (code int) {
 	// An unsupported instruction must fail loudly, not silently mis-execute.
@@ -338,6 +361,11 @@ func (c *cpu) run() (code int) {
 
 func (c *cpu) step() {
 	pc := c.rip
+	c.trace[c.traceIdx] = pc
+	c.traceIdx = (c.traceIdx + 1) % len(c.trace)
+	if c.traceCnt < len(c.trace) {
+		c.traceCnt++
+	}
 	op := c.fetch8()
 
 	// Legacy prefixes: 0x66 / 0xF2 / 0xF3. In a0's output these are always
@@ -434,6 +462,8 @@ func (c *cpu) step() {
 		}
 		v, ok := c.readMem(o.addr, size)
 		if !ok {
+			fmt.Fprintf(os.Stderr, "elfcheck: REGDUMP rax=%x rcx=%x rdx=%x rbx=%x rsp=%x rbp=%x rsi=%x rdi=%x r8=%x r9=%x r10=%x r11=%x r12=%x r13=%x r14=%x r15=%x rip=%x\n",
+				c.regs[0], c.regs[1], c.regs[2], c.regs[3], c.regs[4], c.regs[5], c.regs[6], c.regs[7], c.regs[8], c.regs[9], c.regs[10], c.regs[11], c.regs[12], c.regs[13], c.regs[14], c.regs[15], c.rip)
 			die("read of unmapped memory 0x%x at 0x%x", o.addr, pc)
 		}
 		return v
@@ -592,7 +622,8 @@ func (c *cpu) step() {
 	case 0xc3: // ret
 		v, ok := c.readMem(c.regs[4], 8)
 		if !ok {
-			die("ret with unmapped stack at 0x%x", pc)
+			c.dumpRegs()
+			die("ret with unmapped stack at 0x%x (rsp=0x%x)", pc, c.regs[4])
 		}
 		c.regs[4] += 8
 		c.rip = v
@@ -603,7 +634,8 @@ func (c *cpu) step() {
 		next := c.rip
 		c.regs[4] -= 8
 		if !c.writeMem(c.regs[4], 8, next) {
-			die("call with unmapped stack at 0x%x", pc)
+			c.dumpRegs()
+			die("call with unmapped stack at 0x%x (rsp=0x%x)", pc, c.regs[4])
 		}
 		c.rip = next + uint64(rel)
 		return

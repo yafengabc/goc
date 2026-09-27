@@ -20,3 +20,7 @@ examples/*
 
 # Local agent workspace, not part of the project.
 .workbuddy/
+
+# Ad-hoc build artifacts and local scratch space from debugging sessions.
+c0lib_out.bin
+scratch/

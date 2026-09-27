@@ -170,9 +170,13 @@ func (a *Assembler) BuildPE(outPath string) error {
 	rdataLen := len(blob(rdata))
 	dataLen := len(blob(data))
 
-	// Virtual layout: .text at 0x1000, the merged data section at 0x2000.
+	// Virtual layout: .text at 0x1000; the merged data section starts right
+	// after the text section's page-aligned virtual size. A fixed 0x2000 base
+	// worked only while .text fit in one page — once it outgrows that, .text's
+	// declared VirtualSize overlaps the data section's virtual address and the
+	// loader rejects the file.
 	textBase := sectAlign
-	dataBase := textBase + sectAlign
+	dataBase := textBase + align(len(text.Data), sectAlign)
 
 	// Offsets of each blob inside the merged data section (8-byte aligned so
 	// that dq constants stay naturally aligned).
@@ -245,9 +249,17 @@ func (a *Assembler) BuildPE(outPath string) error {
 		sections = append(sections, outSec{".data", dataBase, merged, 0xC0000040})
 	}
 
-	imageSize := textBase + sectAlign
-	if len(sections) > 1 {
-		imageSize = dataBase + sectAlign
+	// SizeOfImage must cover the end of the last section's virtual range
+	// (each section's virtual address plus its virtual size, rounded up to the
+	// section alignment). Hard-coding two pages worked only while the whole
+	// image fit in them; once .text or .data outgrows that, the loader rejects
+	// the file as malformed.
+	imageSize := 0
+	for _, s := range sections {
+		end := s.va + align(len(s.data), sectAlign)
+		if end > imageSize {
+			imageSize = end
+		}
 	}
 
 	numSec := len(sections)

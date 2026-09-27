@@ -218,13 +218,24 @@ func Lex(src string) ([]Token, error) {
 		}
 		i++ // closing quote
 		push(Token{Kind: TNum, Text: string(rune(ch)), Num: int64(ch), IsChar: true, Line: line})
-	default:
+		default:
 			two := ""
 			if i+1 < n {
 				two = src[i : i+2]
 			}
+			three := ""
+			if i+2 < n {
+				three = src[i : i+3]
+			}
+			switch three {
+			case "<<=", ">>=":
+				push(Token{Kind: TPunct, Text: three, Line: line})
+				i += 3
+				continue
+			}
 			switch two {
-			case "==", "!=", "<=", ">=", "&&", "||", "##", "<<", ">>", "++", "--":
+			case "==", "!=", "<=", ">=", "&&", "||", "##", "<<", ">>", "++", "--",
+				"+=", "-=", "*=", "/=", "%=", "&=", "|=":
 				push(Token{Kind: TPunct, Text: two, Line: line})
 				i += 2
 				continue

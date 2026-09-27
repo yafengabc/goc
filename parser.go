@@ -59,6 +59,11 @@ type Parser struct {
 }
 
 func Parse(toks []Token) (*Program, error) {
+	// va_list is the cursor type for <stdarg.h> variadic access. c0 implements
+	// variadics with a contiguous register/stack save area and walks it with a
+	// plain char* cursor, so va_list is just a pointer typedef (no struct is
+	// needed, and the toy model has no struct support yet).
+	typedefs["va_list"] = PtrType(IntType())
 	p := &Parser{toks: toks}
 	prog := &Program{}
 	for p.cur().Kind != TEOF {
@@ -203,6 +208,7 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	isDouble := false
 	isVoid := false
 	seen := false
+	var tdType *Type // a typedef alias, if this specifier list names one
 	for {
 		if isQualifier(p.cur()) {
 			p.next()
@@ -213,6 +219,14 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		}
 		if p.cur().Text == "struct" {
 			return nil, fmt.Errorf("line %d: struct is not supported in stage 2", p.cur().Line)
+		}
+		// A typedef name carries its own (possibly pointer) type; reuse it
+		// verbatim rather than re-synthesising one from width/signedness.
+		if td := typedefs[p.cur().Text]; td != nil {
+			tdType = td
+			p.next()
+			seen = true
+			continue
 		}
 		k := p.next().Text
 		switch k {
@@ -248,6 +262,12 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	}
 	if width == 0 {
 		width = 8 // bare "signed"/"unsigned" means int
+	}
+	if tdType != nil {
+		// The specifier list was a typedef alias (e.g. va_list, size_t). The
+		// pointer/array suffixes are applied later by parseDeclarator, so just
+		// hand back the alias's underlying type.
+		return tdType, nil
 	}
 	return &Type{Kind: KInt, Width: width, Signed: signed}, nil
 }
@@ -492,7 +512,7 @@ func (p *Parser) parseStmt() (Stmt, error) {
 	t := p.cur()
 	var err error
 	switch {
-	case isTypeName(t):
+	case isTypeName(t) || isQualifier(t):
 		return p.parseDeclaration()
 	case t.Kind == TKeyword && t.Text == "return":
 		p.next()
@@ -612,22 +632,18 @@ func (p *Parser) parseStmt() (Stmt, error) {
 	case p.atPunct("{"):
 		return p.parseBlock()
 	}
+	if p.atPunct(";") {
+		// Empty statement: a bare ";" (e.g. the body of `while (cond);`).
+		p.next()
+		return nil, nil
+	}
 
-	// Expression statement, or assignment if it is followed by '='.
+	// Expression statement. Assignment ("a = b;") is now parsed as an
+	// AssignExpr inside parseExpr and wrapped in an ExprStmt, sharing the same
+	// code path as expression-position assignments.
 	e, err := p.parseExpr()
 	if err != nil {
 		return nil, err
-	}
-	if p.atPunct("=") {
-		p.next()
-		rhs, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expect(";"); err != nil {
-			return nil, err
-		}
-		return &AssignStmt{Lhs: e, Rhs: rhs}, nil
 	}
 	if err := p.expect(";"); err != nil {
 		return nil, err
@@ -672,7 +688,61 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 	return &DeclList{Decls: decls}, nil
 }
 
-func (p *Parser) parseExpr() (Expr, error) { return p.parseCond() }
+func (p *Parser) parseExpr() (Expr, error) { return p.parseAssign() }
+
+// parseAssign parses an assignment expression. Simple "=" binds the value of the
+// right side (and yields it), while the compound operators (+= -= *= /= %= &=
+// |= <<= >>=) desugar to "lhs = lhs OP rhs". Assignment is the lowest-precedence
+// expression operator (below the ternary ?:).
+func (p *Parser) parseAssign() (Expr, error) {
+	left, err := p.parseCond()
+	if err != nil {
+		return nil, err
+	}
+	if p.atPunct("=") {
+		p.next()
+		right, err := p.parseAssign()
+		if err != nil {
+			return nil, err
+		}
+		return &AssignExpr{Lhs: left, Rhs: right}, nil
+	}
+	if op := p.assignOp(); op != "" {
+		p.next()
+		right, err := p.parseAssign()
+		if err != nil {
+			return nil, err
+		}
+		return &AssignExpr{Lhs: left, Rhs: &Binary{Op: op, L: left, R: right}}, nil
+	}
+	return left, nil
+}
+
+// assignOp returns the binary operator a compound-assignment token stands for,
+// or "" if the current token is not a compound-assignment operator.
+func (p *Parser) assignOp() string {
+	switch {
+	case p.atPunct("+="):
+		return "+"
+	case p.atPunct("-="):
+		return "-"
+	case p.atPunct("*="):
+		return "*"
+	case p.atPunct("/="):
+		return "/"
+	case p.atPunct("%="):
+		return "%"
+	case p.atPunct("&="):
+		return "&"
+	case p.atPunct("|="):
+		return "|"
+	case p.atPunct("<<="):
+		return "<<"
+	case p.atPunct(">>="):
+		return ">>"
+	}
+	return ""
+}
 
 // parseCond parses the ternary operator (?:), the lowest-precedence operator
 // the toy model supports (no comma operator).
@@ -899,8 +969,9 @@ func (p *Parser) parseUnary() (Expr, error) {
 		return &IncDecExpr{Op: op, E: e, Prefix: true}, nil
 	}
 	// C-style cast: (type) operand. Only when the token after '(' is a type
-	// name; otherwise '(' is an expression-grouping parenthesis.
-	if p.atPunct("(") && isTypeName(p.peek()) {
+	// name (or a qualifier that begins a type); otherwise '(' is an
+	// expression-grouping parenthesis.
+	if p.atPunct("(") && (isTypeName(p.peek()) || isQualifier(p.peek())) {
 		p.next() // consume '('
 		spec, err := p.parseDeclarationSpecifiers()
 		if err != nil {
@@ -934,6 +1005,31 @@ func (p *Parser) parsePostfix() (Expr, error) {
 				return nil, fmt.Errorf("line %d: cannot call a non-function expression", p.cur().Line)
 			}
 			p.next()
+			// va_arg(ap, Type): the second argument is a type name, not an
+			// expression, so it cannot go through the normal comma-expression
+			// parsing. Build a dedicated VaArgExpr node instead.
+			if id.Name == "va_arg" {
+				ap, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expect(","); err != nil {
+					return nil, err
+				}
+				spec, err := p.parseDeclarationSpecifiers()
+				if err != nil {
+					return nil, err
+				}
+				dt, err := p.parseDeclarator(spec, false, true)
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expect(")"); err != nil {
+					return nil, err
+				}
+				e = &VaArgExpr{Ap: ap, Typ: dt.typ}
+				continue
+			}
 			var args []Expr
 			if !p.atPunct(")") {
 				for {

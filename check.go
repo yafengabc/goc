@@ -318,6 +318,30 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		return n.Typ
 	case *IncDecExpr:
 		return c.checkExpr(n.E, fn)
+	case *AssignExpr:
+		// Assignment "a = b" (statement-level or in expression position) must
+		// have a modifiable lvalue on the left. Statement-level assignments are
+		// parsed as ExprStmt{AssignExpr}, so the lvalue check must live here,
+		// not in checkStmt (whose *AssignStmt branch is never produced by the
+		// parser).
+		lt, ok := c.checkLValue(n.Lhs, fn)
+		if !ok {
+			return IntType()
+		}
+		rt := c.checkExpr(n.Rhs, fn)
+		// Writing through a void* yields a void location; any value may be
+		// stored there (the checker models it as "we do not know the element
+		// type"), so skip the assignability check for that case.
+		if !lt.IsVoid() && !assignable(lt, rt) {
+			c.errf(0, "cannot assign %s to %s", rt, lt)
+		}
+		return rt
+	case *VaArgExpr:
+		ap := c.checkExpr(n.Ap, fn)
+		if !ap.IsPtr() {
+			c.errf(0, "va_arg first argument must be a va_list, got %s", ap)
+		}
+		return n.Typ
 	}
 	return IntType()
 }
@@ -387,6 +411,18 @@ func (c *checker) checkCall(n *Call, fn *FuncDecl) *Type {
 // prototype). It reports arity and argument-type mismatches. isProto only
 // affects the diagnostics wording.
 func (c *checker) checkCallSig(n *Call, fn *FuncDecl, sig *FuncDecl, isProto bool) *Type {
+	if sig.Variadic {
+		// Variadic: require at least the named parameters; the trailing
+		// arguments are passed through the va_list and not type-checked here.
+		if len(n.Args) < len(sig.ParamTypes) {
+			what := "function"
+			if isProto {
+				what = "prototype"
+			}
+			c.errf(0, "call to %q (%s): expected at least %d arguments, got %d", n.Name, what, len(sig.ParamTypes), len(n.Args))
+		}
+		return sig.Ret
+	}
 	if len(n.Args) != len(sig.ParamTypes) {
 		what := "function"
 		if isProto {

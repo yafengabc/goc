@@ -14,6 +14,16 @@ package main
 // call returns int), so declaring them with a prototype would wrongly reject
 // their extra arguments. Everything else is declared and validated normally.
 var builtinHeaders = map[string]string{
+	"stdarg.h": `
+#ifndef C0_STDARG_H
+#define C0_STDARG_H
+// va_list, va_start, va_arg and va_end are provided by the compiler as a
+// built-in pointer type and special-cased code generation. This header exists
+// only so that "#include <stdarg.h>" resolves without a disk lookup; the actual
+// machinery is recognised by name in the parser and code generator.
+#endif
+`,
+
 	"stddef.h": `
 #ifndef C0_STDDEF_H
 #define C0_STDDEF_H

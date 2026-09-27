@@ -1,0 +1,2 @@
+hello world count=42 char=A big=123456789d neg=-7
+nums: 100 200 300
