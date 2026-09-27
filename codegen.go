@@ -108,15 +108,66 @@ const scratchSlots = 32
 // portable C version goclib/goclib.c is the intended replacement once goc can
 // compile it, but goc cannot today. There is no msvcrt anywhere in the pipeline.
 var externDLL = map[string]string{
-	"GetStdHandle":   "kernel32",
-	"WriteFile":      "kernel32",
-	"ReadFile":       "kernel32",
-	"ExitProcess":    "kernel32",
-	"GetProcessHeap": "kernel32",
-	"HeapAlloc":      "kernel32",
-	"HeapFree":       "kernel32",
-	"MessageBoxA":    "user32",
-	"MessageBoxW":    "user32",
+	// kernel32
+	"GetStdHandle":        "kernel32",
+	"WriteFile":           "kernel32",
+	"ReadFile":            "kernel32",
+	"ExitProcess":         "kernel32",
+	"GetProcessHeap":      "kernel32",
+	"HeapAlloc":           "kernel32",
+	"HeapFree":            "kernel32",
+	"GetLastError":        "kernel32",
+	"SetLastError":        "kernel32",
+	"GetFileType":         "kernel32",
+	"GetConsoleMode":      "kernel32",
+	"SetConsoleMode":      "kernel32",
+	"WriteConsoleA":       "kernel32",
+	"CloseHandle":         "kernel32",
+	"FlushFileBuffers":    "kernel32",
+	"GetModuleHandleA":    "kernel32",
+	"GetModuleFileNameA":  "kernel32",
+	"GetCommandLineA":     "kernel32",
+	"GetEnvironmentVariableA": "kernel32",
+	"SetEnvironmentVariableA": "kernel32",
+	"GetCurrentDirectoryA":    "kernel32",
+	"SetCurrentDirectoryA":    "kernel32",
+	"GetTempPathA":        "kernel32",
+	"GetComputerNameA":    "kernel32",
+	"LoadLibraryA":        "kernel32",
+	"FreeLibrary":         "kernel32",
+	"GetTickCount":        "kernel32",
+	"Sleep":               "kernel32",
+	// user32
+	"GetSystemMetrics":    "user32",
+	"MessageBoxA":         "user32",
+	"MessageBoxW":         "user32",
+	"FindWindowA":         "user32",
+	"GetWindowTextA":      "user32",
+	"GetWindowTextLengthA": "user32",
+	"SetWindowTextA":      "user32",
+	"GetForegroundWindow": "user32",
+	"GetDesktopWindow":    "user32",
+	"IsWindow":            "user32",
+	"EnableWindow":        "user32",
+	"ShowWindow":          "user32",
+	"SetFocus":            "user32",
+	"SetCursorPos":        "user32",
+	"GetSysColor":         "user32",
+	"GetDoubleClickTime":  "user32",
+	"SendMessageA":        "user32",
+	"PostMessageA":        "user32",
+	"GetDC":               "user32",
+	"ReleaseDC":           "user32",
+	// gdi32
+	"GetStockObject":      "gdi32",
+	"SelectObject":        "gdi32",
+	"SetBkColor":          "gdi32",
+	"SetTextColor":        "gdi32",
+	"TextOutA":            "gdi32",
+	"LineTo":              "gdi32",
+	"Rectangle":           "gdi32",
+	"Ellipse":             "gdi32",
+	"PatBlt":              "gdi32",
 }
 
 // externLinux lists the syscall names an ELF-target program may reach for.
@@ -2424,6 +2475,25 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		c.emit("mov [rsp+%d], rax", c.stackArgOff(i-len(argRegs)))
 	}
 	c.emit("call %s", target)
+	// Windows API imports return 32-bit values (BOOL/DWORD/int) in EAX; the
+	// upper 32 bits of RAX are not guaranteed to be zero, unlike goclib
+	// functions which leave a clean 64-bit RAX. goc's register model treats
+	// every int-class result as a full 64-bit word, so widen the result to
+	// match the declared return type: sign-extend for signed int, zero-extend
+	// for unsigned (DWORD/UINT). 8-byte returns (HANDLE, LONG, pointers) are
+	// left untouched.
+	if !c.linux {
+		if f, ok := c.funcDefs[n.Name]; ok && externDLL[n.Name] != "" &&
+			f.Ret != nil && f.Ret.Kind == KInt && f.Ret.Width < 8 {
+			sh := 64 - 8*f.Ret.Width
+			c.emit("shl rax, %d", sh)
+			if f.Ret.Signed {
+				c.emit("sar rax, %d", sh)
+			} else {
+				c.emit("shr rax, %d", sh)
+			}
+		}
+	}
 	if extra > 0 {
 		c.emit("add rsp, %d", extra)
 	}

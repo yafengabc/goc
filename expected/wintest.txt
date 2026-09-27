@@ -1,0 +1,10 @@
+stdout handle ok=1
+wintest via WriteFile
+writefile ok=1 wrote=22
+kernel32 module=1
+bad module=1
+lasterror=1
+ticks nondecreasing=1
+sleep delta ok=1
+screensize positive=1
+fails=0

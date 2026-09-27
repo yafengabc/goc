@@ -240,7 +240,7 @@ func Lex(src string) ([]Token, error) {
 				i += 2
 				continue
 			}
-			if strings.IndexByte("+-*/%=<>!(){};,.[]&?:", c) >= 0 {
+			if strings.IndexByte("+-*/%=<>!(){};,.[]&?:|", c) >= 0 {
 				push(Token{Kind: TPunct, Text: string(c), Line: line})
 				i++
 				continue

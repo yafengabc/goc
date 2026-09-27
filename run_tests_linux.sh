@@ -32,6 +32,12 @@ cp goa/goa ./goa   # findGoa looks next to the goc binary first
 pass=0
 fail=0
 
+# Windows-only examples import Win32 DLLs; on a Linux box they have nothing to
+# link against, so skip them here. (On Windows, run_tests.sh still compiles the
+# no-golden ones, e.g. winbox, as a compile-only check.)
+win_only=" wintest winbox "
+is_win_only() { case "$win_only" in *" $1 "*) return 0;; esac; return 1; }
+
 echo "== goc: linux targets, run on the real kernel =="
 for src in examples/*.c; do
     name="$(basename "$src" .c)"
@@ -40,6 +46,11 @@ for src in examples/*.c; do
 
     if [ ! -f "$exp" ]; then
         echo "SKIP  $name  (no expected/$name.txt)"
+        continue
+    fi
+
+    if is_win_only "$name"; then
+        echo "SKIP  $name  (imports Windows DLLs)"
         continue
     fi
 

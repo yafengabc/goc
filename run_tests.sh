@@ -33,12 +33,28 @@ echo "== building elfcheck =="
 pass=0
 fail=0
 
+# Windows-only examples import Win32 DLLs (kernel32/user32/gdi32), so the
+# Linux (ELF64) leg must skip them: they cannot compile without those DLLs.
+win_only=" wintest winbox "
+is_win_only() { case "$win_only" in *" $1 "*) return 0;; esac; return 1; }
+
 for src in examples/*.c; do
     name="$(basename "$src" .c)"
     exp="expected/$name.txt"
 
     if [ ! -f "$exp" ]; then
-        echo "SKIP  $name  (no expected/$name.txt)"
+        if is_win_only "$name"; then
+            # GUI demo with no golden: prove the user32 imports compile+link.
+            if ! ./goc.exe -c "$src" >/dev/null 2>"/tmp/goc_$name.err"; then
+                echo "FAIL  $name  (compile): $(cat /tmp/goc_$name.err)"
+                fail=$((fail + 1))
+            else
+                printf "ok    %-10s compile-only\n" "$name"
+                pass=$((pass + 1))
+            fi
+        else
+            echo "SKIP  $name  (no expected/$name.txt)"
+        fi
         continue
     fi
 
@@ -72,6 +88,11 @@ for src in examples/*.c; do
 
     if [ ! -f "$exp" ]; then
         echo "SKIP  linux/$name  (no expected/$name.txt)"
+        continue
+    fi
+
+    if is_win_only "$name"; then
+        echo "SKIP  linux/$name  (imports Windows DLLs)"
         continue
     fi
 

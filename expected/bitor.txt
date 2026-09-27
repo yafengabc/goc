@@ -1,0 +1,9 @@
+or disjoint = 1
+or overlap = 1
+plus overlap = 1
+or assign = 1
+prec eq = 1
+prec and = 1
+or zero = 1
+or ones = 1
+fails=0
