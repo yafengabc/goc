@@ -89,9 +89,11 @@ const scratchSlots = 32
 
 // externDLL resolves an imported symbol to the DLL that exports it.
 // Anything not listed here is a hard error rather than a silent guess.
-// The C library itself (printf, strlen, malloc, ...) lives in clib_win/ and is
-// implemented in pure assembly on top of kernel32, so there is no msvcrt
-// anywhere in the pipeline.
+// The C library itself (printf, strlen, malloc, ...) is implemented in pure
+// assembly on top of kernel32 (Windows) or syscalls (Linux). The one source is
+// clib/clib.asm, conditionally compiled per target (see selectPlatform); the
+// portable C version clib/c0lib.c is the intended replacement once c0 can
+// compile it, but c0 cannot today. There is no msvcrt anywhere in the pipeline.
 var externDLL = map[string]string{
 	"GetStdHandle":   "kernel32",
 	"WriteFile":      "kernel32",
@@ -114,11 +116,17 @@ var externLinux = map[string]bool{
 }
 
 // ---------------------------------------------------------------------------
-// clib: the C library, as assembly
+// clib: the C library
 // ---------------------------------------------------------------------------
 //
-// The .asm files under clib_win/ and clib_linux/ are embedded into c0 at
-// build time. Each function sits in a
+// The .asm file clib/clib.asm is embedded into c0 at build time. It is ONE
+// source that carries BOTH platforms, selected per target by conditional
+// compilation: the Windows body lives under "#if defined(_WIN64)" and the
+// Linux body under the matching "#else" (see selectPlatform). This is the same
+// trick a normal compiler uses for inline asm — write the portable parts once,
+// isolate the OS-specific bits behind #ifdef.
+//
+// Inside the selected branch each function sits in a
 // block marked with "; @func <name>" and can declare what it needs:
 //
 //	; @deps __clib_write strlen   other clib functions to pull in
@@ -128,18 +136,13 @@ var externLinux = map[string]bool{
 // functions a program actually calls (plus their transitive deps), so a
 // hello-world does not pay for malloc.
 //
-// Adding a function is just dropping it into a file under clib_win/ or
-// clib_linux/.
+// The genuinely cross-platform algorithms (strlen, strcpy, printf formatting,
+// strtol, rand, ...) are also written in portable C in clib/c0lib.c, ready to
+// REPLACE this assembly once c0 supports char/pointer/globals/for (stage 5).
+// Until then the assembly below is the backend that actually runs.
 
-// There are two clibs. clib_win/ is the Windows one (kernel32 WriteFile, heap
-// via GetProcessHeap); clib_linux/ is the Linux one (write/brk syscalls, SysV
-// argument order). Same C names, different bodies.
-//
-//go:embed clib_win/*.asm
-var clibWinFS embed.FS
-
-//go:embed clib_linux/*.asm
-var clibLinuxFS embed.FS
+//go:embed clib/*.asm
+var clibFS embed.FS
 
 type clibFunc struct {
 	name string
@@ -179,10 +182,12 @@ func clibStore(linux bool) (map[string]*clibFunc, *[]string, *[]clibDataBlock) {
 func init() { clibErr = loadClib() }
 
 func loadClib() error {
-	if err := loadClibDir(clibWinFS, "clib_win", false); err != nil {
+	// The same embedded file is loaded twice, once per target; selectPlatform
+	// strips the branch that does not apply before the @func blocks are parsed.
+	if err := loadClibDir(clibFS, "clib", false); err != nil {
 		return err
 	}
-	return loadClibDir(clibLinuxFS, "clib_linux", true)
+	return loadClibDir(clibFS, "clib", true)
 }
 
 func loadClibDir(fs embed.FS, dir string, linux bool) error {
@@ -202,7 +207,10 @@ func loadClibDir(fs embed.FS, dir string, linux bool) error {
 		if err != nil {
 			return err
 		}
-		if err := parseClib(f, string(b), linux); err != nil {
+		// Drop the platform branch that does not apply to this target so that
+		// one file carries both Windows and Linux bodies.
+		src := selectPlatform(string(b), linux)
+		if err := parseClib(f, src, linux); err != nil {
 			return fmt.Errorf("%s/%s: %v", dir, f, err)
 		}
 	}
@@ -214,6 +222,193 @@ func loadClibDir(fs embed.FS, dir string, linux bool) error {
 var clibAliasLinux = map[string]string{
 	"exit": "__clib_exit",
 }
+
+// selectPlatform evaluates a small subset of C conditional compilation over the
+// clib assembly source and returns only the lines that apply to the current
+// target. a0 assembly has no '#' lines of its own, so the directives are
+// unambiguous. Supported:
+//
+//	#if defined(_WIN64)      #elif defined(__linux__)
+//	#else                    #endif
+//	#if 0  #if 1
+//
+// and the boolean operators ! && || ( ) inside the expressions. This is what
+// lets one clib.asm carry both platforms, selected at load time — the same
+// trick a normal compiler uses for inline assembly.
+// clibFrame tracks one #if/#else chain level during platform selection.
+type clibFrame struct{ active, taken bool }
+
+func selectPlatform(src string, linux bool) string {
+	def := map[string]bool{"_WIN64": !linux, "__linux__": linux, "__x86_64__": true}
+	lines := strings.Split(src, "\n")
+	stack := []clibFrame{{active: true}}
+	out := make([]string, 0, len(lines))
+	eval := func(expr string) bool {
+		toks := ceLex(expr)
+		v, _ := ceParse(toks, 0, def)
+		return v
+	}
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		switch {
+		case strings.HasPrefix(t, "#if "):
+			c := eval(strings.TrimSpace(t[3:]))
+			stack = append(stack, clibFrame{active: topActive(stack) && c, taken: c})
+			continue
+		case strings.HasPrefix(t, "#elif "):
+			f := &stack[len(stack)-1]
+			if !f.taken {
+				c := eval(strings.TrimSpace(t[5:]))
+				f.taken = c
+				f.active = topActive(stack[:len(stack)-1]) && c
+			} else {
+				f.active = false
+			}
+			continue
+		case t == "#else":
+			f := &stack[len(stack)-1]
+			f.active = topActive(stack[:len(stack)-1]) && !f.taken
+			f.taken = true
+			continue
+		case t == "#endif":
+			if len(stack) > 1 {
+				stack = stack[:len(stack)-1]
+			}
+			continue
+		}
+		if topActive(stack) {
+			out = append(out, ln)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func topActive(s []clibFrame) bool {
+	if len(s) == 0 {
+		return true
+	}
+	return s[len(s)-1].active
+}
+
+// ceLex tokenises a #if/#elif boolean expression into a flat token slice.
+func ceLex(s string) []string {
+	var toks []string
+	i, n := 0, len(s)
+	for i < n {
+		c := s[i]
+		if c == ' ' || c == '\t' {
+			i++
+			continue
+		}
+		switch c {
+		case '(', ')', '!':
+			toks = append(toks, string(c))
+			i++
+		case '&':
+			toks = append(toks, "&&")
+			i += 2
+		case '|':
+			toks = append(toks, "||")
+			i += 2
+		default:
+			if isIdentStart(c) {
+				j := i
+				for j < n && isIdentChar(s[j]) {
+					j++
+				}
+				toks = append(toks, s[i:j])
+				i = j
+			} else if c >= '0' && c <= '9' {
+				j := i
+				for j < n && s[j] >= '0' && s[j] <= '9' {
+					j++
+				}
+				toks = append(toks, s[i:j])
+				i = j
+			} else {
+				i++ // ignore any other character
+			}
+		}
+	}
+	return toks
+}
+
+// ceParse evaluates a token slice as a boolean expression.
+//
+//	or   := and ('||' and)*
+//	and  := not ('&&' not)*
+//	not  := '!' not | primary
+//	prim := '(' or ')' | 'defined' ('(' ident ')' | ident) | '1' | '0'
+func ceParse(toks []string, i int, def map[string]bool) (bool, int) {
+	return ceOr(toks, i, def)
+}
+func ceOr(toks []string, i int, def map[string]bool) (bool, int) {
+	left, i := ceAnd(toks, i, def)
+	for i < len(toks) && toks[i] == "||" {
+		i++
+		right, ni := ceAnd(toks, i, def)
+		i = ni
+		left = left || right
+	}
+	return left, i
+}
+func ceAnd(toks []string, i int, def map[string]bool) (bool, int) {
+	left, i := ceNot(toks, i, def)
+	for i < len(toks) && toks[i] == "&&" {
+		i++
+		right, ni := ceNot(toks, i, def)
+		i = ni
+		left = left && right
+	}
+	return left, i
+}
+func ceNot(toks []string, i int, def map[string]bool) (bool, int) {
+	if i < len(toks) && toks[i] == "!" {
+		v, ni := ceNot(toks, i+1, def)
+		return !v, ni
+	}
+	return cePrimary(toks, i, def)
+}
+func cePrimary(toks []string, i int, def map[string]bool) (bool, int) {
+	if i >= len(toks) {
+		return false, i
+	}
+	t := toks[i]
+	switch {
+	case t == "(":
+		v, ni := ceOr(toks, i+1, def)
+		if ni < len(toks) && toks[ni] == ")" {
+			ni++
+		}
+		return v, ni
+	case t == "defined":
+		i++
+		name := ""
+		if i < len(toks) && toks[i] == "(" {
+			i++
+			if i < len(toks) {
+				name = toks[i]
+				i++
+			}
+			if i < len(toks) && toks[i] == ")" {
+				i++
+			}
+		} else if i < len(toks) {
+			name = toks[i]
+			i++
+		}
+		return def[name], i
+	case t == "1":
+		return true, i + 1
+	case t == "0":
+		return false, i + 1
+	default:
+		return false, i + 1
+	}
+}
+
+func isIdentStart(c byte) bool { return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+func isIdentChar(c byte) bool  { return isIdentStart(c) || (c >= '0' && c <= '9') }
 
 func parseClib(file, src string, linux bool) error {
 	funcs, order, blocks := clibStore(linux)

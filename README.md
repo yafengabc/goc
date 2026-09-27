@@ -29,8 +29,10 @@ syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 │   ├── asm.go  pe.go  elf.go  main.go                #   Intel 语法子集 -> PE32+ / ELF64
 │   ├── examples/  expected/  run_tests.sh            #   a0 的用例与 golden
 │   └── tools/elfcheck  tools/msgboxcheck             #   验证工具（解释 ELF / 驱动 GUI）
-├── clib_win/                                         # C 库，Windows 版（只靠 kernel32）
-├── clib_linux/                                       # C 库，Linux 版（只靠 syscall）
+├── clib/                                              # 自带的 C 库（见下「clib」一节）
+│   ├── clib.asm                                       #   汇编后端：一份源，#if defined(_WIN64)/#else 双平台
+│   ├── c0lib.h  c0lib.c                               #   跨平台 C 实现（c0 暂不能编译，stage5 启用）
+│   └── README.md                                      #   后端切换与迁移说明
 ├── examples/*.c   expected/*.txt                     # c0 的用例与 golden
 ├── build.sh  run_tests.sh  run_tests_linux.sh          # 构建 / 测试（Win 解释 / Linux 原生）
 └── .github/workflows/ci.yml                            # CI：Linux 原生端到端 + Windows 端到端
@@ -45,9 +47,9 @@ syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 
 - **调用约定**从 Win64（rcx/rdx/r8/r9 + 32 字节 shadow space）切成 SysV
   （rdi/rsi/rdx/rcx/r8/r9，无 shadow space）。
-- **clib 从 `clib_win/` 换成 `clib_linux/`** —— 同名同语义的另一套实现：`__clib_write` 走
-  `write` syscall，`malloc` 用 `brk` 做 bump 分配（`free` 是空操作，进程退出时
-  一起还），`exit` 走 `exit` syscall。
+- **clib 走 `clib/clib.asm` 的 Linux 分支**（`#else` 那段）—— 同名同语义的另一套
+  实现：`__clib_write` 走 `write` syscall，`malloc` 用 `brk` 做 bump 分配
+  （`free` 是空操作，进程退出时一起还），`exit` 走 `exit` syscall。
 - 参数上限相应从「4 个寄存器 + 栈」变成「6 个寄存器 + 栈」。
 
 有个坑值得一提：Linux 下 a0 给每个 extern 生成的 syscall 桩**就叫 extern 的名字**，
@@ -64,33 +66,24 @@ Windows 上没法 exec ELF，所以本机测试用 `asm/tools/elfcheck` 加载�
 
 ## clib：自带的 C 库
 
-`printf` 不是编译器里的一段魔法字符串，而是一个真正的库 —— 两套平行的汇编
-模块，同名同语义、各写一份：
+`printf` 不是编译器里的一段魔法字符串，而是一个真正的库。整套库写在**一份**
+条件编译的汇编源 `clib/clib.asm` 里，用 `#if defined(_WIN64) / #else` 把两套实现
+（Windows 走 kernel32、Linux 走 syscall）合并到同一个文件；c0 在加载时按目标平台
+挑出对应分支（见 `selectPlatform`）。这跟普通编译器用 `#ifdef` 隔离平台相关汇编
+是一个思路 —— 跨平台的部分只写一遍，只把 OS 相关的部分封进 `#ifdef`。
 
-| 文件 | 提供 |
+| 分支 | 提供 |
 |---|---|
-| `clib_win/stdio.asm` | `printf` `sprintf` `puts` `putchar`（内部 `__clib_vfmt` `__clib_write`） |
-| `clib_win/string.asm` | `strlen` `strcpy` `strcmp` `strcat` `memset` `memcpy` |
-| `clib_win/stdlib.asm` | `malloc` `free` `atoi` `abs` `exit` |
-| `clib_linux/*.asm` | 同样三个文件、同样这批函数名，只是换成 syscall 实现 |
+| `#if defined(_WIN64)` | `printf` `sprintf` `puts` `putchar` `getchar` `strlen` `strcpy` `strcmp` `strcat` `strchr` `memset` `memcpy` `memmove` `memcmp` `strncmp` `malloc` `free` `calloc` `atoi` `abs` `strtol` `rand` `srand` `exit`，以及内部 `__clib_write` `__clib_vfmt` `__clib_exit` `__clib_heap_alloc` `__clib_heap_free` `__clib_read` |
+| `#else`（Linux） | 同名同语义，改为 syscall 实现 |
 
-Windows 版全部只建立在 kernel32 之上：`malloc`/`free` 走 `GetProcessHeap` +
+Windows 分支全部只建立在 kernel32 之上：`malloc`/`free` 走 `GetProcessHeap` +
 `HeapAlloc`/`HeapFree`，输出走 `GetStdHandle` + `WriteFile`，所以**依赖表里依然
-没有 msvcrt**。`clib_linux/` 是同名同语义的另一套，只依赖 syscall。
+没有 msvcrt**。Linux 分支只依赖 syscall。
 
-`clib_win/` 和 `clib_linux/` 下的 `.asm` 在编译 c0 时用 `go:embed` 嵌进二进制。
-c0 只把程序**实际调用到**的
+`clib/clib.asm` 在编译 c0 时用 `go:embed` 嵌进二进制。c0 只把程序**实际调用到**的
 函数（及其依赖）拼进生成的汇编里，数据也一样按函数打标记 —— 只用 `putchar`
-的程序不会背上 `printf` 那 512 字节的输出缓冲：
-
-```bash
-$ printf 'int main() { putchar(65); putchar(10); return 0; }\n' > min.c
-$ ./c0.exe min.c
-compiled min.exe (1536 bytes)     # printf/malloc/strlen 一个都没进
-```
-
-库文件的结构靠注释标记，加函数就是往 `clib_win/`（必要时同时 `clib_linux/`）
-里丢一个块：
+的程序不会背上 `printf` 那 512 字节的输出缓冲。库文件的结构靠注释标记：
 
 ```asm
 ; @func strlen          <- 函数名
@@ -107,6 +100,12 @@ __clib_ch db 0
 
 `; @deps __clib_write strlen` 声明依赖，`; @extern WriteFile` 声明需要的导入，
 两者都会被自动展开。
+
+**跨平台 C 版本**：`clib/c0lib.c` + `clib/c0lib.h` 是同一批函数的纯 C 实现，只写
+一遍、两个平台共用。它现在是**休眠源码**——c0 的 C 子集还缺 `char`/指针/全局变量/
+`for`/变参，暂时编不了；一旦 stage5 补齐这些特性，`clib/clib.asm` 就会被它取代，
+汇编层只剩五个 `__clib_*` 平台原语（I/O、堆、退出、读输入）。迁移步骤见
+`clib/README.md`。
 
 已知限制：`printf` 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界
 检查（缓冲区归调用方管）；格式化只认 `%d %s %c %x %f %%`（不支持宽度/精度；
@@ -154,7 +153,7 @@ Windows 下变参从 rdx 起、栈上在 `[rbp+48]`；Linux 下从 rsi 起、栈
 ## 测试
 
 ```bash
-bash run_tests.sh           # c0 端到端 18/18（9 个 Windows + 9 个 Linux，后者用 elfcheck 解释）
+bash run_tests.sh           # c0 端到端 20/20（10 个 Windows + 10 个 Linux，后者用 elfcheck 解释）
 bash run_tests_linux.sh     # 真机版：在 Linux 上直接执行 ELF（CI 的 Ubuntu job 也跑它）
 cd asm && bash run_tests.sh # a0 自己的用例，14/14（11 Windows + 3 Linux）+ 1 个 GUI
 ```
