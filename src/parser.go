@@ -526,15 +526,26 @@ func (p *Parser) parseTypeSuffixes(base *Type, allowFunc bool) (declResult, erro
 	d.typ = base
 	for {
 		if p.atPunct("[") {
-			p.next()
-			n, err := p.parseArrayLength()
-			if err != nil {
-				return d, err
+			// Collect consecutive array lengths first: C applies them
+			// right-to-left. "int m[2][3]" is 2 elements of int[3], NOT 3
+			// elements of int[2] -- wrapping each dimension as it is read
+			// produces the latter, which silently miscomputes every m[i][j]
+			// address (m[0][1] landing on m[1][0]'s bytes).
+			var dims []int
+			for p.atPunct("[") {
+				p.next()
+				n, err := p.parseArrayLength()
+				if err != nil {
+					return d, err
+				}
+				if err := p.expect("]"); err != nil {
+					return d, err
+				}
+				dims = append(dims, n)
 			}
-			if err := p.expect("]"); err != nil {
-				return d, err
+			for i := len(dims) - 1; i >= 0; i-- {
+				d.typ = ArrType(d.typ, dims[i])
 			}
-			d.typ = ArrType(d.typ, n)
 		} else if p.atPunct("(") {
 			if !allowFunc {
 				return d, fmt.Errorf("line %d: function type not allowed here", p.cur().Line)

@@ -2507,7 +2507,17 @@ func (c *CG) elemClassOf(e Expr) CType {
 		}
 		return TInt
 	case *Index:
-		return c.elemClassOf(n.Base)
+		// Mirror elemWidthOf: derive the class from this expression's OWN
+		// type. Recursing into n.Base reports the outer array's element class,
+		// which for "double d[2][2]" is double[2] -- an int-class aggregate --
+		// so d[i][j] was loaded with mov instead of movsd and read as 0.0.
+		if t := c.exprType(n); t != nil {
+			if (t.IsPtr() || t.IsArray()) && t.Elem != nil {
+				return t.Elem.Class()
+			}
+			return t.Class()
+		}
+		return TInt
 	case *MemberExpr:
 		if mt := c.memberType(n.Base, n.Name); mt != nil {
 			return mt.Class()
@@ -2664,7 +2674,22 @@ func (c *CG) elemWidthOf(e Expr) int {
 		}
 		return 8
 	case *Index:
-		return c.elemWidthOf(n.Base)
+		// "m[i]" has m's ELEMENT type, and it is that type's element width
+		// which strides the next subscript: for "int m[2][3]", m[i] is int[3]
+		// and m[i][j] steps 4 bytes, while m[i] itself steps 12. Recursing
+		// into n.Base would reuse m's own stride for both levels and make
+		// every m[i][j] address wrong.
+		if t := c.exprType(n); t != nil {
+			// Still subscriptable (int[3], char*, ...): the next subscript
+			// strides this type's element.
+			if (t.IsPtr() || t.IsArray()) && t.Elem != nil {
+				return c.typeWidth(t.Elem)
+			}
+			// Fully subscripted: the value itself, at its layout width
+			// (int is packed 4 bytes inside an array).
+			return c.typeWidth(t)
+		}
+		return 8
 	case *MemberExpr:
 		if mt := c.memberType(n.Base, n.Name); mt != nil {
 			if (mt.IsPtr() || mt.IsArray()) && mt.Elem != nil {
@@ -3551,8 +3576,17 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 		if f, ok := c.funcDefs[name]; ok {
 			retT = f.Ret
 			paramTypes = f.ParamTypes
+			// A user-defined variadic function ("int log(const char*, ...)")
+			// needs the same calling convention as printf: every argument
+			// travels in a general-purpose slot, because the callee's
+			// prologue only spills the integer argument registers into its
+			// va_list save area. Without this a double argument would be
+			// passed in xmm0 and va_arg would read garbage (0.0).
+			varargs = f.Variadic
 		}
-		varargs = variadicFn(name)
+		if !varargs {
+			varargs = variadicFn(name)
+		}
 	}
 	sretSz := 0
 	if isAgg(retT) {
