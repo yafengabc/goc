@@ -43,16 +43,26 @@ for asm in examples/*.asm; do
         continue
     fi
 
+    # Run and capture the exit code separately: comparing stdout alone would
+    # hide a crash that emits the correct prefix (e.g. fmath CI: "4" then die).
+    ./examples/"$name".exe > "/tmp/a0_$name.raw" 2> "/tmp/a0_$name.err"
+    rc=$?
     # Strip CR: the console layer may emit CRLF on Windows.
-    ./examples/"$name".exe 2>&1 | tr -d '\r' > "/tmp/a0_$name.out"
+    tr -d '\r' < "/tmp/a0_$name.raw" > "/tmp/a0_$name.out"
 
-    if diff -u "$exp" "/tmp/a0_$name.out" > "/tmp/a0_$name.diff"; then
+    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/a0_$name.out" > "/tmp/a0_$name.diff"; then
+        echo "FAIL  $name (exit=$rc)"
+        sed -n '1,12p' "/tmp/a0_$name.diff"
+        echo "  raw bytes:"
+        od -c "/tmp/a0_$name.raw" | head -8
+        if [ -s "/tmp/a0_$name.err" ]; then
+            echo "  stderr:"
+            cat "/tmp/a0_$name.err"
+        fi
+        fail=$((fail + 1))
+    else
         echo "ok    $name"
         pass=$((pass + 1))
-    else
-        echo "FAIL  $name"
-        sed -n '1,12p' "/tmp/a0_$name.diff"
-        fail=$((fail + 1))
     fi
 done
 
