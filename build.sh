@@ -4,7 +4,9 @@
 #
 #   bash build.sh
 #
-# Windows note: goc looks for goa.exe next to itself, so goa is copied up here.
+# Layout: compiler source lives in src/ (module goc) with goa/ (module goa)
+# and goclib/ beside it; every binary is emitted into ./bin so goc and goa
+# stay siblings (findGoa looks next to the goc binary first).
 
 set -euo pipefail
 
@@ -21,17 +23,16 @@ export GOTMPDIR="$TMP"
 
 EXE="$(go env GOEXE)"   # ".exe" on Windows, "" elsewhere
 
+mkdir -p bin
+
 echo "== goc =="
-go build -trimpath -ldflags="-s -w" -o "goc$EXE" .
+(cd src && go build -trimpath -ldflags="-s -w" -o "../bin/goc$EXE" .)
 
 echo "== goa =="
-(cd goa && go build -trimpath -ldflags="-s -w" -o "goa$EXE" .)
-if [ -n "$EXE" ]; then
-    cp "goa/goa$EXE" "./goa$EXE"
-fi
+(cd src/goa && go build -trimpath -ldflags="-s -w" -o "../../bin/goa$EXE" .)
 
 echo "== tools =="
-(cd goa && go build -o "tools/elfcheck$EXE"   ./tools/elfcheck)
-(cd goa && go build -o "tools/msgboxcheck$EXE" ./tools/msgboxcheck)
+(cd tools && go build -o "../bin/elfcheck$EXE"    ./elfcheck)
+(cd tools && go build -o "../bin/msgboxcheck$EXE" ./msgboxcheck)
 
-echo "done: goc$EXE, goa/goa$EXE, goa/tools/elfcheck$EXE, goa/tools/msgboxcheck$EXE"
+echo "done: bin/goc$EXE, bin/goa$EXE, bin/elfcheck$EXE, bin/msgboxcheck$EXE"

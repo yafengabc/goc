@@ -18,17 +18,16 @@ export GOTMPDIR="$TMP"
 [ -n "${GOCACHE:-}" ] || export GOCACHE="$HOME/.cache/go-build"
 
 echo "== building goc =="
-go build -trimpath -ldflags="-s -w" -o goc.exe . || { echo "BUILD FAILED"; exit 1; }
+(cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc.exe .) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
-(cd goa && go build -trimpath -ldflags="-s -w" -o goa.exe .) || { echo "GOA BUILD FAILED"; exit 1; }
-cp goa/goa.exe ./goa.exe
+(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa.exe .) || { echo "GOA BUILD FAILED"; exit 1; }
 
 # elfcheck verifies an ELF and then interprets it, since a Windows box cannot
 # exec one. Same golden files: the Linux backend must print exactly what the
 # Windows one does.
 echo "== building elfcheck =="
-(cd goa && go build -o tools/elfcheck.exe ./tools/elfcheck) || { echo "ELFCHECK BUILD FAILED"; exit 1; }
+(cd tools && go build -o ../bin/elfcheck.exe ./elfcheck) || { echo "ELFCHECK BUILD FAILED"; exit 1; }
 
 pass=0
 fail=0
@@ -45,7 +44,7 @@ for src in examples/*.c; do
     if [ ! -f "$exp" ]; then
         if is_win_only "$name"; then
             # GUI demo with no golden: prove the user32 imports compile+link.
-            if ! ./goc.exe -c "$src" >/dev/null 2>"/tmp/goc_$name.err"; then
+            if ! ./bin/goc.exe -c "$src" >/dev/null 2>"/tmp/goc_$name.err"; then
                 echo "FAIL  $name  (compile): $(cat /tmp/goc_$name.err)"
                 fail=$((fail + 1))
             else
@@ -58,7 +57,7 @@ for src in examples/*.c; do
         continue
     fi
 
-    if ! ./goc.exe -c "$src" >/dev/null 2>"/tmp/goc_$name.err"; then
+    if ! ./bin/goc.exe -c "$src" >/dev/null 2>"/tmp/goc_$name.err"; then
         echo "FAIL  $name  (compile): $(cat /tmp/goc_$name.err)"
         fail=$((fail + 1))
         continue
@@ -96,13 +95,13 @@ for src in examples/*.c; do
         continue
     fi
 
-    if ! ./goc.exe -c -target linux "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
+    if ! ./bin/goc.exe -c -target linux "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
         echo "FAIL  linux/$name  (compile): $(cat /tmp/gocl_$name.err)"
         fail=$((fail + 1))
         continue
     fi
 
-    ./goa/tools/elfcheck.exe "examples/$name" >"/tmp/gocl_$name.out" 2>"/tmp/gocl_$name.err"
+    ./bin/elfcheck.exe "examples/$name" >"/tmp/gocl_$name.out" 2>"/tmp/gocl_$name.err"
     rc=$?
 
     if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/gocl_$name.out" >"/tmp/gocl_$name.diff"; then

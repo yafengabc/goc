@@ -17,16 +17,19 @@ jobs:
           go-version: '1.21'
       - name: gofmt
         run: |
-          out="$(gofmt -l . asm goa/tools/elfcheck goa/tools/msgboxcheck)"
+          out="$(gofmt -l . tools/elfcheck tools/msgboxcheck)"
           if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
       - name: go vet
         run: |
-          go vet ./...
-          (cd goa && go vet ./...)
+          (cd src && go vet ./...)
+          (cd src/goa && go vet ./...)
+          (cd tools && go vet ./...)
       - name: go build
         run: |
-          go build -o goc .
-          (cd goa && go build -o goa .)
+          mkdir -p bin
+          (cd src && go build -o ../bin/goc .)
+          (cd src/goa && go build -o ../../bin/goa .)
+          (cd tools && go build ./elfcheck ./msgboxcheck)
       - name: native Linux e2e (real kernel, real SSE2)
         run: bash run_tests_linux.sh
 
@@ -43,5 +46,5 @@ jobs:
       - name: goc end-to-end
         run: bash run_tests.sh
       - name: goa (non-GUI)
-        run: bash goa/run_tests.sh
+        run: bash src/goa/run_tests.sh
         continue-on-error: true   # msgbox example needs an interactive desktop

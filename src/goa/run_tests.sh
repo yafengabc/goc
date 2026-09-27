@@ -20,10 +20,10 @@ export GOTMPDIR="$TMP"
 
 echo "== building goa =="
 go build -trimpath -ldflags="-s -w" -o goa.exe . || { echo "BUILD FAILED"; exit 1; }
-go build -o tools/msgboxcheck.exe ./tools/msgboxcheck || { echo "TOOL BUILD FAILED"; exit 1; }
+(cd ../../tools && go build -o msgboxcheck.exe ./msgboxcheck) || { echo "TOOL BUILD FAILED"; exit 1; }
 # elfcheck verifies the ELF structure and then interprets the program, since
 # a Windows box cannot actually exec an ELF binary.
-go build -o tools/elfcheck.exe ./tools/elfcheck || { echo "TOOL BUILD FAILED"; exit 1; }
+(cd ../../tools && go build -o elfcheck.exe ./elfcheck) || { echo "TOOL BUILD FAILED"; exit 1; }
 
 pass=0
 fail=0
@@ -86,7 +86,7 @@ for asm in examples/linux/*.asm; do
         continue
     fi
 
-    ./tools/elfcheck.exe "examples/linux/$name" >"/tmp/goa_$name.out" 2>"/tmp/goa_$name.err"
+    ../../tools/elfcheck.exe "examples/linux/$name" >"/tmp/goa_$name.out" 2>"/tmp/goa_$name.err"
     rc=$?
     if [ ! -f "$exp" ]; then
         echo "SKIP  linux/$name  (no expected/linux_$name.txt)"
@@ -110,7 +110,7 @@ echo "pass=$pass fail=$fail"
 # real UI instead. Needs an interactive desktop (fails on a locked screen).
 echo "== gui: examples/msgbox.asm =="
 ./goa.exe examples/msgbox.asm >/dev/null || { echo "FAIL  msgbox (assemble)"; fail=$((fail + 1)); }
-./tools/msgboxcheck.exe examples/msgbox.exe || fail=$((fail + 1))
+../../tools/msgboxcheck.exe examples/msgbox.exe || fail=$((fail + 1))
 
 echo "-----------------------------"
 echo "pass=$pass fail=$fail"

@@ -6,9 +6,10 @@
 *.o
 *.s
 
-# Compiled binaries of the two tools themselves (no suffix outside Windows).
-/goc
-/goa
+# Toolchain binaries (goc, goa, elfcheck, msgboxcheck) all land in bin/.
+# NOTE: never ignore /goc or /src at the root -- src/ is now the compiler
+# source tree and would be swallowed by such a pattern.
+/bin/
 
 # examples/ keeps only the .c sources; everything else there is a build
 # product: examples/*.asm (goc -S output) and examples/foo (Linux ELF).

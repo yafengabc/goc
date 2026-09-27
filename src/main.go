@@ -99,7 +99,7 @@ func main() {
 	goa, err := findGoa()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cannot find goa:", err)
-		fmt.Fprintln(os.Stderr, "build it with: cd goa && go build .")
+		fmt.Fprintln(os.Stderr, "build it with: cd src/goa && go build .")
 		fmt.Fprintln(os.Stderr, "or set GOA=<path to goa>")
 		os.Exit(1)
 	}

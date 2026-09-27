@@ -23,11 +23,11 @@ export GOTMPDIR="$TMP"
 [ -n "${GOCACHE:-}" ] || export GOCACHE="$HOME/.cache/go-build"
 
 echo "== building goc =="
-go build -trimpath -ldflags="-s -w" -o goc . || { echo "BUILD FAILED"; exit 1; }
+mkdir -p bin
+(cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc .) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
-(cd goa && go build -trimpath -ldflags="-s -w" -o goa .) || { echo "GOA BUILD FAILED"; exit 1; }
-cp goa/goa ./goa   # findGoa looks next to the goc binary first
+(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa .) || { echo "GOA BUILD FAILED"; exit 1; }
 
 pass=0
 fail=0
@@ -54,7 +54,7 @@ for src in examples/*.c; do
         continue
     fi
 
-    if ! ./goc -c -target linux "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
+    if ! ./bin/goc -c -target linux "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
         echo "FAIL  $name  (compile): $(cat /tmp/gocl_$name.err)"
         fail=$((fail + 1))
         continue
@@ -83,17 +83,17 @@ echo "-----------------------------"
 echo "pass=$pass fail=$fail"
 
 echo "== goa: linux examples, run on the real kernel =="
-for asm in goa/examples/linux/*.asm; do
+for asm in src/goa/examples/linux/*.asm; do
     name="$(basename "$asm" .asm)"
-    exp="goa/expected/linux_$name.txt"
-    bin="goa/examples/linux/$name"
+    exp="src/goa/expected/linux_$name.txt"
+    bin="src/goa/examples/linux/$name"
 
     if [ ! -f "$exp" ]; then
         echo "SKIP  linux/$name  (no expected/linux_$name.txt)"
         continue
     fi
 
-    if ! ./goa -f elf "$asm" >/dev/null 2>"/tmp/goal_$name.err"; then
+    if ! ./bin/goa -f elf "$asm" >/dev/null 2>"/tmp/goal_$name.err"; then
         echo "FAIL  linux/$name  (assemble): $(cat /tmp/goal_$name.err)"
         fail=$((fail + 1))
         continue

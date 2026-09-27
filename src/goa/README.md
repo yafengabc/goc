@@ -149,12 +149,12 @@ bash run_tests.sh
 ```
 
 会把 `examples/*.asm` 全部汇编、运行，并与 `expected/*.txt` 逐字节比对；
-再把 `examples/linux/*.asm` 汇编成 ELF 并交给 `tools/elfcheck` 跑一遍。
+再把 `examples/linux/*.asm` 汇编成 ELF 并交给 `../../tools/elfcheck` 跑一遍。
 当前 **13/13** 通过（10 个 Windows + 3 个 Linux）。
 
 ### 本机跑不了 ELF，怎么验证？
 
-Windows 上没法 exec 一个 ELF，所以 `tools/elfcheck` 做两件事：
+Windows 上没法 exec 一个 ELF，所以 `../../tools/elfcheck` 做两件事：
 
 1. **结构检查**：按内核加载器的视角逐字段校验（magic / class / 类型 / 机器 /
    entry 是否落在可执行 `PT_LOAD` 内 / `p_vaddr ≡ p_offset (mod p_align)` /
@@ -167,7 +167,7 @@ Windows 上没法 exec 一个 ELF，所以 `tools/elfcheck` 做两件事：
 是有意义的验证：数值算错、递归栈错、syscall 参数错都会立刻暴露。
 （仍建议在有 Linux 的机器上真跑一次，解释器不能替代真实内核。）
 
-`msgbox.asm` 是 GUI 程序，没有 stdout 可比，所以走 `tools/msgboxcheck`：启动 exe、
+`msgbox.asm` 是 GUI 程序，没有 stdout 可比，所以走 `../../tools/msgboxcheck`：启动 exe、
 按标题找到对话框（纯 Go syscall 调 `FindWindowW`）、读出实际显示的正文、用
 `GetDlgItem(IDYES)` + `BM_CLICK` 点「是」、确认程序走了 IDYES 分支、再关窗检查退出码。
 **需要交互式桌面**，锁屏时会失败。

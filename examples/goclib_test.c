@@ -7,7 +7,7 @@
  * every public function (strlen, strcpy, printf, malloc, ...) is the C version
  * from goclib.c, which suppresses the assembly twin.
  */
-#include "../goclib/goclib.c"
+#include "../src/goclib/goclib.c"
 
 int main() {
     /* --- variadic printf: %s %c %d %ld %u %x %f --- */

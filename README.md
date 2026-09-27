@@ -10,10 +10,10 @@
 ```bash
 bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面目录结构）
 
-./goc.exe examples/hello.c                  # 编译并运行（Windows）
-./goc.exe -c examples/hello.c               # 只编译
-./goc.exe -S examples/hello.c               # 只输出汇编（hello.asm）
-./goc.exe -c -target linux examples/hello.c # 出 Linux ELF64（无后缀）
+./bin/goc.exe examples/hello.c                  # 编译并运行（Windows）
+./bin/goc.exe -c examples/hello.c               # 只编译
+./bin/goc.exe -S examples/hello.c               # 只输出汇编（hello.asm）
+./bin/goc.exe -c -target linux examples/hello.c # 出 Linux ELF64（无后缀）
 ```
 
 Windows 产物**只导入 kernel32**（`ExitProcess` / `GetStdHandle` / `WriteFile`）；
@@ -24,21 +24,26 @@ syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 
 ```
 .
-├── lexer.go  parser.go  ast.go  codegen.go  main.go  # goc：迷你 C 编译器
-├── goa/                                              # goa：汇编器（独立 go 模块）
-│   ├── asm.go  pe.go  elf.go  main.go                #   Intel 语法子集 -> PE32+ / ELF64
-│   ├── examples/  expected/  run_tests.sh            #   goa 的用例与 golden
-│   └── tools/elfcheck  tools/msgboxcheck             #   验证工具（解释 ELF / 驱动 GUI）
-├── goclib/                                              # 自带的 C 库（见下「goclib」一节）
-│   ├── goclib.asm                                       #   汇编后端：一份源，#if defined(_WIN64)/#else 双平台
-│   ├── goclib.h  goclib.c                               #   跨平台 C 实现（goc 暂不能编译，stage5 启用）
-│   └── README.md                                      #   后端切换与迁移说明
+├── src/                                                # 编译器源码（go 模块 goc）
+│   ├── lexer.go  parser.go  ast.go  codegen.go  main.go
+│   ├── goa/                                            # goa：汇编器（独立 go 模块）
+│   │   ├── asm.go  pe.go  elf.go  main.go              #   Intel 语法子集 -> PE32+ / ELF64
+│   │   ├── examples/  expected/  run_tests.sh          #   goa 的用例与 golden
+│   │   └── README.md
+│   └── goclib/                                         # 自带的 C 库（见下「goclib」一节）
+│       ├── goclib.asm                                  #   汇编后端：一份源，#if defined(_WIN64)/#else 双平台
+│       ├── goclib.h  goclib.c                          #   跨平台 C 实现（goc 暂不能编译，stage5 启用）
+│       └── README.md                                   #   后端切换与迁移说明
+├── tools/                                              # 验证工具（独立 go 模块）
+│   ├── elfcheck  msgboxcheck                           #   解释 ELF / 驱动 GUI 断言
+│   └── peun.py  ucrun.py                               #   PE / ucrt 逆向辅助脚本
+├── bin/                                                # 构建产物（goc / goa / elfcheck / msgboxcheck）
 ├── examples/*.c   expected/*.txt                     # goc 的用例与 golden
 ├── build.sh  run_tests.sh  run_tests_linux.sh          # 构建 / 测试（Win 解释 / Linux 原生）
 └── .github/workflows/ci.yml                            # CI：Linux 原生端到端 + Windows 端到端
 ```
 
-`goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
+`src/goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
 直接出 exe，不需要 goc。
 
 ## Linux 目标
@@ -47,7 +52,7 @@ syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 
 - **调用约定**从 Win64（rcx/rdx/r8/r9 + 32 字节 shadow space）切成 SysV
   （rdi/rsi/rdx/rcx/r8/r9，无 shadow space）。
-- **goclib 走 `goclib/goclib.asm` 的 Linux 分支**（`#else` 那段）—— 同名同语义的另一套
+- **goclib 走 `src/goclib/goclib.asm` 的 Linux 分支**（`#else` 那段）—— 同名同语义的另一套
   实现：`__goclib_write` 走 `write` syscall，`malloc` 用 `brk` 做 bump 分配
   （`free` 是空操作，进程退出时一起还），`exit` 走 `exit` syscall。
 - 参数上限相应从「4 个寄存器 + 栈」变成「6 个寄存器 + 栈」。
@@ -56,7 +61,7 @@ syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 所以 goclib 里的 `exit` 函数必须改名 `__goclib_exit`（否则会覆盖桩的符号并无限递归），
 由 goc 在生成调用时做一次别名映射（`goclibAliasLinux`）。
 
-Windows 上没法 exec ELF，所以本机测试用 `goa/tools/elfcheck` 加载并解释执行
+Windows 上没法 exec ELF，所以本机测试用 `tools/elfcheck` 加载并解释执行
 （校验 ELF 头/程序头，然后真的解释指令、模拟 write/exit/brk）。同一份 golden
 文件：Linux 后端的输出必须和 Windows 逐字节一致。
 
@@ -67,7 +72,7 @@ Windows 上没法 exec ELF，所以本机测试用 `goa/tools/elfcheck` 加载�
 ## goclib：自带的 C 库
 
 `printf` 不是编译器里的一段魔法字符串，而是一个真正的库。整套库写在**一份**
-条件编译的汇编源 `goclib/goclib.asm` 里，用 `#if defined(_WIN64) / #else` 把两套实现
+条件编译的汇编源 `src/goclib/goclib.asm` 里，用 `#if defined(_WIN64) / #else` 把两套实现
 （Windows 走 kernel32、Linux 走 syscall）合并到同一个文件；goc 在加载时按目标平台
 挑出对应分支（见 `selectPlatform`）。这跟普通编译器用 `#ifdef` 隔离平台相关汇编
 是一个思路 —— 跨平台的部分只写一遍，只把 OS 相关的部分封进 `#ifdef`。
@@ -81,7 +86,7 @@ Windows 分支全部只建立在 kernel32 之上：`malloc`/`free` 走 `GetProce
 `HeapAlloc`/`HeapFree`，输出走 `GetStdHandle` + `WriteFile`，所以**依赖表里依然
 没有 msvcrt**。Linux 分支只依赖 syscall。
 
-`goclib/goclib.asm` 在编译 goc 时用 `go:embed` 嵌进二进制。goc 只把程序**实际调用到**的
+`src/goclib/goclib.asm` 在编译 goc 时用 `go:embed` 嵌进二进制。goc 只把程序**实际调用到**的
 函数（及其依赖）拼进生成的汇编里，数据也一样按函数打标记 —— 只用 `putchar`
 的程序不会背上 `printf` 那 512 字节的输出缓冲。库文件的结构靠注释标记：
 
@@ -101,11 +106,11 @@ __goclib_ch db 0
 `; @deps __goclib_write strlen` 声明依赖，`; @extern WriteFile` 声明需要的导入，
 两者都会被自动展开。
 
-**跨平台 C 版本**：`goclib/goclib.c` + `goclib/goclib.h` 是同一批函数的纯 C 实现，只写
+**跨平台 C 版本**：`src/goclib/goclib.c` + `src/goclib/goclib.h` 是同一批函数的纯 C 实现，只写
 一遍、两个平台共用。它现在是**休眠源码**——goc 的 C 子集还缺 `char`/指针/全局变量/
-`for`/变参，暂时编不了；一旦 stage5 补齐这些特性，`goclib/goclib.asm` 就会被它取代，
+`for`/变参，暂时编不了；一旦 stage5 补齐这些特性，`src/goclib/goclib.asm` 就会被它取代，
 汇编层只剩五个 `__goclib_*` 平台原语（I/O、堆、退出、读输入）。迁移步骤见
-`goclib/README.md`。
+`src/goclib/README.md`。
 
 已知限制：`printf` 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界
 检查（缓冲区归调用方管）；格式化只认 `%d %s %c %x %f %%`（不支持宽度/精度；
