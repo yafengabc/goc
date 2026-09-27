@@ -82,6 +82,23 @@ func TestCheckAssignToArray(t *testing.T) {
 	}
 }
 
+func TestCheckAddressOfArray(t *testing.T) {
+	// &array is valid and yields a pointer to the whole array (int (*)[N]),
+	// NOT a decayed pointer to element 0. Arrays are lvalues for the purpose
+	// of taking their address even though they are not modifiable lvalues.
+	src := `
+int main() {
+    int a[5];
+    int (*pa)[5] = &a;
+    int *p = a;          // decays to element-0 pointer
+    int **ppm = &p;      // taking the address of a pointer is a pointer to pointer
+    return (int)(pa) + (int)(p) + (int)(ppm);
+}`
+	if errs := checkSrc(t, src); len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+}
+
 func TestCheckReturnFromVoid(t *testing.T) {
 	src := `void f() { return 1; } int main() { f(); return 0; }`
 	errs := checkSrc(t, src)

@@ -441,6 +441,13 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 				if ft := c.funcTypeByName(id.Name); ft != nil {
 					return PtrType(ft)
 				}
+				if t := c.lookup(id.Name); t != nil && t.IsArray() {
+					// &array yields a pointer to the whole array
+					// (int (*)[N]), NOT a decayed pointer to element 0. Arrays
+					// are lvalues for the purpose of taking their address even
+					// though they are not modifiable lvalues.
+					return PtrType(t)
+				}
 			}
 			lt, ok := c.checkLValue(n.E, fn)
 			if !ok {

@@ -2811,6 +2811,16 @@ func (c *CG) elemWidthOf(e Expr) int {
 		return c.typeWidth(vi.typ)
 	case *Unary:
 		if n.Op == "*" {
+			// The stride when subscripting *p: the width of what p points at.
+			// If p points at an array (int (*)[N]), then (*p)[i] steps by that
+			// array's ELEMENT width, not the array's own size -- so a pointer
+			// to a 5-int array indexes at 4-byte strides, not 20.
+			if t := c.exprType(n.E); t != nil && t.IsPtr() && t.Elem != nil {
+				if t.Elem.IsArray() && t.Elem.Elem != nil {
+					return c.typeWidth(t.Elem.Elem)
+				}
+				return c.typeWidth(t.Elem)
+			}
 			return c.elemWidthOf(n.E)
 		}
 		return 8
@@ -2851,9 +2861,14 @@ func (c *CG) elemWidthOf(e Expr) int {
 }
 
 // ptrElemWidth returns the byte stride of the element a pointer points at
-// (used to scale pointer arithmetic). A void pointer strides one byte.
+// (used to scale pointer arithmetic). A void pointer strides one byte. An
+// array used as a value has decayed to a pointer to element 0, so its stride
+// is the array element width too.
 func (c *CG) ptrElemWidth(t *Type) int {
 	if t != nil && t.IsPtr() && t.Elem != nil {
+		return c.typeWidth(t.Elem)
+	}
+	if t != nil && t.IsArray() && t.Elem != nil {
 		return c.typeWidth(t.Elem)
 	}
 	return 1
@@ -3418,8 +3433,12 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		// element size, exactly as array subscripting does.
 		ltType := c.exprType(n.L)
 		rtType := c.exprType(n.R)
-		lPtr := ltType != nil && ltType.IsPtr()
-		rPtr := rtType != nil && rtType.IsPtr()
+		// An array used as an operand is a value context, so it has already
+		// decayed to a pointer to element 0 (see loadVar); treat KArr exactly
+		// like KPtr for pointer arithmetic. "a + 2" must step by the element
+		// width, not by 2 bytes.
+		lPtr := ltType != nil && (ltType.IsPtr() || ltType.IsArray())
+		rPtr := rtType != nil && (rtType.IsPtr() || rtType.IsArray())
 		if lPtr || rPtr {
 			if n.Op == "*" || n.Op == "/" {
 				return TInt, fmt.Errorf("operator %q is not defined for pointers", n.Op)
