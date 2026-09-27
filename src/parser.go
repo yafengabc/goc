@@ -6,8 +6,8 @@ import "fmt"
 // specifier.
 var typeKeywords = map[string]bool{
 	"void": true, "char": true, "int": true, "long": true, "short": true,
-	"unsigned": true, "signed": true, "double": true, "struct": true, "union": true,
-	"enum": true,
+	"unsigned": true, "signed": true, "double": true, "float": true,
+	"struct": true, "union": true, "enum": true,
 }
 
 // qualifierKeywords are type qualifiers that decorate a specifier list but
@@ -226,7 +226,7 @@ func (p *Parser) atPunct(s string) bool {
 func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	signed := true
 	width := 0
-	isDouble := false
+	var fp *Type // set when a floating-point specifier (float/double) is seen
 	isVoid := false
 	seen := false
 	var tdType *Type // a typedef alias, if this specifier list names one
@@ -275,7 +275,9 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		case "long":
 			width = 8
 		case "double":
-			isDouble = true
+			fp = DoubleType()
+		case "float":
+			fp = FloatType()
 		case "unsigned":
 			signed = false
 		case "signed":
@@ -286,8 +288,8 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	if !seen {
 		return nil, fmt.Errorf("line %d: expected type specifier, got %q", p.cur().Line, p.cur().Text)
 	}
-	if isDouble {
-		return DoubleType(), nil
+	if fp != nil {
+		return fp, nil
 	}
 	if isVoid {
 		return VoidType(), nil
@@ -1496,7 +1498,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	case t.Kind == TNum:
 		p.next()
 		if t.IsDbl {
-			return &NumLit{Kind: TDouble, Fval: t.Fval}, nil
+			return &NumLit{Kind: TDouble, Fval: t.Fval, IsFloat: t.IsFloat}, nil
 		}
 		return &NumLit{Val: t.Num, Kind: TInt}, nil
 	case t.Kind == TStr:

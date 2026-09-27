@@ -389,6 +389,9 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 	switch n := e.(type) {
 	case *NumLit:
 		if n.Kind == TDouble {
+			if n.IsFloat {
+				return FloatType()
+			}
 			return DoubleType()
 		}
 		return IntType()
@@ -567,11 +570,18 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 			c.errf(0, "invalid pointer arithmetic on %s and %s", lt, rt)
 			return lt
 		}
-		if lt.Kind == KDouble || rt.Kind == KDouble {
+		// Usual arithmetic conversions: the wider floating type wins, so
+		// float+double is double while float+float stays float. Either way the
+		// value is carried in an XMM register; only its 4/8-byte storage
+		// footprint differs.
+		if lt.IsFloating() || rt.IsFloating() {
 			if n.Op == "%" {
 				c.errf(0, "operator '%%' requires integer operands, got %s and %s", lt, rt)
 			}
-			return DoubleType()
+			if lt.Kind == KDouble || rt.Kind == KDouble {
+				return DoubleType()
+			}
+			return FloatType()
 		}
 		return IntType()
 	case "<", ">", "<=", ">=", "==", "!=":

@@ -18,7 +18,7 @@ const (
 )
 
 var keywords = map[string]bool{
-	"int": true, "double": true, "if": true, "else": true, "while": true, "return": true,
+	"int": true, "double": true, "float": true, "if": true, "else": true, "while": true, "return": true,
 	"char": true, "long": true, "short": true, "unsigned": true, "signed": true,
 	"void": true, "struct": true, "union": true, "enum": true,
 	"for": true, "break": true, "continue": true,
@@ -28,15 +28,16 @@ var keywords = map[string]bool{
 }
 
 type Token struct {
-	Kind   TokKind
-	Text   string
-	Num    int64
-	Fval   float64
-	IsDbl  bool
-	IsChar bool // a 'x' character literal (carried as an integer constant in Num)
-	Str    []byte
-	Line   int
-	Space  bool // true if whitespace preceded this token (separates macro name from '(' etc.)
+	Kind    TokKind
+	Text    string
+	Num     int64
+	Fval    float64
+	IsDbl   bool
+	IsFloat bool // a float constant: a floating literal with the f/F suffix
+	IsChar  bool // a 'x' character literal (carried as an integer constant in Num)
+	Str     []byte
+	Line    int
+	Space   bool // true if whitespace preceded this token (separates macro name from '(' etc.)
 }
 
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
@@ -128,10 +129,33 @@ func Lex(src string) ([]Token, error) {
 					i++
 				}
 			}
+			// Exponent: [eE][+-]?digits. Only taken when at least one digit
+			// follows, so "1e" or "1ex" still lex as an integer plus an
+			// identifier.
+			if i < n && (src[i] == 'e' || src[i] == 'E') {
+				j := i + 1
+				if j < n && (src[j] == '+' || src[j] == '-') {
+					j++
+				}
+				if j < n && isDigit(src[j]) {
+					isDbl = true
+					i = j
+					for i < n && isDigit(src[i]) {
+						i++
+					}
+				}
+			}
 			text := src[start:i]
 			if isDbl {
+				isFloat := false
+				for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
+					if src[i] == 'f' || src[i] == 'F' {
+						isFloat = true
+					}
+					i++
+				}
 				f, _ := strconv.ParseFloat(text, 64)
-				push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, Line: line})
+				push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, Line: line})
 			} else {
 				var v int64
 				fmt.Sscanf(text, "%d", &v)

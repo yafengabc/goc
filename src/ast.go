@@ -155,9 +155,10 @@ type ContinueStmt struct{}
 type Expr interface{}
 
 type NumLit struct {
-	Val  int64
-	Kind CType
-	Fval float64
+	Val     int64
+	Kind    CType
+	Fval    float64
+	IsFloat bool // a "1.5f" literal: type float rather than double
 }
 
 type StrLit struct {

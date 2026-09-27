@@ -3,6 +3,7 @@ package main
 import (
 	"embed"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,65 +122,65 @@ const scratchSlots = 32
 // compile it, but goc cannot today. There is no msvcrt anywhere in the pipeline.
 var externDLL = map[string]string{
 	// kernel32
-	"GetStdHandle":        "kernel32",
-	"WriteFile":           "kernel32",
-	"ReadFile":            "kernel32",
-	"ExitProcess":         "kernel32",
-	"GetProcessHeap":      "kernel32",
-	"HeapAlloc":           "kernel32",
-	"HeapFree":            "kernel32",
-	"GetLastError":        "kernel32",
-	"SetLastError":        "kernel32",
-	"GetFileType":         "kernel32",
-	"GetConsoleMode":      "kernel32",
-	"SetConsoleMode":      "kernel32",
-	"WriteConsoleA":       "kernel32",
-	"CloseHandle":         "kernel32",
-	"FlushFileBuffers":    "kernel32",
-	"GetModuleHandleA":    "kernel32",
-	"GetModuleFileNameA":  "kernel32",
-	"GetCommandLineA":     "kernel32",
+	"GetStdHandle":            "kernel32",
+	"WriteFile":               "kernel32",
+	"ReadFile":                "kernel32",
+	"ExitProcess":             "kernel32",
+	"GetProcessHeap":          "kernel32",
+	"HeapAlloc":               "kernel32",
+	"HeapFree":                "kernel32",
+	"GetLastError":            "kernel32",
+	"SetLastError":            "kernel32",
+	"GetFileType":             "kernel32",
+	"GetConsoleMode":          "kernel32",
+	"SetConsoleMode":          "kernel32",
+	"WriteConsoleA":           "kernel32",
+	"CloseHandle":             "kernel32",
+	"FlushFileBuffers":        "kernel32",
+	"GetModuleHandleA":        "kernel32",
+	"GetModuleFileNameA":      "kernel32",
+	"GetCommandLineA":         "kernel32",
 	"GetEnvironmentVariableA": "kernel32",
 	"SetEnvironmentVariableA": "kernel32",
 	"GetCurrentDirectoryA":    "kernel32",
 	"SetCurrentDirectoryA":    "kernel32",
-	"GetTempPathA":        "kernel32",
-	"GetComputerNameA":    "kernel32",
-	"LoadLibraryA":        "kernel32",
-	"FreeLibrary":         "kernel32",
-	"GetTickCount":        "kernel32",
-	"Sleep":               "kernel32",
+	"GetTempPathA":            "kernel32",
+	"GetComputerNameA":        "kernel32",
+	"LoadLibraryA":            "kernel32",
+	"FreeLibrary":             "kernel32",
+	"GetTickCount":            "kernel32",
+	"Sleep":                   "kernel32",
 	// user32
-	"GetSystemMetrics":    "user32",
-	"MessageBoxA":         "user32",
-	"MessageBoxW":         "user32",
-	"FindWindowA":         "user32",
-	"GetWindowTextA":      "user32",
+	"GetSystemMetrics":     "user32",
+	"MessageBoxA":          "user32",
+	"MessageBoxW":          "user32",
+	"FindWindowA":          "user32",
+	"GetWindowTextA":       "user32",
 	"GetWindowTextLengthA": "user32",
-	"SetWindowTextA":      "user32",
-	"GetForegroundWindow": "user32",
-	"GetDesktopWindow":    "user32",
-	"IsWindow":            "user32",
-	"EnableWindow":        "user32",
-	"ShowWindow":          "user32",
-	"SetFocus":            "user32",
-	"SetCursorPos":        "user32",
-	"GetSysColor":         "user32",
-	"GetDoubleClickTime":  "user32",
-	"SendMessageA":        "user32",
-	"PostMessageA":        "user32",
-	"GetDC":               "user32",
-	"ReleaseDC":           "user32",
+	"SetWindowTextA":       "user32",
+	"GetForegroundWindow":  "user32",
+	"GetDesktopWindow":     "user32",
+	"IsWindow":             "user32",
+	"EnableWindow":         "user32",
+	"ShowWindow":           "user32",
+	"SetFocus":             "user32",
+	"SetCursorPos":         "user32",
+	"GetSysColor":          "user32",
+	"GetDoubleClickTime":   "user32",
+	"SendMessageA":         "user32",
+	"PostMessageA":         "user32",
+	"GetDC":                "user32",
+	"ReleaseDC":            "user32",
 	// gdi32
-	"GetStockObject":      "gdi32",
-	"SelectObject":        "gdi32",
-	"SetBkColor":          "gdi32",
-	"SetTextColor":        "gdi32",
-	"TextOutA":            "gdi32",
-	"LineTo":              "gdi32",
-	"Rectangle":           "gdi32",
-	"Ellipse":             "gdi32",
-	"PatBlt":              "gdi32",
+	"GetStockObject": "gdi32",
+	"SelectObject":   "gdi32",
+	"SetBkColor":     "gdi32",
+	"SetTextColor":   "gdi32",
+	"TextOutA":       "gdi32",
+	"LineTo":         "gdi32",
+	"Rectangle":      "gdi32",
+	"Ellipse":        "gdi32",
+	"PatBlt":         "gdi32",
 }
 
 // externLinux lists the syscall names an ELF-target program may reach for.
@@ -681,6 +682,10 @@ func (c *CG) slotWidth(t *Type) int {
 			return 1
 		}
 		return t.Width
+	case KFloat:
+		// A float scalar really is 4 bytes in memory: it is stored as an IEEE
+		// single and widened to double on every read. (A double stays 8.)
+		return 4
 	case KPtr, KFunc, KDouble:
 		return 8
 	case KStruct, KUnion:
@@ -810,8 +815,15 @@ func (c *CG) loadVar(vi varInfo) {
 		c.resW = c.semWOf(vi.typ)
 		return
 	}
-	if vi.typ != nil && vi.typ.Kind == KDouble {
-		c.emit("movsd xmm0, [rbp%+d]", vi.off)
+	if vi.typ != nil && vi.typ.IsFloating() {
+		// A float scalar is stored as a 4-byte IEEE single; widen it to the
+		// double every expression carries. Doubles load unchanged.
+		if vi.typ.Kind == KFloat {
+			c.emit("movss xmm0, [rbp%+d]", vi.off)
+			c.emit("cvtss2sd xmm0, xmm0")
+		} else {
+			c.emit("movsd xmm0, [rbp%+d]", vi.off)
+		}
 		c.resTyp = TDouble
 		c.resSigned = false
 		c.resW = 8
@@ -848,8 +860,15 @@ func (c *CG) storeVar(vi varInfo) {
 		c.emit("mov %s, rax", vi.reg)
 		return
 	}
-	if vi.typ != nil && vi.typ.Kind == KDouble {
-		c.emit("movsd [rbp%+d], xmm0", vi.off)
+	if vi.typ != nil && vi.typ.IsFloating() {
+		// Narrow the double in xmm0 down to a 4-byte IEEE single for float
+		// storage; doubles store unchanged.
+		if vi.typ.Kind == KFloat {
+			c.emit("cvtsd2ss xmm0, xmm0")
+			c.emit("movss [rbp%+d], xmm0", vi.off)
+		} else {
+			c.emit("movsd [rbp%+d], xmm0", vi.off)
+		}
 		return
 	}
 	switch c.slotWidth(vi.typ) {
@@ -952,6 +971,20 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 					// consumers must go through genLValue (see structSrcAddr).
 					return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
 				}
+				if gt != nil && gt.IsFloating() {
+					// A float global is stored as a 4-byte single and widened
+					// on the way in, exactly like a float local.
+					if gt.Kind == KFloat {
+						c.emit("movss xmm0, [rip+%s]", c.globalLab[n.Name])
+						c.emit("cvtss2sd xmm0, xmm0")
+					} else {
+						c.emit("movsd xmm0, [rip+%s]", c.globalLab[n.Name])
+					}
+					c.resTyp = TDouble
+					c.resSigned = false
+					c.resW = 8
+					return TDouble, nil
+				}
 				c.emit("mov rax, [rip+%s]", c.globalLab[n.Name])
 				c.resTyp = TInt
 				c.resSigned = gt != nil && gt.Kind == KInt && gt.Signed
@@ -1018,7 +1051,7 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		// slot width would read 4 bytes past a trailing int member. Double
 		// members load into xmm0, not rax.
 		width := c.typeWidth(t)
-		if t.Kind == KDouble {
+		if t.IsFloating() {
 			c.genLoadElem("r10", width, TDouble, false)
 			return c.resTyp, nil
 		}
@@ -1088,6 +1121,17 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		}
 		if err := c.ensureType(n.Typ.Class()); err != nil {
 			return t, err
+		}
+		if n.Typ.Kind == KFloat {
+			// A float result is carried as a *valid* double (the single's
+			// value widened back), so cvtsd2ss narrows the source to a
+			// single (low 32 bits, high 32 cleared) and cvtss2sd re-widens
+			// it to the equivalent double. Without the re-widen xmm0 would
+			// hold the single's bit pattern in its low half with zeroed high
+			// bits -- not the float's value as a double -- which breaks every
+			// later consumer (store, comparison, arithmetic).
+			c.emit("cvtsd2ss xmm0, xmm0")
+			c.emit("cvtss2sd xmm0, xmm0")
 		}
 		c.resTyp = n.Typ.Class()
 		c.resSigned = n.Typ.Kind == KInt && n.Typ.Signed
@@ -1343,6 +1387,23 @@ func Gen(prog *Program, linux bool) (string, error) {
 				out.WriteString("\n")
 				continue
 			}
+			if g.Typ != nil && g.Typ.IsFloating() {
+				// A float global is 4 bytes of IEEE single; a double is a
+				// quad. Only a literal initialiser (optionally negated) is
+				// foldable here; anything else falls back to zero.
+				f := 0.0
+				if v, ok := foldFloatInit(g.Init); ok {
+					f = v
+				}
+				if g.Typ.Kind == KFloat {
+					bits := math.Float32bits(float32(f))
+					out.WriteString(fmt.Sprintf("%s db %d, %d, %d, %d\n", lab,
+						bits&0xff, (bits>>8)&0xff, (bits>>16)&0xff, (bits>>24)&0xff))
+				} else {
+					out.WriteString(fmt.Sprintf("%s dq %s\n", lab, formatDouble(f)))
+				}
+				continue
+			}
 			val := int64(0)
 			if v, ok := foldConstInit(g.Init); ok {
 				val = v
@@ -1398,6 +1459,67 @@ func foldConstInit(e Expr) (int64, bool) {
 		case "+":
 			return v, true
 		}
+	}
+	return 0, false
+}
+
+// foldFloatInit folds the constant initialiser of a global float/double down
+// to its value. Like foldConstInit it understands a bare literal, a negated
+// literal and an enumerator name; anything else yields ok=false and the global
+// falls back to 0.0.
+func foldFloatInit(e Expr) (float64, bool) {
+	switch n := e.(type) {
+	case nil:
+		return 0, true
+	case *NumLit:
+		if n.Kind == TDouble {
+			return n.Fval, true
+		}
+		return float64(n.Val), true
+	case *Ident:
+		if v, ok := enumConsts[n.Name]; ok {
+			return float64(v), true
+		}
+		return 0, false
+	case *Unary:
+		v, ok := foldFloatInit(n.E)
+		if !ok {
+			return 0, false
+		}
+		switch n.Op {
+		case "-":
+			return -v, true
+		case "+":
+			return v, true
+		}
+	case *Binary:
+		l, ok1 := foldFloatInit(n.L)
+		r, ok2 := foldFloatInit(n.R)
+		if !ok1 || !ok2 {
+			return 0, false
+		}
+		switch n.Op {
+		case "+":
+			return l + r, true
+		case "-":
+			return l - r, true
+		case "*":
+			return l * r, true
+		case "/":
+			if r == 0 {
+				return 0, false
+			}
+			return l / r, true
+		}
+		return 0, false
+	case *CastExpr:
+		if v, ok := foldFloatInit(n.E); ok {
+			return v, true
+		}
+		if v, ok := foldConstInit(n.E); ok {
+			return float64(v), true
+		}
+		return 0, false
 	}
 	return 0, false
 }
@@ -1600,7 +1722,10 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	ri := 0
 	stackDecls := make([]localDecl, 0, len(decls))
 	for _, d := range decls {
-		intClass := d.typ != nil && !d.typ.IsArray() && d.typ.Kind != KDouble &&
+		// Only integer-class scalars get a callee-save home: float rides in
+		// XMM registers like double (and is 4 bytes in memory), so it must
+		// stay on the stack.
+		intClass := d.typ != nil && !d.typ.IsArray() && !d.typ.IsFloating() &&
 			d.typ.Kind != KStruct && d.typ.Kind != KUnion
 		if intClass && !addrTaken[d.name] && ri < len(regPool) {
 			regOf[d.name] = regPool[ri]
@@ -1807,7 +1932,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			continue // aggregate params are copied from their hidden pointer below
 		}
 		vi := c.vars[f.Params[i]]
-		if pt.Kind == KDouble {
+		if pt.IsFloating() {
 			// XMM index: Windows numbers XMM argument registers positionally
 			// (shared with the GP slot counter, hidden pointer included);
 			// SysV numbers them by FP-argument order only.
@@ -1817,7 +1942,14 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			}
 			fpIdx++
 			if xmmAt < len(argXMM) {
-				c.emit("movsd [rbp%+d], %s", vi.off, argXMM[xmmAt])
+				// A float parameter arrives in the low 32 bits of its XMM
+				// register; store it as a 4-byte single. The body widens it
+				// back to double on every read.
+				if pt.Kind == KFloat {
+					c.emit("movss [rbp%+d], %s", vi.off, argXMM[xmmAt])
+				} else {
+					c.emit("movsd [rbp%+d], %s", vi.off, argXMM[xmmAt])
+				}
 				continue
 			}
 		}
@@ -1950,13 +2082,15 @@ func (c *CG) genStmt(s Stmt) error {
 			return err
 		}
 		ec := c.elemClassOf(n.Lhs)
+		// The temporary always holds the value at its full scalar width
+		// (a float expression is carried as a double); genStoreElem narrows
+		// it back when the destination is a 4-byte float.
 		if ec == TDouble {
 			c.emit("movsd xmm0, [rbp%+d]", rslot)
-			c.emit("movsd [r10], xmm0")
 		} else {
 			c.emit("mov rax, [rbp%+d]", rslot)
-			c.genStoreElem("r10", c.lvalueWidth(n.Lhs), ec)
 		}
+		c.genStoreElem("r10", c.lvalueWidth(n.Lhs), ec)
 		c.tmpDepth--
 		return nil
 	case *ExprStmt:
@@ -1989,6 +2123,11 @@ func (c *CG) genStmt(s Stmt) error {
 			}
 			if err := c.ensureType(c.curRet.Class()); err != nil {
 				return err
+			}
+			// A float return leaves a single in the low 32 bits of xmm0; the
+			// value has been computed as a double, so narrow it on the way out.
+			if c.curRet != nil && c.curRet.Kind == KFloat {
+				c.emit("cvtsd2ss xmm0, xmm0")
 			}
 		} else {
 			c.emit("mov rax, 0")
@@ -2296,20 +2435,20 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 			c.emit("xorpd xmm1, xmm1")
 			c.emit("subsd xmm1, xmm0")
 			c.emit("movsd xmm0, xmm1")
-	} else {
-		c.emit("neg rax")
-		// Integer promotion: a narrow operand (char/short) negates as a
-		// signed int; an int keeps its own signedness; an 8-byte value
-		// (long/unsigned long) keeps the full 64-bit result.
-		w, s := c.resW, c.resSigned
-		if w < 4 {
-			w, s = 4, true
+		} else {
+			c.emit("neg rax")
+			// Integer promotion: a narrow operand (char/short) negates as a
+			// signed int; an int keeps its own signedness; an 8-byte value
+			// (long/unsigned long) keeps the full 64-bit result.
+			w, s := c.resW, c.resSigned
+			if w < 4 {
+				w, s = 4, true
+			}
+			c.resW = w
+			if w == 4 {
+				c.canonInt(s)
+			}
 		}
-		c.resW = w
-		if w == 4 {
-			c.canonInt(s)
-		}
-	}
 		return t, nil
 	}
 	// "!" -- force the operand to int, then rax = (rax == 0)
@@ -2539,6 +2678,8 @@ func (c *CG) typeWidth(t *Type) int {
 	switch t.Kind {
 	case KPtr, KFunc:
 		return 8
+	case KFloat:
+		return 4
 	case KDouble:
 		return 8
 	case KArr:
@@ -2709,6 +2850,15 @@ func (c *CG) elemWidthOf(e Expr) int {
 	return 8
 }
 
+// ptrElemWidth returns the byte stride of the element a pointer points at
+// (used to scale pointer arithmetic). A void pointer strides one byte.
+func (c *CG) ptrElemWidth(t *Type) int {
+	if t != nil && t.IsPtr() && t.Elem != nil {
+		return c.typeWidth(t.Elem)
+	}
+	return 1
+}
+
 // elemSignedOf returns whether the element referenced by a pointer/array e has
 // a signed integer type (false for unsigned / double / pointer elements).
 func (c *CG) elemSignedOf(e Expr) bool {
@@ -2733,7 +2883,14 @@ func (c *CG) elemSignedOf(e Expr) bool {
 // is zero- or sign-extended into rax depending on signedness.
 func (c *CG) genLoadElem(reg string, width int, class CType, signed bool) {
 	if class == TDouble {
-		c.emit("movsd xmm0, [%s]", reg)
+		if width == 4 {
+			// A float element/member: 4 bytes on the wire, widened to the
+			// double every expression carries.
+			c.emit("movss xmm0, [%s]", reg)
+			c.emit("cvtss2sd xmm0, xmm0")
+		} else {
+			c.emit("movsd xmm0, [%s]", reg)
+		}
 		c.resTyp = TDouble
 		c.resSigned = false
 		c.resW = 8
@@ -2768,7 +2925,14 @@ func (c *CG) genLoadElem(reg string, width int, class CType, signed bool) {
 // xmm0 (double) into the address held in reg, honouring the element width.
 func (c *CG) genStoreElem(reg string, width int, class CType) {
 	if class == TDouble {
-		c.emit("movsd [%s], xmm0", reg)
+		if width == 4 {
+			// Float destination: round the double in xmm0 to a single and
+			// store only its 4 bytes, so adjacent elements survive.
+			c.emit("cvtsd2ss xmm0, xmm0")
+			c.emit("movss [%s], xmm0", reg)
+		} else {
+			c.emit("movsd [%s], xmm0", reg)
+		}
 		return
 	}
 	switch width {
@@ -2887,9 +3051,10 @@ func (c *CG) lvalueWidth(e Expr) int {
 			if vi.typ.IsPtr() {
 				return 8
 			}
-			if vi.typ.Kind == KInt {
+			if vi.typ.Kind == KInt || vi.typ.Kind == KFloat {
 				// char/short stay narrow; int becomes an 8-byte slot so it can
 				// hold a 64-bit pointer that was stored in an int variable.
+				// float is a genuine 4-byte IEEE single.
 				return c.slotWidth(vi.typ)
 			}
 			if vi.typ.Kind == KStruct || vi.typ.Kind == KUnion {
@@ -2898,6 +3063,11 @@ func (c *CG) lvalueWidth(e Expr) int {
 			return 8
 		}
 		if c.globals[id.Name] {
+			// A float global occupies 4 bytes in .data (emitted as four db
+			// values); everything else is a quad.
+			if gt := c.globalTyp[id.Name]; gt != nil && gt.Kind == KFloat {
+				return 4
+			}
 			return 8
 		}
 		return 8
@@ -2913,6 +3083,9 @@ func (c *CG) lvalueClass(e Expr) CType {
 			return vi.typ.Class()
 		}
 		if c.globals[id.Name] {
+			if gt := c.globalTyp[id.Name]; gt != nil {
+				return gt.Class()
+			}
 			return TInt
 		}
 		return TInt
@@ -2989,41 +3162,41 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 	// register-allocated because they can be address-taken).
 	if id, ok := n.E.(*Ident); ok {
 		if vi, ok2 := c.vars[id.Name]; ok2 && vi.reg != "" {
-		if n.Prefix {
-			if step == 1 {
-				c.emit("inc %s", vi.reg)
-			} else {
-				c.emit("add %s, %d", vi.reg, step)
-			}
-			c.emit("mov rax, %s", vi.reg)
-			if resW == 4 {
-				// Canonicalise both the result and the cached register: an
-				// int wraps at 32 bits, and the register must stay canonical
-				// for later loads of this variable.
-				c.canonInt(signed)
-				c.emit("mov %s, rax", vi.reg)
-			}
-		} else {
-			c.emit("mov rax, %s", vi.reg) // old value (already canonical)
-			if step == 1 {
-				c.emit("inc %s", vi.reg)
-			} else {
-				c.emit("add %s, %d", vi.reg, step)
-			}
-			if resW == 4 {
-				// Canonicalise the register's new value through a scratch
-				// round-trip; rax keeps returning the old value.
-				c.emit("mov rdx, rax") // save old value
+			if n.Prefix {
+				if step == 1 {
+					c.emit("inc %s", vi.reg)
+				} else {
+					c.emit("add %s, %d", vi.reg, step)
+				}
 				c.emit("mov rax, %s", vi.reg)
-				c.canonInt(signed)
-				c.emit("mov %s, rax", vi.reg)
-				c.emit("mov rax, rdx") // restore old value as the result
+				if resW == 4 {
+					// Canonicalise both the result and the cached register: an
+					// int wraps at 32 bits, and the register must stay canonical
+					// for later loads of this variable.
+					c.canonInt(signed)
+					c.emit("mov %s, rax", vi.reg)
+				}
+			} else {
+				c.emit("mov rax, %s", vi.reg) // old value (already canonical)
+				if step == 1 {
+					c.emit("inc %s", vi.reg)
+				} else {
+					c.emit("add %s, %d", vi.reg, step)
+				}
+				if resW == 4 {
+					// Canonicalise the register's new value through a scratch
+					// round-trip; rax keeps returning the old value.
+					c.emit("mov rdx, rax") // save old value
+					c.emit("mov rax, %s", vi.reg)
+					c.canonInt(signed)
+					c.emit("mov %s, rax", vi.reg)
+					c.emit("mov rax, rdx") // restore old value as the result
+				}
 			}
-		}
-		c.resTyp = TInt
-		c.resSigned = signed
-		c.resW = resW
-		return TInt, nil
+			c.resTyp = TInt
+			c.resSigned = signed
+			c.resW = resW
+			return TInt, nil
 		}
 	}
 
@@ -3034,11 +3207,13 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 	}
 	width := c.lvalueWidth(n.E)
 	double := false
-	if t := c.exprType(n.E); t != nil && t.Kind == KDouble {
+	if t := c.exprType(n.E); t != nil && t.IsFloating() {
 		double = true
 	}
 	if double {
-		c.genLoadElem("r10", 8, TDouble, false)
+		// width is 4 for a float lvalue: genLoadElem widens it to a double
+		// and genStoreElem rounds the updated value back to a single.
+		c.genLoadElem("r10", width, TDouble, false)
 		c.emit("movsd xmm1, xmm0") // keep current for postfix restore
 		c.loadDoubleConst(1.0)
 		if n.Op == "++" {
@@ -3046,7 +3221,7 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 		} else {
 			c.emit("subsd xmm0, xmm1")
 		}
-		c.genStoreElem("r10", 8, TDouble)
+		c.genStoreElem("r10", width, TDouble)
 		if !n.Prefix {
 			c.emit("movsd xmm0, xmm1")
 		}
@@ -3237,6 +3412,61 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		// 8-byte result (long/unsigned long) keeps its full 64-bit value.
 		w, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
 		c.emit("mov r10, [rbp%+d]", off) // left -> r10, right -> rax
+		// ---- pointer arithmetic ----
+		// A pointer value is carried as an 8-byte integer in rax/r10. When an
+		// operand has pointer type we stride the integer side by the pointed-to
+		// element size, exactly as array subscripting does.
+		ltType := c.exprType(n.L)
+		rtType := c.exprType(n.R)
+		lPtr := ltType != nil && ltType.IsPtr()
+		rPtr := rtType != nil && rtType.IsPtr()
+		if lPtr || rPtr {
+			if n.Op == "*" || n.Op == "/" {
+				return TInt, fmt.Errorf("operator %q is not defined for pointers", n.Op)
+			}
+			if lPtr && rPtr {
+				if n.Op != "-" {
+					return TInt, fmt.Errorf("only subtraction is defined for two pointers")
+				}
+				ew := c.ptrElemWidth(ltType)
+				c.emit("sub r10, rax") // byte difference (left - right)
+				c.emit("mov rax, r10")
+				if ew != 1 {
+					c.emit("cqo")
+					c.emit("mov r11, %d", ew)
+					c.emit("idiv r11")
+				}
+				c.resTyp = TInt
+				c.resSigned = true
+				c.resW = 8
+				return TInt, nil
+			}
+			// Exactly one pointer operand: bring the pointer into r10 and the
+			// integer into rax, then scale the integer by the element size.
+			ew := 1
+			if lPtr {
+				ew = c.ptrElemWidth(ltType)
+			} else {
+				ew = c.ptrElemWidth(rtType)
+				// left (int) is in r10, right (pointer) is in rax: swap.
+				c.emit("mov r11, rax") // r11 = pointer
+				c.emit("mov rax, r10") // rax = integer
+				c.emit("mov r10, r11") // r10 = pointer
+			}
+			if ew != 1 {
+				c.emit("imul rax, %d", ew)
+			}
+			if n.Op == "+" {
+				c.emit("add rax, r10")
+			} else {
+				c.emit("sub r10, rax")
+				c.emit("mov rax, r10")
+			}
+			c.resTyp = TInt
+			c.resSigned = false
+			c.resW = 8
+			return TInt, nil
+		}
 		switch n.Op {
 		case "+":
 			c.emit("add rax, r10")
@@ -3434,6 +3664,10 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 type argSlot struct {
 	slot int
 	typ  CType
+	// f32 marks an argument bound to a float parameter: the ABI carries it in
+	// the low 32 bits of an XMM register (or stack slot), so the double every
+	// expression is computed in must be narrowed at the call site.
+	f32 bool
 }
 
 // variadicFn reports whether a goclib function takes printf-style varargs.
@@ -3695,13 +3929,21 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 			return TInt, err
 		}
 		// C's usual conversion at call sites: an int argument passed to a
-		// declared double parameter is widened before it is spilled, so the
-		// callee (which reads double params from an XMM register) sees the
-		// right value.
-		if !varargs && t == TInt && i < len(paramTypes) && paramTypes[i] != nil && paramTypes[i].Kind == KDouble {
-			c.emit("cvtsi2sd xmm0, rax")
-			t = TDouble
-			c.resTyp = TDouble
+		// declared floating parameter is widened to double before it is
+		// spilled, so the callee (which reads FP params from an XMM register)
+		// sees the right value. A float parameter is narrowed back to a
+		// single when the argument is marshalled into its XMM/stack slot.
+		f32 := false
+		if !varargs && i < len(paramTypes) && paramTypes[i] != nil {
+			pt := paramTypes[i]
+			if pt.IsFloating() {
+				f32 = pt.Kind == KFloat
+				if t == TInt {
+					c.emit("cvtsi2sd xmm0, rax")
+					t = TDouble
+					c.resTyp = TDouble
+				}
+			}
 		}
 		c.tmpDepth++
 		if t == TDouble && !varargs {
@@ -3712,7 +3954,7 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 			}
 			c.emit("mov [rbp%+d], rax", c.tmpSlot(c.tmpDepth))
 		}
-		slots[i] = argSlot{slot: c.tmpDepth, typ: t}
+		slots[i] = argSlot{slot: c.tmpDepth, typ: t, f32: f32}
 		consumed++
 	}
 	if extra > 0 {
@@ -3741,11 +3983,29 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 		}
 		if s.typ == TDouble {
 			if regIdx < len(argRegs) && xmmAt < len(argXMM) {
-				c.emit("movsd %s, [rbp%+d]", argXMM[xmmAt], c.tmpSlot(s.slot))
+				if s.f32 {
+					// float parameter: the ABI carries a single in the low
+					// 32 bits, so narrow the double here. Load the double
+					// straight into the destination XMM register and narrow
+					// in place -- do NOT route through xmm0 as a scratch,
+					// because xmm0 may itself be one of the argument
+					// registers the previous iteration already populated.
+					c.emit("movsd %s, [rbp%+d]", argXMM[xmmAt], c.tmpSlot(s.slot))
+					c.emit("cvtsd2ss %s, %s", argXMM[xmmAt], argXMM[xmmAt])
+				} else {
+					c.emit("movsd %s, [rbp%+d]", argXMM[xmmAt], c.tmpSlot(s.slot))
+				}
 				xmmIdx++
 				continue
 			}
 			c.emit("movsd xmm0, [rbp%+d]", c.tmpSlot(s.slot))
+			if s.f32 {
+				// A stack-passed float sits in the low half of an 8-byte slot
+				// (the callee reads it in place with a 4-byte load).
+				c.emit("cvtsd2ss xmm0, xmm0")
+				c.emit("movss [rsp+%d], xmm0", c.stackArgOff(regIdx-len(argRegs)))
+				continue
+			}
 			c.emit("movq rax, xmm0")
 			c.emit("mov [rsp+%d], rax", c.stackArgOff(regIdx-len(argRegs)))
 			continue
@@ -3797,6 +4057,12 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 	// live below them until its consumer releases it.
 	c.tmpDepth -= consumed
 
+	// A float return arrives in the low 32 bits of xmm0. Widen it back to the
+	// double every expression is carried in, so the caller needs no special
+	// case for where the value came from.
+	if retT != nil && retT.Kind == KFloat {
+		c.emit("cvtss2sd xmm0, xmm0")
+	}
 	// Result type: user functions declare it; goclib and extern calls return int.
 	ret := TInt
 	if retT != nil {

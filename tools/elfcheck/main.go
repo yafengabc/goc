@@ -493,8 +493,8 @@ func (c *cpu) step() {
 			if c.cond(op2) {
 				c.rip = c.rip + uint64(rel)
 			}
-		case legacy == 0xf2 || legacy == 0x66:
-			// ---- SSE2 (the scalar double / quadword set goa emits) ----
+		case legacy == 0xf2 || legacy == 0xf3 || legacy == 0x66:
+			// ---- SSE2 (the scalar double / single set goa emits) ----
 			// XMM and GP registers share the ModRM field convention: REX.R
 			// extends the reg field, REX.B the rm register field. The XMM
 			// operand sits in the reg field for every form except cvttsd2si
@@ -513,10 +513,42 @@ func (c *cpu) step() {
 				}
 				return v
 			}
+			// getSse32 reads the rm operand as the low 32 bits of an XMM
+			// register or 4 bytes of memory (a float).
+			getSse32 := func(o rmOperand) uint32 {
+				if !o.isMem {
+					return uint32(c.xmm[o.reg][0])
+				}
+				v, ok := c.readMem(o.addr, 4)
+				if !ok {
+					die("SSE read of unmapped memory 0x%x at 0x%x", o.addr, pc)
+				}
+				return uint32(v)
+			}
 			switch op2 {
-			case 0x10, 0x11: // movsd xmm, xmm/m64 / movsd xmm/m64, xmm
+			case 0x10, 0x11: // movsd/movss xmm, xmm/m  /  movsd/movss m, xmm
 				reg, o := modrm()
-				if op2 == 0x10 {
+				if legacy == 0xf3 {
+					// movss moves 32 bits only. A register source merges
+					// into the low half (the upper half is preserved, as on
+					// real hardware); a memory source zeroes it.
+					if op2 == 0x10 {
+						bits := uint64(getSse32(o))
+						if o.isMem {
+							c.xmm[reg][1] = 0
+							c.xmm[reg][0] = bits
+						} else {
+							c.xmm[reg][0] = (c.xmm[reg][0] &^ 0xffffffff) | bits
+						}
+					} else {
+						bits := c.xmm[reg][0] & 0xffffffff
+						if !o.isMem {
+							c.xmm[o.reg][0] = (c.xmm[o.reg][0] &^ 0xffffffff) | bits
+						} else if !c.writeMem(o.addr, 4, bits) {
+							die("SSE write to unmapped memory 0x%x at 0x%x", o.addr, pc)
+						}
+					}
+				} else if op2 == 0x10 {
 					bits := getSse(o)
 					if o.isMem {
 						c.xmm[reg][1] = 0 // a memory source zeroes the upper half
@@ -547,6 +579,20 @@ func (c *cpu) step() {
 					a = math.Sqrt(b)
 				}
 				c.xmm[reg][0] = math.Float64bits(a)
+			case 0x5a: // cvtss2sd xmm, xmm/m32 (F3) / cvtsd2ss xmm, xmm/m64 (F2)
+				reg, o := modrm()
+				switch legacy {
+				case 0xf3:
+					src := math.Float32frombits(getSse32(o))
+					c.xmm[reg][0] = math.Float64bits(float64(src))
+				case 0xf2:
+					// Like hardware, only the low 32 bits are written; the
+					// upper half keeps whatever it held.
+					f32 := math.Float32bits(float32(math.Float64frombits(getSse(o))))
+					c.xmm[reg][0] = (c.xmm[reg][0] &^ 0xffffffff) | uint64(f32)
+				default:
+					die("unsupported opcode %02x 0F 5A at 0x%x", legacy, pc)
+				}
 			case 0x2a: // cvtsi2sd xmm, r/m64 (REX.W required)
 				if !w {
 					die("unsupported cvtsi2sd without REX.W at 0x%x", pc)
@@ -923,31 +969,31 @@ func (c *cpu) step() {
 	case 0xff: // inc/dec/call/jmp r/m64
 		reg, o := modrm()
 		switch reg {
-	case 2: // call r/m64 -- indirect call (used for function pointers)
-		dst := getRM(o)
-		c.regs[4] -= 8
-		if !c.writeMem(c.regs[4], 8, c.rip) {
-			c.dumpRegs()
-			die("indirect call with unmapped stack at 0x%x (rsp=0x%x)", pc, c.regs[4])
+		case 2: // call r/m64 -- indirect call (used for function pointers)
+			dst := getRM(o)
+			c.regs[4] -= 8
+			if !c.writeMem(c.regs[4], 8, c.rip) {
+				c.dumpRegs()
+				die("indirect call with unmapped stack at 0x%x (rsp=0x%x)", pc, c.regs[4])
+			}
+			c.rip = dst
+			return
+		case 4: // jmp r/m64 -- absolute indirect jump
+			c.rip = getRM(o)
+			return
+		case 0:
+			v := getRM(o) + 1
+			setRM(o, v)
+			c.zf, c.sf = v == 0, v>>63 != 0
+			c.of = getRM(o) == 0
+		case 1:
+			v := getRM(o) - 1
+			setRM(o, v)
+			c.zf, c.sf = v == 0, v>>63 != 0
+		default:
+			die("unsupported FF /%d at 0x%x", reg, pc)
 		}
-		c.rip = dst
 		return
-	case 4: // jmp r/m64 -- absolute indirect jump
-		c.rip = getRM(o)
-		return
-	case 0:
-		v := getRM(o) + 1
-		setRM(o, v)
-		c.zf, c.sf = v == 0, v>>63 != 0
-		c.of = getRM(o) == 0
-	case 1:
-		v := getRM(o) - 1
-		setRM(o, v)
-		c.zf, c.sf = v == 0, v>>63 != 0
-	default:
-		die("unsupported FF /%d at 0x%x", reg, pc)
-	}
-	return
 
 	case 0xf7: // idiv/div/neg/mul r/m64
 		reg, o := modrm()

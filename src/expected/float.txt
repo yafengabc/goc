@@ -1,0 +1,43 @@
+== scalar ==
+a=1.250000 b=0.500000
+sum=1.750000
+diff=0.750000
+prod=0.625000
+div=2.500000
+neg=-1.250000
+sizeof float=4
+sizeof a=4
+sizeof double=8
+== rounding ==
+third=0.333333
+dthird=0.333333
+cmp=1
+== array ==
+arr: 1.500000 2.500000 4.000000 -0.500000
+sizeof arr=16
+== struct ==
+p: 7 3.500000 9.500000
+sizeof pair=16
+== pointer ==
+q=2.500000
+arr1=4.500000
+next=4.000000
+== function ==
+addf=3.750000
+halve=3.500000
+r=1.750000
+ints=3.000000
+== global ==
+gf=2.500000
+gf=5.000000
+garr: 1.250000 2.500000 3.750000
+== cast ==
+toint=1
+todouble=1.250000
+fromdouble=0.333333
+dd=1.250000
+ff=1.250000
+== inc ==
+a=2.250000
+post=0.500000
+b=1.500000

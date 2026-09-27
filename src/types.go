@@ -14,6 +14,7 @@ const (
 	KVoid TypeKind = iota
 	KInt
 	KDouble
+	KFloat
 	KPtr
 	KArr
 	KFunc
@@ -55,6 +56,7 @@ func CharType() *Type                 { return &Type{Kind: KInt, Width: 1, Signe
 func UnsignedType() *Type             { return &Type{Kind: KInt, Width: 4, Signed: false} }
 func UnsignedCharType() *Type         { return &Type{Kind: KInt, Width: 1, Signed: false} }
 func DoubleType() *Type               { return &Type{Kind: KDouble} }
+func FloatType() *Type                { return &Type{Kind: KFloat} }
 func VoidType() *Type                 { return &Type{Kind: KVoid} }
 func PtrType(elem *Type) *Type        { return &Type{Kind: KPtr, Elem: elem} }
 func ArrType(elem *Type, n int) *Type { return &Type{Kind: KArr, Elem: elem, Len: n} }
@@ -76,7 +78,8 @@ func UnionType(members []*Member) *Type {
 // --- layout -----------------------------------------------------------------
 
 // alignOf returns the natural alignment of a type on the Win64 / System V x86-64
-// ABIs: char=1, short=2, int/long=4/8, double/pointer=8, struct=its own Align.
+// ABIs: char=1, short=2, int/long=4/8, float=4, double/pointer=8, struct=its own
+// Align.
 func alignOf(t *Type) int {
 	if t == nil {
 		return 1
@@ -84,6 +87,8 @@ func alignOf(t *Type) int {
 	switch t.Kind {
 	case KInt:
 		return t.Width // 1, 2, 4, or 8
+	case KFloat:
+		return 4
 	case KDouble, KPtr, KFunc:
 		return 8
 	case KArr:
@@ -104,6 +109,8 @@ func sizeOf(t *Type) int {
 	switch t.Kind {
 	case KInt:
 		return t.Width
+	case KFloat:
+		return 4
 	case KDouble, KPtr, KFunc:
 		return 8
 	case KArr:
@@ -165,19 +172,28 @@ func (t *Type) computeLayout() {
 // --- predicates -------------------------------------------------------------
 
 // Class returns the low-level codegen scalar class for this type. Everything
-// that is not a double is an 8-byte integer-class value (pointers included).
+// that is not floating point is an 8-byte integer-class value (pointers
+// included). float shares the double class: a float scalar is always widened to
+// a double in registers/temporaries and only narrowed back to 4 bytes at real
+// float storage (array elements, struct members, float parameters, returns).
 func (t *Type) Class() CType {
-	if t.Kind == KDouble {
+	if t.Kind == KDouble || t.Kind == KFloat {
 		return TDouble
 	}
 	return TInt
 }
 
-func (t *Type) IsArith() bool    { return t.Kind == KInt || t.Kind == KDouble }
+func (t *Type) IsArith() bool    { return t.Kind == KInt || t.Kind == KDouble || t.Kind == KFloat }
 func (t *Type) IsIntClass() bool { return t.Kind == KInt }
 func (t *Type) IsScalar() bool   { return t.IsArith() || t.Kind == KPtr }
 func (t *Type) IsVoid() bool     { return t.Kind == KVoid }
 func (t *Type) IsPtr() bool      { return t.Kind == KPtr }
+func (t *Type) IsFloat() bool    { return t.Kind == KFloat }
+
+// IsFloating reports whether the type is a real floating-point type (float or
+// double), as opposed to the codegen scalar class TDouble which float also
+// rides in.
+func (t *Type) IsFloating() bool { return t.Kind == KDouble || t.Kind == KFloat }
 func (t *Type) IsArray() bool    { return t.Kind == KArr }
 func (t *Type) IsFunc() bool     { return t.Kind == KFunc }
 func (t *Type) IsStruct() bool   { return t.Kind == KStruct }
@@ -198,6 +214,8 @@ func (t *Type) String() string {
 		return "void"
 	case KDouble:
 		return "double"
+	case KFloat:
+		return "float"
 	case KInt:
 		s := ""
 		if !t.Signed {

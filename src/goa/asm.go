@@ -986,7 +986,7 @@ func (a *Assembler) encode(mnem string, ops []Operand, ln string) error {
 		a.emitByte(0x05)
 		return nil
 	case "movsd", "movss", "addsd", "subsd", "mulsd", "divsd", "sqtsd",
-		"xorpd", "ucomisd", "cvtsi2sd", "cvttsd2si", "movq":
+		"xorpd", "ucomisd", "cvtsi2sd", "cvttsd2si", "cvtss2sd", "cvtsd2ss", "movq":
 		return a.encodeSSE(mnem, ops, ln)
 	}
 	return fmt.Errorf("unknown instruction: %q (line %q)", mnem, ln)
@@ -1722,6 +1722,10 @@ var sseSpec = map[string]struct {
 	"ucomisd":   {0x66, 0x2E, false, false},
 	"cvtsi2sd":  {0xF2, 0x2A, true, false},
 	"cvttsd2si": {0xF2, 0x2C, true, false},
+	// Single <-> double conversions. Both are XMM-dst with an XMM or m32/m64
+	// source, which is exactly the generic two-operand shape above.
+	"cvtss2sd": {0xF3, 0x5A, false, false},
+	"cvtsd2ss": {0xF2, 0x5A, false, false},
 }
 
 // emitSSE emits the REX prefix for an SSE instruction: W + R (reg field) + B
