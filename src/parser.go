@@ -7,6 +7,7 @@ import "fmt"
 var typeKeywords = map[string]bool{
 	"void": true, "char": true, "int": true, "long": true, "short": true,
 	"unsigned": true, "signed": true, "double": true, "struct": true, "union": true,
+	"enum": true,
 }
 
 // qualifierKeywords are type qualifiers that decorate a specifier list but
@@ -24,6 +25,12 @@ var typedefs = map[string]*Type{}
 // declaration "struct S;" creates the type; a later definition "struct S {...}"
 // fills in the members in place so every reference shares the same *Type.
 var structs = map[string]*Type{}
+
+// enumConsts maps an enumerator name to its integer value. Enumerators are
+// file-scope integer constants in C; the checker, the constant-expression
+// evaluator and the code generator all consult this table as a fallback when a
+// name is not a variable.
+var enumConsts = map[string]int64{}
 
 func isTypeName(tok Token) bool {
 	if tok.Kind == TKeyword && typeKeywords[tok.Text] {
@@ -128,6 +135,13 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A bare "struct S {...};" / "union U {...};" / "enum E {...};" type
+	// definition declares no symbol: the tag and any enumerators are registered
+	// during specifier parsing, and the declaration ends right at ';'.
+	if p.atPunct(";") {
+		p.next()
+		return nil, nil
+	}
 	d, err := p.parseDeclarator(spec, true, false)
 	if err != nil {
 		return nil, err
@@ -223,6 +237,13 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		}
 		if p.cur().Text == "struct" || p.cur().Text == "union" {
 			t, err := p.parseStructSpecifier(p.cur().Text == "union")
+			if err != nil {
+				return nil, err
+			}
+			return t, nil
+		}
+		if p.cur().Text == "enum" {
+			t, err := p.parseEnumSpecifier()
 			if err != nil {
 				return nil, err
 			}
@@ -371,6 +392,61 @@ func (p *Parser) parseStructMembers() ([]*Member, error) {
 	return members, nil
 }
 
+// parseEnumSpecifier parses an enum type specifier:
+//
+//	"enum Tag"        -> reference to (or forward declaration of) an enum type
+//	"enum { A, B }"   -> anonymous definition of constants
+//	"enum Tag { A=1, B }" -> tagged definition of constants
+//
+// goc models every enum as a plain signed int (C guarantees the enumerator type
+// is int-compatible; the tag is only source-level identity). The enumerator
+// names are registered in enumConsts with the usual auto-increment semantics:
+// the first enumerator is 0 and each following one without an explicit '=' is
+// the previous value plus one.
+func (p *Parser) parseEnumSpecifier() (*Type, error) {
+	p.next() // consume "enum"
+	if p.cur().Kind == TIdent {
+		// A tag name ("enum Color { ... }" or "enum Color x;"). Consume it and
+		// fall through; every enum is modelled as int.
+		p.next()
+	}
+	if !p.atPunct("{") {
+		// Tag reference (or forward declaration "enum Tag;"). Every enum is
+		// modelled as int; the tag is not otherwise consulted.
+		return IntType(), nil
+	}
+	p.next() // consume "{"
+	val := int64(0)
+	for {
+		if p.cur().Kind != TIdent {
+			return nil, fmt.Errorf("line %d: expected enumerator name, got %q", p.cur().Line, p.cur().Text)
+		}
+		name := p.next().Text
+		if p.atPunct("=") {
+			p.next()
+			v, err := p.constAdd()
+			if err != nil {
+				return nil, err
+			}
+			val = int64(v)
+		}
+		enumConsts[name] = val
+		if p.atPunct(",") {
+			p.next()
+			if p.atPunct("}") {
+				break
+			}
+			val++
+			continue
+		}
+		break
+	}
+	if err := p.expect("}"); err != nil {
+		return nil, err
+	}
+	return IntType(), nil
+}
+
 // parseDeclarator applies pointer prefixes, a direct declarator (name or
 // grouping), and array/function suffixes to base. When allowFunc is false the
 // function suffix is rejected (it only makes sense at the top level).
@@ -507,9 +583,29 @@ func (p *Parser) constPrim() (int, error) {
 		}
 		return v, nil
 	}
+	if p.atPunct("-") {
+		p.next()
+		v, err := p.constPrim()
+		if err != nil {
+			return 0, err
+		}
+		return -v, nil
+	}
+	if p.atPunct("+") {
+		p.next()
+		return p.constPrim()
+	}
 	if p.cur().Kind == TNum && !p.cur().IsDbl {
 		v := int(p.next().Num)
 		return v, nil
+	}
+	// An enumerator name may appear in a constant expression (array size,
+	// another enumerator's value): look it up in the enum table.
+	if p.cur().Kind == TIdent {
+		if v, ok := enumConsts[p.cur().Text]; ok {
+			p.next()
+			return int(v), nil
+		}
 	}
 	return 0, fmt.Errorf("line %d: expected integer constant, got %q", p.cur().Line, p.cur().Text)
 }
@@ -756,6 +852,12 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 	spec, err := p.parseDeclarationSpecifiers()
 	if err != nil {
 		return nil, err
+	}
+	// A bare type definition inside a block ("struct S {...};" / "enum { A };")
+	// declares no variable; the empty DeclList is a harmless no-op statement.
+	if p.atPunct(";") {
+		p.next()
+		return &DeclList{}, nil
 	}
 	var decls []*DeclStmt
 	for {

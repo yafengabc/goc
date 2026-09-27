@@ -187,6 +187,11 @@ func (c *checker) checkLValue(e Expr, fn *FuncDecl) (*Type, bool) {
 	case *Ident:
 		t := c.lookup(n.Name)
 		if t == nil {
+			if _, ok := enumConsts[n.Name]; ok {
+				// An enumerator is an integer constant, not an lvalue.
+				c.errf(n.Line, "enum constant %q is not an lvalue", n.Name)
+				return IntType(), false
+			}
 			c.errf(n.Line, "undeclared identifier %q", n.Name)
 			return IntType(), false
 		}
@@ -278,6 +283,10 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 	case *Ident:
 		t := c.lookup(n.Name)
 		if t == nil {
+			if _, ok := enumConsts[n.Name]; ok {
+				// Enumerators are integer constants: usable as rvalues.
+				return IntType()
+			}
 			c.errf(n.Line, "undeclared identifier %q", n.Name)
 			return IntType()
 		}

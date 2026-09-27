@@ -17,8 +17,8 @@ bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面�
 ./bin/goc.exe -c -target linux src/examples/hello.c  # 出 Linux ELF64（无后缀）
 ```
 
-Windows 产物**只导入 kernel32**（`ExitProcess` / `GetStdHandle` / `WriteFile`）；
-Linux 产物是静态 ELF，一条动态链接都没有，只发 `write` / `exit` / `brk` 三个
+Windows 产物**只导入 kernel32**（`ExitProcess` / `GetStdHandle` / `WriteFile`）；  
+Linux 产物是静态 ELF，一条动态链接都没有，只发 `write` / `exit` / `brk` 三个  
 syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 
 ## 目录结构
@@ -44,51 +44,51 @@ syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 └── .github/workflows/ci.yml                            # CI：Linux 原生端到端 + Windows 端到端
 ```
 
-`src/goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
+`src/goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，  
 直接出 exe，不需要 goc。
 
 ## Linux 目标
 
 `-target linux` 会让 goc 换一套东西：
 
-- **调用约定**从 Win64（rcx/rdx/r8/r9 + 32 字节 shadow space）切成 SysV
+- **调用约定**从 Win64（rcx/rdx/r8/r9 + 32 字节 shadow space）切成 SysV  
   （rdi/rsi/rdx/rcx/r8/r9，无 shadow space）。
-- **goclib 走 `src/goclib/goclib.asm` 的 Linux 分支**（`#else` 那段）—— 同名同语义的另一套
-  实现：`__goclib_write` 走 `write` syscall，`malloc` 用 `brk` 做 bump 分配
+- **goclib 走 `src/goclib/goclib.asm` 的 Linux 分支**（`#else` 那段）—— 同名同语义的另一套  
+  实现：`__goclib_write` 走 `write` syscall，`malloc` 用 `brk` 做 bump 分配  
   （`free` 是空操作，进程退出时一起还），`exit` 走 `exit` syscall。
 - 参数上限相应从「4 个寄存器 + 栈」变成「6 个寄存器 + 栈」。
 
-有个坑值得一提：Linux 下 goa 给每个 extern 生成的 syscall 桩**就叫 extern 的名字**，
-所以 goclib 里的 `exit` 函数必须改名 `__goclib_exit`（否则会覆盖桩的符号并无限递归），
+有个坑值得一提：Linux 下 goa 给每个 extern 生成的 syscall 桩**就叫 extern 的名字**，  
+所以 goclib 里的 `exit` 函数必须改名 `__goclib_exit`（否则会覆盖桩的符号并无限递归），  
 由 goc 在生成调用时做一次别名映射（`goclibAliasLinux`）。
 
-Windows 上没法 exec ELF，所以本机测试用 `tools/elfcheck` 加载并解释执行
-（校验 ELF 头/程序头，然后真的解释指令、模拟 write/exit/brk）。同一份 golden
+Windows 上没法 exec ELF，所以本机测试用 `tools/elfcheck` 加载并解释执行  
+（校验 ELF 头/程序头，然后真的解释指令、模拟 write/exit/brk）。同一份 golden  
 文件：Linux 后端的输出必须和 Windows 逐字节一致。
 
-真正的内核验证交给 CI：`.github/workflows/ci.yml` 的 Ubuntu job 会用
-`run_tests_linux.sh` **直接执行**所有 Linux ELF 目标（不走解释器），真实内核 +
+真正的内核验证交给 CI：`.github/workflows/ci.yml` 的 Ubuntu job 会用  
+`run_tests_linux.sh` **直接执行**所有 Linux ELF 目标（不走解释器），真实内核 +  
 真实 SSE2，这才是 double 支持最硬的证明。
 
 ## goclib：自带的 C 库
 
-`printf` 不是编译器里的一段魔法字符串，而是一个真正的库。整套库写在**一份**
-条件编译的汇编源 `src/goclib/goclib.asm` 里，用 `#if defined(_WIN64) / #else` 把两套实现
-（Windows 走 kernel32、Linux 走 syscall）合并到同一个文件；goc 在加载时按目标平台
-挑出对应分支（见 `selectPlatform`）。这跟普通编译器用 `#ifdef` 隔离平台相关汇编
+`printf` 不是编译器里的一段魔法字符串，而是一个真正的库。整套库写在**一份**  
+条件编译的汇编源 `src/goclib/goclib.asm` 里，用 `#if defined(_WIN64) / #else` 把两套实现  
+（Windows 走 kernel32、Linux 走 syscall）合并到同一个文件；goc 在加载时按目标平台  
+挑出对应分支（见 `selectPlatform`）。这跟普通编译器用 `#ifdef` 隔离平台相关汇编  
 是一个思路 —— 跨平台的部分只写一遍，只把 OS 相关的部分封进 `#ifdef`。
 
-| 分支 | 提供 |
-|---|---|
+| 分支                    | 提供                                                                                                                                                                                                                                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `#if defined(_WIN64)` | `printf` `sprintf` `puts` `putchar` `getchar` `strlen` `strcpy` `strcmp` `strcat` `strchr` `memset` `memcpy` `memmove` `memcmp` `strncmp` `malloc` `free` `calloc` `atoi` `abs` `strtol` `rand` `srand` `exit`，以及内部 `__goclib_write` `__goclib_vfmt` `__goclib_exit` `__goclib_heap_alloc` `__goclib_heap_free` `__goclib_read` |
-| `#else`（Linux） | 同名同语义，改为 syscall 实现 |
+| `#else`（Linux）        | 同名同语义，改为 syscall 实现                                                                                                                                                                                                                                                                                                             |
 
-Windows 分支全部只建立在 kernel32 之上：`malloc`/`free` 走 `GetProcessHeap` +
-`HeapAlloc`/`HeapFree`，输出走 `GetStdHandle` + `WriteFile`，所以**依赖表里依然
+Windows 分支全部只建立在 kernel32 之上：`malloc`/`free` 走 `GetProcessHeap` +  
+`HeapAlloc`/`HeapFree`，输出走 `GetStdHandle` + `WriteFile`，所以**依赖表里依然  
 没有 msvcrt**。Linux 分支只依赖 syscall。
 
-`src/goclib/goclib.asm` 在编译 goc 时用 `go:embed` 嵌进二进制。goc 只把程序**实际调用到**的
-函数（及其依赖）拼进生成的汇编里，数据也一样按函数打标记 —— 只用 `putchar`
+`src/goclib/goclib.asm` 在编译 goc 时用 `go:embed` 嵌进二进制。goc 只把程序**实际调用到**的  
+函数（及其依赖）拼进生成的汇编里，数据也一样按函数打标记 —— 只用 `putchar`  
 的程序不会背上 `printf` 那 512 字节的输出缓冲。库文件的结构靠注释标记：
 
 ```asm
@@ -104,57 +104,57 @@ __goclib_ch db 0
 ; @end
 ```
 
-`; @deps __goclib_write strlen` 声明依赖，`; @extern WriteFile` 声明需要的导入，
+`; @deps __goclib_write strlen` 声明依赖，`; @extern WriteFile` 声明需要的导入，  
 两者都会被自动展开。
 
-**跨平台 C 版本**：`src/goclib/goclib.c` + `src/goclib/goclib.h` 是同一批函数的纯 C 实现，只写
-一遍、两个平台共用。它现在是**休眠源码**——goc 的 C 子集还缺 `char`/指针/全局变量/
-`for`/变参，暂时编不了；一旦 stage5 补齐这些特性，`src/goclib/goclib.asm` 就会被它取代，
-汇编层只剩五个 `__goclib_*` 平台原语（I/O、堆、退出、读输入）。迁移步骤见
+**跨平台 C 版本**：`src/goclib/goclib.c` + `src/goclib/goclib.h` 是同一批函数的纯 C 实现，只写  
+一遍、两个平台共用。它现在是**休眠源码**——goc 的 C 子集还缺 `char`/指针/全局变量/  
+`for`/变参，暂时编不了；一旦 stage5 补齐这些特性，`src/goclib/goclib.asm` 就会被它取代，  
+汇编层只剩五个 `__goclib_*` 平台原语（I/O、堆、退出、读输入）。迁移步骤见  
 `src/goclib/README.md`。
 
-已知限制：`printf` 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界
-检查（缓冲区归调用方管）；格式化只认 `%d %s %c %x %f %%`（不支持宽度/精度；
+已知限制：`printf` 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界  
+检查（缓冲区归调用方管）；格式化只认 `%d %s %c %x %f %%`（不支持宽度/精度；  
 `%f` 固定 6 位小数，相当于 C 的 `%.6f`）。
 
 ## 支持的语言子集
 
-- 类型：`int` 与 `double`（都是 8 字节栈槽），函数参数最多 8 个（前 4 个走
+- 类型：`int` 与 `double`（都是 8 字节栈槽），函数参数最多 8 个（前 4 个走  
   寄存器，其余压栈）
 - `if` / `else` / `while` / `return`、块作用域
-- 运算符：`+ - * / %`、`< > <= >= == !=`、`&& ||`、`& | ^ << >>`、`!`、
-  一元 `-`、三元 `?:`，以及 `+= -= *= /= %= &= |= <<= >>=` 复合赋值；操作数含
+- 运算符：`+ - * / %`、`< > <= >= == !=`、`&& ||`、`& | ^ << >>`、`!`、  
+  一元 `-`、三元 `?:`，以及 `+= -= *= /= %= &= |= <<= >>=` 复合赋值；操作数含  
   `double` 时 `+ - * /` 与比较自动提升，结果类型随操作数
 - 字符串字面量、`printf` 调用（`%d %s %c %x %f %%`）
 
 ## double 支持
 
-`double` 走 SSE2 标量指令：参数放在 xmm0..xmm3（Windows）或 xmm0..xmm7（SysV），
-算术用 `addsd` / `subsd` / `mulsd` / `divsd`，整型↔浮点转换用 `cvtsi2sd` /
-`cvttsd2si`（截断），比较用 `ucomisd` 再跟无符号跳转（jb/ja/jbe/jae/je/jne）。
+`double` 走 SSE2 标量指令：参数放在 xmm0..xmm3（Windows）或 xmm0..xmm7（SysV），  
+算术用 `addsd` / `subsd` / `mulsd` / `divsd`，整型↔浮点转换用 `cvtsi2sd` /  
+`cvttsd2si`（截断），比较用 `ucomisd` 再跟无符号跳转（jb/ja/jbe/jae/je/jne）。  
 常量落在 `.data` 的 `dq` 里，RIP 相对寻址读取。
 
-goclib 的 `%f` 用「取整 + 小数部分循环乘 10」输出固定 6 位小数：`cvttsd2si` 截出
-整数位，`cvtsi2sd` 转回去 `subsd` 减掉，剩下的小数部分循环 6 次乘 10 逐位压出；
+goclib 的 `%f` 用「取整 + 小数部分循环乘 10」输出固定 6 位小数：`cvttsd2si` 截出  
+整数位，`cvtsi2sd` 转回去 `subsd` 减掉，剩下的小数部分循环 6 次乘 10 逐位压出；  
 `%f` 的变参槽位传的是 8 字节 IEEE-754 位模式（`movq rax, xmm0`）。
 
-Windows 上没法直接执行 SSE2 验证编码，所以 elfcheck 解释器补了 F2/66 前缀解析和
-这套指令的解释执行 —— Linux 目标的 fp 用例与 Windows 输出逐字节一致。CI 的
-Ubuntu job 还会把 `fp` 的 Linux ELF **直接跑在真实内核上**再比一次，覆盖
+Windows 上没法直接执行 SSE2 验证编码，所以 elfcheck 解释器补了 F2/66 前缀解析和  
+这套指令的解释执行 —— Linux 目标的 fp 用例与 Windows 输出逐字节一致。CI 的  
+Ubuntu job 还会把 `fp` 的 Linux ELF **直接跑在真实内核上**再比一次，覆盖  
 解释器验证不到的地方（真实 syscall、栈对齐、16 字节 xorpd 等）。
 
 ## 调用约定
 
-默认遵循 Windows x64 ABI：整数参数走 RCX/RDX/R8/R9，第 5 个起放 `[rsp+32]`；
-调用者预留 32 字节 shadow space，每个 `call` 处 RSP 保持 16 字节对齐。压栈参数
-时多申请的空间会向上取整到 16，对齐才不会被破坏。二元表达式的左操作数溢出到
+默认遵循 Windows x64 ABI：整数参数走 RCX/RDX/R8/R9，第 5 个起放 `[rsp+32]`；  
+调用者预留 32 字节 shadow space，每个 `call` 处 RSP 保持 16 字节对齐。压栈参数  
+时多申请的空间会向上取整到 16，对齐才不会被破坏。二元表达式的左操作数溢出到  
 rbp 相对栈槽（而不是 `push`/`pop`），也是同一个原因。
 
-`-target linux` 时走 SysV AMD64：参数走 RDI/RSI/RDX/RCX/R8/R9，第 7 个起放
+`-target linux` 时走 SysV AMD64：参数走 RDI/RSI/RDX/RCX/R8/R9，第 7 个起放  
 `[rsp]`（没有 shadow space）。栈帧里因此少算 32 字节。
 
-goclib 的变参函数（`printf` / `sprintf`）在入口处把寄存器里的变参和栈上的一起
-收集到 `__goclib_va`，然后才做第一次 `call` —— 否则寄存器里的变参会先被冲掉。
+goclib 的变参函数（`printf` / `sprintf`）在入口处把寄存器里的变参和栈上的一起  
+收集到 `__goclib_va`，然后才做第一次 `call` —— 否则寄存器里的变参会先被冲掉。  
 Windows 下变参从 rdx 起、栈上在 `[rbp+48]`；Linux 下从 rsi 起、栈上在 `[rbp+16]`。
 
 ## 测试
@@ -169,8 +169,8 @@ cd src/goa && bash run_tests.sh # goa 自己的用例，14/14（11 Windows + 3 L
 
 ## 体积对比
 
-| | gcc 后端 | goc + goa |
-|---|---|---|
+|            | gcc 后端   | goc + goa   |
+| ---------- | -------- | ----------- |
 | `stress.c` | 72611 字节 | **4096 字节** |
 
 差了约 17 倍 —— gcc 那个把整个 CRT 启动代码和 msvcrt 都链进去了。

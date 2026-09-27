@@ -1,0 +1,28 @@
+== by value ==
+3 4
+30
+302
+3 4
+== assign ==
+3 4 99 4
+== sret chain ==
+5 6
+15
+== small ==
+65 66 131
+== nested ==
+1 2 30 40
+3
+== stack args ==
+28
+== array ==
+0 1 4
+6
+== double member ==
+7 2.500000
+== union ==
+300 44
+263
+== global ==
+0 0
+33 22

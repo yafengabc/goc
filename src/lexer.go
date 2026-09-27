@@ -20,7 +20,7 @@ const (
 var keywords = map[string]bool{
 	"int": true, "double": true, "if": true, "else": true, "while": true, "return": true,
 	"char": true, "long": true, "short": true, "unsigned": true, "signed": true,
-	"void": true, "struct": true,
+	"void": true, "struct": true, "union": true, "enum": true,
 	"for": true, "break": true, "continue": true,
 	"typedef": true, "extern": true, "static": true,
 	"const": true, "volatile": true, "restrict": true,

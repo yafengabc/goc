@@ -52,6 +52,11 @@ type CG struct {
 	loops       []loopLabels    // active loop targets for break/continue
 	saveBaseOff int             // rbp offset of the variadic save area (0 if none)
 	nFixed      int             // number of named params before "..." in the current fn
+	sretSlot    int // rbp offset of this function's hidden sret-pointer slot (0 = returns a scalar)
+	resStruct   bool    // the last call returned a struct; its value is in a tmp result buffer
+	resStructSz int     // size in bytes of that struct
+	resStructK  int     // tmpSlot index of the first result-buffer slot
+	resStructSl int     // number of tmp slots occupied by the result buffer
 }
 
 // loopLabels records the break/continue targets of the innermost loop.
@@ -918,10 +923,26 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 				c.resW = 8
 				return TInt, nil
 			}
+			if isAgg(gt) {
+				// A whole struct/union value cannot be loaded into rax;
+				// consumers must go through genLValue (see structSrcAddr).
+				return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
+			}
 			c.emit("mov rax, [rip+%s]", c.globalLab[n.Name])
 			c.resTyp = TInt
 			c.resSigned = gt != nil && gt.Kind == KInt && gt.Signed
 			c.resW = c.semWOf(gt)
+			return TInt, nil
+		}
+		if ev, ok := enumConsts[n.Name]; ok {
+			// An enumerator is a compile-time integer constant.
+			c.emit("mov rax, %d", ev)
+			c.resTyp = TInt
+			c.resSigned = true
+			c.resW = 4
+			if ev > 0x7fffffff || ev < -0x80000000 {
+				c.resW = 8
+			}
 			return TInt, nil
 		}
 			return TInt, fmt.Errorf("undefined variable %q", n.Name)
@@ -933,6 +954,11 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 			c.resSigned = false
 			c.resW = 8
 			return TInt, nil
+		}
+		if isAgg(vi.typ) {
+			// A whole struct/union value cannot be loaded into rax; consumers
+			// must go through genLValue (see structSrcAddr).
+			return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
 		}
 		c.loadVar(vi)
 		return c.resTyp, nil
@@ -965,8 +991,13 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		}
 		// Members are laid out at their C type width (MSVC x64 packs an int
 		// member as 4 bytes), not the 8-byte scalar slot width -- loading the
-		// slot width would read 4 bytes past a trailing int member.
+		// slot width would read 4 bytes past a trailing int member. Double
+		// members load into xmm0, not rax.
 		width := c.typeWidth(t)
+		if t.Kind == KDouble {
+			c.genLoadElem("r10", width, TDouble, false)
+			return c.resTyp, nil
+		}
 		signed := t.Kind == KInt && t.Signed
 		c.genLoadElem("r10", width, TInt, signed)
 		return c.resTyp, nil
@@ -1045,19 +1076,28 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 	case *AssignExpr:
 		// Whole-struct/union assignment: neither side fits in a register, so
 		// there is no scalar fast path and we never load the value into rax.
-		// Copy the RHS lvalue's bytes into the LHS lvalue with a tail-call of
-		// copyBytes. This is how "s = t;" (and nested/pointed struct members)
-		// are compiled; returning the struct by value is not supported, so the
-		// assignment expression's own value is left undefined (rarely used).
-		if lt := c.exprType(n.Lhs); lt != nil && (lt.IsStruct() || lt.IsUnion()) {
-			if err := c.genLValue(n.Rhs); err != nil {
+		// The RHS may be an lvalue (copied byte-for-byte) or a call returning
+		// a struct (whose result buffer is consumed). This is how "s = t;"
+		// and "s = make(1, 2);" are compiled; the assignment expression's own
+		// value is left undefined (rarely used).
+		if lt := c.exprType(n.Lhs); isAgg(lt) {
+			if err := c.structSrcAddr(n.Rhs, c.exprType(n.Rhs)); err != nil {
 				return lt.Class(), err
 			}
-			c.emit("mov r11, r10") // r11 = source address
+			// Park the source address in a frame temporary: genLValue on the
+			// left side is free to clobber r11 (element addressing uses it).
+			c.emit("mov r11, r10")
+			c.tmpDepth++
+			srcSlot := c.tmpSlot(c.tmpDepth)
+			c.emit("mov [rbp%+d], r11", srcSlot)
 			if err := c.genLValue(n.Lhs); err != nil {
+				c.tmpDepth--
 				return lt.Class(), err
 			}
+			c.emit("mov r11, [rbp%+d]", srcSlot)
+			c.tmpDepth--
 			c.copyBytes("r10", "r11", lt.Size)
+			c.releaseResStruct()
 			c.resTyp = lt.Class()
 			c.resSigned = false
 			c.resW = 8
@@ -1261,24 +1301,25 @@ func Gen(prog *Program, linux bool) (string, error) {
 		out.WriteString("\nsection .data\n")
 		for _, g := range prog.Globals {
 			lab := c.globalLab[g.Name]
-			if g.Typ != nil && g.Typ.IsArray() {
-				ln := g.Typ.Len
-				if ln < 1 {
-					ln = 1
+			if g.Typ != nil && (g.Typ.IsArray() || isAgg(g.Typ)) {
+				// typeWidth already returns the full byte size (elem width *
+				// len for arrays, the computed Size for structs/unions), so
+				// that IS the size to zero-fill.
+				size := c.typeWidth(g.Typ)
+				if size < 1 {
+					size = 1
 				}
-				w := c.typeWidth(g.Typ) // 1 for char[], 8 otherwise
-				size := w * ln
 				n := (size + 7) / 8
-				out.WriteString(lab + " dq")
-				for i := 0; i < n; i++ {
-					out.WriteString(" 0")
+				out.WriteString(lab + " dq 0")
+				for i := 1; i < n; i++ {
+					out.WriteString(", 0")
 				}
 				out.WriteString("\n")
 				continue
 			}
 			val := int64(0)
-			if nl, ok := g.Init.(*NumLit); ok && nl.Kind != TDouble {
-				val = nl.Val
+			if v, ok := foldConstInit(g.Init); ok {
+				val = v
 			}
 			out.WriteString(fmt.Sprintf("%s dq %d\n", lab, val))
 		}
@@ -1299,6 +1340,40 @@ func Gen(prog *Program, linux bool) (string, error) {
 		}
 	}
 	return out.String(), nil
+}
+
+// foldConstInit folds the constant initialiser of a global variable down to an
+// integer. The parser represents "= 42" as a NumLit, "= -1" as Unary{'-'}, and
+// "= GREEN" as an Ident naming an enumerator. Anything else (a double literal,
+// an expression, a struct initialiser) is not foldable at emission time and
+// yields ok=false, so the global falls back to zero.
+func foldConstInit(e Expr) (int64, bool) {
+	switch n := e.(type) {
+	case nil:
+		return 0, true
+	case *NumLit:
+		if n.Kind == TDouble {
+			return 0, false
+		}
+		return n.Val, true
+	case *Ident:
+		if v, ok := enumConsts[n.Name]; ok {
+			return v, true
+		}
+		return 0, false
+	case *Unary:
+		v, ok := foldConstInit(n.E)
+		if !ok {
+			return 0, false
+		}
+		switch n.Op {
+		case "-":
+			return -v, true
+		case "+":
+			return v, true
+		}
+	}
+	return 0, false
 }
 
 // findAddressTaken returns the set of local variable names whose address is
@@ -1399,7 +1474,23 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	c.vars = map[string]varInfo{}
 	c.curRet = f.Ret
 	c.curParam = f.ParamTypes
+	c.sretSlot = 0
+	// Hidden struct-return pointer (sret): a function returning a struct or
+	// union receives the address of the caller's result buffer in its FIRST
+	// integer argument register (RCX on Win64, RDI on SysV). Every user
+	// parameter therefore shifts one register slot to the right; regShift
+	// captures that offset and regCap is the user-parameter register count.
+	isSret := isAgg(f.Ret)
+	regShift := 0
+	if isSret {
+		regShift = 1
+	}
+	argRegs := c.argRegs()
+	regCap := len(argRegs) - regShift
 	for i, p := range f.Params {
+		// Placeholder homes; the real ones are assigned in the frame-layout
+		// phase below. Registering early keeps param names out of the local
+		// declaration gather.
 		c.vars[p] = varInfo{off: 16 + 8*i, typ: f.ParamTypes[i]} // [rbp+16], ...
 	}
 
@@ -1479,6 +1570,72 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// always take an 8-byte slot in this relaxed toy model.
 	regArea := 8 * len(c.usedRegs)
 	localBytes := 0
+
+	// Parameter homes. Register parameters are spilled into this function's
+	// OWN frame on both targets: on SysV, [rbp+16+8k] is the caller's stack-
+	// argument area (there is no shadow space), so spilling there clobbers
+	// stack arguments 7 and up -- observed as sum7(1..7) losing its seventh
+	// argument on Linux. Windows gets the same treatment for uniformity; its
+	// 32-byte shadow space stays reserved at call sites for ABI compliance.
+	//
+	// Struct/union parameters arrive as hidden pointers to caller-owned
+	// bytes (the caller passes the address of a private copy in one GP
+	// register slot). They get a full-size local slot and the prologue
+	// copies the bytes in, so the body treats them like any aggregate local
+	// with value semantics.
+	//
+	// Stack parameters are read in place from the caller's argument area:
+	//   Win : [rbp+16+8*(i+regShift)]  ([rbp+16+8k] maps to caller [rsp+8k])
+	//   SysV: [rbp+16+8*(i-regCap)]    (caller placed stack arg j at [rsp+8j])
+	type paramCopy struct {
+		name   string
+		typ    *Type
+		srcReg string // incoming hidden-pointer register ("" = on the stack)
+		srcOff int    // incoming hidden-pointer rbp offset (stack params)
+	}
+	var paramCopies []paramCopy
+	aggSlotBytes := func(pt *Type) int {
+		w := pt.Size
+		if w < 1 {
+			w = 8
+		}
+		if w%8 != 0 {
+			w += 8 - w%8
+		}
+		return w
+	}
+	for i, p := range f.Params {
+		pt := f.ParamTypes[i]
+		if !isAgg(pt) {
+			if i < regCap {
+				localBytes += 8
+				c.vars[p] = varInfo{off: -(regArea + localBytes), typ: pt}
+			} else if c.linux {
+				c.vars[p] = varInfo{off: 16 + 8*(i-regCap), typ: pt}
+			} else {
+				c.vars[p] = varInfo{off: 16 + 8*(i+regShift), typ: pt}
+			}
+			continue
+		}
+		localBytes += aggSlotBytes(pt)
+		c.vars[p] = varInfo{off: -(regArea + localBytes), typ: pt}
+		pc := paramCopy{name: p, typ: pt}
+		if i < regCap {
+			pc.srcReg = argRegs[i+regShift]
+		} else if c.linux {
+			pc.srcOff = 16 + 8*(i-regCap)
+		} else {
+			pc.srcOff = 16 + 8*(i+regShift)
+		}
+		paramCopies = append(paramCopies, pc)
+	}
+	// The hidden sret pointer gets its own frame slot, parked in the
+	// prologue and read back by ReturnStmt.
+	if isSret {
+		localBytes += 8
+		c.sretSlot = -(regArea + localBytes)
+	}
+
 	for _, d := range stackDecls {
 		if d.typ != nil && d.typ.IsArray() {
 			ln := d.typ.Len
@@ -1558,11 +1715,15 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	for i, r := range c.usedRegs {
 		c.emit("mov [rbp-%d], %s", 8*(i+1), r)
 	}
+	// Park the hidden struct-return pointer in its frame slot before any
+	// call can clobber the first integer argument register.
+	if isSret {
+		c.emit("mov [rbp%+d], %s", c.sretSlot, argRegs[0])
+	}
 
 	// Spill the register arguments into this function's frame so the rest of
 	// the code can read params from the stack like normal locals. Double
 	// parameters arrive in XMM registers and are stored as 8 bytes (movsd).
-	argRegs := c.argRegs()
 	argXMM := c.argXMM()
 
 	// A variadic callee must copy the caller's STACK arguments into its save
@@ -1575,27 +1736,56 @@ func (c *CG) genFunc(f *FuncDecl) error {
 		if !c.linux {
 			vaStackBase = 48
 		}
-		for i := len(argRegs); i < maxArgs; i++ {
-			c.emit("mov rax, [rbp+%d]", vaStackBase+8*(i-len(argRegs)))
-			c.emit("mov [rbp%+d], rax", c.saveBaseOff+8*i)
+		for i := regCap; i < maxArgs; i++ {
+			// user arg i lives at caller stack slot i-regCap; its save-area
+			// slot is i+regShift (slot 0 is the hidden sret pointer, if any)
+			c.emit("mov rax, [rbp+%d]", vaStackBase+8*(i-regCap))
+			c.emit("mov [rbp%+d], rax", c.saveBaseOff+8*(i+regShift))
 		}
 	}
 
-	for i := 0; i < len(f.Params) && i < len(argRegs); i++ {
-		off := 16 + 8*i
-		if f.ParamTypes[i].Kind == KDouble && i < len(argXMM) {
-			c.emit("movsd [rbp+%d], %s", off, argXMM[i])
-		} else {
-			c.emit("mov [rbp+%d], %s", off, argRegs[i])
+	fpIdx := 0 // SysV: XMM argument registers are numbered by FP-arg order
+	for i := 0; i < len(f.Params) && i < regCap; i++ {
+		pt := f.ParamTypes[i]
+		if isAgg(pt) {
+			continue // aggregate params are copied from their hidden pointer below
 		}
+		vi := c.vars[f.Params[i]]
+		if pt.Kind == KDouble {
+			// XMM index: Windows numbers XMM argument registers positionally
+			// (shared with the GP slot counter, hidden pointer included);
+			// SysV numbers them by FP-argument order only.
+			xmmAt := i + regShift
+			if c.linux {
+				xmmAt = fpIdx
+			}
+			fpIdx++
+			if xmmAt < len(argXMM) {
+				c.emit("movsd [rbp%+d], %s", vi.off, argXMM[xmmAt])
+				continue
+			}
+		}
+		c.emit("mov [rbp%+d], %s", vi.off, argRegs[i+regShift])
+	}
+	// Copy aggregate parameters out of their caller-owned hidden pointers
+	// into the local slots reserved above.
+	for _, pc := range paramCopies {
+		vi := c.vars[pc.name]
+		if pc.srcReg != "" {
+			c.emit("mov r10, %s", pc.srcReg)
+		} else {
+			c.emit("mov r10, [rbp%+d]", pc.srcOff)
+		}
+		c.emit("lea r11, [rbp%+d]", vi.off)
+		c.copyBytes("r11", "r10", pc.typ.Size)
 	}
 
 	// Variadic: copy the register args into the save area. The caller-stack
 	// args were copied above, before the register spill clobbered the
 	// caller's stack-argument zone.
 	if f.Variadic {
-		for i := 0; i < len(argRegs); i++ {
-			c.emit("mov [rbp%+d], %s", c.saveBaseOff+8*i, argRegs[i])
+		for k := regShift; k < len(argRegs); k++ {
+			c.emit("mov [rbp%+d], %s", c.saveBaseOff+8*k, argRegs[k])
 		}
 	}
 
@@ -1634,6 +1824,23 @@ func (c *CG) genStmt(s Stmt) error {
 			// Arrays are not initialised here; the checker rejects initialisers.
 			return nil
 		}
+		if isAgg(vi.typ) {
+			// Whole-aggregate declaration: copy the initialiser's bytes (or
+			// zero-fill) into the local slot. The value never enters rax.
+			if n.Init != nil {
+				if err := c.structSrcAddr(n.Init, c.exprType(n.Init)); err != nil {
+					return err
+				}
+				c.emit("mov r11, r10") // r11 = source address
+				c.emit("lea r10, [rbp%+d]", vi.off)
+				c.copyBytes("r10", "r11", vi.typ.Size)
+				c.releaseResStruct()
+			} else {
+				c.emit("lea r10, [rbp%+d]", vi.off)
+				c.zeroBytes("r10", vi.typ.Size)
+			}
+			return nil
+		}
 		if n.Init != nil {
 			if _, err := c.genExprT(n.Init); err != nil {
 				return err
@@ -1648,6 +1855,14 @@ func (c *CG) genStmt(s Stmt) error {
 			c.emit("mov [rbp%+d], 0", vi.off)
 		}
 	case *AssignStmt:
+		// Whole-aggregate assignment shares the AssignExpr code path (which
+		// handles both lvalue and struct-returning-call right-hand sides).
+		// Statement-level assignments are normally parsed as
+		// ExprStmt{AssignExpr}; this branch is a safety net.
+		if isAgg(c.exprType(n.Lhs)) {
+			_, err := c.genExprT(&AssignExpr{Lhs: n.Lhs, Rhs: n.Rhs})
+			return err
+		}
 		// Fast path: a simple scalar local on the left can be stored
 		// directly to its home register, with no need to compute an address.
 		if id, ok := n.Lhs.(*Ident); ok {
@@ -1692,7 +1907,26 @@ func (c *CG) genStmt(s Stmt) error {
 		if _, err := c.genExprT(n.E); err != nil {
 			return err
 		}
+		// A discarded struct-returning call leaves its result buffer live;
+		// nothing will consume it here, so release it.
+		c.releaseResStruct()
 	case *ReturnStmt:
+		if isAgg(c.curRet) {
+			// Struct/union return: copy the value through the hidden result
+			// pointer into the caller's buffer. rax is never used.
+			if n.E == nil {
+				return fmt.Errorf("missing return value in function returning %s", c.curRet.String())
+			}
+			if err := c.structSrcAddr(n.E, c.exprType(n.E)); err != nil {
+				return err
+			}
+			c.emit("mov r11, r10")                  // r11 = source address
+			c.emit("mov r10, [rbp%+d]", c.sretSlot) // r10 = caller's buffer
+			c.copyBytes("r10", "r11", c.curRet.Size)
+			c.releaseResStruct()
+			c.emitEpilogue()
+			return nil
+		}
 		if n.E != nil {
 			if _, err := c.genExprT(n.E); err != nil {
 				return err
@@ -1918,9 +2152,17 @@ func (c *CG) genLValue(e Expr) error {
 		if id, ok := n.Base.(*Ident); ok {
 			vi, ok2 := c.vars[id.Name]
 			if !ok2 {
-				return fmt.Errorf("undefined variable %q", id.Name)
-			}
-			if vi.typ.IsArray() {
+				if c.globals[id.Name] {
+					// Global array: rip-relative lea of element 0.
+					gt := c.globalTyp[id.Name]
+					if gt == nil || !gt.IsArray() {
+						return fmt.Errorf("cannot index non-array global %q", id.Name)
+					}
+					c.emit("lea r10, [rip+%s]", c.globalLab[id.Name])
+				} else {
+					return fmt.Errorf("undefined variable %q", id.Name)
+				}
+			} else if vi.typ.IsArray() {
 				c.emit("lea r10, [rbp%+d]", vi.off)
 			} else {
 				c.loadVar(vi) // rax = pointer value
@@ -1999,6 +2241,17 @@ func (c *CG) elemClassOf(e Expr) CType {
 	case *Ident:
 		vi, ok := c.vars[n.Name]
 		if !ok {
+			if gt := c.globalTyp[n.Name]; gt != nil {
+				if gt.Kind == KDouble {
+					return TDouble
+				}
+				if gt.IsPtr() && gt.Elem != nil {
+					return gt.Elem.Class()
+				}
+				if gt.IsArray() && gt.Elem != nil {
+					return gt.Elem.Class()
+				}
+			}
 			return TInt
 		}
 		if vi.typ.Kind == KDouble {
@@ -2097,6 +2350,7 @@ func (c *CG) exprType(e Expr) *Type {
 		if vi, ok := c.vars[n.Name]; ok {
 			return vi.typ
 		}
+		return c.globalTyp[n.Name]
 	case *Unary:
 		if n.Op == "*" {
 			if t := c.exprType(n.E); t != nil && t.IsPtr() {
@@ -2115,6 +2369,15 @@ func (c *CG) exprType(e Expr) *Type {
 		return c.memberType(n.Base, n.Name)
 	case *CastExpr:
 		return n.Typ
+	case *Call:
+		// A call's type is the callee's declared return type (nil for
+		// goclib / extern calls, which return int). This is how struct-
+		// returning calls are recognised at argument / assignment / return
+		// positions so their result buffer can be consumed by address.
+		if fd, ok := c.funcDefs[n.Name]; ok {
+			return fd.Ret
+		}
+		return nil
 	}
 	return nil
 }
@@ -2129,7 +2392,14 @@ func (c *CG) elemWidthOf(e Expr) int {
 	case *Ident:
 		vi, ok := c.vars[n.Name]
 		if !ok {
-			return 8
+			gt := c.globalTyp[n.Name]
+			if gt == nil {
+				return 8
+			}
+			if (gt.IsPtr() || gt.IsArray()) && gt.Elem != nil {
+				return c.typeWidth(gt.Elem)
+			}
+			return c.typeWidth(gt)
 		}
 		if vi.typ != nil && (vi.typ.IsPtr() || vi.typ.IsArray()) && vi.typ.Elem != nil {
 			return c.typeWidth(vi.typ.Elem)
@@ -2257,6 +2527,62 @@ func (c *CG) copyBytes(dst, src string, n int) {
 	for i := 0; i < rem; i++ {
 		c.emit("mov al, byte [%s+%d]", src, off+i)
 		c.emit("mov byte [%s+%d], al", dst, off+i)
+	}
+}
+
+// isAgg reports whether t is a struct/union aggregate, i.e. a value that is
+// never loaded into a register but always handled by address + copyBytes.
+func isAgg(t *Type) bool {
+	return t != nil && (t.IsStruct() || t.IsUnion())
+}
+
+// zeroBytes emits code that stores n zero bytes at the memory pointed to by
+// dst (a register holding an address). Used to default-initialise struct and
+// union locals that have no initialiser.
+func (c *CG) zeroBytes(dst string, n int) {
+	if n <= 0 {
+		return
+	}
+	c.emit("xor eax, eax")
+	off := 0
+	for off+8 <= n {
+		c.emit("mov [%s+%d], rax", dst, off)
+		off += 8
+	}
+	for i := off; i < n; i++ {
+		c.emit("mov byte [%s+%d], al", dst, i)
+	}
+}
+
+// structSrcAddr emits code that leaves the address of the struct/union value
+// of expression e in r10. Two kinds of sources are accepted:
+//   - an lvalue (local/global struct, member, *p, arr[i]): genLValue computes
+//     the address directly;
+//   - a call returning a struct: genExprT leaves the value in the callee's
+//     result buffer; the buffer is left LIVE and c.resStruct stays true, and
+//     the caller must eventually call releaseResStruct (after copying the
+//     bytes out) or claim its slots itself (when passing it on as an
+//     argument, where the buffer must survive until the outer call).
+func (c *CG) structSrcAddr(e Expr, t *Type) error {
+	if call, ok := e.(*Call); ok && isAgg(t) {
+		if _, err := c.genExprT(call); err != nil {
+			return err
+		}
+		if !c.resStruct {
+			return fmt.Errorf("call %q does not produce a struct value", call.Name)
+		}
+		c.emit("lea r10, [rbp%+d]", c.tmpSlot(c.resStructK))
+		return nil
+	}
+	return c.genLValue(e)
+}
+
+// releaseResStruct frees the pending struct-return result buffer (if any)
+// after its bytes have been consumed by a copy.
+func (c *CG) releaseResStruct() {
+	if c.resStruct {
+		c.tmpDepth -= c.resStructSl
+		c.resStruct = false
 	}
 }
 
@@ -2852,7 +3178,15 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 			if err := c.genLValue(n.Args[0]); err != nil {
 				return TInt, err
 			}
-			c.emit("lea rax, [rbp%+d]", c.saveBaseOff+8*c.nFixed)
+			// The cursor starts at the first variadic slot. Slot 0 of the
+			// save area is the hidden sret pointer when this function
+			// returns a struct, so named params (and the cursor) shift by
+			// one there too.
+			rs := 0
+			if isAgg(c.curRet) {
+				rs = 1
+			}
+			c.emit("lea rax, [rbp%+d]", c.saveBaseOff+8*(c.nFixed+rs))
 			c.emit("mov [r10], rax")
 		}
 		c.resTyp = TInt
@@ -2864,13 +3198,30 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	if nargs > maxArgs {
 		return TInt, fmt.Errorf("%s: too many arguments (max %d)", n.Name, maxArgs)
 	}
+	// Struct/union return: the caller allocates a temporary result buffer,
+	// passes its address as the hidden first argument (argRegs[0]) and every
+	// user argument shifts one register slot to the right.
+	retT := (*Type)(nil)
+	if f, ok := c.funcDefs[n.Name]; ok {
+		retT = f.Ret
+	}
+	sretSz := 0
+	if isAgg(retT) {
+		sretSz = retT.Size
+	}
+	regShift := 0
+	if sretSz > 0 {
+		regShift = 1
+	}
 	// Anything past the register arguments goes on the stack. On Windows the
 	// stack arguments live at [rsp+32] and up, *above* the 32-byte shadow
 	// space the callee is allowed to spill its register params into, so the
 	// caller must reserve that shadow space too. On Linux there is no shadow
 	// space (args at [rsp]). The total is rounded up to 16 so RSP stays
-	// aligned at every call site.
-	stackArgs := nargs - len(argRegs)
+	// aligned at every call site. With a hidden struct-return pointer the
+	// user register capacity is one slot smaller (argRegs[0] carries the
+	// pointer, which never spills to the stack).
+	stackArgs := nargs - (len(argRegs) - regShift)
 	if stackArgs < 0 {
 		stackArgs = 0
 	}
@@ -2905,8 +3256,42 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	}
 
 	varargs := variadicFn(n.Name)
+	// Reserve the struct-return result buffer BELOW the argument spill
+	// slots: it must stay live while the arguments are evaluated (an
+	// argument may itself nest calls) and is consumed by the caller
+	// afterwards (decl / assignment / return / argument position).
+	resK, resSl := 0, 0
+	if sretSz > 0 {
+		resSl = (sretSz + 7) / 8
+		resK = c.tmpDepth + 1
+		c.tmpDepth += resSl
+	}
 	slots := make([]argSlot, nargs)
+	consumed := 0
 	for i := 0; i < nargs; i++ {
+		// Struct/union arguments are passed by hidden pointer: evaluate the
+		// ADDRESS of the value into r10 and spill that address into one GP
+		// slot (the callee copies the bytes into its own local slot).
+		if at := c.exprType(n.Args[i]); isAgg(at) {
+			if err := c.structSrcAddr(n.Args[i], at); err != nil {
+				return TInt, err
+			}
+			if c.resStruct {
+				// The address points into a nested call's result buffer;
+				// claim its slots so later argument evaluation cannot
+				// overwrite the bytes we are about to pass by address. The
+				// claim is released together with the argument slots after
+				// the call returns.
+				c.tmpDepth += c.resStructSl
+				consumed += c.resStructSl
+				c.resStruct = false
+			}
+			c.tmpDepth++
+			c.emit("mov [rbp%+d], r10", c.tmpSlot(c.tmpDepth))
+			slots[i] = argSlot{slot: c.tmpDepth, typ: TInt}
+			consumed++
+			continue
+		}
 		t, err := c.genExprT(n.Args[i])
 		if err != nil {
 			return TInt, err
@@ -2932,37 +3317,54 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 			c.emit("mov [rbp%+d], rax", c.tmpSlot(c.tmpDepth))
 		}
 		slots[i] = argSlot{slot: c.tmpDepth, typ: t}
+		consumed++
 	}
 	if extra > 0 {
 		c.emit("sub rsp, %d", extra)
 	}
+	// regIdx is an argument's ABI register-slot index: shifted by one for
+	// struct-returning calls, whose slot 0 carries the hidden result
+	// pointer. XMM indices: Windows numbers XMM argument registers
+	// positionally (shared with the GP slot counter), SysV by FP-arg order.
+	xmmIdx := 0
 	for i := 0; i < nargs; i++ {
 		s := slots[i]
+		regIdx := i + regShift
+		xmmAt := regIdx
+		if c.linux {
+			xmmAt = xmmIdx
+		}
 		if varargs {
-			if i < len(argRegs) {
-				c.emit("mov %s, [rbp%+d]", argRegs[i], c.tmpSlot(s.slot))
+			if regIdx < len(argRegs) {
+				c.emit("mov %s, [rbp%+d]", argRegs[regIdx], c.tmpSlot(s.slot))
 				continue
 			}
 			c.emit("mov rax, [rbp%+d]", c.tmpSlot(s.slot))
-			c.emit("mov [rsp+%d], rax", c.stackArgOff(i-len(argRegs)))
+			c.emit("mov [rsp+%d], rax", c.stackArgOff(regIdx-len(argRegs)))
 			continue
 		}
 		if s.typ == TDouble {
-			if i < len(argRegs) && i < len(argXMM) {
-				c.emit("movsd %s, [rbp%+d]", argXMM[i], c.tmpSlot(s.slot))
+			if regIdx < len(argRegs) && xmmAt < len(argXMM) {
+				c.emit("movsd %s, [rbp%+d]", argXMM[xmmAt], c.tmpSlot(s.slot))
+				xmmIdx++
 				continue
 			}
 			c.emit("movsd xmm0, [rbp%+d]", c.tmpSlot(s.slot))
 			c.emit("movq rax, xmm0")
-			c.emit("mov [rsp+%d], rax", c.stackArgOff(i-len(argRegs)))
+			c.emit("mov [rsp+%d], rax", c.stackArgOff(regIdx-len(argRegs)))
 			continue
 		}
-		if i < len(argRegs) {
-			c.emit("mov %s, [rbp%+d]", argRegs[i], c.tmpSlot(s.slot))
+		if regIdx < len(argRegs) {
+			c.emit("mov %s, [rbp%+d]", argRegs[regIdx], c.tmpSlot(s.slot))
 			continue
 		}
 		c.emit("mov rax, [rbp%+d]", c.tmpSlot(s.slot))
-		c.emit("mov [rsp+%d], rax", c.stackArgOff(i-len(argRegs)))
+		c.emit("mov [rsp+%d], rax", c.stackArgOff(regIdx-len(argRegs)))
+	}
+	// The hidden result pointer rides in the first integer argument
+	// register; its buffer was reserved below the argument slots.
+	if sretSz > 0 {
+		c.emit("lea %s, [rbp%+d]", argRegs[0], c.tmpSlot(resK))
 	}
 	c.emit("call %s", target)
 	// Windows API imports return 32-bit values (BOOL/DWORD/int) in EAX; the
@@ -2987,20 +3389,36 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	if extra > 0 {
 		c.emit("add rsp, %d", extra)
 	}
-	c.tmpDepth -= nargs
+	// Free the argument spill slots (including any claimed nested-call
+	// result buffers). A struct-returning call's OWN result buffer stays
+	// live below them until its consumer releases it.
+	c.tmpDepth -= consumed
 
 	// Result type: user functions declare it; goclib and extern calls return int.
 	ret := TInt
-	if f, ok := c.funcDefs[n.Name]; ok {
-		ret = f.Ret.Class()
+	if retT != nil {
+		ret = retT.Class()
 	}
 	c.resTyp = ret
-	if f, ok := c.funcDefs[n.Name]; ok {
+	if sretSz > 0 {
+		// The struct value lives in the caller's result buffer, NOT in rax;
+		// consumers (decl / assignment / return / argument) must go through
+		// structSrcAddr and releaseResStruct.
+		c.resStruct = true
+		c.resStructSz = sretSz
+		c.resStructK = resK
+		c.resStructSl = resSl
+		c.resSigned = false
+		c.resW = 8
+		return ret, nil
+	}
+	c.resStruct = false
+	if retT != nil {
 		switch {
-		case f.Ret.Kind == KInt:
-			c.resSigned = f.Ret.Signed
-			c.resW = f.Ret.Width
-		case f.Ret.Kind == KPtr || f.Ret.Kind == KFunc:
+		case retT.Kind == KInt:
+			c.resSigned = retT.Signed
+			c.resW = retT.Width
+		case retT.Kind == KPtr || retT.Kind == KFunc:
 			c.resSigned = false
 			c.resW = 8
 		default:
