@@ -19,6 +19,8 @@ const (
 
 var keywords = map[string]bool{
 	"int": true, "double": true, "if": true, "else": true, "while": true, "return": true,
+	"char": true, "long": true, "short": true, "unsigned": true, "signed": true,
+	"void": true, "struct": true,
 }
 
 type Token struct {
@@ -168,11 +170,11 @@ func Lex(src string) ([]Token, error) {
 				i += 2
 				continue
 			}
-			if strings.IndexByte("+-*/%=<>!(){};,.", c) >= 0 {
-				push(Token{Kind: TPunct, Text: string(c), Line: line})
-				i++
-				continue
-			}
+		if strings.IndexByte("+-*/%=<>!(){};,.[]&", c) >= 0 {
+			push(Token{Kind: TPunct, Text: string(c), Line: line})
+			i++
+			continue
+		}
 			return nil, fmt.Errorf("line %d: unexpected character %q", line, c)
 		}
 	}

@@ -70,6 +70,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "parse error:", err)
 		os.Exit(1)
 	}
+	if errs := Check(prog); len(errs) > 0 {
+		fmt.Fprintln(os.Stderr, "type error(s):")
+		for _, e := range errs {
+			fmt.Fprintln(os.Stderr, "  "+e.Error())
+		}
+		os.Exit(1)
+	}
 	asm, err := Gen(prog, linux)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "codegen error:", err)

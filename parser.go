@@ -2,6 +2,34 @@ package main
 
 import "fmt"
 
+// typeKeywords are the keywords the parser treats as the start of a type
+// specifier. "struct" is recognised but rejected (not implemented in stage 2).
+var typeKeywords = map[string]bool{
+	"void": true, "char": true, "int": true, "long": true, "short": true,
+	"unsigned": true, "signed": true, "double": true, "struct": true,
+}
+
+func isTypeName(tok Token) bool {
+	return tok.Kind == TKeyword && typeKeywords[tok.Text]
+}
+
+// paramDecl is an intermediate result of a declarator: the declared name and
+// the full type built from the specifiers plus pointer/array/function suffixes.
+type paramDecl struct {
+	Name string
+	Typ  *Type
+	Line int
+}
+
+// declResult is what parseDeclarator returns: the name, its (possibly function)
+// type, and the parameter names when the type is a function.
+type declResult struct {
+	name       string
+	typ        *Type
+	paramNames []string
+	line       int
+}
+
 type Parser struct {
 	toks []Token
 	pos  int
@@ -39,68 +67,273 @@ func (p *Parser) expect(punct string) error {
 	return nil
 }
 
-func (p *Parser) expectKeyword(kw string) error {
-	if p.cur().Kind != TKeyword || p.cur().Text != kw {
-		return fmt.Errorf("line %d: expected keyword %q, got %q", p.cur().Line, kw, p.cur().Text)
-	}
-	p.next()
-	return nil
+func (p *Parser) atPunct(s string) bool {
+	return p.cur().Kind == TPunct && p.cur().Text == s
 }
 
-func (p *Parser) parseType() (CType, error) {
-	t := p.cur()
-	if t.Kind == TKeyword && (t.Text == "int" || t.Text == "double") {
-		p.next()
-		if t.Text == "double" {
-			return TDouble, nil
+// ---------------------------------------------------------------------------
+// Type specifiers: void / char / int / long / short / unsigned / signed / double
+// ---------------------------------------------------------------------------
+
+func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
+	signed := true
+	width := 0
+	isDouble := false
+	isVoid := false
+	seen := false
+	for isTypeName(p.cur()) {
+		if p.cur().Text == "struct" {
+			return nil, fmt.Errorf("line %d: struct is not supported in stage 2", p.cur().Line)
 		}
-		return TInt, nil
+		k := p.next().Text
+		switch k {
+		case "void":
+			isVoid = true
+		case "char":
+			width = 1
+		case "short":
+			width = 2
+		case "int":
+			if width == 0 {
+				width = 4
+			}
+		case "long":
+			width = 8
+		case "double":
+			isDouble = true
+		case "unsigned":
+			signed = false
+		case "signed":
+			signed = true
+		}
+		seen = true
 	}
-	// No explicit type keyword: default to int (keeps `int main` and older
-	// single-type programs working).
-	return TInt, nil
+	if !seen {
+		return nil, fmt.Errorf("line %d: expected type specifier, got %q", p.cur().Line, p.cur().Text)
+	}
+	if isDouble {
+		return DoubleType(), nil
+	}
+	if isVoid {
+		return VoidType(), nil
+	}
+	if width == 0 {
+		width = 8 // bare "signed"/"unsigned" means int
+	}
+	return &Type{Kind: KInt, Width: width, Signed: signed}, nil
 }
 
-func (p *Parser) parseFunc() (*FuncDecl, error) {
-	ret, err := p.parseType()
-	if err != nil {
-		return nil, err
+// parseDeclarator applies pointer prefixes, a direct declarator (name or
+// grouping), and array/function suffixes to base. When allowFunc is false the
+// function suffix is rejected (it only makes sense at the top level).
+func (p *Parser) parseDeclarator(base *Type, allowFunc bool) (declResult, error) {
+	for p.atPunct("*") {
+		base = PtrType(base)
+		p.next()
 	}
-	if p.cur().Kind != TIdent {
-		return nil, fmt.Errorf("line %d: expected function name", p.cur().Line)
+	var d declResult
+	wasGrouped := false
+	if p.atPunct("(") {
+		p.next()
+		inner, err := p.parseDeclarator(base, allowFunc)
+		if err != nil {
+			return d, err
+		}
+		if err := p.expect(")"); err != nil {
+			return d, err
+		}
+		d = inner
+		d.line = inner.line
+		wasGrouped = true
+	} else {
+		if p.cur().Kind != TIdent {
+			return d, fmt.Errorf("line %d: expected declarator name, got %q", p.cur().Line, p.cur().Text)
+		}
+		nameTok := p.next()
+		d.name = nameTok.Text
+		d.line = nameTok.Line
+		d.typ = base
 	}
-	name := p.next().Text
-	if err := p.expect("("); err != nil {
-		return nil, err
-	}
-	var params []string
-	var paramTypes []CType
-	if p.cur().Text != ")" {
-		for {
-			pt, err := p.parseType()
+	// Suffixes: array [...], function (...). A function suffix on a grouped
+	// declarator would be a function pointer, which stage 2 does not support.
+	for {
+		if p.atPunct("[") {
+			p.next()
+			n, err := p.parseArrayLength()
 			if err != nil {
-				return nil, err
+				return d, err
 			}
-			if p.cur().Kind != TIdent {
-				return nil, fmt.Errorf("line %d: expected parameter name", p.cur().Line)
+			if err := p.expect("]"); err != nil {
+				return d, err
 			}
-			params = append(params, p.next().Text)
-			paramTypes = append(paramTypes, pt)
-			if p.cur().Text == "," {
-				p.next()
-				continue
+			d.typ = ArrType(d.typ, n)
+		} else if p.atPunct("(") {
+			if !allowFunc {
+				return d, fmt.Errorf("line %d: function type not allowed here", p.cur().Line)
 			}
+			if wasGrouped {
+				return d, fmt.Errorf("line %d: function pointers are not supported in stage 2", p.cur().Line)
+			}
+			params, names, err := p.parseParamList()
+			if err != nil {
+				return d, err
+			}
+			d.typ = FuncType(d.typ, params)
+			d.paramNames = names
+		} else {
 			break
 		}
 	}
+	return d, nil
+}
+
+// parseArrayLength parses a small integer constant expression for [N]. An
+// empty pair of brackets (incomplete array type, e.g. "int a[]" in a
+// parameter list) yields 0; the caller decays such a parameter to a pointer.
+func (p *Parser) parseArrayLength() (int, error) {
+	if p.atPunct("]") {
+		return 0, nil
+	}
+	v, err := p.constAdd()
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+func (p *Parser) constAdd() (int, error) {
+	v, err := p.constMul()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("+") || p.atPunct("-") {
+		op := p.next().Text
+		r, err := p.constMul()
+		if err != nil {
+			return 0, err
+		}
+		if op == "+" {
+			v += r
+		} else {
+			v -= r
+		}
+	}
+	return v, nil
+}
+
+func (p *Parser) constMul() (int, error) {
+	v, err := p.constPrim()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("*") || p.atPunct("/") {
+		op := p.next().Text
+		r, err := p.constPrim()
+		if err != nil {
+			return 0, err
+		}
+		if op == "*" {
+			v *= r
+		} else {
+			if r == 0 {
+				return 0, fmt.Errorf("line %d: division by zero in array size", p.cur().Line)
+			}
+			v /= r
+		}
+	}
+	return v, nil
+}
+
+func (p *Parser) constPrim() (int, error) {
+	if p.atPunct("(") {
+		p.next()
+		v, err := p.constAdd()
+		if err != nil {
+			return 0, err
+		}
+		if err := p.expect(")"); err != nil {
+			return 0, err
+		}
+		return v, nil
+	}
+	if p.cur().Kind == TNum && !p.cur().IsDbl {
+		v := int(p.next().Num)
+		return v, nil
+	}
+	return 0, fmt.Errorf("line %d: expected integer constant, got %q", p.cur().Line, p.cur().Text)
+}
+
+// parseParamList parses the (...) of a function declarator. Array parameters
+// decay to pointers, matching C. "void" as the sole parameter means empty.
+func (p *Parser) parseParamList() ([]*Type, []string, error) {
+	if err := p.expect("("); err != nil {
+		return nil, nil, err
+	}
+	var types []*Type
+	var names []string
+	if p.atPunct(")") {
+		p.next()
+		return types, names, nil
+	}
+	for {
+		spec, err := p.parseDeclarationSpecifiers()
+		if err != nil {
+			return nil, nil, err
+		}
+		if p.atPunct(")") {
+			// "void" alone => empty parameter list
+			if spec.IsVoid() {
+				p.next()
+				return types, names, nil
+			}
+			return nil, nil, fmt.Errorf("line %d: expected parameter name", p.cur().Line)
+		}
+		pd, err := p.parseDeclarator(spec, false)
+		if err != nil {
+			return nil, nil, err
+		}
+		if pd.typ.IsArray() {
+			pd.typ = PtrType(pd.typ.Elem)
+		}
+		types = append(types, pd.typ)
+		names = append(names, pd.name)
+		if p.atPunct(",") {
+			p.next()
+			continue
+		}
+		break
+	}
 	if err := p.expect(")"); err != nil {
+		return nil, nil, err
+	}
+	return types, names, nil
+}
+
+// parseFunc parses a single function definition: specifiers, a function
+// declarator, and a body block.
+func (p *Parser) parseFunc() (*FuncDecl, error) {
+	ret, err := p.parseDeclarationSpecifiers()
+	if err != nil {
 		return nil, err
+	}
+	d, err := p.parseDeclarator(ret, true)
+	if err != nil {
+		return nil, err
+	}
+	if d.typ.Kind != KFunc {
+		return nil, fmt.Errorf("line %d: expected function definition", p.cur().Line)
 	}
 	body, err := p.parseBlock()
 	if err != nil {
 		return nil, err
 	}
-	return &FuncDecl{Name: name, Ret: ret, Params: params, ParamTypes: paramTypes, Body: body}, nil
+	return &FuncDecl{
+		Name:       d.name,
+		Ret:        d.typ.Ret,
+		Params:     d.paramNames,
+		ParamTypes: d.typ.Params,
+		Body:       body,
+	}, nil
 }
 
 func (p *Parser) parseBlock() (*Block, error) {
@@ -108,7 +341,7 @@ func (p *Parser) parseBlock() (*Block, error) {
 		return nil, err
 	}
 	b := &Block{}
-	for p.cur().Text != "}" {
+	for !p.atPunct("}") {
 		if p.cur().Kind == TEOF {
 			return nil, fmt.Errorf("line %d: unexpected EOF inside block", p.cur().Line)
 		}
@@ -125,10 +358,12 @@ func (p *Parser) parseBlock() (*Block, error) {
 func (p *Parser) parseStmt() (Stmt, error) {
 	t := p.cur()
 	switch {
+	case isTypeName(t):
+		return p.parseDeclaration()
 	case t.Kind == TKeyword && t.Text == "return":
 		p.next()
 		var e Expr
-		if p.cur().Text != ";" {
+		if !p.atPunct(";") {
 			var err error
 			e, err = p.parseExpr()
 			if err != nil {
@@ -181,51 +416,67 @@ func (p *Parser) parseStmt() (Stmt, error) {
 			return nil, err
 		}
 		return &WhileStmt{Cond: cond, Body: body}, nil
-	case t.Kind == TKeyword && (t.Text == "int" || t.Text == "double"):
-		typ, _ := p.parseType()
-		if p.cur().Kind != TIdent {
-			return nil, fmt.Errorf("line %d: expected variable name", p.cur().Line)
-		}
-		name := p.next().Text
-		var init Expr
-		if p.cur().Text == "=" {
-			p.next()
-			var err error
-			init, err = p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-		}
-		if err := p.expect(";"); err != nil {
-			return nil, err
-		}
-		return &DeclStmt{Name: name, Typ: typ, Init: init}, nil
-	case t.Kind == TIdent:
-		name := t.Text
-		if p.peek().Text == "=" {
-			p.next() // ident
-			p.next() // '='
-			e, err := p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-			if err := p.expect(";"); err != nil {
-				return nil, err
-			}
-			return &AssignStmt{Name: name, E: e}, nil
-		}
-		e, err := p.parseExpr()
+	case p.atPunct("{"):
+		return p.parseBlock()
+	}
+
+	// Expression statement, or assignment if it is followed by '='.
+	e, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if p.atPunct("=") {
+		p.next()
+		rhs, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
 		if err := p.expect(";"); err != nil {
 			return nil, err
 		}
-		return &ExprStmt{E: e}, nil
-	case t.Kind == TPunct && t.Text == "{":
-		return p.parseBlock()
+		return &AssignStmt{Lhs: e, Rhs: rhs}, nil
 	}
-	return nil, fmt.Errorf("line %d: unexpected token %q", t.Line, t.Text)
+	if err := p.expect(";"); err != nil {
+		return nil, err
+	}
+	return &ExprStmt{E: e}, nil
+}
+
+// parseDeclaration parses one declaration specifier list followed by a
+// comma-separated list of initialised declarators: "int a = 1, b[3];".
+func (p *Parser) parseDeclaration() (Stmt, error) {
+	spec, err := p.parseDeclarationSpecifiers()
+	if err != nil {
+		return nil, err
+	}
+	var decls []*DeclStmt
+	for {
+		pd, err := p.parseDeclarator(spec, false)
+		if err != nil {
+			return nil, err
+		}
+		var init Expr
+		if p.atPunct("=") {
+			p.next()
+			init, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+		}
+		decls = append(decls, &DeclStmt{Name: pd.name, Typ: pd.typ, Init: init, Line: pd.line})
+		if p.atPunct(",") {
+			p.next()
+			continue
+		}
+		break
+	}
+	if err := p.expect(";"); err != nil {
+		return nil, err
+	}
+	if len(decls) == 1 {
+		return decls[0], nil
+	}
+	return &DeclList{Decls: decls}, nil
 }
 
 func (p *Parser) parseExpr() (Expr, error) { return p.parseOr() }
@@ -235,7 +486,7 @@ func (p *Parser) parseOr() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.cur().Text == "||" {
+	for p.atPunct("||") {
 		p.next()
 		right, err := p.parseAnd()
 		if err != nil {
@@ -251,7 +502,7 @@ func (p *Parser) parseAnd() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.cur().Text == "&&" {
+	for p.atPunct("&&") {
 		p.next()
 		right, err := p.parseEq()
 		if err != nil {
@@ -267,7 +518,7 @@ func (p *Parser) parseEq() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.cur().Text == "==" || p.cur().Text == "!=" {
+	for p.atPunct("==") || p.atPunct("!=") {
 		op := p.next().Text
 		right, err := p.parseRel()
 		if err != nil {
@@ -283,7 +534,7 @@ func (p *Parser) parseRel() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.cur().Text == "<" || p.cur().Text == ">" || p.cur().Text == "<=" || p.cur().Text == ">=" {
+	for p.atPunct("<") || p.atPunct(">") || p.atPunct("<=") || p.atPunct(">=") {
 		op := p.next().Text
 		right, err := p.parseAdd()
 		if err != nil {
@@ -299,7 +550,7 @@ func (p *Parser) parseAdd() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.cur().Text == "+" || p.cur().Text == "-" {
+	for p.atPunct("+") || p.atPunct("-") {
 		op := p.next().Text
 		right, err := p.parseMul()
 		if err != nil {
@@ -315,7 +566,7 @@ func (p *Parser) parseMul() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for p.cur().Text == "*" || p.cur().Text == "/" || p.cur().Text == "%" {
+	for p.atPunct("*") || p.atPunct("/") || p.atPunct("%") {
 		op := p.next().Text
 		right, err := p.parseUnary()
 		if err != nil {
@@ -327,7 +578,7 @@ func (p *Parser) parseMul() (Expr, error) {
 }
 
 func (p *Parser) parseUnary() (Expr, error) {
-	if p.cur().Text == "-" || p.cur().Text == "!" {
+	if p.atPunct("-") || p.atPunct("!") {
 		op := p.next().Text
 		e, err := p.parseUnary()
 		if err != nil {
@@ -335,7 +586,71 @@ func (p *Parser) parseUnary() (Expr, error) {
 		}
 		return &Unary{Op: op, E: e}, nil
 	}
-	return p.parsePrimary()
+	if p.atPunct("*") { // indirection (dereference)
+		p.next()
+		e, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		return &Unary{Op: "*", E: e}, nil
+	}
+	if p.atPunct("&") { // address-of
+		p.next()
+		e, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		return &Unary{Op: "&", E: e}, nil
+	}
+	return p.parsePostfix()
+}
+
+func (p *Parser) parsePostfix() (Expr, error) {
+	e, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		if p.atPunct("(") {
+			id, ok := e.(*Ident)
+			if !ok {
+				return nil, fmt.Errorf("line %d: cannot call a non-function expression", p.cur().Line)
+			}
+			p.next()
+			var args []Expr
+			if !p.atPunct(")") {
+				for {
+					a, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					args = append(args, a)
+					if p.atPunct(",") {
+						p.next()
+						continue
+					}
+					break
+				}
+			}
+			if err := p.expect(")"); err != nil {
+				return nil, err
+			}
+			e = &Call{Name: id.Name, Args: args}
+		} else if p.atPunct("[") {
+			p.next()
+			idx, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expect("]"); err != nil {
+				return nil, err
+			}
+			e = &Index{Base: e, Idx: idx}
+		} else {
+			break
+		}
+	}
+	return e, nil
 }
 
 func (p *Parser) parsePrimary() (Expr, error) {
@@ -346,7 +661,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		if t.IsDbl {
 			return &NumLit{Kind: TDouble, Fval: t.Fval}, nil
 		}
-		return &NumLit{Val: t.Num}, nil
+		return &NumLit{Val: t.Num, Kind: TInt}, nil
 	case t.Kind == TStr:
 		// Adjacent string literals concatenate (C translation phase 6), e.g.
 		// "a" "b" becomes "ab". This is what lets a pasting macro like
@@ -362,30 +677,8 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		return &StrLit{Bytes: b}, nil
 	case t.Kind == TIdent:
 		p.next()
-		if p.cur().Text == "(" {
-			p.next()
-			var args []Expr
-			if p.cur().Text != ")" {
-				for {
-					e, err := p.parseExpr()
-					if err != nil {
-						return nil, err
-					}
-					args = append(args, e)
-					if p.cur().Text == "," {
-						p.next()
-						continue
-					}
-					break
-				}
-			}
-			if err := p.expect(")"); err != nil {
-				return nil, err
-			}
-			return &Call{Name: t.Text, Args: args}, nil
-		}
-		return &Ident{Name: t.Text}, nil
-	case p.cur().Text == "(":
+		return &Ident{Name: t.Text, Line: t.Line}, nil
+	case p.atPunct("("):
 		p.next()
 		e, err := p.parseExpr()
 		if err != nil {

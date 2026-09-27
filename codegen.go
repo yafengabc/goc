@@ -17,7 +17,7 @@ import (
 // varInfo records a variable's stack slot and type.
 type varInfo struct {
 	off int
-	typ CType
+	typ *Type
 }
 
 type CG struct {
@@ -35,8 +35,8 @@ type CG struct {
 	calls     map[string]bool // functions called that are not defined here
 	need      map[string]bool // clib functions this program actually uses
 	linux     bool            // true -> SysV ABI + ELF output
-	curRet    CType           // return type of the function being generated
-	curParam  []CType         // parameter types of the current function
+	curRet   *Type  // return type of the function being generated
+	curParam []*Type // parameter types of the current function
 	resTyp    CType           // type of the value left by the last genExprT
 }
 
@@ -383,7 +383,7 @@ func (c *CG) emit(format string, a ...any) {
 // movsd (not movq) is used for the XMM <-> memory moves: a0 only knows the
 // GP <-> XMM forms of movq.
 func (c *CG) loadVar(vi varInfo) {
-	if vi.typ == TDouble {
+	if vi.typ != nil && vi.typ.Kind == KDouble {
 		c.emit("movsd xmm0, [rbp%+d]", vi.off)
 		c.resTyp = TDouble
 	} else {
@@ -395,7 +395,7 @@ func (c *CG) loadVar(vi varInfo) {
 // storeVar emits code that stores the value currently in rax (int) or xmm0
 // (double) into variable vi's slot.
 func (c *CG) storeVar(vi varInfo) {
-	if vi.typ == TDouble {
+	if vi.typ != nil && vi.typ.Kind == KDouble {
 		c.emit("movsd [rbp%+d], xmm0", vi.off)
 	} else {
 		c.emit("mov [rbp%+d], rax", vi.off)
@@ -456,12 +456,31 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		if !ok {
 			return TInt, fmt.Errorf("undefined variable %q", n.Name)
 		}
+		if vi.typ.IsArray() {
+			// An array used as a value decays to a pointer to element 0.
+			c.emit("lea rax, [rbp%+d]", vi.off)
+			c.resTyp = TInt
+			return TInt, nil
+		}
 		c.loadVar(vi)
 		return c.resTyp, nil
 	case *Unary:
 		return c.genUnary(n)
 	case *Binary:
 		return c.genBinary(n)
+	case *Index:
+		if err := c.genLValue(n); err != nil {
+			return TInt, err
+		}
+		ec := c.elemClassOf(n.Base)
+		if ec == TDouble {
+			c.emit("movsd xmm0, [r10]")
+			c.resTyp = TDouble
+			return TDouble, nil
+		}
+		c.emit("mov rax, [r10]")
+		c.resTyp = TInt
+		return TInt, nil
 	case *Call:
 		return c.genCallExpr(n)
 	}
@@ -627,10 +646,24 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			for _, st := range n.Stmts {
 				collect(st)
 			}
+		case *DeclList:
+			for _, d := range n.Decls {
+				collect(d)
+			}
 		case *DeclStmt:
 			if _, ok := c.vars[n.Name]; !ok {
-				localCount++
-				c.vars[n.Name] = varInfo{off: -(40 + 8*localCount), typ: n.Typ}
+				if n.Typ.IsArray() {
+					ln := n.Typ.Len
+					if ln < 1 {
+						ln = 1
+					}
+					off := -(40 + 8*(localCount + ln))
+					localCount += ln
+					c.vars[n.Name] = varInfo{off: off, typ: n.Typ}
+				} else {
+					localCount++
+					c.vars[n.Name] = varInfo{off: -(40 + 8*localCount), typ: n.Typ}
+				}
 			}
 		case *IfStmt:
 			collect(n.Then)
@@ -671,7 +704,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	argXMM := c.argXMM()
 	for i := 0; i < len(f.Params) && i < len(argRegs); i++ {
 		off := 16 + 8*i
-		if f.ParamTypes[i] == TDouble && i < len(argXMM) {
+		if f.ParamTypes[i].Kind == KDouble && i < len(argXMM) {
 			c.emit("movsd [rbp+%d], %s", off, argXMM[i])
 		} else {
 			c.emit("mov [rbp+%d], %s", off, argRegs[i])
@@ -710,11 +743,15 @@ func (c *CG) genStmt(s Stmt) error {
 		}
 	case *DeclStmt:
 		vi := c.vars[n.Name]
+		if vi.typ.IsArray() {
+			// Arrays are not initialised here; the checker rejects initialisers.
+			return nil
+		}
 		if n.Init != nil {
 			if _, err := c.genExprT(n.Init); err != nil {
 				return err
 			}
-			if err := c.ensureType(vi.typ); err != nil {
+			if err := c.ensureType(vi.typ.Class()); err != nil {
 				return err
 			}
 			c.storeVar(vi)
@@ -722,14 +759,32 @@ func (c *CG) genStmt(s Stmt) error {
 			c.emit("mov [rbp%+d], 0", vi.off)
 		}
 	case *AssignStmt:
-		vi := c.vars[n.Name]
-		if _, err := c.genExprT(n.E); err != nil {
+		rt, err := c.genExprT(n.Rhs)
+		if err != nil {
 			return err
 		}
-		if err := c.ensureType(vi.typ); err != nil {
+		// Spill the right-hand side into a frame temporary so computing the
+		// lvalue address (which may itself call functions) cannot clobber it.
+		c.tmpDepth++
+		rslot := c.tmpSlot(c.tmpDepth)
+		if rt == TDouble {
+			c.emit("movsd [rbp%+d], xmm0", rslot)
+		} else {
+			c.emit("mov [rbp%+d], rax", rslot)
+		}
+		if err := c.genLValue(n.Lhs); err != nil {
 			return err
 		}
-		c.storeVar(vi)
+		ec := c.elemClassOf(n.Lhs)
+		if ec == TDouble {
+			c.emit("movsd xmm0, [rbp%+d]", rslot)
+			c.emit("movsd [r10], xmm0")
+		} else {
+			c.emit("mov rax, [rbp%+d]", rslot)
+			c.emit("mov [r10], rax")
+		}
+		c.tmpDepth--
+		return nil
 	case *ExprStmt:
 		if _, err := c.genExprT(n.E); err != nil {
 			return err
@@ -739,9 +794,9 @@ func (c *CG) genStmt(s Stmt) error {
 			if _, err := c.genExprT(n.E); err != nil {
 				return err
 			}
-			if err := c.ensureType(c.curRet); err != nil {
-				return err
-			}
+		if err := c.ensureType(c.curRet.Class()); err != nil {
+			return err
+		}
 		} else {
 			c.emit("mov rax, 0")
 		}
@@ -792,6 +847,36 @@ func (c *CG) genStmt(s Stmt) error {
 }
 
 func (c *CG) genUnary(n *Unary) (CType, error) {
+	switch n.Op {
+	case "&":
+		// &*p is just p (the pointer value); everything else is a real lvalue.
+		if inner, ok := n.E.(*Unary); ok && inner.Op == "*" {
+			if _, err := c.genExprT(inner.E); err != nil {
+				return TInt, err
+			}
+		} else {
+			if err := c.genLValue(n.E); err != nil {
+				return TInt, err
+			}
+			c.emit("mov rax, r10")
+		}
+		c.resTyp = TInt
+		return TInt, nil
+	case "*":
+		// Dereference: n.E evaluates to the pointer value (in rax).
+		if _, err := c.genExprT(n.E); err != nil {
+			return TInt, err
+		}
+		ec := c.elemClassOf(n.E)
+		if ec == TDouble {
+			c.emit("movsd xmm0, [rax]")
+			c.resTyp = TDouble
+			return TDouble, nil
+		}
+		c.emit("mov rax, [rax]")
+		c.resTyp = TInt
+		return TInt, nil
+	}
 	t, err := c.genExprT(n.E)
 	if err != nil {
 		return TInt, err
@@ -821,6 +906,107 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 	c.emit("mov rax, 1")
 	c.sb.WriteString(lEnd + ":\n")
 	return TInt, nil
+}
+
+// genLValue emits code that leaves the address of the lvalue e in r10.
+func (c *CG) genLValue(e Expr) error {
+	switch n := e.(type) {
+	case *Ident:
+		vi, ok := c.vars[n.Name]
+		if !ok {
+			return fmt.Errorf("undefined variable %q", n.Name)
+		}
+		c.emit("lea r10, [rbp%+d]", vi.off)
+		return nil
+	case *Unary:
+		if n.Op != "*" {
+			return fmt.Errorf("expression is not an lvalue")
+		}
+		// The address of *p is simply the pointer value p holds.
+		if _, err := c.genExprT(n.E); err != nil {
+			return err
+		}
+		c.emit("mov r10, rax")
+		return nil
+	case *Index:
+		// Element address = base_address + index*8. Compute the index first
+		// and spill it, because evaluating the base may call a function and
+		// clobber the volatile registers.
+		if _, err := c.genExprT(n.Idx); err != nil {
+			return err
+		}
+		c.tmpDepth++
+		islot := c.tmpSlot(c.tmpDepth)
+		c.emit("mov [rbp%+d], rax", islot)
+		if id, ok := n.Base.(*Ident); ok {
+			vi, ok2 := c.vars[id.Name]
+			if !ok2 {
+				return fmt.Errorf("undefined variable %q", id.Name)
+			}
+			if vi.typ.IsArray() {
+				c.emit("lea r10, [rbp%+d]", vi.off)
+			} else {
+				c.loadVar(vi) // rax = pointer value
+				c.emit("mov r10, rax")
+			}
+		} else if u, ok := n.Base.(*Unary); ok && u.Op == "*" {
+			if _, err := c.genExprT(u.E); err != nil {
+				return err
+			}
+			c.emit("mov r10, rax")
+		} else if ix, ok := n.Base.(*Index); ok {
+			if err := c.genLValue(ix); err != nil {
+				return err
+			}
+			// r10 already holds the base element address
+		} else {
+			if _, err := c.genExprT(n.Base); err != nil {
+				return err
+			}
+			c.emit("mov r10, rax")
+		}
+		c.emit("mov r11, [rbp%+d]", islot)
+		// byte offset = index * 8 (every slot is 8 bytes). a0 has no imul-with-
+		// immediate and no shl, so triple a doubling add (8 = 2^3).
+		c.emit("add r11, r11")
+		c.emit("add r11, r11")
+		c.emit("add r11, r11")
+		c.emit("add r10, r11")
+		c.tmpDepth--
+		return nil
+	}
+	return fmt.Errorf("expression is not an lvalue")
+}
+
+// elemClassOf returns the codegen class (int vs double) of the value obtained
+// by dereferencing / indexing e. It inspects the structured type behind local
+// variables and the shape of nested dereferences / subscripts.
+func (c *CG) elemClassOf(e Expr) CType {
+	switch n := e.(type) {
+	case *Ident:
+		vi, ok := c.vars[n.Name]
+		if !ok {
+			return TInt
+		}
+		if vi.typ.Kind == KDouble {
+			return TDouble
+		}
+		if vi.typ.IsPtr() && vi.typ.Elem != nil {
+			return vi.typ.Elem.Class()
+		}
+		if vi.typ.IsArray() && vi.typ.Elem != nil {
+			return vi.typ.Elem.Class()
+		}
+		return TInt
+	case *Unary:
+		if n.Op == "*" {
+			return c.elemClassOf(n.E)
+		}
+		return TInt
+	case *Index:
+		return c.elemClassOf(n.Base)
+	}
+	return TInt
 }
 
 // setcc emits "rax = (left OP right)" using a conditional branch, because a0
@@ -1107,7 +1293,7 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		// callee (which reads double params from an XMM register) sees the
 		// right value.
 		if !varargs && t == TInt {
-			if fd, ok := c.funcDefs[n.Name]; ok && i < len(fd.ParamTypes) && fd.ParamTypes[i] == TDouble {
+			if fd, ok := c.funcDefs[n.Name]; ok && i < len(fd.ParamTypes) && fd.ParamTypes[i].Kind == KDouble {
 				c.emit("cvtsi2sd xmm0, rax")
 				t = TDouble
 				c.resTyp = TDouble
@@ -1164,7 +1350,7 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	// Result type: user functions declare it; clib and extern calls return int.
 	ret := TInt
 	if f, ok := c.funcDefs[n.Name]; ok {
-		ret = f.Ret
+		ret = f.Ret.Class()
 	}
 	c.resTyp = ret
 	return ret, nil

@@ -20,9 +20,9 @@ type Program struct {
 
 type FuncDecl struct {
 	Name       string
-	Ret        CType
+	Ret        *Type
 	Params     []string
-	ParamTypes []CType
+	ParamTypes []*Type
 	Body       *Block
 }
 
@@ -30,17 +30,23 @@ type Block struct {
 	Stmts []Stmt
 }
 
+// DeclList groups several comma-separated declarations from one statement.
+type DeclList struct {
+	Decls []*DeclStmt
+}
+
 type Stmt interface{}
 
 type DeclStmt struct {
 	Name string
-	Typ  CType
+	Typ  *Type
 	Init Expr // may be nil
+	Line int
 }
 
 type AssignStmt struct {
-	Name string
-	E    Expr
+	Lhs Expr // must be an lvalue: Ident, Unary("*"), or Index
+	Rhs Expr
 }
 
 type ExprStmt struct {
@@ -76,6 +82,7 @@ type StrLit struct {
 
 type Ident struct {
 	Name string
+	Line int
 }
 
 type Unary struct {
@@ -92,4 +99,11 @@ type Binary struct {
 type Call struct {
 	Name string
 	Args []Expr
+}
+
+// Index is the subscript operator: arr[i] or ptr[i]. The base may be an array
+// or a pointer; the element type is the base's element type.
+type Index struct {
+	Base Expr
+	Idx  Expr
 }
