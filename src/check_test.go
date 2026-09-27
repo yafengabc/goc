@@ -97,3 +97,66 @@ func TestCheckNoMain(t *testing.T) {
 		t.Fatal("expected a no-main error")
 	}
 }
+
+func TestCheckFunctionPointer(t *testing.T) {
+	src := `
+int add(int a, int b) { return a + b; }
+int apply(int (*op)(int, int), int a, int b) { return op(a, b); }
+typedef int (*binop)(int, int);
+struct box { binop f; };
+int main() {
+    int (*fp)(int, int) = add;
+    int x = fp(1, 2);
+    int y = (*fp)(3, 4);
+    int z = apply(add, 5, 6);
+    binop op = &add;
+    struct box b;
+    b.f = add;
+    int w = b.f(1, 1);
+    return x + y + z + w + op(2, 2);
+}`
+	if errs := checkSrc(t, src); len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+}
+
+func TestCheckFunctionPointerArity(t *testing.T) {
+	src := `
+int add(int a, int b) { return a + b; }
+int main() {
+    int (*fp)(int, int) = add;
+    return fp(1);
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("expected a wrong-argument-count error through a function pointer")
+	}
+}
+
+func TestCheckFunctionPointerArgType(t *testing.T) {
+	src := `
+double half(double x) { return x / 2.0; }
+int main() {
+    double (*fp)(double) = half;
+    return fp(1.5, 2.5);
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("expected an arity error on a function-pointer call")
+	}
+}
+
+func TestCheckIncompatibleFunctionPointer(t *testing.T) {
+	src := `
+int add(int a, int b) { return a + b; }
+double avg(double a, double b) { return (a + b) / 2.0; }
+int main() {
+    int (*fp)(int, int) = add;
+    fp = avg;
+    return 0;
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("expected an incompatible-function-pointer assignment error")
+	}
+}

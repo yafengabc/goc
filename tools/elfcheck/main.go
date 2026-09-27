@@ -923,19 +923,31 @@ func (c *cpu) step() {
 	case 0xff: // inc/dec/call/jmp r/m64
 		reg, o := modrm()
 		switch reg {
-		case 0:
-			v := getRM(o) + 1
-			setRM(o, v)
-			c.zf, c.sf = v == 0, v>>63 != 0
-			c.of = getRM(o) == 0
-		case 1:
-			v := getRM(o) - 1
-			setRM(o, v)
-			c.zf, c.sf = v == 0, v>>63 != 0
-		default:
-			die("unsupported FF /%d at 0x%x", reg, pc)
+	case 2: // call r/m64 -- indirect call (used for function pointers)
+		dst := getRM(o)
+		c.regs[4] -= 8
+		if !c.writeMem(c.regs[4], 8, c.rip) {
+			c.dumpRegs()
+			die("indirect call with unmapped stack at 0x%x (rsp=0x%x)", pc, c.regs[4])
 		}
+		c.rip = dst
 		return
+	case 4: // jmp r/m64 -- absolute indirect jump
+		c.rip = getRM(o)
+		return
+	case 0:
+		v := getRM(o) + 1
+		setRM(o, v)
+		c.zf, c.sf = v == 0, v>>63 != 0
+		c.of = getRM(o) == 0
+	case 1:
+		v := getRM(o) - 1
+		setRM(o, v)
+		c.zf, c.sf = v == 0, v>>63 != 0
+	default:
+		die("unsupported FF /%d at 0x%x", reg, pc)
+	}
+	return
 
 	case 0xf7: // idiv/div/neg/mul r/m64
 		reg, o := modrm()

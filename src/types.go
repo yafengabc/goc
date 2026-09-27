@@ -1,5 +1,7 @@
 package main
 
+import "strings"
+
 // Type is the structured C type used by the front end (parser + checker).
 //
 // The code generator does not consume Type directly: it only cares whether a
@@ -32,17 +34,18 @@ type Member struct {
 }
 
 type Type struct {
-	Kind    TypeKind
-	Elem    *Type   // KPtr / KArr: element type
-	Len     int     // KArr: number of elements (0 = incomplete)
-	Params  []*Type // KFunc: parameter types
-	Ret     *Type   // KFunc: return type
-	Width   int     // KInt: 1=char, 2=short, 4=int, 8=long
-	Signed  bool    // KInt
-	Members []*Member // KStruct / KUnion: ordered fields
-	Size    int     // KStruct / KUnion: total size in bytes (aligned)
-	Align   int     // KStruct / KUnion: required alignment (0 = not computed)
-	Tag     string  // KStruct / KUnion: optional struct tag (named structs)
+	Kind     TypeKind
+	Elem     *Type     // KPtr / KArr: element type
+	Len      int       // KArr: number of elements (0 = incomplete)
+	Params   []*Type   // KFunc: parameter types
+	Ret      *Type     // KFunc: return type
+	Variadic bool      // KFunc: declared with a trailing "..."
+	Width    int       // KInt: 1=char, 2=short, 4=int, 8=long
+	Signed   bool      // KInt
+	Members  []*Member // KStruct / KUnion: ordered fields
+	Size     int       // KStruct / KUnion: total size in bytes (aligned)
+	Align    int       // KStruct / KUnion: required alignment (0 = not computed)
+	Tag      string    // KStruct / KUnion: optional struct tag (named structs)
 }
 
 // --- constructors -----------------------------------------------------------
@@ -231,7 +234,22 @@ func (t *Type) String() string {
 		}
 		return "union{}"
 	case KFunc:
-		return "function"
+		ret := "void"
+		if t.Ret != nil {
+			ret = t.Ret.String()
+		}
+		ps := make([]string, 0, len(t.Params))
+		for _, p := range t.Params {
+			if p == nil {
+				ps = append(ps, "?")
+				continue
+			}
+			ps = append(ps, p.String())
+		}
+		if t.Variadic {
+			ps = append(ps, "...")
+		}
+		return ret + "(" + strings.Join(ps, ", ") + ")"
 	}
 	return "?"
 }

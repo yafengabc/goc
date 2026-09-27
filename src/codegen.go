@@ -909,42 +909,52 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		c.resW = 8 // a string literal is a pointer
 		return TInt, nil
 	case *Ident:
+		// A function designator used as a value decays to a pointer to that
+		// function, exactly like an array: "fp = add;". Function names live in
+		// a separate namespace from variables, so this must be resolved first.
+		if sym, ok := c.funcAddrSym(n.Name); ok {
+			c.emit("lea rax, [rip+%s]", sym)
+			c.resTyp = TInt
+			c.resSigned = false
+			c.resW = 8 // a function address is a pointer
+			return TInt, nil
+		}
 		vi, ok := c.vars[n.Name]
 		if !ok {
-		if c.globals[n.Name] {
-			// Global / static variable: load its value via rip-relative
-			// addressing into the .data section. Arrays decay to a pointer to
-			// element 0 (mirroring local arrays).
-			gt := c.globalTyp[n.Name]
-			if gt != nil && gt.IsArray() {
-				c.emit("lea rax, [rip+%s]", c.globalLab[n.Name])
+			if c.globals[n.Name] {
+				// Global / static variable: load its value via rip-relative
+				// addressing into the .data section. Arrays decay to a pointer
+				// to element 0 (mirroring local arrays).
+				gt := c.globalTyp[n.Name]
+				if gt != nil && gt.IsArray() {
+					c.emit("lea rax, [rip+%s]", c.globalLab[n.Name])
+					c.resTyp = TInt
+					c.resSigned = false
+					c.resW = 8
+					return TInt, nil
+				}
+				if isAgg(gt) {
+					// A whole struct/union value cannot be loaded into rax;
+					// consumers must go through genLValue (see structSrcAddr).
+					return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
+				}
+				c.emit("mov rax, [rip+%s]", c.globalLab[n.Name])
 				c.resTyp = TInt
-				c.resSigned = false
-				c.resW = 8
+				c.resSigned = gt != nil && gt.Kind == KInt && gt.Signed
+				c.resW = c.semWOf(gt)
 				return TInt, nil
 			}
-			if isAgg(gt) {
-				// A whole struct/union value cannot be loaded into rax;
-				// consumers must go through genLValue (see structSrcAddr).
-				return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
+			if ev, ok := enumConsts[n.Name]; ok {
+				// An enumerator is a compile-time integer constant.
+				c.emit("mov rax, %d", ev)
+				c.resTyp = TInt
+				c.resSigned = true
+				c.resW = 4
+				if ev > 0x7fffffff || ev < -0x80000000 {
+					c.resW = 8
+				}
+				return TInt, nil
 			}
-			c.emit("mov rax, [rip+%s]", c.globalLab[n.Name])
-			c.resTyp = TInt
-			c.resSigned = gt != nil && gt.Kind == KInt && gt.Signed
-			c.resW = c.semWOf(gt)
-			return TInt, nil
-		}
-		if ev, ok := enumConsts[n.Name]; ok {
-			// An enumerator is a compile-time integer constant.
-			c.emit("mov rax, %d", ev)
-			c.resTyp = TInt
-			c.resSigned = true
-			c.resW = 4
-			if ev > 0x7fffffff || ev < -0x80000000 {
-				c.resW = 8
-			}
-			return TInt, nil
-		}
 			return TInt, fmt.Errorf("undefined variable %q", n.Name)
 		}
 		if vi.typ.IsArray() {
@@ -1073,6 +1083,8 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		return c.genIncDec(n)
 	case *Call:
 		return c.genCallExpr(n)
+	case *IndirectCall:
+		return c.genIndirectCall(n)
 	case *AssignExpr:
 		// Whole-struct/union assignment: neither side fits in a register, so
 		// there is no scalar fast path and we never load the value into rax.
@@ -1410,6 +1422,11 @@ func (c *CG) findAddressTaken(f *FuncDecl) map[string]bool {
 					}
 				}
 			}
+			for _, a := range n.Args {
+				walkExpr(a)
+			}
+		case *IndirectCall:
+			walkExpr(n.Fn)
 			for _, a := range n.Args {
 				walkExpr(a)
 			}
@@ -2058,6 +2075,15 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 		if _, err := c.genExprT(n.E); err != nil {
 			return TInt, err
 		}
+		// Dereferencing a pointer to FUNCTION yields the function designator,
+		// whose value IS that same address -- there is nothing to load. This
+		// is what makes "(*fp)(x)" branch to the same place as "fp(x)".
+		if t := c.exprType(n.E); t != nil && t.IsPtr() && t.Elem != nil && t.Elem.IsFunc() {
+			c.resTyp = TInt
+			c.resSigned = false
+			c.resW = 8
+			return TInt, nil
+		}
 		ec := c.elemClassOf(n.E)
 		width := c.elemWidthOf(n.E)
 		signed := c.elemSignedOf(n.E)
@@ -2113,6 +2139,12 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 func (c *CG) genLValue(e Expr) error {
 	switch n := e.(type) {
 	case *Ident:
+		// Address of a function designator: "&add" is just another spelling of
+		// "add". Both yield the function's address.
+		if sym, ok := c.funcAddrSym(n.Name); ok {
+			c.emit("lea r10, [rip+%s]", sym)
+			return nil
+		}
 		vi, ok := c.vars[n.Name]
 		if !ok {
 			if c.globals[n.Name] {
@@ -2207,7 +2239,16 @@ func (c *CG) genLValue(e Expr) error {
 				st = bt.Elem
 			}
 		} else {
-			if err := c.genLValue(n.Base); err != nil {
+			if bt := c.exprType(n.Base); isAgg(bt) {
+				// The base is a whole struct VALUE rather than an lvalue --
+				// typically a call returning a struct ("mkpt(1,2).x"), whose
+				// bytes live in a result buffer. Take its address from there
+				// and leave the buffer claimed; the statement that encloses
+				// this expression releases it.
+				if err := c.structSrcAddr(n.Base, bt); err != nil {
+					return err
+				}
+			} else if err := c.genLValue(n.Base); err != nil {
 				return err
 			}
 			st = c.exprType(n.Base)
@@ -2350,6 +2391,12 @@ func (c *CG) exprType(e Expr) *Type {
 		if vi, ok := c.vars[n.Name]; ok {
 			return vi.typ
 		}
+		// A function designator decays to a pointer to that function.
+		if fd, ok := c.funcDefs[n.Name]; ok {
+			ft := FuncType(fd.Ret, fd.ParamTypes)
+			ft.Variadic = fd.Variadic
+			return PtrType(ft)
+		}
 		return c.globalTyp[n.Name]
 	case *Unary:
 		if n.Op == "*" {
@@ -2376,6 +2423,16 @@ func (c *CG) exprType(e Expr) *Type {
 		// positions so their result buffer can be consumed by address.
 		if fd, ok := c.funcDefs[n.Name]; ok {
 			return fd.Ret
+		}
+		// The name may designate a function-pointer VARIABLE rather than a
+		// function: its result type comes from the pointer's static type.
+		if _, ft, ok := c.fnPtrVar(n.Name); ok {
+			return ft.Ret
+		}
+		return nil
+	case *IndirectCall:
+		if ft := funcTypeOf(c.exprType(n.Fn)); ft != nil {
+			return ft.Ret
 		}
 		return nil
 	}
@@ -2564,15 +2621,29 @@ func (c *CG) zeroBytes(dst string, n int) {
 //     bytes out) or claim its slots itself (when passing it on as an
 //     argument, where the buffer must survive until the outer call).
 func (c *CG) structSrcAddr(e Expr, t *Type) error {
-	if call, ok := e.(*Call); ok && isAgg(t) {
-		if _, err := c.genExprT(call); err != nil {
-			return err
+	switch call := e.(type) {
+	case *Call:
+		if isAgg(t) {
+			if _, err := c.genExprT(call); err != nil {
+				return err
+			}
+			if !c.resStruct {
+				return fmt.Errorf("call %q does not produce a struct value", call.Name)
+			}
+			c.emit("lea r10, [rbp%+d]", c.tmpSlot(c.resStructK))
+			return nil
 		}
-		if !c.resStruct {
-			return fmt.Errorf("call %q does not produce a struct value", call.Name)
+	case *IndirectCall:
+		if isAgg(t) {
+			if _, err := c.genExprT(call); err != nil {
+				return err
+			}
+			if !c.resStruct {
+				return fmt.Errorf("function-pointer call does not produce a struct value")
+			}
+			c.emit("lea r10, [rbp%+d]", c.tmpSlot(c.resStructK))
+			return nil
 		}
-		c.emit("lea r10, [rbp%+d]", c.tmpSlot(c.resStructK))
-		return nil
 	}
 	return c.genLValue(e)
 }
@@ -3153,6 +3224,29 @@ func variadicFn(name string) bool {
 	return name == "printf" || name == "sprintf"
 }
 
+// funcAddrSym resolves a function designator to the symbol whose address it
+// decays to ("fp = add;"). Only functions whose code lands in this translation
+// unit qualify: user definitions and goclib helpers. Taking the address counts
+// as a use, so a goclib helper referenced this way is pulled in exactly as if
+// it had been called.
+func (c *CG) funcAddrSym(name string) (string, bool) {
+	sym := name
+	if c.linux {
+		if a, ok := goclibAliasLinux[name]; ok {
+			sym = a
+		}
+	}
+	if c.funcs[name] {
+		return sym, true
+	}
+	funcs, _, _ := goclibStore(c.linux)
+	if _, ok := funcs[sym]; ok {
+		c.need[sym] = true
+		return sym, true
+	}
+	return "", false
+}
+
 // genCallExpr emits a call and returns the callee's result type.
 //
 // Calling conventions:
@@ -3192,18 +3286,77 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		c.resTyp = TInt
 		return TInt, nil
 	}
+	// A call whose name designates a VARIABLE holding a function pointer is an
+	// indirect call: C spells it exactly like a direct call ("fp(x)"), but the
+	// address has to be loaded from the variable at run time.
+	if !c.funcs[n.Name] {
+		if e, ft, ok := c.fnPtrVar(n.Name); ok {
+			return c.genCall("", e, ft, n.Args)
+		}
+	}
+	return c.genCall(n.Name, nil, nil, n.Args)
+}
+
+// fnPtrVar resolves a name that designates a local variable, parameter or
+// global holding a function pointer. It returns the callee expression (the
+// variable read itself) together with the static function type behind it.
+func (c *CG) fnPtrVar(name string) (Expr, *Type, bool) {
+	if vi, ok := c.vars[name]; ok {
+		if ft := funcTypeOf(vi.typ); ft != nil {
+			return &Ident{Name: name}, ft, true
+		}
+	}
+	if gt, ok := c.globalTyp[name]; ok {
+		if ft := funcTypeOf(gt); ft != nil {
+			return &Ident{Name: name}, ft, true
+		}
+	}
+	return nil, nil, false
+}
+
+// genIndirectCall emits a call through a computed function address: (*fp)(x),
+// tab[i](x), s.cb(x). The callee expression is evaluated once, before the
+// arguments, so that evaluating an argument cannot clobber it.
+func (c *CG) genIndirectCall(n *IndirectCall) (CType, error) {
+	return c.genCall("", n.Fn, funcTypeOf(c.exprType(n.Fn)), n.Args)
+}
+
+// genCall emits a call and returns the callee's result type. name selects a
+// directly called symbol; when fnExpr is non-nil the call is indirect and the
+// address comes from evaluating that expression (ft is the static function type
+// behind the pointer, nil when it could not be recovered -- such a call then
+// behaves like an untyped extern returning int). Both paths marshall arguments
+// identically; only the branch differs.
+func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, error) {
+	indirect := fnExpr != nil
+	diag := name
+	if indirect {
+		diag = "function pointer"
+	}
 	argRegs := c.argRegs()
 	argXMM := c.argXMM()
-	nargs := len(n.Args)
+	nargs := len(args)
 	if nargs > maxArgs {
-		return TInt, fmt.Errorf("%s: too many arguments (max %d)", n.Name, maxArgs)
+		return TInt, fmt.Errorf("%s: too many arguments (max %d)", diag, maxArgs)
 	}
 	// Struct/union return: the caller allocates a temporary result buffer,
 	// passes its address as the hidden first argument (argRegs[0]) and every
 	// user argument shifts one register slot to the right.
 	retT := (*Type)(nil)
-	if f, ok := c.funcDefs[n.Name]; ok {
-		retT = f.Ret
+	varargs := false
+	var paramTypes []*Type
+	if indirect {
+		if ft != nil {
+			retT = ft.Ret
+			varargs = ft.Variadic
+			paramTypes = ft.Params
+		}
+	} else {
+		if f, ok := c.funcDefs[name]; ok {
+			retT = f.Ret
+			paramTypes = f.ParamTypes
+		}
+		varargs = variadicFn(name)
 	}
 	sretSz := 0
 	if isAgg(retT) {
@@ -3239,23 +3392,24 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	}
 
 	// Resolve the callee. A goclib function may live under a different symbol
-	// than its C name (see goclibAliasLinux).
-	target := n.Name
-	if c.linux {
-		if a, ok := goclibAliasLinux[n.Name]; ok {
-			target = a
+	// than its C name (see goclibAliasLinux). Direct calls only: an indirect
+	// target is a run-time value, not a symbol we can book here.
+	target := name
+	if !indirect {
+		if c.linux {
+			if a, ok := goclibAliasLinux[name]; ok {
+				target = a
+			}
+		}
+		if !c.funcs[name] && name != "main" {
+			funcs, _, _ := goclibStore(c.linux)
+			if _, ok := funcs[target]; ok {
+				c.need[target] = true
+			} else {
+				c.calls[name] = true
+			}
 		}
 	}
-	if !c.funcs[n.Name] && n.Name != "main" {
-		funcs, _, _ := goclibStore(c.linux)
-		if _, ok := funcs[target]; ok {
-			c.need[target] = true
-		} else {
-			c.calls[n.Name] = true
-		}
-	}
-
-	varargs := variadicFn(n.Name)
 	// Reserve the struct-return result buffer BELOW the argument spill
 	// slots: it must stay live while the arguments are evaluated (an
 	// argument may itself nest calls) and is consumed by the caller
@@ -3268,12 +3422,26 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	}
 	slots := make([]argSlot, nargs)
 	consumed := 0
+	// Indirect call: evaluate the target address now and park it in its own
+	// frame slot, above the result buffer and below the argument slots.
+	// Argument evaluation may itself contain calls, so nothing here may be
+	// left in a volatile register.
+	tgtSlot := 0
+	if indirect {
+		if _, err := c.genExprT(fnExpr); err != nil {
+			return TInt, err
+		}
+		c.tmpDepth++
+		tgtSlot = c.tmpDepth
+		c.emit("mov [rbp%+d], rax", c.tmpSlot(tgtSlot))
+		consumed++
+	}
 	for i := 0; i < nargs; i++ {
 		// Struct/union arguments are passed by hidden pointer: evaluate the
 		// ADDRESS of the value into r10 and spill that address into one GP
 		// slot (the callee copies the bytes into its own local slot).
-		if at := c.exprType(n.Args[i]); isAgg(at) {
-			if err := c.structSrcAddr(n.Args[i], at); err != nil {
+		if at := c.exprType(args[i]); isAgg(at) {
+			if err := c.structSrcAddr(args[i], at); err != nil {
 				return TInt, err
 			}
 			if c.resStruct {
@@ -3292,7 +3460,7 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 			consumed++
 			continue
 		}
-		t, err := c.genExprT(n.Args[i])
+		t, err := c.genExprT(args[i])
 		if err != nil {
 			return TInt, err
 		}
@@ -3300,12 +3468,10 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		// declared double parameter is widened before it is spilled, so the
 		// callee (which reads double params from an XMM register) sees the
 		// right value.
-		if !varargs && t == TInt {
-			if fd, ok := c.funcDefs[n.Name]; ok && i < len(fd.ParamTypes) && fd.ParamTypes[i].Kind == KDouble {
-				c.emit("cvtsi2sd xmm0, rax")
-				t = TDouble
-				c.resTyp = TDouble
-			}
+		if !varargs && t == TInt && i < len(paramTypes) && paramTypes[i] != nil && paramTypes[i].Kind == KDouble {
+			c.emit("cvtsi2sd xmm0, rax")
+			t = TDouble
+			c.resTyp = TDouble
 		}
 		c.tmpDepth++
 		if t == TDouble && !varargs {
@@ -3366,7 +3532,14 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	if sretSz > 0 {
 		c.emit("lea %s, [rbp%+d]", argRegs[0], c.tmpSlot(resK))
 	}
-	c.emit("call %s", target)
+	if indirect {
+		// Reload the target address last: marshalling the arguments above is
+		// free to clobber rax, but nothing between here and the call needs it.
+		c.emit("mov rax, [rbp%+d]", c.tmpSlot(tgtSlot))
+		c.emit("call rax")
+	} else {
+		c.emit("call %s", target)
+	}
 	// Windows API imports return 32-bit values (BOOL/DWORD/int) in EAX; the
 	// upper 32 bits of RAX are not guaranteed to be zero, unlike goclib
 	// functions which leave a clean 64-bit RAX. goc's register model treats
@@ -3374,8 +3547,8 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	// match the declared return type: sign-extend for signed int, zero-extend
 	// for unsigned (DWORD/UINT). 8-byte returns (HANDLE, LONG, pointers) are
 	// left untouched.
-	if !c.linux {
-		if f, ok := c.funcDefs[n.Name]; ok && externDLL[n.Name] != "" &&
+	if !c.linux && !indirect {
+		if f, ok := c.funcDefs[name]; ok && externDLL[name] != "" &&
 			f.Ret != nil && f.Ret.Kind == KInt && f.Ret.Width < 8 {
 			sh := 64 - 8*f.Ret.Width
 			c.emit("shl rax, %d", sh)

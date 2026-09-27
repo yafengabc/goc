@@ -137,6 +137,16 @@ type Call struct {
 	Args []Expr
 }
 
+// IndirectCall is a call whose callee is computed at run time rather than
+// named: (*fp)(x), tab[i](x), s.cb(x). Fn evaluates to the address of the
+// function. A call written directly against an identifier is still a Call --
+// even when that identifier turns out to be a function-pointer variable, which
+// the type checker and code generator resolve later.
+type IndirectCall struct {
+	Fn   Expr
+	Args []Expr
+}
+
 // Index is the subscript operator: arr[i] or ptr[i]. The base may be an array
 // or a pointer; the element type is the base's element type.
 type Index struct {

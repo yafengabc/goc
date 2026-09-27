@@ -283,15 +283,26 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 	case *Ident:
 		t := c.lookup(n.Name)
 		if t == nil {
-			if _, ok := enumConsts[n.Name]; ok {
+			// Functions live in their own namespace, not in the variable
+			// scopes: a bare function name used as an expression is valid even
+			// though no variable declaration provides a type for it.
+			if ft := c.funcTypeByName(n.Name); ft != nil {
+				t = ft
+			} else if _, ok := enumConsts[n.Name]; ok {
 				// Enumerators are integer constants: usable as rvalues.
 				return IntType()
+			} else {
+				c.errf(n.Line, "undeclared identifier %q", n.Name)
+				return IntType()
 			}
-			c.errf(n.Line, "undeclared identifier %q", n.Name)
-			return IntType()
 		}
 		if t.IsArray() {
 			return PtrType(t.Elem) // array decays to pointer
+		}
+		if t.IsFunc() {
+			// A function designator used as a value decays to a pointer to
+			// that function, exactly like an array: "fp = add;".
+			return PtrType(t)
 		}
 		return t
 	case *Unary:
@@ -306,6 +317,14 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			c.checkExpr(n.E, fn)
 			return IntType()
 		case "&":
+			// Taking the address of a function designator is how a function
+			// pointer is initialised ("fp = &add"). The designator is not an
+			// lvalue, so it must be resolved before the lvalue check.
+			if id, ok := n.E.(*Ident); ok {
+				if ft := c.funcTypeByName(id.Name); ft != nil {
+					return PtrType(ft)
+				}
+			}
 			lt, ok := c.checkLValue(n.E, fn)
 			if !ok {
 				return IntType()
@@ -320,12 +339,19 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			if t.Elem == nil {
 				return VoidType()
 			}
+			// *fp on a pointer to function names the function itself, which
+			// decays straight back to the pointer to it.
+			if t.Elem.IsFunc() {
+				return PtrType(t.Elem)
+			}
 			return t.Elem
 		}
 	case *Binary:
 		return c.checkBinary(n, fn)
 	case *Call:
 		return c.checkCall(n, fn)
+	case *IndirectCall:
+		return c.checkIndirectCall(n, fn)
 	case *Index:
 		base := c.checkExpr(n.Base, fn)
 		idx := c.checkExpr(n.Idx, fn)
@@ -455,48 +481,101 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 
 func (c *checker) checkCall(n *Call, fn *FuncDecl) *Type {
 	if fd, ok := c.funcs[n.Name]; ok {
-		return c.checkCallSig(n, fn, fd, false)
+		return c.checkArgs(n.Name, fd.ParamTypes, fd.Variadic, n.Args, fn, fd.Ret)
 	}
 	if pd, ok := c.protos[n.Name]; ok {
-		return c.checkCallSig(n, fn, pd, true)
+		return c.checkArgs(n.Name, pd.ParamTypes, pd.Variadic, n.Args, fn, pd.Ret)
+	}
+	// The name may designate a VARIABLE holding a function pointer: C allows
+	// "fp(x)" exactly like "(*fp)(x)", and goc parses both against identifier
+	// callees. Function names and variables are separate namespaces, so this
+	// is unambiguous once the function tables above have been consulted.
+	if ft := funcTypeOf(c.lookup(n.Name)); ft != nil {
+		return c.checkArgs(n.Name, ft.Params, ft.Variadic, n.Args, fn, ft.Ret)
 	}
 	// External / goclib call whose signature we do not model: accept it and
 	// assume an int result (true for every goclib function goc exposes).
 	return IntType()
 }
 
-// checkCallSig validates a call against a known signature (a definition or a
-// prototype). It reports arity and argument-type mismatches. isProto only
-// affects the diagnostics wording.
-func (c *checker) checkCallSig(n *Call, fn *FuncDecl, sig *FuncDecl, isProto bool) *Type {
-	if sig.Variadic {
-		// Variadic: require at least the named parameters; the trailing
-		// arguments are passed through the va_list and not type-checked here.
-		if len(n.Args) < len(sig.ParamTypes) {
-			what := "function"
-			if isProto {
-				what = "prototype"
+// funcTypeOf returns the function type behind t: KFunc as it stands, or the
+// pointee of a pointer to function -- the only shape a function type can take
+// once it is stored in a variable, parameter, struct member or return value.
+func funcTypeOf(t *Type) *Type {
+	if t == nil {
+		return nil
+	}
+	if t.IsFunc() {
+		return t
+	}
+	if t.IsPtr() && t.Elem != nil && t.Elem.IsFunc() {
+		return t.Elem
+	}
+	return nil
+}
+
+// checkArgs validates a resolved argument list against a parameter list. It
+// reports arity and argument-type mismatches and returns the call result type.
+// A variadic signature requires at least its named parameters.
+func (c *checker) checkArgs(what string, params []*Type, variadic bool, args []Expr, fn *FuncDecl, ret *Type) *Type {
+	if variadic {
+		if len(args) < len(params) {
+			c.errf(0, "call to %q: expected at least %d arguments, got %d", what, len(params), len(args))
+		}
+		for i, a := range args {
+			if i >= len(params) {
+				break // trailing variadic arguments are not type-checked here
 			}
-			c.errf(0, "call to %q (%s): expected at least %d arguments, got %d", n.Name, what, len(sig.ParamTypes), len(n.Args))
+			at := c.checkExpr(a, fn)
+			if !assignable(params[i], at) {
+				c.errf(0, "call to %q: argument %d has type %s, expected %s", what, i+1, at, params[i])
+			}
 		}
-		return sig.Ret
+		return ret
 	}
-	if len(n.Args) != len(sig.ParamTypes) {
-		what := "function"
-		if isProto {
-			what = "prototype"
-		}
-		c.errf(0, "call to %q (%s): expected %d arguments, got %d", n.Name, what, len(sig.ParamTypes), len(n.Args))
-		return sig.Ret
+	if len(args) != len(params) {
+		c.errf(0, "call to %q: expected %d arguments, got %d", what, len(params), len(args))
+		return ret
 	}
-	for i, a := range n.Args {
+	for i, a := range args {
 		at := c.checkExpr(a, fn)
-		if !assignable(sig.ParamTypes[i], at) {
+		if !assignable(params[i], at) {
 			c.errf(0, "call to %q: argument %d has type %s, expected %s",
-				n.Name, i+1, at, sig.ParamTypes[i])
+				what, i+1, at, params[i])
 		}
 	}
-	return sig.Ret
+	return ret
+}
+
+// funcTypeByName returns the type of a declared function (a definition or a
+// prototype), or nil when the name is not one. Functions live in their own
+// namespace, separate from variables.
+func (c *checker) funcTypeByName(name string) *Type {
+	var fd *FuncDecl
+	if f, ok := c.funcs[name]; ok {
+		fd = f
+	} else if p, ok := c.protos[name]; ok {
+		fd = p
+	}
+	if fd == nil {
+		return nil
+	}
+	ft := FuncType(fd.Ret, fd.ParamTypes)
+	ft.Variadic = fd.Variadic
+	return ft
+}
+
+// checkIndirectCall validates a call through a computed function address.
+func (c *checker) checkIndirectCall(n *IndirectCall, fn *FuncDecl) *Type {
+	ft := funcTypeOf(c.checkExpr(n.Fn, fn))
+	if ft == nil {
+		c.errf(0, "called expression (%T) is not a function pointer", n.Fn)
+		for _, a := range n.Args {
+			c.checkExpr(a, fn) // still walk the arguments for their own errors
+		}
+		return IntType()
+	}
+	return c.checkArgs(ft.String(), ft.Params, ft.Variadic, n.Args, fn, ft.Ret)
 }
 
 // assignable reports whether a value of src may be stored into a location of

@@ -114,10 +114,13 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 			return nil, err
 		}
 		for {
-			pd, err := p.parseDeclarator(spec, false, false)
+			pd, err := p.parseDeclarator(spec, true, false)
 			if err != nil {
 				return nil, err
 			}
+			// The alias keeps the declared type verbatim: "typedef int fn(int)"
+			// really does name a function type, and "fn *fp;" is how pointers
+			// to it are declared.
 			typedefs[pd.name] = pd.typ
 			if p.atPunct(",") {
 				p.next()
@@ -189,7 +192,7 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 		return nil, fmt.Errorf("line %d: expected ';' after global declaration", p.cur().Line)
 	}
 	p.next()
-	p.globals = append(p.globals, &DeclStmt{Name: d.name, Typ: d.typ, Init: init, Line: d.line})
+	p.globals = append(p.globals, &DeclStmt{Name: d.name, Typ: declType(d.typ), Init: init, Line: d.line})
 	return nil, nil
 }
 
@@ -368,14 +371,14 @@ func (p *Parser) parseStructMembers() ([]*Member, error) {
 			return nil, err
 		}
 		for {
-			d, err := p.parseDeclarator(spec, false, false)
+			d, err := p.parseDeclarator(spec, true, false)
 			if err != nil {
 				return nil, err
 			}
 			if d.typ == nil {
 				return nil, fmt.Errorf("line %d: expected struct member name", p.cur().Line)
 			}
-			members = append(members, &Member{Name: d.name, Type: d.typ})
+			members = append(members, &Member{Name: d.name, Type: declType(d.typ)})
 			if p.atPunct(",") {
 				p.next()
 				continue
@@ -456,19 +459,42 @@ func (p *Parser) parseDeclarator(base *Type, allowFunc bool, abstract bool) (dec
 		p.next()
 	}
 	var d declResult
-	wasGrouped := false
 	if p.atPunct("(") {
-		p.next()
-		inner, err := p.parseDeclarator(base, allowFunc, abstract)
+		// Parenthesised declarator: "int (*fp)(int)", "int (*tab[4])(void)".
+		// The suffixes that follow the group apply to the OUTER type, not to
+		// the inner declarator, which is exactly what makes (*fp)(int) a
+		// pointer to a function rather than a function returning a pointer.
+		//
+		// Following the standard trick: parse the inner declarator once merely
+		// to step over it, apply the trailing suffixes to base, then rewind and
+		// re-parse the inner part with the suffix-built type as its starting
+		// point. The first pass's result is discarded.
+		open := p.pos
+		p.next() // consume '('
+		if _, err := p.parseDeclarator(base, allowFunc, abstract); err != nil {
+			return d, err
+		}
+		if err := p.expect(")"); err != nil {
+			return d, err
+		}
+		tail, err := p.parseTypeSuffixes(base, allowFunc)
+		if err != nil {
+			return d, err
+		}
+		after := p.pos
+		p.pos = open + 1
+		d, err = p.parseDeclarator(tail.typ, allowFunc, abstract)
 		if err != nil {
 			return d, err
 		}
 		if err := p.expect(")"); err != nil {
 			return d, err
 		}
-		d = inner
-		d.line = inner.line
-		wasGrouped = true
+		p.pos = after
+		// When the inner declarator carries a function suffix it supplies this
+		// declaration's parameter names (e.g. "int (*f(int x))(int)"), so keep
+		// whatever the second pass produced.
+		return d, nil
 	} else if p.cur().Kind == TIdent {
 		nameTok := p.next()
 		d.name = nameTok.Text
@@ -480,8 +506,24 @@ func (p *Parser) parseDeclarator(base *Type, allowFunc bool, abstract bool) (dec
 	} else {
 		return d, fmt.Errorf("line %d: expected declarator name, got %q", p.cur().Line, p.cur().Text)
 	}
-	// Suffixes: array [...], function (...). A function suffix on a grouped
-	// declarator would be a function pointer, which stage 2 does not support.
+	// Suffixes: array [...], function (...).
+	suf, err := p.parseTypeSuffixes(d.typ, allowFunc)
+	if err != nil {
+		return d, err
+	}
+	d.typ = suf.typ
+	d.paramNames = suf.paramNames
+	d.variadic = suf.variadic
+	return d, nil
+}
+
+// parseTypeSuffixes applies the array / function suffixes of a declarator to
+// base and stops at the first token that starts none. It is a separate pass so
+// a parenthesised declarator can have the suffixes behind its closing paren
+// folded into the type its inner declarator starts from.
+func (p *Parser) parseTypeSuffixes(base *Type, allowFunc bool) (declResult, error) {
+	var d declResult
+	d.typ = base
 	for {
 		if p.atPunct("[") {
 			p.next()
@@ -497,14 +539,12 @@ func (p *Parser) parseDeclarator(base *Type, allowFunc bool, abstract bool) (dec
 			if !allowFunc {
 				return d, fmt.Errorf("line %d: function type not allowed here", p.cur().Line)
 			}
-			if wasGrouped {
-				return d, fmt.Errorf("line %d: function pointers are not supported in stage 2", p.cur().Line)
-			}
 			params, names, variadic, err := p.parseParamList()
 			if err != nil {
 				return d, err
 			}
 			d.typ = FuncType(d.typ, params)
+			d.typ.Variadic = variadic
 			d.paramNames = names
 			d.variadic = variadic
 		} else {
@@ -512,6 +552,17 @@ func (p *Parser) parseDeclarator(base *Type, allowFunc bool, abstract bool) (dec
 		}
 	}
 	return d, nil
+}
+
+// declType applies C's declaration adjustment to a declarator's type: a
+// parameter (or object) declared with function type really holds a pointer to
+// that function. Function definitions keep the raw KFunc type, which is why the
+// conversion lives here rather than in parseDeclarator.
+func declType(t *Type) *Type {
+	if t != nil && t.IsFunc() {
+		return PtrType(t)
+	}
+	return t
 }
 
 // parseArrayLength parses a small integer constant expression for [N]. An
@@ -627,6 +678,23 @@ func (p *Parser) consumeEllipsis() {
 	p.next()
 }
 
+// paramIsNamed reports whether the tokens at the cursor (just past a
+// parameter's declaration specifiers) introduce the parameter's name. Skipping
+// pointer prefixes, an identifier that is not itself a type name means the
+// declarator is named; anything else means the parameter is unnamed and its
+// declarator must be parsed abstractly.
+func (p *Parser) paramIsNamed() bool {
+	i := p.pos
+	for i < len(p.toks) && p.toks[i].Kind == TPunct && p.toks[i].Text == "*" {
+		i++
+	}
+	if i >= len(p.toks) {
+		return false
+	}
+	t := p.toks[i]
+	return t.Kind == TIdent && !isTypeName(t)
+}
+
 func (p *Parser) parseParamList() ([]*Type, []string, bool, error) {
 	if err := p.expect("("); err != nil {
 		return nil, nil, false, err
@@ -655,15 +723,26 @@ func (p *Parser) parseParamList() ([]*Type, []string, bool, error) {
 				p.next()
 				return types, names, variadic, nil
 			}
-			return nil, nil, false, fmt.Errorf("line %d: expected parameter name", p.cur().Line)
+			// Otherwise the last parameter is unnamed and ends here; the
+			// abstract-declarator parse below records its type and the loop
+			// consumes the ')'.
 		}
-		pd, err := p.parseDeclarator(spec, false, false)
+		// A parameter may be unnamed ("int f(int, char*)"): only its type
+		// matters, so such a declarator is abstract. Whether a name follows is
+		// decided by looking past any pointer prefixes for an identifier that
+		// is not itself a type specifier.
+		abstract := !p.paramIsNamed()
+		pd, err := p.parseDeclarator(spec, true, abstract)
 		if err != nil {
 			return nil, nil, false, err
 		}
+		// C's parameter adjustment: an array parameter decays to a pointer to
+		// its element type, and a function parameter becomes a pointer to that
+		// function (so "int f(int (*cb)(int))" receives an 8-byte pointer).
 		if pd.typ.IsArray() {
 			pd.typ = PtrType(pd.typ.Elem)
 		}
+		pd.typ = declType(pd.typ)
 		types = append(types, pd.typ)
 		names = append(names, pd.name)
 		if p.atPunct(",") {
@@ -861,10 +940,7 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 	}
 	var decls []*DeclStmt
 	for {
-		pd, err := p.parseDeclarator(spec, false, false)
-		if err != nil {
-			return nil, err
-		}
+		pd, err := p.parseDeclarator(spec, true, false)
 		var init Expr
 		if p.atPunct("=") {
 			p.next()
@@ -873,7 +949,7 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 				return nil, err
 			}
 		}
-		decls = append(decls, &DeclStmt{Name: pd.name, Typ: pd.typ, Init: init, Line: pd.line})
+		decls = append(decls, &DeclStmt{Name: pd.name, Typ: declType(pd.typ), Init: init, Line: pd.line})
 		if p.atPunct(",") {
 			p.next()
 			continue
@@ -1150,7 +1226,7 @@ func (p *Parser) parseUnary() (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			dt, err := p.parseDeclarator(spec, false, true)
+			dt, err := p.parseDeclarator(spec, true, true)
 			if err != nil {
 				return nil, err
 			}
@@ -1206,7 +1282,7 @@ func (p *Parser) parseUnary() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		dt, err := p.parseDeclarator(spec, false, true)
+		dt, err := p.parseDeclarator(spec, true, true)
 		if err != nil {
 			return nil, err
 		}
@@ -1229,15 +1305,15 @@ func (p *Parser) parsePostfix() (Expr, error) {
 	}
 	for {
 		if p.atPunct("(") {
-			id, ok := e.(*Ident)
-			if !ok {
-				return nil, fmt.Errorf("line %d: cannot call a non-function expression", p.cur().Line)
-			}
+			// Any expression may be called: a plain identifier takes the
+			// direct-call path, everything else ((*fp)(x), tab[i](x),
+			// s.cb(x)) goes through a computed address.
+			id, _ := e.(*Ident)
 			p.next()
 			// va_arg(ap, Type): the second argument is a type name, not an
 			// expression, so it cannot go through the normal comma-expression
 			// parsing. Build a dedicated VaArgExpr node instead.
-			if id.Name == "va_arg" {
+			if id != nil && id.Name == "va_arg" {
 				ap, err := p.parseExpr()
 				if err != nil {
 					return nil, err
@@ -1249,7 +1325,7 @@ func (p *Parser) parsePostfix() (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
-				dt, err := p.parseDeclarator(spec, false, true)
+				dt, err := p.parseDeclarator(spec, true, true)
 				if err != nil {
 					return nil, err
 				}
@@ -1277,7 +1353,15 @@ func (p *Parser) parsePostfix() (Expr, error) {
 			if err := p.expect(")"); err != nil {
 				return nil, err
 			}
-			e = &Call{Name: id.Name, Args: args}
+			// A callee that is a plain identifier stays a Call (the fast path
+			// every direct call -- including calls through a function-pointer
+			// VARIABLE -- takes). Anything else is reached through a computed
+			// address: (*fp)(x), tab[i](x), s.cb(x), (f ? g : h)(x).
+			if id, ok := e.(*Ident); ok {
+				e = &Call{Name: id.Name, Args: args}
+			} else {
+				e = &IndirectCall{Fn: e, Args: args}
+			}
 		} else if p.atPunct("[") {
 			p.next()
 			idx, err := p.parseExpr()
