@@ -50,7 +50,12 @@ for asm in examples/*.asm; do
     # Strip CR: the console layer may emit CRLF on Windows.
     tr -d '\r' < "/tmp/a0_$name.raw" > "/tmp/a0_$name.out"
 
-    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/a0_$name.out" > "/tmp/a0_$name.diff"; then
+    # Always run diff so the diagnostic file exists even on crash (the
+    # rc!=0 || !diff short-circuit previously skipped diff, leaving sed
+    # with no file to read).
+    diff -u "$exp" "/tmp/a0_$name.out" > "/tmp/a0_$name.diff"
+    diffrc=$?
+    if [ "$rc" -ne 0 ] || [ "$diffrc" -ne 0 ]; then
         echo "FAIL  $name (exit=$rc)"
         sed -n '1,12p' "/tmp/a0_$name.diff"
         echo "  raw bytes:"

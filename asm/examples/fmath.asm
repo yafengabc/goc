@@ -70,6 +70,11 @@ _start:
     call ExitProcess
 
 write_digit:
+    ; Windows x64 ABI: allocate 32 bytes of shadow space plus an 8-byte pad so
+    ; that RSP is 16-byte aligned when WriteFile is entered (callee entry
+    ; requires RSP % 16 == 8; entering with % 16 == 0 can crash on stricter
+    ; Windows Server console I/O paths, e.g. CI runners).
+    sub rsp, 40
     add al, 48
     mov [rip+buf], al
     mov rcx, [rip+hStdout]
@@ -78,4 +83,5 @@ write_digit:
     lea r9, [rip+bytesWritten]
     mov [rsp+32], 0
     call WriteFile
+    add rsp, 40
     ret
