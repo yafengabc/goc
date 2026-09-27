@@ -87,7 +87,9 @@ section .text
 __goclib_vfmt:
     ; rcx = dst, rdx = fmt, r8 = va array, r9 = limit -> rax = chars written
     ; Supports %d %s %c %x %f %%. Stops as soon as the buffer is full.
-    ; %f prints a fixed 6 fractional digits, like C's default %.6f.
+    ; %f honours an optional ".precision": %f == %.6f, %.Nf prints N digits,
+    ; %.0f prints none. Field width is parsed and ignored; output is truncated
+    ; (no rounding), matching the existing default-precision behaviour.
     push rbp
     mov rbp, rsp
     push rbx
@@ -120,6 +122,50 @@ __goclib_vfmt_loop:
     jmp __goclib_vfmt_loop
 __goclib_vfmt_pct:
     inc rsi
+    ; Parse optional field width (ignored), then ".precision", then any length
+    ; modifier, so %f / %.6f / %.15f / %10.2f all reach the specifier with r9
+    ; holding the fractional-digit count (default 6 when no '.' appears).
+    mov r9, 6                    ; default precision
+__goclib_vfmt_pf_width:
+    xor rax, rax
+    mov al, [rsi]
+    cmp rax, 0x30
+    jb __goclib_vfmt_pf_dot
+    cmp rax, 0x39
+    ja __goclib_vfmt_pf_dot
+    inc rsi                      ; skip a width digit (width unsupported)
+    jmp __goclib_vfmt_pf_width
+__goclib_vfmt_pf_dot:
+    cmp rax, 0x2e                ; '.'
+    jne __goclib_vfmt_pf_len
+    inc rsi
+    xor r9, r9                   ; '.' seen: reset precision accumulator
+__goclib_vfmt_pf_prec:
+    xor rax, rax
+    mov al, [rsi]
+    cmp rax, 0x30
+    jb __goclib_vfmt_pf_len
+    cmp rax, 0x39
+    ja __goclib_vfmt_pf_len
+    imul r9, 10
+    add r9, rax
+    sub r9, 0x30
+    inc rsi
+    jmp __goclib_vfmt_pf_prec
+__goclib_vfmt_pf_len:
+    cmp rax, 0x6c                ; 'l'
+    je __goclib_vfmt_pf_skip_len
+    cmp rax, 0x4c                ; 'L'
+    je __goclib_vfmt_pf_skip_len
+    cmp rax, 0x68                ; 'h'
+    je __goclib_vfmt_pf_skip_len
+    jmp __goclib_vfmt_pf_done
+__goclib_vfmt_pf_skip_len:
+    inc rsi
+    xor rax, rax
+    mov al, [rsi]
+    jmp __goclib_vfmt_pf_len
+__goclib_vfmt_pf_done:
     xor rax, rax
     mov al, [rsi]
     cmp rax, 0                   ; trailing '%' -> stop
@@ -264,13 +310,19 @@ __goclib_vfmt_flt_em:
     jge __goclib_vfmt_done
     jmp __goclib_vfmt_flt_em
 __goclib_vfmt_flt_dot:
+    cmp r9, 0
+    je __goclib_vfmt_flt_nodot
     mov bl, 0x2e                 ; '.'
     mov [rdi+r12], bl
     inc r12
     cmp r12, r14
     jge __goclib_vfmt_done
-    mov r9, 6                    ; six fractional digits
+__goclib_vfmt_flt_nodot:
+    jmp __goclib_vfmt_flt_fr
 __goclib_vfmt_flt_fr:
+    cmp r9, 0                    ; no more fractional digits?
+    je __goclib_vfmt_next
+    dec r9
     mulsd xmm0, [rip+__goclib_f10]
     cvttsd2si rcx, xmm0          ; next digit
     cvtsi2sd xmm1, rcx
@@ -281,9 +333,7 @@ __goclib_vfmt_flt_fr:
     inc r12
     cmp r12, r14
     jge __goclib_vfmt_done
-    dec r9
-    jne __goclib_vfmt_flt_fr
-    jmp __goclib_vfmt_next
+    jmp __goclib_vfmt_flt_fr
 __goclib_vfmt_flt_neg:
     mov bl, 0x2d                 ; '-'
     mov [rdi+r12], bl
@@ -1122,7 +1172,9 @@ section .text
 __goclib_vfmt:
     ; rdi = dst, rsi = fmt, rdx = va array, rcx = limit -> rax = chars written
     ; Supports %d %s %c %x %f %%. Stops as soon as the buffer is full.
-    ; %f prints a fixed 6 fractional digits, like C's default %.6f.
+    ; %f honours an optional ".precision": %f == %.6f, %.Nf prints N digits,
+    ; %.0f prints none. Field width is parsed and ignored; output is truncated
+    ; (no rounding), matching the existing default-precision behaviour.
     push rbp
     mov rbp, rsp
     push rbx
@@ -1153,6 +1205,50 @@ __goclib_vfmt_loop:
     jmp __goclib_vfmt_loop
 __goclib_vfmt_pct:
     inc rsi
+    ; Parse optional field width (ignored), then ".precision", then any length
+    ; modifier, so %f / %.6f / %.15f / %10.2f all reach the specifier with r9
+    ; holding the fractional-digit count (default 6 when no '.' appears).
+    mov r9, 6                    ; default precision
+__goclib_vfmt_pf_width:
+    xor rax, rax
+    mov al, [rsi]
+    cmp rax, 0x30
+    jb __goclib_vfmt_pf_dot
+    cmp rax, 0x39
+    ja __goclib_vfmt_pf_dot
+    inc rsi                      ; skip a width digit (width unsupported)
+    jmp __goclib_vfmt_pf_width
+__goclib_vfmt_pf_dot:
+    cmp rax, 0x2e                ; '.'
+    jne __goclib_vfmt_pf_len
+    inc rsi
+    xor r9, r9                   ; '.' seen: reset precision accumulator
+__goclib_vfmt_pf_prec:
+    xor rax, rax
+    mov al, [rsi]
+    cmp rax, 0x30
+    jb __goclib_vfmt_pf_len
+    cmp rax, 0x39
+    ja __goclib_vfmt_pf_len
+    imul r9, 10
+    add r9, rax
+    sub r9, 0x30
+    inc rsi
+    jmp __goclib_vfmt_pf_prec
+__goclib_vfmt_pf_len:
+    cmp rax, 0x6c                ; 'l'
+    je __goclib_vfmt_pf_skip_len
+    cmp rax, 0x4c                ; 'L'
+    je __goclib_vfmt_pf_skip_len
+    cmp rax, 0x68                ; 'h'
+    je __goclib_vfmt_pf_skip_len
+    jmp __goclib_vfmt_pf_done
+__goclib_vfmt_pf_skip_len:
+    inc rsi
+    xor rax, rax
+    mov al, [rsi]
+    jmp __goclib_vfmt_pf_len
+__goclib_vfmt_pf_done:
     xor rax, rax
     mov al, [rsi]
     cmp rax, 0                   ; trailing '%' -> stop
@@ -1288,13 +1384,19 @@ __goclib_vfmt_flt_em:
     jge __goclib_vfmt_done
     jmp __goclib_vfmt_flt_em
 __goclib_vfmt_flt_dot:
+    cmp r9, 0
+    je __goclib_vfmt_flt_nodot
     mov bl, 0x2e                 ; '.'
     mov [r15+r12], bl
     inc r12
     cmp r12, r14
     jge __goclib_vfmt_done
-    mov r9, 6                    ; six fractional digits
+__goclib_vfmt_flt_nodot:
+    jmp __goclib_vfmt_flt_fr
 __goclib_vfmt_flt_fr:
+    cmp r9, 0                    ; no more fractional digits?
+    je __goclib_vfmt_next
+    dec r9
     mulsd xmm0, [rip+__goclib_f10]
     cvttsd2si rcx, xmm0          ; next digit
     cvtsi2sd xmm1, rcx
@@ -1305,9 +1407,7 @@ __goclib_vfmt_flt_fr:
     inc r12
     cmp r12, r14
     jge __goclib_vfmt_done
-    dec r9
-    jne __goclib_vfmt_flt_fr
-    jmp __goclib_vfmt_next
+    jmp __goclib_vfmt_flt_fr
 __goclib_vfmt_flt_neg:
     mov bl, 0x2d                 ; '-'
     mov [r15+r12], bl
