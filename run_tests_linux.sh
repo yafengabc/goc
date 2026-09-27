@@ -57,6 +57,9 @@ for src in examples/*.c; do
     if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/c0l_$name.out" >"/tmp/c0l_$name.diff"; then
         echo "FAIL  $name  (exit=$rc)"
         sed -n '1,12p' "/tmp/c0l_$name.diff"
+        echo "--- actual output (od -c) ---"
+        od -c "/tmp/c0l_$name.out" | head -25
+        echo "--- stderr ---"
         head -3 "/tmp/c0l_$name.err"
         fail=$((fail + 1))
     else
@@ -91,6 +94,9 @@ for asm in asm/examples/linux/*.asm; do
     if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/a0l_$name.out" >"/tmp/a0l_$name.diff"; then
         echo "FAIL  linux/$name  (exit=$rc)"
         sed -n '1,12p' "/tmp/a0l_$name.diff"
+        echo "--- actual output (od -c) ---"
+        od -c "/tmp/a0l_$name.out" | head -25
+        echo "--- stderr ---"
         head -3 "/tmp/a0l_$name.err"
         fail=$((fail + 1))
     else

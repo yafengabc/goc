@@ -745,7 +745,9 @@ func (a *Assembler) encodeMovRegMem(regOp Operand, memOp Operand, store, isByte 
 		if e.rexB {
 			rex |= 0x01
 		}
-		if rex != 0x40 {
+		// spl/bpl/sil/dil (ModRM.reg 4..7) require a REX prefix: without it they
+		// decode as ah/ch/dh/bh. Only al/cl/dl/bl (0..3) may omit the REX byte.
+		if rex != 0x40 || (regField >= 4 && regField <= 7) {
 			a.emitByte(rex)
 		}
 	} else {
@@ -1243,7 +1245,10 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 	if dst.kind == K_REG && src.kind == K_REG {
 		if dst.isByte || src.isByte {
 			// REX must precede the opcode. reg field = dst (REX.R), rm = src (REX.B).
-			if dst.reg >= 8 || src.reg >= 8 {
+			// spl/bpl/sil/dil (4..7) also need a REX prefix or they decode as ah/ch/dh/bh.
+			needRex := dst.reg >= 8 || src.reg >= 8 ||
+				(dst.reg >= 4 && dst.reg <= 7) || (src.reg >= 4 && src.reg <= 7)
+			if needRex {
 				rex := byte(0x40)
 				if dst.reg >= 8 {
 					rex |= 0x04
@@ -1278,8 +1283,11 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 	if dst.kind == K_MEM && dst.isRip && src.kind == K_REG {
 		if src.isByte {
 			// 0x88 = mov r/m8, r8: modrm reg field = src -> REX.R (0x44), not REX.B.
+			// spl/bpl/sil/dil (4..7) also need a bare REX (0x40) or they decode as ah/ch/dh/bh.
 			if src.reg >= 8 {
 				a.emitByte(0x44)
+			} else if src.reg >= 4 {
+				a.emitByte(0x40)
 			}
 			a.emitByte(0x88) // store r/m8, r8
 			a.emitByte(modrmRip(src.reg))
@@ -1298,8 +1306,11 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 	// mov reg8, [rip+sym]  (8-bit load)
 	if dst.kind == K_REG && dst.isByte && src.kind == K_MEM && src.isRip {
 		// 0x8A = mov r8, r/m8: modrm reg field = dst -> REX.R (0x44).
+		// spl/bpl/sil/dil (4..7) also need a bare REX (0x40) or they decode as ah/ch/dh/bh.
 		if dst.reg >= 8 {
 			a.emitByte(0x44)
+		} else if dst.reg >= 4 {
+			a.emitByte(0x40)
 		}
 		a.emitByte(0x8A)
 		a.emitByte(modrmRip(dst.reg))
