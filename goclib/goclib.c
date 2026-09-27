@@ -1,13 +1,13 @@
-#include "c0lib.h"
+#include "goclib.h"
 #include <stdarg.h>
 
 /* =============================================================================
- * c0lib.c — portable implementation of the c0 C library.
+ * goclib.c — portable implementation of the goc C library.
  *
- * See c0lib.h for the layering and the migration plan. Everything here is plain
- * C layered on the five __clib_* platform primitives. This file is dormant
- * until c0 can compile it (stage 5); the working backend today is the assembly
- * under clib/windows/ and clib/linux/.
+ * See goclib.h for the layering and the migration plan. Everything here is plain
+ * C layered on the five __goclib_* platform primitives. This file is dormant
+ * until goc can compile it (stage 5); the working backend today is the assembly
+ * under goclib/windows/ and goclib/linux/.
  * ========================================================================== */
 
 /* ----------------------------- <string.h> ------------------------------- */
@@ -97,16 +97,16 @@ int memcmp(const void *a, const void *b, size_t n) {
 /* ----------------------------- <stdlib.h> ------------------------------- */
 
 void *malloc(size_t size) {
-    return __clib_heap_alloc((long)size);
+    return __goclib_heap_alloc((long)size);
 }
 
 void free(void *p) {
-    __clib_heap_free(p);
+    __goclib_heap_free(p);
 }
 
 void *calloc(size_t n, size_t size) {
     size_t total = n * size;
-    void *p = __clib_heap_alloc((long)total);
+    void *p = __goclib_heap_alloc((long)total);
     if (p) memset(p, 0, total);
     return p;
 }
@@ -166,7 +166,7 @@ void srand(unsigned int seed) {
 }
 
 void exit(int code) {
-    __clib_exit((long)code);
+    __goclib_exit((long)code);
 }
 
 /* ----------------------------- <stdio.h> --------------------------------- */
@@ -301,26 +301,26 @@ int printf(const char *fmt, ...) {
     va_start(ap, fmt);
     int n = vfmt(buf, 512, fmt, ap);
     va_end(ap);
-    __clib_write(buf, n);
+    __goclib_write(buf, n);
     return n;
 }
 
 int puts(const char *s) {
     long n = (long)strlen(s);
-    __clib_write(s, n);
-    __clib_write("\n", 1);
+    __goclib_write(s, n);
+    __goclib_write("\n", 1);
     return 0;
 }
 
 int putchar(int c) {
     char b = (char)c;
-    __clib_write(&b, 1);
+    __goclib_write(&b, 1);
     return c;
 }
 
 int getchar(void) {
     char b;
-    long n = __clib_read(&b, 1);
+    long n = __goclib_read(&b, 1);
     if (n <= 0) return -1;
     return (unsigned char)b;
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""peun.py -- run a Windows x86-64 PE (as produced by a0) under Unicorn.
+"""peun.py -- run a Windows x86-64 PE (as produced by goa) under Unicorn.
 
 Mirror of ucrun.py for the Windows side: instead of emulating Linux
 syscalls we hook the import thunks (`call [rip+disp32]`) and emulate the
@@ -40,7 +40,7 @@ class Trap(Exception):
 
 
 class PE:
-    """Parse a minimal PE32+ (the kind a0 writes) into loadable sections."""
+    """Parse a minimal PE32+ (the kind goa writes) into loadable sections."""
 
     def __init__(self, data):
         pe = struct.unpack_from("<I", data, 0x3C)[0]

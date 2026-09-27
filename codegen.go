@@ -8,8 +8,8 @@ import (
 	"strings"
 )
 
-// CG emits x86-64 assembly in the Intel syntax that a0 (our own assembler)
-// understands. No gcc anywhere in the pipeline: c0 -> .asm -> a0 -> .exe.
+// CG emits x86-64 assembly in the Intel syntax that goa (our own assembler)
+// understands. No gcc anywhere in the pipeline: goc -> .asm -> goa -> .exe.
 //
 // The generated code follows the Windows x64 ABI: integer args in RCX/RDX/R8/R9,
 // a 32-byte shadow space reserved by the caller, and RSP kept 16-byte aligned
@@ -24,32 +24,32 @@ type varInfo struct {
 }
 
 type CG struct {
-	sb        strings.Builder
-	strs      []StrLit
-	strLab    map[*StrLit]string
-	doubles   []float64
-	doubleLab map[float64]string
-	label     int
-	vars      map[string]varInfo // per-function: param = +off, local = -off
-	localBytes int               // bytes consumed by stack-resident locals (incl. array padding)
-	regArea   int                // bytes reserved just below rbp for saved callee-save regs
-	globals   map[string]bool    // names of program-level (global/static) variables
-	globalLab map[string]string  // name -> .data label for a global variable
-	usedRegs  []string           // callee-save registers actually used as local homes
-	tmpDepth  int                // live expression-temporary slots
-	funcs     map[string]bool    // user-defined functions (by name)
-	funcDefs  map[string]*FuncDecl
-	calls     map[string]bool // functions called that are not defined here
-	need      map[string]bool // clib functions this program actually uses
-	linux     bool            // true -> SysV ABI + ELF output
-	curRet   *Type  // return type of the function being generated
-	curParam []*Type // parameter types of the current function
-	resTyp    CType           // type of the value left by the last genExprT
-	resSigned bool            // signedness of the last genExprT result (int-class only)
-	tmpSgn    []bool          // signedness of each expression-temporary slot
-	loops     []loopLabels    // active loop targets for break/continue
-	saveBaseOff int           // rbp offset of the variadic save area (0 if none)
-	nFixed    int             // number of named params before "..." in the current fn
+	sb          strings.Builder
+	strs        []StrLit
+	strLab      map[*StrLit]string
+	doubles     []float64
+	doubleLab   map[float64]string
+	label       int
+	vars        map[string]varInfo // per-function: param = +off, local = -off
+	localBytes  int                // bytes consumed by stack-resident locals (incl. array padding)
+	regArea     int                // bytes reserved just below rbp for saved callee-save regs
+	globals     map[string]bool    // names of program-level (global/static) variables
+	globalLab   map[string]string  // name -> .data label for a global variable
+	usedRegs    []string           // callee-save registers actually used as local homes
+	tmpDepth    int                // live expression-temporary slots
+	funcs       map[string]bool    // user-defined functions (by name)
+	funcDefs    map[string]*FuncDecl
+	calls       map[string]bool // functions called that are not defined here
+	need        map[string]bool // goclib functions this program actually uses
+	linux       bool            // true -> SysV ABI + ELF output
+	curRet      *Type           // return type of the function being generated
+	curParam    []*Type         // parameter types of the current function
+	resTyp      CType           // type of the value left by the last genExprT
+	resSigned   bool            // signedness of the last genExprT result (int-class only)
+	tmpSgn      []bool          // signedness of each expression-temporary slot
+	loops       []loopLabels    // active loop targets for break/continue
+	saveBaseOff int             // rbp offset of the variadic save area (0 if none)
+	nFixed      int             // number of named params before "..." in the current fn
 }
 
 // loopLabels records the break/continue targets of the innermost loop.
@@ -91,7 +91,7 @@ func (c *CG) shadowSpace() int {
 	return 32
 }
 
-// maxArgs is the number of integer arguments c0 can pass. Four go in
+// maxArgs is the number of integer arguments goc can pass. Four go in
 // RCX/RDX/R8/R9; the rest are spilled onto the stack at [rsp+32] and up,
 // which is what lets printf() take more than three varargs.
 const maxArgs = 8
@@ -104,9 +104,9 @@ const scratchSlots = 32
 // Anything not listed here is a hard error rather than a silent guess.
 // The C library itself (printf, strlen, malloc, ...) is implemented in pure
 // assembly on top of kernel32 (Windows) or syscalls (Linux). The one source is
-// clib/clib.asm, conditionally compiled per target (see selectPlatform); the
-// portable C version clib/c0lib.c is the intended replacement once c0 can
-// compile it, but c0 cannot today. There is no msvcrt anywhere in the pipeline.
+// goclib/goclib.asm, conditionally compiled per target (see selectPlatform); the
+// portable C version goclib/goclib.c is the intended replacement once goc can
+// compile it, but goc cannot today. There is no msvcrt anywhere in the pipeline.
 var externDLL = map[string]string{
 	"GetStdHandle":   "kernel32",
 	"WriteFile":      "kernel32",
@@ -120,7 +120,7 @@ var externDLL = map[string]string{
 }
 
 // externLinux lists the syscall names an ELF-target program may reach for.
-// a0 turns each into a `mov rax,N; syscall; ret` stub, so the C code never
+// goa turns each into a `mov rax,N; syscall; ret` stub, so the C code never
 // links against a library.
 var externLinux = map[string]bool{
 	"read": true, "write": true, "open": true, "close": true,
@@ -130,10 +130,10 @@ var externLinux = map[string]bool{
 }
 
 // ---------------------------------------------------------------------------
-// clib: the C library
+// goclib: the C library
 // ---------------------------------------------------------------------------
 //
-// The .asm file clib/clib.asm is embedded into c0 at build time. It is ONE
+// The .asm file goclib/goclib.asm is embedded into goc at build time. It is ONE
 // source that carries BOTH platforms, selected per target by conditional
 // compilation: the Windows body lives under "#if defined(_WIN64)" and the
 // Linux body under the matching "#else" (see selectPlatform). This is the same
@@ -143,65 +143,65 @@ var externLinux = map[string]bool{
 // Inside the selected branch each function sits in a
 // block marked with "; @func <name>" and can declare what it needs:
 //
-//	; @deps __clib_write strlen   other clib functions to pull in
+//	; @deps __goclib_write strlen   other goclib functions to pull in
 //	; @extern WriteFile           imports to declare
 //
-// A block marked "; @data" holds that file's static data. c0 emits only the
+// A block marked "; @data" holds that file's static data. goc emits only the
 // functions a program actually calls (plus their transitive deps), so a
 // hello-world does not pay for malloc.
 //
 // The genuinely cross-platform algorithms (strlen, strcpy, printf formatting,
-// strtol, rand, ...) are also written in portable C in clib/c0lib.c, ready to
-// REPLACE this assembly once c0 supports char/pointer/globals/for (stage 5).
+// strtol, rand, ...) are also written in portable C in goclib/goclib.c, ready to
+// REPLACE this assembly once goc supports char/pointer/globals/for (stage 5).
 // Until then the assembly below is the backend that actually runs.
 
-//go:embed clib/*.asm
-var clibFS embed.FS
+//go:embed goclib/*.asm
+var goclibFS embed.FS
 
-type clibFunc struct {
+type goclibFunc struct {
 	name string
-	deps []string // other clib functions required
+	deps []string // other goclib functions required
 	exts []string // imported symbols required
 	body string
 	file string
 }
 
-// clibDataBlock is a chunk of static data emitted only when at least one of
+// goclibDataBlock is a chunk of static data emitted only when at least one of
 // the functions named in `needs` made it into the program. That keeps
 // printf's 512-byte output buffer out of a program that only calls putchar.
-type clibDataBlock struct {
+type goclibDataBlock struct {
 	file  string
 	needs []string
 	text  string
 }
 
 var (
-	clibFuncsWin    = map[string]*clibFunc{}
-	clibOrderWin    []string // source order, for stable output
-	clibBlocksWin   []clibDataBlock
-	clibFuncsLinux  = map[string]*clibFunc{}
-	clibOrderLinux  []string
-	clibBlocksLinux []clibDataBlock
-	clibErr         error
+	goclibFuncsWin    = map[string]*goclibFunc{}
+	goclibOrderWin    []string // source order, for stable output
+	goclibBlocksWin   []goclibDataBlock
+	goclibFuncsLinux  = map[string]*goclibFunc{}
+	goclibOrderLinux  []string
+	goclibBlocksLinux []goclibDataBlock
+	goclibErr         error
 )
 
-// clibStore picks the tables for a target.
-func clibStore(linux bool) (map[string]*clibFunc, *[]string, *[]clibDataBlock) {
+// goclibStore picks the tables for a target.
+func goclibStore(linux bool) (map[string]*goclibFunc, *[]string, *[]goclibDataBlock) {
 	if linux {
-		return clibFuncsLinux, &clibOrderLinux, &clibBlocksLinux
+		return goclibFuncsLinux, &goclibOrderLinux, &goclibBlocksLinux
 	}
-	return clibFuncsWin, &clibOrderWin, &clibBlocksWin
+	return goclibFuncsWin, &goclibOrderWin, &goclibBlocksWin
 }
 
-func init() { clibErr = loadClib() }
+func init() { goclibErr = loadClib() }
 
 func loadClib() error {
 	// The same embedded file is loaded twice, once per target; selectPlatform
 	// strips the branch that does not apply before the @func blocks are parsed.
-	if err := loadClibDir(clibFS, "clib", false); err != nil {
+	if err := loadClibDir(goclibFS, "goclib", false); err != nil {
 		return err
 	}
-	return loadClibDir(clibFS, "clib", true)
+	return loadClibDir(goclibFS, "goclib", true)
 }
 
 func loadClibDir(fs embed.FS, dir string, linux bool) error {
@@ -231,15 +231,15 @@ func loadClibDir(fs embed.FS, dir string, linux bool) error {
 	return nil
 }
 
-// clibAlias maps a C name to a different symbol on Linux. Needed where the C
-// name would collide with an a0 syscall stub of the same name.
-var clibAliasLinux = map[string]string{
-	"exit": "__clib_exit",
+// goclibAlias maps a C name to a different symbol on Linux. Needed where the C
+// name would collide with an goa syscall stub of the same name.
+var goclibAliasLinux = map[string]string{
+	"exit": "__goclib_exit",
 }
 
 // selectPlatform evaluates a small subset of C conditional compilation over the
-// clib assembly source and returns only the lines that apply to the current
-// target. a0 assembly has no '#' lines of its own, so the directives are
+// goclib assembly source and returns only the lines that apply to the current
+// target. goa assembly has no '#' lines of its own, so the directives are
 // unambiguous. Supported:
 //
 //	#if defined(_WIN64)      #elif defined(__linux__)
@@ -247,15 +247,15 @@ var clibAliasLinux = map[string]string{
 //	#if 0  #if 1
 //
 // and the boolean operators ! && || ( ) inside the expressions. This is what
-// lets one clib.asm carry both platforms, selected at load time — the same
+// lets one goclib.asm carry both platforms, selected at load time — the same
 // trick a normal compiler uses for inline assembly.
-// clibFrame tracks one #if/#else chain level during platform selection.
-type clibFrame struct{ active, taken bool }
+// goclibFrame tracks one #if/#else chain level during platform selection.
+type goclibFrame struct{ active, taken bool }
 
 func selectPlatform(src string, linux bool) string {
 	def := map[string]bool{"_WIN64": !linux, "__linux__": linux, "__x86_64__": true}
 	lines := strings.Split(src, "\n")
-	stack := []clibFrame{{active: true}}
+	stack := []goclibFrame{{active: true}}
 	out := make([]string, 0, len(lines))
 	eval := func(expr string) bool {
 		toks := ceLex(expr)
@@ -267,7 +267,7 @@ func selectPlatform(src string, linux bool) string {
 		switch {
 		case strings.HasPrefix(t, "#if "):
 			c := eval(strings.TrimSpace(t[3:]))
-			stack = append(stack, clibFrame{active: topActive(stack) && c, taken: c})
+			stack = append(stack, goclibFrame{active: topActive(stack) && c, taken: c})
 			continue
 		case strings.HasPrefix(t, "#elif "):
 			f := &stack[len(stack)-1]
@@ -297,7 +297,7 @@ func selectPlatform(src string, linux bool) string {
 	return strings.Join(out, "\n")
 }
 
-func topActive(s []clibFrame) bool {
+func topActive(s []goclibFrame) bool {
 	if len(s) == 0 {
 		return true
 	}
@@ -425,14 +425,14 @@ func isIdentStart(c byte) bool { return c == '_' || (c >= 'a' && c <= 'z') || (c
 func isIdentChar(c byte) bool  { return isIdentStart(c) || (c >= '0' && c <= '9') }
 
 func parseClib(file, src string, linux bool) error {
-	funcs, order, blocks := clibStore(linux)
-	var cur *clibFunc
+	funcs, order, blocks := goclibStore(linux)
+	var cur *goclibFunc
 	var data []string
 	var dataNeeds []string
 	inData := false
 	flush := func() error {
 		if inData {
-			*blocks = append(*blocks, clibDataBlock{
+			*blocks = append(*blocks, goclibDataBlock{
 				file:  file,
 				needs: dataNeeds,
 				text:  strings.Join(data, "\n"),
@@ -477,7 +477,7 @@ func parseClib(file, src string, linux bool) error {
 			if name == "" {
 				return fmt.Errorf("@func without a name")
 			}
-			cur = &clibFunc{name: name, file: file}
+			cur = &goclibFunc{name: name, file: file}
 		case strings.HasPrefix(t, "; @deps"):
 			if cur == nil {
 				return fmt.Errorf("@deps outside a function")
@@ -499,10 +499,10 @@ func parseClib(file, src string, linux bool) error {
 	return flush()
 }
 
-// clibUsed expands the set of needed clib functions into their transitive
+// goclibUsed expands the set of needed goclib functions into their transitive
 // closure, and reports the imports and static data that go with them.
-func clibUsed(need map[string]bool, linux bool) (order []string, exts []string, data string, err error) {
-	funcs, _, blocks := clibStore(linux)
+func goclibUsed(need map[string]bool, linux bool) (order []string, exts []string, data string, err error) {
+	funcs, _, blocks := goclibStore(linux)
 	seen := map[string]bool{}
 	queue := make([]string, 0, len(need))
 	for n := range need {
@@ -517,7 +517,7 @@ func clibUsed(need map[string]bool, linux bool) (order []string, exts []string, 
 		}
 		f, ok := funcs[n]
 		if !ok {
-			return nil, nil, "", fmt.Errorf("clib: function %q is not defined for this target", n)
+			return nil, nil, "", fmt.Errorf("goclib: function %q is not defined for this target", n)
 		}
 		seen[n] = true
 		order = append(order, n)
@@ -554,15 +554,15 @@ func clibUsed(need map[string]bool, linux bool) (order []string, exts []string, 
 	return order, exts, db.String(), nil
 }
 
-// clibNames lists the public (non-internal) clib functions, for error messages.
-func clibNames(linux bool) []string {
-	funcs, order, _ := clibStore(linux)
+// goclibNames lists the public (non-internal) goclib functions, for error messages.
+func goclibNames(linux bool) []string {
+	funcs, order, _ := goclibStore(linux)
 	_ = funcs
 	var out []string
 	for _, n := range *order {
 		if strings.HasPrefix(n, "__") {
 			// Internal name that a C-facing alias points at: report the C name.
-			for cName, sym := range clibAliasLinux {
+			for cName, sym := range goclibAliasLinux {
 				if sym == n {
 					out = append(out, cName)
 				}
@@ -594,7 +594,7 @@ func (c *CG) emit(format string, a ...any) {
 
 // loadVar emits code that loads variable vi's value into rax (int) or xmm0
 // (double), and records the resulting type in c.resTyp.
-// movsd (not movq) is used for the XMM <-> memory moves: a0 only knows the
+// movsd (not movq) is used for the XMM <-> memory moves: goa only knows the
 // GP <-> XMM forms of movq.
 func (c *CG) loadVar(vi varInfo) {
 	if vi.reg != "" {
@@ -845,10 +845,10 @@ func (c *CG) genExpr(e Expr) error {
 }
 
 // Gen produces the full assembly source for a program. linux selects the
-// SysV ABI and the Linux clib; otherwise Windows x64 conventions are used.
+// SysV ABI and the Linux goclib; otherwise Windows x64 conventions are used.
 func Gen(prog *Program, linux bool) (string, error) {
-	if clibErr != nil {
-		return "", clibErr
+	if goclibErr != nil {
+		return "", goclibErr
 	}
 	c := &CG{
 		strLab:    map[*StrLit]string{},
@@ -872,7 +872,7 @@ func Gen(prog *Program, linux bool) (string, error) {
 	}
 	// Prototypes (from #include'd headers) are registered only for call-site
 	// double-promotion; they are deliberately NOT added to c.funcs, so a
-	// prototype for a clib function still triggers clib inclusion.
+	// prototype for a goclib function still triggers goclib inclusion.
 	for _, f := range prog.Prototypes {
 		c.funcDefs[f.Name] = f
 	}
@@ -890,15 +890,15 @@ func Gen(prog *Program, linux bool) (string, error) {
 		return "", fmt.Errorf("program has no main()")
 	}
 
-	// Pull in exactly the clib functions this program calls, plus whatever
+	// Pull in exactly the goclib functions this program calls, plus whatever
 	// those depend on.
-	order, clibExts, dataBlock, err := clibUsed(c.need, c.linux)
+	order, goclibExts, dataBlock, err := goclibUsed(c.need, c.linux)
 	if err != nil {
 		return "", err
 	}
 
 	// Every import the program needs: the exit routine for the entry stub,
-	// whatever the C code calls directly, and whatever clib pulled in.
+	// whatever the C code calls directly, and whatever goclib pulled in.
 	importSet := map[string]bool{}
 	if c.linux {
 		importSet["exit"] = true
@@ -908,31 +908,31 @@ func Gen(prog *Program, linux bool) (string, error) {
 	for name := range c.calls {
 		importSet[name] = true
 	}
-	for _, e := range clibExts {
+	for _, e := range goclibExts {
 		importSet[e] = true
 	}
 	imports := make([]string, 0, len(importSet))
 	for name := range importSet {
 		if c.linux {
 			if !externLinux[name] {
-				return "", fmt.Errorf("unknown function %q: not in clib (%s), and not a Linux syscall a0 knows",
-					name, strings.Join(clibNames(c.linux), ", "))
+				return "", fmt.Errorf("unknown function %q: not in goclib (%s), and not a Linux syscall goa knows",
+					name, strings.Join(goclibNames(c.linux), ", "))
 			}
-			// ELF targets have no DLLs: a0 turns this into a syscall stub.
+			// ELF targets have no DLLs: goa turns this into a syscall stub.
 			imports = append(imports, fmt.Sprintf("extern %s\n", name))
 			continue
 		}
 		dll, ok := externDLL[name]
 		if !ok {
-			return "", fmt.Errorf("unknown function %q: not in clib (%s), and not in externDLL",
-				name, strings.Join(clibNames(c.linux), ", "))
+			return "", fmt.Errorf("unknown function %q: not in goclib (%s), and not in externDLL",
+				name, strings.Join(goclibNames(c.linux), ", "))
 		}
 		imports = append(imports, fmt.Sprintf("extern %s, %s\n", name, dll))
 	}
 	sort.Strings(imports)
 
 	var out strings.Builder
-	out.WriteString("; generated by c0 -- assembled by a0, no gcc involved\n")
+	out.WriteString("; generated by goc -- assembled by goa, no gcc involved\n")
 	out.WriteString("section .text\n")
 	out.WriteString("global _start\n")
 	out.WriteString("\n")
@@ -958,12 +958,12 @@ func Gen(prog *Program, linux bool) (string, error) {
 	out.WriteString(body.String())
 
 	if len(order) > 0 {
-		out.WriteString("\n; --- clib: only what this program uses ---\n")
+		out.WriteString("\n; --- goclib: only what this program uses ---\n")
 		if dataBlock != "" {
 			out.WriteString(dataBlock)
 			out.WriteString("section .text\n")
 		}
-		funcs, _, _ := clibStore(c.linux)
+		funcs, _, _ := goclibStore(c.linux)
 		for _, n := range order {
 			out.WriteString(funcs[n].body)
 		}
@@ -971,7 +971,7 @@ func Gen(prog *Program, linux bool) (string, error) {
 
 	// Program-level (global / static) variables live in a writable .data
 	// section, referenced via rip. Only constant integer initialisers are
-	// supported today (c0lib's globals are all simple constants). Arrays are
+	// supported today (goclib's globals are all simple constants). Arrays are
 	// zero-filled for their full byte size so rip-relative indexing works.
 	if len(prog.Globals) > 0 {
 		out.WriteString("\nsection .data\n")
@@ -1312,7 +1312,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 }
 
 // emitEpilogue restores the saved callee-save registers, then returns.
-// (a0 has no `leave`, so spell it out.)
+// (goa has no `leave`, so spell it out.)
 func (c *CG) emitEpilogue() {
 	for i := len(c.usedRegs) - 1; i >= 0; i-- {
 		c.emit("mov %s, [rbp-%d]", c.usedRegs[i], 8*(i+1))
@@ -1399,9 +1399,9 @@ func (c *CG) genStmt(s Stmt) error {
 			if _, err := c.genExprT(n.E); err != nil {
 				return err
 			}
-		if err := c.ensureType(c.curRet.Class()); err != nil {
-			return err
-		}
+			if err := c.ensureType(c.curRet.Class()); err != nil {
+				return err
+			}
 		} else {
 			c.emit("mov rax, 0")
 		}
@@ -1631,7 +1631,7 @@ func (c *CG) genLValue(e Expr) error {
 		c.emit("mov r11, [rbp%+d]", islot)
 		// byte offset = index * element_width. Char elements pack one byte
 		// per slot (string literals, char arrays, char* buffers); everything
-		// else keeps the 8-byte slot stride. a0 supports imul-with-immediate,
+		// else keeps the 8-byte slot stride. goa supports imul-with-immediate,
 		// so a single scaled multiply replaces the old triple doubling-add.
 		ew := c.elemWidthOf(n.Base)
 		c.emit("imul r11, %d", ew)
@@ -2002,7 +2002,7 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 	return TInt, nil
 }
 
-// setcc emits "rax = (left OP right)" using a conditional branch, because a0
+// setcc emits "rax = (left OP right)" using a conditional branch, because goa
 // does not implement the setcc/movzx pair that gcc's assembler provides.
 func (c *CG) emitCompare(jmpIfTrue string) {
 	lTrue := c.newLabel("cmp")
@@ -2144,8 +2144,8 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		case "*":
 			c.emit("imul rax, r10")
 		case "/":
-			c.emit("mov r11, rax")            // divisor
-			c.emit("mov rax, r10")            // dividend
+			c.emit("mov r11, rax") // divisor
+			c.emit("mov rax, r10") // dividend
 			if leftSigned {
 				c.emit("cqo")
 				c.emit("idiv r11")
@@ -2179,8 +2179,8 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		}
 		// Shift count must live in cl (low 8 bits of rcx); the left operand
 		// rides in a frame temporary.
-		c.emit("mov rcx, rax")             // count
-		c.emit("mov rax, [rbp%+d]", off)   // left
+		c.emit("mov rcx, rax")           // count
+		c.emit("mov rax, [rbp%+d]", off) // left
 		switch n.Op {
 		case "<<":
 			c.emit("shl rax, cl")
@@ -2285,11 +2285,11 @@ type argSlot struct {
 	typ  CType
 }
 
-// variadicFn reports whether a clib function takes printf-style varargs.
-// For those, c0 passes every argument in an 8-byte "general-purpose slot"
-// (doubles are moved bitwise into rax first), so the __clib_va array lines
+// variadicFn reports whether a goclib function takes printf-style varargs.
+// For those, goc passes every argument in an 8-byte "general-purpose slot"
+// (doubles are moved bitwise into rax first), so the __goclib_va array lines
 // up positionally with the format string: the %d/%f/%s consumers all walk
-// the same 8-byte cursor, exactly like the clib prologue expects.
+// the same 8-byte cursor, exactly like the goclib prologue expects.
 func variadicFn(name string) bool {
 	return name == "printf" || name == "sprintf"
 }
@@ -2301,7 +2301,7 @@ func variadicFn(name string) bool {
 //     its position and type -- doubles to xmm0-3 (Win) / xmm0-7 (SysV),
 //     everything else to rcx/rdx/r8/r9 (Win) / rdi/rsi/... (SysV).
 //   - Varargs (printf/sprintf): every argument rides in an 8-byte GP slot,
-//     double bit patterns included, so __clib_va needs no XMM handling.
+//     double bit patterns included, so __goclib_va needs no XMM handling.
 //
 // Each argument is evaluated and spilled to a frame temporary slot, and only
 // loaded into the argument registers right before the call. This is required
@@ -2310,7 +2310,7 @@ func variadicFn(name string) bool {
 func (c *CG) genCallExpr(n *Call) (CType, error) {
 	// va_start / va_end are compiler builtins, not real functions. va_start
 	// seeds the va_list cursor with the address of the first variadic slot;
-	// va_end is a no-op in c0's flat-cursor model.
+	// va_end is a no-op in goc's flat-cursor model.
 	if n.Name == "va_start" || n.Name == "va_end" {
 		if n.Name == "va_start" {
 			if len(n.Args) < 1 {
@@ -2346,16 +2346,16 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		}
 	}
 
-	// Resolve the callee. A clib function may live under a different symbol
-	// than its C name (see clibAliasLinux).
+	// Resolve the callee. A goclib function may live under a different symbol
+	// than its C name (see goclibAliasLinux).
 	target := n.Name
 	if c.linux {
-		if a, ok := clibAliasLinux[n.Name]; ok {
+		if a, ok := goclibAliasLinux[n.Name]; ok {
 			target = a
 		}
 	}
 	if !c.funcs[n.Name] && n.Name != "main" {
-		funcs, _, _ := clibStore(c.linux)
+		funcs, _, _ := goclibStore(c.linux)
 		if _, ok := funcs[target]; ok {
 			c.need[target] = true
 		} else {
@@ -2429,7 +2429,7 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	}
 	c.tmpDepth -= nargs
 
-	// Result type: user functions declare it; clib and extern calls return int.
+	// Result type: user functions declare it; goclib and extern calls return int.
 	ret := TInt
 	if f, ok := c.funcDefs[n.Name]; ok {
 		ret = f.Ret.Class()
@@ -2444,7 +2444,7 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 }
 
 // encodeStr renders decoded string bytes as a double-quoted literal with
-// escapes, for a0's db directive.
+// escapes, for goa's db directive.
 func encodeStr(b []byte) string {
 	var sb strings.Builder
 	for _, ch := range b {
@@ -2470,12 +2470,12 @@ func encodeStr(b []byte) string {
 	return sb.String()
 }
 
-// formatDouble renders a float64 as a Go-syntax literal that a0's `dq`
+// formatDouble renders a float64 as a Go-syntax literal that goa's `dq`
 // directive can parse back into IEEE-754 bits ("1.5", "0x1.2p3", ...).
 //
-// 'g' formatting would print integral doubles as bare integers ("10"), and a0
+// 'g' formatting would print integral doubles as bare integers ("10"), and goa
 // parses those via ParseInt -> the integer bit pattern (0xa) instead of the
-// double (0x4024000000000000). Force a trailing ".0" so a0's ParseFloat path
+// double (0x4024000000000000). Force a trailing ".0" so goa's ParseFloat path
 // is taken.
 func formatDouble(v float64) string {
 	s := strconv.FormatFloat(v, 'g', -1, 64)

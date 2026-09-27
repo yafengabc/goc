@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression suite for a0: assemble every example, run it, and byte-compare
+# Regression suite for goa: assemble every example, run it, and byte-compare
 # the output against expected/<name>.txt.
 #
 # Usage:  bash run_tests.sh
@@ -18,8 +18,8 @@ export HOME="${HOME:-/tmp}"
 export GOTMPDIR="$TMP"
 [ -n "${GOCACHE:-}" ] || export GOCACHE="$HOME/.cache/go-build"
 
-echo "== building a0 =="
-go build -trimpath -ldflags="-s -w" -o a0.exe . || { echo "BUILD FAILED"; exit 1; }
+echo "== building goa =="
+go build -trimpath -ldflags="-s -w" -o goa.exe . || { echo "BUILD FAILED"; exit 1; }
 go build -o tools/msgboxcheck.exe ./tools/msgboxcheck || { echo "TOOL BUILD FAILED"; exit 1; }
 # elfcheck verifies the ELF structure and then interprets the program, since
 # a Windows box cannot actually exec an ELF binary.
@@ -32,8 +32,8 @@ for asm in examples/*.asm; do
     name="$(basename "$asm" .asm)"
     exp="expected/$name.txt"
 
-    if ! ./a0.exe "$asm" >/dev/null 2>"/tmp/a0_$name.err"; then
-        echo "FAIL  $name  (assemble): $(cat /tmp/a0_$name.err)"
+    if ! ./goa.exe "$asm" >/dev/null 2>"/tmp/goa_$name.err"; then
+        echo "FAIL  $name  (assemble): $(cat /tmp/goa_$name.err)"
         fail=$((fail + 1))
         continue
     fi
@@ -45,24 +45,24 @@ for asm in examples/*.asm; do
 
     # Run and capture the exit code separately: comparing stdout alone would
     # hide a crash that emits the correct prefix (e.g. fmath CI: "4" then die).
-    ./examples/"$name".exe > "/tmp/a0_$name.raw" 2> "/tmp/a0_$name.err"
+    ./examples/"$name".exe > "/tmp/goa_$name.raw" 2> "/tmp/goa_$name.err"
     rc=$?
     # Strip CR: the console layer may emit CRLF on Windows.
-    tr -d '\r' < "/tmp/a0_$name.raw" > "/tmp/a0_$name.out"
+    tr -d '\r' < "/tmp/goa_$name.raw" > "/tmp/goa_$name.out"
 
     # Always run diff so the diagnostic file exists even on crash (the
     # rc!=0 || !diff short-circuit previously skipped diff, leaving sed
     # with no file to read).
-    diff -u "$exp" "/tmp/a0_$name.out" > "/tmp/a0_$name.diff"
+    diff -u "$exp" "/tmp/goa_$name.out" > "/tmp/goa_$name.diff"
     diffrc=$?
     if [ "$rc" -ne 0 ] || [ "$diffrc" -ne 0 ]; then
         echo "FAIL  $name (exit=$rc)"
-        sed -n '1,12p' "/tmp/a0_$name.diff"
+        sed -n '1,12p' "/tmp/goa_$name.diff"
         echo "  raw bytes:"
-        od -c "/tmp/a0_$name.raw" | head -8
-        if [ -s "/tmp/a0_$name.err" ]; then
+        od -c "/tmp/goa_$name.raw" | head -8
+        if [ -s "/tmp/goa_$name.err" ]; then
             echo "  stderr:"
-            cat "/tmp/a0_$name.err"
+            cat "/tmp/goa_$name.err"
         fi
         fail=$((fail + 1))
     else
@@ -80,22 +80,22 @@ for asm in examples/linux/*.asm; do
     name="$(basename "$asm" .asm)"
     exp="expected/linux_$name.txt"
 
-    if ! ./a0.exe -f elf "$asm" >/dev/null 2>"/tmp/a0_$name.err"; then
-        echo "FAIL  linux/$name  (assemble): $(cat /tmp/a0_$name.err)"
+    if ! ./goa.exe -f elf "$asm" >/dev/null 2>"/tmp/goa_$name.err"; then
+        echo "FAIL  linux/$name  (assemble): $(cat /tmp/goa_$name.err)"
         fail=$((fail + 1))
         continue
     fi
 
-    ./tools/elfcheck.exe "examples/linux/$name" >"/tmp/a0_$name.out" 2>"/tmp/a0_$name.err"
+    ./tools/elfcheck.exe "examples/linux/$name" >"/tmp/goa_$name.out" 2>"/tmp/goa_$name.err"
     rc=$?
     if [ ! -f "$exp" ]; then
         echo "SKIP  linux/$name  (no expected/linux_$name.txt)"
         continue
     fi
-    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/a0_$name.out" >"/tmp/a0_$name.diff"; then
+    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/goa_$name.out" >"/tmp/goa_$name.diff"; then
         echo "FAIL  linux/$name  (exit=$rc)"
-        sed -n '1,12p' "/tmp/a0_$name.diff"
-        cat "/tmp/a0_$name.err"
+        sed -n '1,12p' "/tmp/goa_$name.diff"
+        cat "/tmp/goa_$name.err"
         fail=$((fail + 1))
     else
         echo "ok    linux/$name"
@@ -109,7 +109,7 @@ echo "pass=$pass fail=$fail"
 # GUI example: cannot be compared against stdout, so drive it through the
 # real UI instead. Needs an interactive desktop (fails on a locked screen).
 echo "== gui: examples/msgbox.asm =="
-./a0.exe examples/msgbox.asm >/dev/null || { echo "FAIL  msgbox (assemble)"; fail=$((fail + 1)); }
+./goa.exe examples/msgbox.asm >/dev/null || { echo "FAIL  msgbox (assemble)"; fail=$((fail + 1)); }
 ./tools/msgboxcheck.exe examples/msgbox.exe || fail=$((fail + 1))
 
 echo "-----------------------------"

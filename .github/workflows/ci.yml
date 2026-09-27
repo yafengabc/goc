@@ -17,16 +17,16 @@ jobs:
           go-version: '1.21'
       - name: gofmt
         run: |
-          out="$(gofmt -l . asm asm/tools/elfcheck asm/tools/msgboxcheck)"
+          out="$(gofmt -l . asm goa/tools/elfcheck goa/tools/msgboxcheck)"
           if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
       - name: go vet
         run: |
           go vet ./...
-          (cd asm && go vet ./...)
+          (cd goa && go vet ./...)
       - name: go build
         run: |
-          go build -o c0 .
-          (cd asm && go build -o a0 .)
+          go build -o goc .
+          (cd goa && go build -o goa .)
       - name: native Linux e2e (real kernel, real SSE2)
         run: bash run_tests_linux.sh
 
@@ -38,10 +38,10 @@ jobs:
         with:
           go-version: '1.21'
       # 16 checks: 8 examples x (Windows exe + Linux ELF interpreted by
-      # elfcheck). No interactive desktop here, so the a0 GUI example is not
+      # elfcheck). No interactive desktop here, so the goa GUI example is not
       # part of CI.
-      - name: c0 end-to-end
+      - name: goc end-to-end
         run: bash run_tests.sh
-      - name: a0 (non-GUI)
-        run: bash asm/run_tests.sh
+      - name: goa (non-GUI)
+        run: bash goa/run_tests.sh
         continue-on-error: true   # msgbox example needs an interactive desktop

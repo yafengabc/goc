@@ -402,8 +402,8 @@ func (c *checker) checkCall(n *Call, fn *FuncDecl) *Type {
 	if pd, ok := c.protos[n.Name]; ok {
 		return c.checkCallSig(n, fn, pd, true)
 	}
-	// External / clib call whose signature we do not model: accept it and
-	// assume an int result (true for every clib function c0 exposes).
+	// External / goclib call whose signature we do not model: accept it and
+	// assume an int result (true for every goclib function goc exposes).
 	return IntType()
 }
 

@@ -1,6 +1,6 @@
-// Exercises the whole clib: stdio, string and stdlib.
+// Exercises the whole goclib: stdio, string and stdlib.
 // A string literal is just a pointer, and a pointer fits in an int
-// variable, so the heap functions are usable even though c0 has no
+// variable, so the heap functions are usable even though goc has no
 // pointer type.
 
 int main() {

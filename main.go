@@ -9,20 +9,20 @@ import (
 	"strings"
 )
 
-// c0: a tiny C compiler.
+// goc: a tiny C compiler.
 //
 // Pipeline: lex -> parse -> generate x86-64 assembly (Intel syntax) ->
-// a0 assembles it straight into a native executable. No gcc, no libc.
+// goa assembles it straight into a native executable. No gcc, no libc.
 //
 //   - default (Windows): PE32+, kernel32 only
 //   - -target linux:     static ELF64, raw syscalls only
 //
 // Usage:
 //
-//	c0 file.c                 compile and run
-//	c0 -c file.c              compile only (produce file.exe / file)
-//	c0 -S file.c              emit assembly only (produce file.asm)
-//	c0 -target linux file.c   produce a Linux ELF64 instead
+//	goc file.c                 compile and run
+//	goc -c file.c              compile only (produce file.exe / file)
+//	goc -S file.c              emit assembly only (produce file.asm)
+//	goc -target linux file.c   produce a Linux ELF64 instead
 func main() {
 	args := os.Args[1:]
 	mode := "run" // run | compile | asm
@@ -37,7 +37,7 @@ func main() {
 			mode = "asm"
 		case a == "-target" || a == "-f" || a == "--format":
 			if i+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "c0: -target needs an argument (windows or linux)")
+				fmt.Fprintln(os.Stderr, "goc: -target needs an argument (windows or linux)")
 				os.Exit(1)
 			}
 			i++
@@ -50,7 +50,7 @@ func main() {
 		}
 	}
 	if len(files) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: c0 [-c|-S] [-target linux] <file.c>")
+		fmt.Fprintln(os.Stderr, "usage: goc [-c|-S] [-target linux] <file.c>")
 		os.Exit(1)
 	}
 	srcPath := files[0]
@@ -95,12 +95,12 @@ func main() {
 		return
 	}
 
-	// Hand the assembly to a0, our own assembler. No gcc involved.
-	a0, err := findA0()
+	// Hand the assembly to goa, our own assembler. No gcc involved.
+	goa, err := findGoa()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "cannot find a0:", err)
-		fmt.Fprintln(os.Stderr, "build it with: cd asm && go build .")
-		fmt.Fprintln(os.Stderr, "or set A0=<path to a0>")
+		fmt.Fprintln(os.Stderr, "cannot find goa:", err)
+		fmt.Fprintln(os.Stderr, "build it with: cd goa && go build .")
+		fmt.Fprintln(os.Stderr, "or set GOA=<path to goa>")
 		os.Exit(1)
 	}
 
@@ -110,14 +110,14 @@ func main() {
 	}
 	var cmd *exec.Cmd
 	if linux {
-		cmd = exec.Command(a0, "-f", "elf", sfile, out)
+		cmd = exec.Command(goa, "-f", "elf", sfile, out)
 	} else {
-		cmd = exec.Command(a0, sfile, out)
+		cmd = exec.Command(goa, sfile, out)
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "a0 failed:", err)
+		fmt.Fprintln(os.Stderr, "goa failed:", err)
 		os.Exit(1)
 	}
 	fmt.Printf("compiled %s -> %s\n", srcPath, out)
@@ -149,15 +149,15 @@ func main() {
 	}
 }
 
-// findA0 locates the a0 assembler: $A0 if set, then next to the c0
-// executable, then PATH. The binary is a0.exe on Windows and a0 elsewhere.
-func findA0() (string, error) {
-	if v := os.Getenv("A0"); v != "" {
+// findGoa locates the goa assembler: $GOA if set, then next to the goc
+// executable, then PATH. The binary is goa.exe on Windows and goa elsewhere.
+func findGoa() (string, error) {
+	if v := os.Getenv("GOA"); v != "" {
 		return v, nil
 	}
-	name := "a0"
+	name := "goa"
 	if runtime.GOOS == "windows" {
-		name = "a0.exe"
+		name = "goa.exe"
 	}
 	if self, err := os.Executable(); err == nil {
 		cand := filepath.Join(filepath.Dir(self), name)

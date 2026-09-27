@@ -172,7 +172,7 @@ func main() {
 
 	// Never leave a modal dialog stuck on screen, whatever happens.
 	defer func() {
-		for _, t := range []string{"a0 GUI 演示", "结果"} {
+		for _, t := range []string{"goa GUI 演示", "结果"} {
 			if h := findWindow(t); h != 0 {
 				closeWindow(h)
 			}
@@ -186,7 +186,7 @@ func main() {
 
 	// 1. The first dialog must appear with our UTF-16 caption. Matching the
 	//    title is itself the proof that the wide strings were encoded right.
-	dlg := waitWindow("a0 GUI 演示", 10*time.Second)
+	dlg := waitWindow("goa GUI 演示", 10*time.Second)
 	if dlg == 0 {
 		select {
 		case err := <-done:

@@ -1,10 +1,10 @@
 ; Linux ELF64 hello world -- static, no libc, no dynamic linker.
 ;
 ; `extern write` / `extern exit` are not DLL imports here: for an ELF target
-; a0 turns each into a `mov rax, <number>; syscall; ret` stub, so the call
+; goa turns each into a `mov rax, <number>; syscall; ret` stub, so the call
 ; site uses the SysV argument registers (rdi, rsi, rdx) directly.
 ;
-;   a0 -f elf hello.asm  &&  ./hello
+;   goa -f elf hello.asm  &&  ./hello
 
 extern write
 extern exit

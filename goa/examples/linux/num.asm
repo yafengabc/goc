@@ -8,7 +8,7 @@
 ;   fact(5) = 120
 ;   fib(10) = 55
 ;
-;   a0 -f elf num.asm && ./num
+;   goa -f elf num.asm && ./num
 
 extern write
 extern exit

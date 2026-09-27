@@ -1,4 +1,4 @@
-# Build products. *.exe covers c0.exe / a0.exe and every compiled example on
+# Build products. *.exe covers goc.exe / goa.exe and every compiled example on
 # Windows; Linux ELF output has no suffix and is ignored per-directory below.
 *.exe
 .cache/
@@ -7,20 +7,20 @@
 *.s
 
 # Compiled binaries of the two tools themselves (no suffix outside Windows).
-/c0
-/a0
+/goc
+/goa
 
 # examples/ keeps only the .c sources; everything else there is a build
-# product: examples/*.asm (c0 -S output) and examples/foo (Linux ELF).
+# product: examples/*.asm (goc -S output) and examples/foo (Linux ELF).
 examples/*
 !examples/*.c
 
-# clib_win/*.asm and clib_linux/*.asm are embedded into c0 with go:embed and
-# must stay in the repository -- they are sources, not build products.
+# goclib/*.asm is embedded into goc with go:embed and must stay in the
+# repository -- it is source, not a build product.
 
 # Local agent workspace, not part of the project.
 .workbuddy/
 
 # Ad-hoc build artifacts and local scratch space from debugging sessions.
-c0lib_out.bin
+goclib_out.bin
 scratch/

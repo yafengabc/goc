@@ -19,23 +19,23 @@ const (
 
 type Type struct {
 	Kind   TypeKind
-	Elem   *Type  // KPtr / KArr: element type
-	Len    int    // KArr: number of elements (0 = incomplete)
+	Elem   *Type   // KPtr / KArr: element type
+	Len    int     // KArr: number of elements (0 = incomplete)
 	Params []*Type // KFunc: parameter types
-	Ret    *Type  // KFunc: return type
-	Width  int    // KInt: 1=char, 4=int, 8=long (toy still uses 8-byte slots)
-	Signed bool   // KInt
+	Ret    *Type   // KFunc: return type
+	Width  int     // KInt: 1=char, 4=int, 8=long (toy still uses 8-byte slots)
+	Signed bool    // KInt
 }
 
 // --- constructors -----------------------------------------------------------
 
-func IntType() *Type        { return &Type{Kind: KInt, Width: 8, Signed: true} }
-func CharType() *Type       { return &Type{Kind: KInt, Width: 1, Signed: true} }
-func UnsignedType() *Type   { return &Type{Kind: KInt, Width: 8, Signed: false} }
-func UnsignedCharType() *Type { return &Type{Kind: KInt, Width: 1, Signed: false} }
-func DoubleType() *Type     { return &Type{Kind: KDouble} }
-func VoidType() *Type       { return &Type{Kind: KVoid} }
-func PtrType(elem *Type) *Type { return &Type{Kind: KPtr, Elem: elem} }
+func IntType() *Type                  { return &Type{Kind: KInt, Width: 8, Signed: true} }
+func CharType() *Type                 { return &Type{Kind: KInt, Width: 1, Signed: true} }
+func UnsignedType() *Type             { return &Type{Kind: KInt, Width: 8, Signed: false} }
+func UnsignedCharType() *Type         { return &Type{Kind: KInt, Width: 1, Signed: false} }
+func DoubleType() *Type               { return &Type{Kind: KDouble} }
+func VoidType() *Type                 { return &Type{Kind: KVoid} }
+func PtrType(elem *Type) *Type        { return &Type{Kind: KPtr, Elem: elem} }
 func ArrType(elem *Type, n int) *Type { return &Type{Kind: KArr, Elem: elem, Len: n} }
 func FuncType(ret *Type, params []*Type) *Type {
 	return &Type{Kind: KFunc, Ret: ret, Params: params}
@@ -52,13 +52,13 @@ func (t *Type) Class() CType {
 	return TInt
 }
 
-func (t *Type) IsArith() bool { return t.Kind == KInt || t.Kind == KDouble }
+func (t *Type) IsArith() bool    { return t.Kind == KInt || t.Kind == KDouble }
 func (t *Type) IsIntClass() bool { return t.Kind == KInt }
-func (t *Type) IsScalar() bool { return t.IsArith() || t.Kind == KPtr }
-func (t *Type) IsVoid() bool { return t.Kind == KVoid }
-func (t *Type) IsPtr() bool { return t.Kind == KPtr }
-func (t *Type) IsArray() bool { return t.Kind == KArr }
-func (t *Type) IsFunc() bool { return t.Kind == KFunc }
+func (t *Type) IsScalar() bool   { return t.IsArith() || t.Kind == KPtr }
+func (t *Type) IsVoid() bool     { return t.Kind == KVoid }
+func (t *Type) IsPtr() bool      { return t.Kind == KPtr }
+func (t *Type) IsArray() bool    { return t.Kind == KArr }
+func (t *Type) IsFunc() bool     { return t.Kind == KFunc }
 
 // PtrElem returns the element type of a pointer/array, or nil.
 func (t *Type) PtrElem() *Type {

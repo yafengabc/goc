@@ -1,4 +1,4 @@
-// elfcheck verifies a Linux ELF64 binary produced by a0 and then *runs* it
+// elfcheck verifies a Linux ELF64 binary produced by goa and then *runs* it
 // by interpreting its instructions. Native execution needs a Linux kernel;
 // this gets as close as a Windows box can:
 //
@@ -9,7 +9,7 @@
 // The program's own output goes to stdout (so it can be diffed against a
 // golden file exactly like a real run); diagnostics go to stderr.
 //
-// The interpreter covers the instruction subset a0 emits. Anything else is a
+// The interpreter covers the instruction subset goa emits. Anything else is a
 // loud "unsupported opcode" failure, never a silent wrong answer.
 package main
 
@@ -368,9 +368,9 @@ func (c *cpu) step() {
 	}
 	op := c.fetch8()
 
-	// Legacy prefixes: 0x66 / 0xF2 / 0xF3. In a0's output these are always
+	// Legacy prefixes: 0x66 / 0xF2 / 0xF3. In goa's output these are always
 	// the mandatory prefixes of the SSE2 instructions (there are no REP or
-	// operand-size-override forms -- clib has no string ops), so we remember
+	// operand-size-override forms -- goclib has no string ops), so we remember
 	// the last one and only apply it inside the 0F two-byte opcode switch.
 	legacy := byte(0)
 	for op == 0x66 || op == 0xf2 || op == 0xf3 {
@@ -378,7 +378,7 @@ func (c *cpu) step() {
 		op = c.fetch8()
 	}
 
-	// REX prefix (only REX.W / .R / .B matter for what a0 emits).
+	// REX prefix (only REX.W / .R / .B matter for what goa emits).
 	rex := byte(0)
 	if op >= 0x40 && op <= 0x4f {
 		rex = op
@@ -409,7 +409,7 @@ func (c *cpu) step() {
 		if mod == 3 {
 			return reg, rmOperand{isMem: false, reg: rmRaw + int(rex&1)*8}
 		}
-		// Memory forms a0 emits: [rip+disp32], [base+disp8/32], and
+		// Memory forms goa emits: [rip+disp32], [base+disp8/32], and
 		// [base+index*scale+disp] via SIB.
 		//
 		// Subtlety: when rm==4 signals a SIB byte, REX.B extends the SIB's
@@ -494,12 +494,12 @@ func (c *cpu) step() {
 				c.rip = c.rip + uint64(rel)
 			}
 		case legacy == 0xf2 || legacy == 0x66:
-			// ---- SSE2 (the scalar double / quadword set a0 emits) ----
+			// ---- SSE2 (the scalar double / quadword set goa emits) ----
 			// XMM and GP registers share the ModRM field convention: REX.R
 			// extends the reg field, REX.B the rm register field. The XMM
 			// operand sits in the reg field for every form except cvttsd2si
 			// and movq r64,xmm (where the GP operand takes it), exactly as
-			// a0 encodes them.
+			// goa encodes them.
 			//
 			// getSse reads the rm operand as the low 64 bits of an XMM
 			// register or 8 bytes of memory (a double).
@@ -584,7 +584,7 @@ func (c *cpu) step() {
 				a := c.xmmF(reg)
 				b := math.Float64frombits(getSse(o))
 				// ZF=equal, CF=below, OF/SF/AF clear. PF (unordered/NaN) is
-				// not tracked -- a0 never compares NaN.
+				// not tracked -- goa never compares NaN.
 				c.zf = a == b
 				c.cf = a < b
 				c.sf, c.of = false, false
@@ -811,7 +811,7 @@ func (c *cpu) step() {
 		c.setFlagsSub(a, b, a-b)
 		return
 
-	case 0x69: // imul r64, r/m64, imm32   (a0's "imul reg, imm" two-operand form)
+	case 0x69: // imul r64, r/m64, imm32   (goa's "imul reg, imm" two-operand form)
 		reg, o := modrm()
 		imm := uint64(int64(int32(c.fetch32())))
 		c.regs[reg] = uint64(int64(getRM(o)) * int64(imm))
@@ -990,7 +990,7 @@ func (c *cpu) step() {
 }
 
 // int128 / uint128 model the RDX:RAX dividend of a 128-bit divide. We only
-// need values that fit, which is every case a0-generated code produces.
+// need values that fit, which is every case goa-generated code produces.
 func int128(lo, hi int64) int64 {
 	// Callers only use this when hi is a sign extension of lo.
 	if hi == 0 || hi == -1 {

@@ -1,4 +1,4 @@
-; fmath.asm - exercises the SSE2 scalar-double subset of a0.
+; fmath.asm - exercises the SSE2 scalar-double subset of goa.
 ; Output should be "46321":
 ;   1.5 + 2.5            -> 4
 ;   3.0 * 2.0            -> 6

@@ -1,5 +1,5 @@
 ; hello.asm - prints "Hello, world!" using kernel32 directly.
-; Assembled + linked by a0 into a stand-alone Windows PE executable.
+; Assembled + linked by goa into a stand-alone Windows PE executable.
 
 section .data
 msg          db "Hello, world!", 10, 0

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Native Linux end-to-end test for the c0 -> a0 pipeline.
+# Native Linux end-to-end test for the goc -> goa pipeline.
 #
 # Same idea as run_tests.sh (which runs on Windows and interprets the Linux
 # ELF outputs with elfcheck), but this script runs on a real Linux box and
@@ -22,17 +22,17 @@ export HOME="${HOME:-/tmp}"
 export GOTMPDIR="$TMP"
 [ -n "${GOCACHE:-}" ] || export GOCACHE="$HOME/.cache/go-build"
 
-echo "== building c0 =="
-go build -trimpath -ldflags="-s -w" -o c0 . || { echo "BUILD FAILED"; exit 1; }
+echo "== building goc =="
+go build -trimpath -ldflags="-s -w" -o goc . || { echo "BUILD FAILED"; exit 1; }
 
-echo "== building a0 =="
-(cd asm && go build -trimpath -ldflags="-s -w" -o a0 .) || { echo "A0 BUILD FAILED"; exit 1; }
-cp asm/a0 ./a0   # findA0 looks next to the c0 binary first
+echo "== building goa =="
+(cd goa && go build -trimpath -ldflags="-s -w" -o goa .) || { echo "GOA BUILD FAILED"; exit 1; }
+cp goa/goa ./goa   # findGoa looks next to the goc binary first
 
 pass=0
 fail=0
 
-echo "== c0: linux targets, run on the real kernel =="
+echo "== goc: linux targets, run on the real kernel =="
 for src in examples/*.c; do
     name="$(basename "$src" .c)"
     exp="expected/$name.txt"
@@ -43,24 +43,24 @@ for src in examples/*.c; do
         continue
     fi
 
-    if ! ./c0 -c -target linux "$src" >/dev/null 2>"/tmp/c0l_$name.err"; then
-        echo "FAIL  $name  (compile): $(cat /tmp/c0l_$name.err)"
+    if ! ./goc -c -target linux "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
+        echo "FAIL  $name  (compile): $(cat /tmp/gocl_$name.err)"
         fail=$((fail + 1))
         continue
     fi
 
-    # No CR stripping here: on Linux the clib writes raw bytes and the golden
+    # No CR stripping here: on Linux the goclib writes raw bytes and the golden
     # files are LF, so the comparison is byte-for-byte.
-    ./"$bin" >"/tmp/c0l_$name.out" 2>"/tmp/c0l_$name.err"
+    ./"$bin" >"/tmp/gocl_$name.out" 2>"/tmp/gocl_$name.err"
     rc=$?
 
-    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/c0l_$name.out" >"/tmp/c0l_$name.diff"; then
+    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/gocl_$name.out" >"/tmp/gocl_$name.diff"; then
         echo "FAIL  $name  (exit=$rc)"
-        sed -n '1,12p' "/tmp/c0l_$name.diff"
+        sed -n '1,12p' "/tmp/gocl_$name.diff"
         echo "--- actual output (od -c) ---"
-        od -c "/tmp/c0l_$name.out" | head -25
+        od -c "/tmp/gocl_$name.out" | head -25
         echo "--- stderr ---"
-        head -3 "/tmp/c0l_$name.err"
+        head -3 "/tmp/gocl_$name.err"
         fail=$((fail + 1))
     else
         printf "ok    %-10s %6d bytes\n" "$name" "$(stat -c%s "$bin")"
@@ -71,33 +71,33 @@ done
 echo "-----------------------------"
 echo "pass=$pass fail=$fail"
 
-echo "== a0: linux examples, run on the real kernel =="
-for asm in asm/examples/linux/*.asm; do
+echo "== goa: linux examples, run on the real kernel =="
+for asm in goa/examples/linux/*.asm; do
     name="$(basename "$asm" .asm)"
-    exp="asm/expected/linux_$name.txt"
-    bin="asm/examples/linux/$name"
+    exp="goa/expected/linux_$name.txt"
+    bin="goa/examples/linux/$name"
 
     if [ ! -f "$exp" ]; then
         echo "SKIP  linux/$name  (no expected/linux_$name.txt)"
         continue
     fi
 
-    if ! ./a0 -f elf "$asm" >/dev/null 2>"/tmp/a0l_$name.err"; then
-        echo "FAIL  linux/$name  (assemble): $(cat /tmp/a0l_$name.err)"
+    if ! ./goa -f elf "$asm" >/dev/null 2>"/tmp/goal_$name.err"; then
+        echo "FAIL  linux/$name  (assemble): $(cat /tmp/goal_$name.err)"
         fail=$((fail + 1))
         continue
     fi
 
-    ./"$bin" >"/tmp/a0l_$name.out" 2>"/tmp/a0l_$name.err"
+    ./"$bin" >"/tmp/goal_$name.out" 2>"/tmp/goal_$name.err"
     rc=$?
 
-    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/a0l_$name.out" >"/tmp/a0l_$name.diff"; then
+    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/goal_$name.out" >"/tmp/goal_$name.diff"; then
         echo "FAIL  linux/$name  (exit=$rc)"
-        sed -n '1,12p' "/tmp/a0l_$name.diff"
+        sed -n '1,12p' "/tmp/goal_$name.diff"
         echo "--- actual output (od -c) ---"
-        od -c "/tmp/a0l_$name.out" | head -25
+        od -c "/tmp/goal_$name.out" | head -25
         echo "--- stderr ---"
-        head -3 "/tmp/a0l_$name.err"
+        head -3 "/tmp/goal_$name.err"
         fail=$((fail + 1))
     else
         echo "ok    linux/$name"

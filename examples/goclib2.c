@@ -1,7 +1,7 @@
-// Exercises the stage-4 clib additions: strtol, calloc, strchr, strncmp,
+// Exercises the stage-4 goclib additions: strtol, calloc, strchr, strncmp,
 // memcmp, memmove, rand, srand (getchar is covered separately -- it needs
-// interactive stdin). Pointers are stored in int variables because c0's C
-// subset has no pointer type; all byte-level work happens inside the clib.
+// interactive stdin). Pointers are stored in int variables because goc's C
+// subset has no pointer type; all byte-level work happens inside the goclib.
 //
 // Deterministic output, no stdin, so it is safe for the headless test harness
 // on both the Windows and Linux (elfcheck) targets.

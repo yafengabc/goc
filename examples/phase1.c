@@ -1,8 +1,8 @@
-// Phase-1 feature test for c0's stage-5 C subset.
+// Phase-1 feature test for goc's stage-5 C subset.
 //
 // Exercises: char literals, for / break / continue, ternary, shifts,
 // bitwise AND, prefix & postfix ++/--, casts, const, typedef, extern, and
-// global / static variables. The non-variadic clib-style helpers are written
+// global / static variables. The non-variadic goclib-style helpers are written
 // in C (no variadic macros yet) and exercised from main. Output is compared
 // against expected/phase1.txt on both the Windows-native and Linux(elfcheck)
 // targets, so the golden must be identical across both backends.
@@ -19,7 +19,7 @@ const int kAnswer = 42;
 int g_counter = 7;                    // global in .data
 static unsigned long rand_state = 1;  // global static (LCG state)
 
-// ---- C implementations of a few clib functions (non-variadic subset) ----
+// ---- C implementations of a few goclib functions (non-variadic subset) ----
 
 size_t my_strlen(int s) {
     char* p = (char*)s;

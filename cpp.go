@@ -1,6 +1,6 @@
 package main
 
-// cpp.go — the C preprocessor for c0.
+// cpp.go — the C preprocessor for goc.
 //
 // It runs on the token stream produced by Lex (where '#' is a real token) and
 // returns a fully-expanded token stream that Parse can consume. The design is
@@ -14,7 +14,7 @@ package main
 //   - #if / #ifdef / #ifndef / #else / #elif / #endif  (constant expressions,
 //     including the defined() operator)
 //   - #error   (raised only when the branch is active)
-//   - predefined macros __FILE__, __LINE__, __c0__
+//   - predefined macros __FILE__, __LINE__, __goc__
 //   - backslash line continuations inside macro definitions
 //
 // Things deliberately left for a later stage: #pragma beyond ignoring it,
@@ -334,7 +334,7 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 	full, err := p.resolveInclude(path, filename, angled)
 	if err != nil {
 		if angled {
-			// System headers that c0 ships (stdio.h, stdlib.h, string.h, ...)
+			// System headers that goc ships (stdio.h, stdlib.h, string.h, ...)
 			// are embedded and injected directly, with no disk lookup. An
 			// unavailable <file> is skipped rather than fatal.
 			if src, ok := builtinHeaders[path]; ok {
@@ -397,7 +397,7 @@ func (p *Preprocessor) expandAt(raw []Token, i int, filename string, line int) (
 			return []Token{tokStr(filename, t.Line)}, i + 1
 		case "__LINE__":
 			return []Token{tokNum(int64(line), t.Line)}, i + 1
-		case "__c0__":
+		case "__goc__":
 			return []Token{tokNum(1, t.Line)}, i + 1
 		}
 		if m, ok := p.macros[t.Text]; ok && !p.inExpand[t.Text] && p.active() {

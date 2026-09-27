@@ -8,8 +8,8 @@ import (
 
 func usage() {
 	fmt.Fprintf(os.Stderr,
-		"a0 - assemble a small x86-64 subset into a runnable executable\n\n"+
-			"usage: a0 [-f pe|elf] <file.asm> [output]\n\n"+
+		"goa - assemble a small x86-64 subset into a runnable executable\n\n"+
+			"usage: goa [-f pe|elf] <file.asm> [output]\n\n"+
 			"  -f pe    Windows PE32+ (default). Output gets a .exe suffix.\n"+
 			"  -f elf   Linux ELF64, static, no libc. Output has no suffix.\n\n"+
 			"PE targets import externs from DLLs (`extern WriteFile, kernel32`).\n"+
@@ -27,7 +27,7 @@ func main() {
 		switch {
 		case arg == "-f" || arg == "--format" || arg == "-target":
 			if i+1 >= len(args) {
-				fmt.Fprintln(os.Stderr, "a0: -f needs an argument (pe or elf)")
+				fmt.Fprintln(os.Stderr, "goa: -f needs an argument (pe or elf)")
 				os.Exit(1)
 			}
 			i++
@@ -40,7 +40,7 @@ func main() {
 			usage()
 			return
 		case strings.HasPrefix(arg, "-"):
-			fmt.Fprintf(os.Stderr, "a0: unknown option %q\n", arg)
+			fmt.Fprintf(os.Stderr, "goa: unknown option %q\n", arg)
 			os.Exit(1)
 		default:
 			positional = append(positional, arg)
@@ -58,7 +58,7 @@ func main() {
 	case "elf", "linux":
 		elf = true
 	default:
-		fmt.Fprintf(os.Stderr, "a0: unknown output format %q (want pe or elf)\n", format)
+		fmt.Fprintf(os.Stderr, "goa: unknown output format %q (want pe or elf)\n", format)
 		os.Exit(1)
 	}
 

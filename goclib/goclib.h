@@ -1,27 +1,27 @@
-#ifndef C0LIB_H
-#define C0LIB_H
+#ifndef GOCLIB_H
+#define GOCLIB_H
 
 /* =============================================================================
- * c0lib — the canonical, cross-platform C library for c0.
+ * goclib — the canonical, cross-platform C library for goc.
  *
- * This header + c0lib.c are the *intended* backend for c0. They are written in
+ * This header + goclib.c are the *intended* backend for goc. They are written in
  * plain, portable C (char / pointer / static / for / stdarg) and implement the
  * whole <stddef.h>/<string.h>/<stdlib.h>/<stdio.h> subset in one place.
  *
- * They are DORMANT today: c0's C subset (stage 4 and earlier) cannot compile
+ * They are DORMANT today: goc's C subset (stage 4 and earlier) cannot compile
  * them — it lacks char, real pointers, global/static variables, for-loops and
  * variadic functions. The backend that actually runs right now is the assembly
- * under clib/windows/ and clib/linux/ (same C names, different bodies), which
- * c0 embeds and links.
+ * under goclib/windows/ and goclib/linux/ (same C names, different bodies), which
+ * goc embeds and links.
  *
- * Once c0 grows those features (the stage-5 plan), the migration is:
- *   1. Make c0 compile clib/c0lib.c into the user program's translation unit.
+ * Once goc grows those features (the stage-5 plan), the migration is:
+ *   1. Make goc compile goclib/goclib.c into the user program's translation unit.
  *   2. Carve the five platform primitives out of the asm and expose them with
- *      the __clib_ prefix on BOTH targets (see the extern block below).
- *   3. Delete the public functions from clib/windows/ and clib/linux/ — they
- *      are now provided by c0lib.c, which calls the __clib_* primitives.
+ *      the __goclib_ prefix on BOTH targets (see the extern block below).
+ *   3. Delete the public functions from goclib/windows/ and goclib/linux/ — they
+ *      are now provided by goclib.c, which calls the __goclib_* primitives.
  *
- * The __clib_* primitives are the ONLY things that must stay in assembly,
+ * The __goclib_* primitives are the ONLY things that must stay in assembly,
  * because they touch the OS (I/O, heap, process exit, stdin). Everything else
  * is portable C.
  * ========================================================================== */
@@ -29,17 +29,17 @@
 typedef unsigned long size_t;
 typedef long          ptrdiff_t;
 
-/* ---- platform primitives (supplied by clib/windows and clib/linux) -------- */
+/* ---- platform primitives (supplied by goclib/windows and goclib/linux) -------- */
 /* Write `len` bytes from `buf` to standard output. Returns bytes written. */
-long __clib_write(const char *buf, long len);
+long __goclib_write(const char *buf, long len);
 /* Terminate the process with `code` (does not return). */
-void __clib_exit(long code);
+void __goclib_exit(long code);
 /* Allocate `size` bytes from the process heap; returns 0 on failure. */
-void *__clib_heap_alloc(long size);
-/* Free a block previously returned by __clib_heap_alloc. */
-void  __clib_heap_free(void *p);
+void *__goclib_heap_alloc(long size);
+/* Free a block previously returned by __goclib_heap_alloc. */
+void  __goclib_heap_free(void *p);
 /* Read up to `len` bytes from standard input into `buf`; <=0 at EOF. */
-long __clib_read(char *buf, long len);
+long __goclib_read(char *buf, long len);
 
 /* ----------------------------- <stddef.h> ------------------------------- */
 #define NULL ((void *)0)
@@ -75,4 +75,4 @@ int  puts(const char *s);
 int  putchar(int c);
 int  getchar(void);
 
-#endif /* C0LIB_H */
+#endif /* GOCLIB_H */

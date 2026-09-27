@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build the whole toolchain: c0 (compiler), a0 (assembler) and the two test
+# Build the whole toolchain: goc (compiler), goa (assembler) and the two test
 # tools. Safe to run from any directory; paths resolve relative to this script.
 #
 #   bash build.sh
 #
-# Windows note: c0 looks for a0.exe next to itself, so a0 is copied up here.
+# Windows note: goc looks for goa.exe next to itself, so goa is copied up here.
 
 set -euo pipefail
 
@@ -21,17 +21,17 @@ export GOTMPDIR="$TMP"
 
 EXE="$(go env GOEXE)"   # ".exe" on Windows, "" elsewhere
 
-echo "== c0 =="
-go build -trimpath -ldflags="-s -w" -o "c0$EXE" .
+echo "== goc =="
+go build -trimpath -ldflags="-s -w" -o "goc$EXE" .
 
-echo "== a0 =="
-(cd asm && go build -trimpath -ldflags="-s -w" -o "a0$EXE" .)
+echo "== goa =="
+(cd goa && go build -trimpath -ldflags="-s -w" -o "goa$EXE" .)
 if [ -n "$EXE" ]; then
-    cp "asm/a0$EXE" "./a0$EXE"
+    cp "goa/goa$EXE" "./goa$EXE"
 fi
 
 echo "== tools =="
-(cd asm && go build -o "tools/elfcheck$EXE"   ./tools/elfcheck)
-(cd asm && go build -o "tools/msgboxcheck$EXE" ./tools/msgboxcheck)
+(cd goa && go build -o "tools/elfcheck$EXE"   ./tools/elfcheck)
+(cd goa && go build -o "tools/msgboxcheck$EXE" ./tools/msgboxcheck)
 
-echo "done: c0$EXE, asm/a0$EXE, asm/tools/elfcheck$EXE, asm/tools/msgboxcheck$EXE"
+echo "done: goc$EXE, goa/goa$EXE, goa/tools/elfcheck$EXE, goa/tools/msgboxcheck$EXE"

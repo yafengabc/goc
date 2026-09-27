@@ -1,13 +1,13 @@
-/* c0lib_test.c -- end-to-end proof that c0 compiles the REAL C-version clib
- * (clib/c0lib.c) and that it runs correctly on both backends.
+/* goclib_test.c -- end-to-end proof that goc compiles the REAL C-version goclib
+ * (goclib/goclib.c) and that it runs correctly on both backends.
  *
- * We #include the canonical clib/c0lib.c verbatim; everything below is just a
- * driver that exercises it. The five __clib_* OS primitives come from the
- * hand-written assembly backend (clib/clib.asm), which c0 pulls in on demand;
+ * We #include the canonical goclib/goclib.c verbatim; everything below is just a
+ * driver that exercises it. The five __goclib_* OS primitives come from the
+ * hand-written assembly backend (goclib/goclib.asm), which goc pulls in on demand;
  * every public function (strlen, strcpy, printf, malloc, ...) is the C version
- * from c0lib.c, which suppresses the assembly twin.
+ * from goclib.c, which suppresses the assembly twin.
  */
-#include "../clib/c0lib.c"
+#include "../goclib/goclib.c"
 
 int main() {
     /* --- variadic printf: %s %c %d %ld %u %x %f --- */

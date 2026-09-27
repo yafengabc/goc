@@ -27,15 +27,15 @@ var keywords = map[string]bool{
 }
 
 type Token struct {
-	Kind  TokKind
-	Text  string
-	Num   int64
-	Fval  float64
-	IsDbl bool
+	Kind   TokKind
+	Text   string
+	Num    int64
+	Fval   float64
+	IsDbl  bool
 	IsChar bool // a 'x' character literal (carried as an integer constant in Num)
-	Str   []byte
-	Line  int
-	Space bool // true if whitespace preceded this token (separates macro name from '(' etc.)
+	Str    []byte
+	Line   int
+	Space  bool // true if whitespace preceded this token (separates macro name from '(' etc.)
 }
 
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
@@ -181,43 +181,43 @@ func Lex(src string) ([]Token, error) {
 			if i >= n {
 				return nil, fmt.Errorf("line %d: unterminated string literal", line)
 			}
-		i++ // closing quote
-		push(Token{Kind: TStr, Str: buf, Line: line})
-	case c == '\'':
-		// Character literal 'x' (or '\n', '\0', ...). Carried as an integer
-		// constant (the byte value) so the parser/codegen need no new node.
-		i++
-		var ch byte
-		if i < n && src[i] == '\\' && i+1 < n {
+			i++ // closing quote
+			push(Token{Kind: TStr, Str: buf, Line: line})
+		case c == '\'':
+			// Character literal 'x' (or '\n', '\0', ...). Carried as an integer
+			// constant (the byte value) so the parser/codegen need no new node.
 			i++
-			switch src[i] {
-			case 'n':
-				ch = '\n'
-			case 't':
-				ch = '\t'
-			case 'r':
-				ch = '\r'
-			case '\\':
-				ch = '\\'
-			case '\'':
-				ch = '\''
-			case '"':
-				ch = '"'
-			case '0':
-				ch = 0
-			default:
+			var ch byte
+			if i < n && src[i] == '\\' && i+1 < n {
+				i++
+				switch src[i] {
+				case 'n':
+					ch = '\n'
+				case 't':
+					ch = '\t'
+				case 'r':
+					ch = '\r'
+				case '\\':
+					ch = '\\'
+				case '\'':
+					ch = '\''
+				case '"':
+					ch = '"'
+				case '0':
+					ch = 0
+				default:
+					ch = src[i]
+				}
+				i++
+			} else if i < n {
 				ch = src[i]
+				i++
 			}
-			i++
-		} else if i < n {
-			ch = src[i]
-			i++
-		}
-		if i >= n || src[i] != '\'' {
-			return nil, fmt.Errorf("line %d: unterminated character literal", line)
-		}
-		i++ // closing quote
-		push(Token{Kind: TNum, Text: string(rune(ch)), Num: int64(ch), IsChar: true, Line: line})
+			if i >= n || src[i] != '\'' {
+				return nil, fmt.Errorf("line %d: unterminated character literal", line)
+			}
+			i++ // closing quote
+			push(Token{Kind: TNum, Text: string(rune(ch)), Num: int64(ch), IsChar: true, Line: line})
 		default:
 			two := ""
 			if i+1 < n {
@@ -240,11 +240,11 @@ func Lex(src string) ([]Token, error) {
 				i += 2
 				continue
 			}
-		if strings.IndexByte("+-*/%=<>!(){};,.[]&?:", c) >= 0 {
-			push(Token{Kind: TPunct, Text: string(c), Line: line})
-			i++
-			continue
-		}
+			if strings.IndexByte("+-*/%=<>!(){};,.[]&?:", c) >= 0 {
+				push(Token{Kind: TPunct, Text: string(c), Line: line})
+				i++
+				continue
+			}
 			return nil, fmt.Errorf("line %d: unexpected character %q", line, c)
 		}
 	}

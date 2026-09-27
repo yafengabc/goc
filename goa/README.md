@@ -1,4 +1,4 @@
-# a0 — 纯 Go 的 x86-64 汇编器 + PE / ELF 生成器
+# goa — 纯 Go 的 x86-64 汇编器 + PE / ELF 生成器
 
 不依赖 gcc / nasm / 任何外部工具链：Go 标准库解析 asm，直接输出可执行文件。
 
@@ -6,16 +6,16 @@
 - `-f elf` 输出 **Linux ELF64**（静态、无 libc、无动态链接器）
 
 ```bash
-go build -trimpath -ldflags="-s -w" -o a0.exe .
-./a0.exe examples/hello.asm              # -> examples/hello.exe
-./a0.exe examples/hello.asm out.exe      # 指定输出名
-./a0.exe -f elf examples/linux/hello.asm # -> examples/linux/hello（Linux 惯例无后缀）
+go build -trimpath -ldflags="-s -w" -o goa.exe .
+./goa.exe examples/hello.asm              # -> examples/hello.exe
+./goa.exe examples/hello.asm out.exe      # 指定输出名
+./goa.exe -f elf examples/linux/hello.asm # -> examples/linux/hello（Linux 惯例无后缀）
 ```
 
 ## Linux ELF 目标
 
 ```asm
-extern write          ; SYS_write，a0 生成 mov rax,1; syscall; ret 桩
+extern write          ; SYS_write，goa 生成 mov rax,1; syscall; ret 桩
 extern exit           ; SYS_exit
 
 section .data
@@ -34,9 +34,9 @@ _start:
 
 要点：
 
-- **没有 DLL 可导入**。`extern <name>` 里的名字必须是 a0 认识的 Linux 系统调用名
+- **没有 DLL 可导入**。`extern <name>` 里的名字必须是 goa 认识的 Linux 系统调用名
   （`write` `read` `open` `close` `brk` `mmap` `exit` `exit_group` `getpid`
-  `nanosleep` `writev` …），否则直接报错。a0 为每个 extern 生成一个桩
+  `nanosleep` `writev` …），否则直接报错。goa 为每个 extern 生成一个桩
   `mov rax, <号>; syscall; ret`，所以 `call write` 就是一次 syscall。
 - 也可以直接写 `syscall` 指令（见 `examples/linux/raw.asm`）。
 - 参数是 **SysV AMD64** 顺序：`rdi, rsi, rdx, rcx, r8, r9`，没有 shadow space。

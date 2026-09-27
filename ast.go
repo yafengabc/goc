@@ -1,12 +1,12 @@
 package main
 
-// AST node definitions for the tiny C subset understood by c0.
+// AST node definitions for the tiny C subset understood by goc.
 
 type Node interface{}
 
 // CType is the type of a value. Everything is 8 bytes on the stack; the only
 // distinction is whether an expression lives in a GP register (int) or an XMM
-// register (double) and how clib / the ABI treat it.
+// register (double) and how goclib / the ABI treat it.
 type CType int
 
 const (
@@ -19,8 +19,8 @@ type Program struct {
 	// Prototypes are forward declarations from #include'd headers (Body ==
 	// nil). They are used only by the type checker to validate calls; they
 	// are never emitted as code, and they are deliberately kept out of the
-	// code generator's "defined functions" set so that a prototype for a clib
-	// function (e.g. strlen) still triggers clib inclusion rather than being
+	// code generator's "defined functions" set so that a prototype for a goclib
+	// function (e.g. strlen) still triggers goclib inclusion rather than being
 	// mistaken for a user definition.
 	Prototypes []*FuncDecl
 	// Globals are top-level variable declarations (with optional initialisers).
@@ -162,9 +162,9 @@ type CastExpr struct {
 // IncDecExpr is a prefix (++x) or postfix (x++) increment/decrement. Prefix is
 // true for ++x / --x, false for x++ / x--.
 type IncDecExpr struct {
-	Op      string // "++" or "--"
-	E       Expr
-	Prefix  bool
+	Op     string // "++" or "--"
+	E      Expr
+	Prefix bool
 }
 
 // VaArgExpr is the va_arg(ap, Type) builtin of <stdarg.h>. The second "argument"

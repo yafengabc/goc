@@ -1,3 +1,3 @@
-module c0
+module goc
 
 go 1.21

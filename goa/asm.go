@@ -209,9 +209,9 @@ func (a *Assembler) defineSym(name string) {
 	if _, exists := a.syms[name]; exists {
 		// ELF syscall stubs are reserved: keep the first (stub) definition so
 		// `call exit` from asm always reaches the kernel, even if a C function
-		// (e.g. clib's `void exit(int)`) later defines a label with the same
+		// (e.g. goclib's `void exit(int)`) later defines a label with the same
 		// name. C-facing calls to that function are rewritten by the compiler
-		// to __clib_exit, so the C label is dead code and must not win.
+		// to __goclib_exit, so the C label is dead code and must not win.
 		if a.target == targetELF {
 			if _, isSyscall := a.exts[name]; isSyscall {
 				return
@@ -279,7 +279,7 @@ func (a *Assembler) emitSyscallStubs() error {
 		num, ok := linuxSyscalls[n]
 		if !ok {
 			a.cur = prev
-			return fmt.Errorf("extern %q: not a Linux syscall known to a0; an ELF target has no DLL imports", n)
+			return fmt.Errorf("extern %q: not a Linux syscall known to goa; an ELF target has no DLL imports", n)
 		}
 		a.defineSym(n)
 		if err := a.encode("mov", []Operand{

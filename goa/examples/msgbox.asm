@@ -5,8 +5,8 @@
 ; and `subsystem windows` so Windows does not allocate a console.
 
 section .data
-caption  du "a0 GUI 演示"
-text     du "这是 a0 编译出来的。\n纯 Go 汇编器 + 手写 PE 写入器，全程没用 gcc。\n\n点“是”再看一个框，点“否”直接退出。"
+caption  du "goa GUI 演示"
+text     du "这是 goa 编译出来的。\n纯 Go 汇编器 + 手写 PE 写入器，全程没用 gcc。\n\n点“是”再看一个框，点“否”直接退出。"
 yes_text du "你点了「是」。\nMessageBoxW 返回 IDYES = 6"
 no_text  du "你点了「否」。\nMessageBoxW 返回 IDNO  = 7"
 res_cap  du "结果"

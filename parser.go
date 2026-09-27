@@ -59,7 +59,7 @@ type Parser struct {
 }
 
 func Parse(toks []Token) (*Program, error) {
-	// va_list is the cursor type for <stdarg.h> variadic access. c0 implements
+	// va_list is the cursor type for <stdarg.h> variadic access. goc implements
 	// variadics with a contiguous register/stack save area and walks it with a
 	// plain char* cursor, so va_list is just a pointer typedef (no struct is
 	// needed, and the toy model has no struct support yet).

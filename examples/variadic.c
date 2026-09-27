@@ -1,4 +1,4 @@
-// Definitive test for c0's variadic support: a c0-compiled printf-style
+// Definitive test for goc's variadic support: a goc-compiled printf-style
 // function (my_printf) using va_list/va_start/va_arg/va_end, that actually
 // prints the real argument values (decimal ints, strings, chars, longs) so we
 // can confirm both the ordering AND the data are correct. All vararg types are
