@@ -14,10 +14,13 @@ import (
 // The generated code follows the Windows x64 ABI: integer args in RCX/RDX/R8/R9,
 // a 32-byte shadow space reserved by the caller, and RSP kept 16-byte aligned
 // at every call site.
-// varInfo records a variable's stack slot and type.
+// varInfo records a variable's home: either a stack slot (off != 0) or a
+// callee-save register (reg != ""). Doubles and address-taken / array locals
+// always live on the stack; small int locals may be cached in a register.
 type varInfo struct {
 	off int
 	typ *Type
+	reg string
 }
 
 type CG struct {
@@ -28,7 +31,9 @@ type CG struct {
 	doubleLab map[float64]string
 	label     int
 	vars      map[string]varInfo // per-function: param = +off, local = -off
-	localCnt  int                // number of locals in current function
+	localCnt  int                // number of stack-resident locals in current function
+	regArea   int                // bytes reserved just below rbp for saved callee-save regs
+	usedRegs  []string           // callee-save registers actually used as local homes
 	tmpDepth  int                // live expression-temporary slots
 	funcs     map[string]bool    // user-defined functions (by name)
 	funcDefs  map[string]*FuncDecl
@@ -370,7 +375,7 @@ func (c *CG) newLabel(prefix string) string {
 // used to spill the left operand of a binary expression without touching
 // RSP (so 16-byte stack alignment at calls is preserved).
 func (c *CG) tmpSlot(k int) int {
-	return -(40 + 8*c.localCnt + 8*k)
+	return -(c.regArea + 8*c.localCnt + 8*k)
 }
 
 // emit writes one indented instruction line.
@@ -383,6 +388,12 @@ func (c *CG) emit(format string, a ...any) {
 // movsd (not movq) is used for the XMM <-> memory moves: a0 only knows the
 // GP <-> XMM forms of movq.
 func (c *CG) loadVar(vi varInfo) {
+	if vi.reg != "" {
+		// Register-cached int local: value is already in the callee-save.
+		c.emit("mov rax, %s", vi.reg)
+		c.resTyp = TInt
+		return
+	}
 	if vi.typ != nil && vi.typ.Kind == KDouble {
 		c.emit("movsd xmm0, [rbp%+d]", vi.off)
 		c.resTyp = TDouble
@@ -393,8 +404,14 @@ func (c *CG) loadVar(vi varInfo) {
 }
 
 // storeVar emits code that stores the value currently in rax (int) or xmm0
-// (double) into variable vi's slot.
+// (double) into variable vi's slot or home register.
 func (c *CG) storeVar(vi varInfo) {
+	if vi.reg != "" {
+		// Register-cached int local: keep it in the callee-save (which
+		// survives function calls, so no spill is needed).
+		c.emit("mov %s, rax", vi.reg)
+		return
+	}
 	if vi.typ != nil && vi.typ.Kind == KDouble {
 		c.emit("movsd [rbp%+d], xmm0", vi.off)
 	} else {
@@ -623,6 +640,72 @@ func Gen(prog *Program, linux bool) (string, error) {
 	return out.String(), nil
 }
 
+// findAddressTaken returns the set of local variable names whose address is
+// taken anywhere in f (via &x). Such locals cannot live in a register,
+// because there would be nowhere for the pointer to point.
+func (c *CG) findAddressTaken(f *FuncDecl) map[string]bool {
+	taken := map[string]bool{}
+	var walkExpr func(e Expr)
+	walkExpr = func(e Expr) {
+		if e == nil {
+			return
+		}
+		switch n := e.(type) {
+		case *Unary:
+			if n.Op == "&" {
+				if id, ok := n.E.(*Ident); ok {
+					taken[id.Name] = true
+				}
+			}
+			walkExpr(n.E)
+		case *Binary:
+			walkExpr(n.L)
+			walkExpr(n.R)
+		case *Index:
+			walkExpr(n.Base)
+			walkExpr(n.Idx)
+		case *Call:
+			for _, a := range n.Args {
+				walkExpr(a)
+			}
+		}
+	}
+	var walkStmt func(s Stmt)
+	walkStmt = func(s Stmt) {
+		if s == nil {
+			return
+		}
+		switch n := s.(type) {
+		case *Block:
+			for _, st := range n.Stmts {
+				walkStmt(st)
+			}
+		case *DeclList:
+			for _, d := range n.Decls {
+				walkStmt(d)
+			}
+		case *DeclStmt:
+			walkExpr(n.Init)
+		case *AssignStmt:
+			walkExpr(n.Lhs)
+			walkExpr(n.Rhs)
+		case *ExprStmt:
+			walkExpr(n.E)
+		case *ReturnStmt:
+			walkExpr(n.E)
+		case *IfStmt:
+			walkExpr(n.Cond)
+			walkStmt(n.Then)
+			walkStmt(n.Else)
+		case *WhileStmt:
+			walkExpr(n.Cond)
+			walkStmt(n.Body)
+		}
+	}
+	walkStmt(f.Body)
+	return taken
+}
+
 func (c *CG) genFunc(f *FuncDecl) error {
 	c.vars = map[string]varInfo{}
 	c.curRet = f.Ret
@@ -631,58 +714,91 @@ func (c *CG) genFunc(f *FuncDecl) error {
 		c.vars[p] = varInfo{off: 16 + 8*i, typ: f.ParamTypes[i]} // [rbp+16], ...
 	}
 
-	// Pre-assign stack slots to every local declaration (including
-	// those inside nested blocks), so variable offsets are stable.
-	//
-	// Stack layout below rbp:
-	//   [rbp-8  .. -32 ]  saved non-volatile regs (rbx,r12,r13,r14)
-	//   [rbp-40 ..      ]  locals (8 bytes each)
-	//   [.. continued ]    expression temporaries (tmpSlot)
-	localCount := 0
-	var collect func(Stmt)
-	collect = func(s Stmt) {
+	// localDecl is one (name, type) pair for a function-local variable.
+	type localDecl struct {
+		name string
+		typ  *Type
+	}
+
+	// Gather every local declaration (including those inside nested blocks)
+	// so we can decide, up front, which ones live in callee-save registers
+	// and which stay on the stack.
+	var decls []localDecl
+	var gather func(Stmt)
+	gather = func(s Stmt) {
 		switch n := s.(type) {
 		case *Block:
 			for _, st := range n.Stmts {
-				collect(st)
+				gather(st)
 			}
 		case *DeclList:
 			for _, d := range n.Decls {
-				collect(d)
+				gather(d)
 			}
 		case *DeclStmt:
 			if _, ok := c.vars[n.Name]; !ok {
-				if n.Typ.IsArray() {
-					ln := n.Typ.Len
-					if ln < 1 {
-						ln = 1
-					}
-					off := -(40 + 8*(localCount + ln))
-					localCount += ln
-					c.vars[n.Name] = varInfo{off: off, typ: n.Typ}
-				} else {
-					localCount++
-					c.vars[n.Name] = varInfo{off: -(40 + 8*localCount), typ: n.Typ}
-				}
+				decls = append(decls, localDecl{n.Name, n.Typ})
 			}
 		case *IfStmt:
-			collect(n.Then)
+			gather(n.Then)
 			if n.Else != nil {
-				collect(n.Else)
+				gather(n.Else)
 			}
 		case *WhileStmt:
-			collect(n.Body)
+			gather(n.Body)
 		}
 	}
 	for _, st := range f.Body.Stmts {
-		collect(st)
+		gather(st)
 	}
+
+	// A local whose address is taken (&x) cannot live in a register, doubles
+	// cannot live in a GPR, and arrays obviously need memory. Everything else
+	// that is a small int is a candidate for a callee-save register home.
+	addrTaken := c.findAddressTaken(f)
+	regPool := []string{"rbx", "r12", "r13", "r14"}
+	c.usedRegs = nil
+	regOf := map[string]string{}
+	ri := 0
+	stackDecls := make([]localDecl, 0, len(decls))
+	for _, d := range decls {
+		intClass := d.typ != nil && !d.typ.IsArray() && d.typ.Kind != KDouble
+		if intClass && !addrTaken[d.name] && ri < len(regPool) {
+			regOf[d.name] = regPool[ri]
+			c.usedRegs = append(c.usedRegs, regPool[ri])
+			c.vars[d.name] = varInfo{reg: regPool[ri], typ: d.typ}
+			ri++
+		} else {
+			stackDecls = append(stackDecls, d)
+		}
+	}
+
+	// Assign stack slots to the remaining locals (and every array). The
+	// callee-save save area sits just below rbp; locals grow downward from
+	// there, and expression temporaries (tmpSlot) sit below the locals.
+	regArea := 8 * len(c.usedRegs)
+	localCount := 0
+	for _, d := range stackDecls {
+		if d.typ != nil && d.typ.IsArray() {
+			ln := d.typ.Len
+			if ln < 1 {
+				ln = 1
+			}
+			off := -(regArea + 8*(localCount + ln))
+			localCount += ln
+			c.vars[d.name] = varInfo{off: off, typ: d.typ}
+		} else {
+			localCount++
+			c.vars[d.name] = varInfo{off: -(regArea + 8*localCount), typ: d.typ}
+		}
+	}
+	c.regArea = regArea
 	c.localCnt = localCount
 	c.tmpDepth = 0
 
-	// shadow space (Windows only) + 32 bytes for saved non-volatile regs +
-	// locals + expression temporaries.
-	frame := c.shadowSpace() + 32 + 8*localCount + 8*scratchSlots
+	// shadow space (Windows only) + callee-save save area + locals +
+	// expression temporaries, all kept 16-byte aligned.
+	frame := c.shadowSpace() + regArea + 8*localCount + 8*scratchSlots
 	if frame%16 != 0 {
 		frame += 16 - frame%16
 	}
@@ -691,11 +807,10 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	c.emit("push rbp")
 	c.emit("mov rbp, rsp")
 	c.emit("sub rsp, %d", frame)
-	// Save non-volatile registers we use as argument temporaries.
-	c.emit("mov [rbp-8], rbx")
-	c.emit("mov [rbp-16], r12")
-	c.emit("mov [rbp-24], r13")
-	c.emit("mov [rbp-32], r14")
+	// Save only the callee-save registers we actually use as local homes.
+	for i, r := range c.usedRegs {
+		c.emit("mov [rbp-%d], %s", 8*(i+1), r)
+	}
 
 	// Spill the register arguments into this function's frame so the rest of
 	// the code can read params from the stack like normal locals. Double
@@ -721,13 +836,12 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	return nil
 }
 
-// emitEpilogue restores the saved non-volatile registers, then returns.
+// emitEpilogue restores the saved callee-save registers, then returns.
 // (a0 has no `leave`, so spell it out.)
 func (c *CG) emitEpilogue() {
-	c.emit("mov rbx, [rbp-8]")
-	c.emit("mov r12, [rbp-16]")
-	c.emit("mov r13, [rbp-24]")
-	c.emit("mov r14, [rbp-32]")
+	for i := len(c.usedRegs) - 1; i >= 0; i-- {
+		c.emit("mov %s, [rbp-%d]", c.usedRegs[i], 8*(i+1))
+	}
 	c.emit("mov rsp, rbp")
 	c.emit("pop rbp")
 	c.emit("ret")
@@ -755,10 +869,26 @@ func (c *CG) genStmt(s Stmt) error {
 				return err
 			}
 			c.storeVar(vi)
+		} else if vi.reg != "" {
+			c.emit("xor %s, %s", vi.reg, vi.reg)
 		} else {
 			c.emit("mov [rbp%+d], 0", vi.off)
 		}
 	case *AssignStmt:
+		// Fast path: a simple scalar local on the left can be stored
+		// directly to its home register, with no need to compute an address.
+		if id, ok := n.Lhs.(*Ident); ok {
+			if vi, ok2 := c.vars[id.Name]; ok2 && vi.reg != "" {
+				if _, err := c.genExprT(n.Rhs); err != nil {
+					return err
+				}
+				if err := c.ensureType(vi.typ.Class()); err != nil {
+					return err
+				}
+				c.storeVar(vi)
+				return nil
+			}
+		}
 		rt, err := c.genExprT(n.Rhs)
 		if err != nil {
 			return err
@@ -915,6 +1045,11 @@ func (c *CG) genLValue(e Expr) error {
 		vi, ok := c.vars[n.Name]
 		if !ok {
 			return fmt.Errorf("undefined variable %q", n.Name)
+		}
+		if vi.reg != "" {
+			// Reached only if a register-cached local had its address taken,
+			// which findAddressTaken should have prevented.
+			return fmt.Errorf("cannot take address of register-allocated variable %q", n.Name)
 		}
 		c.emit("lea r10, [rbp%+d]", vi.off)
 		return nil
