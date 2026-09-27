@@ -11,10 +11,12 @@
 # source tree and would be swallowed by such a pattern.
 /bin/
 
-# examples/ keeps only the .c sources; everything else there is a build
-# product: examples/*.asm (goc -S output) and examples/foo (Linux ELF).
-examples/*
-!examples/*.c
+# src/examples/ keeps only the .c sources; everything else there is a build
+# product: src/examples/*.asm (goc -S output) and src/examples/foo (Linux ELF).
+# Test runs use `goc -o bin/goc-out` so this rule is a safety net for
+# hand-invoked `goc -S`/`goc -c` runs that write next to the source.
+src/examples/*
+!src/examples/*.c
 
 # goclib/*.asm is embedded into goc with go:embed and must stay in the
 # repository -- it is source, not a build product.

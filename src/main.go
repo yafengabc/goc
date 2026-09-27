@@ -22,11 +22,13 @@ import (
 //	goc file.c                 compile and run
 //	goc -c file.c              compile only (produce file.exe / file)
 //	goc -S file.c              emit assembly only (produce file.asm)
+//	goc -o dir -c file.c       write all outputs into dir/ instead of beside file.c
 //	goc -target linux file.c   produce a Linux ELF64 instead
 func main() {
 	args := os.Args[1:]
 	mode := "run" // run | compile | asm
 	linux := false
+	outDir := ""
 	var files []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -35,6 +37,13 @@ func main() {
 			mode = "compile"
 		case a == "-S":
 			mode = "asm"
+		case a == "-o" || a == "-outdir":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "goc: -o needs a directory argument")
+				os.Exit(1)
+			}
+			i++
+			outDir = args[i]
 		case a == "-target" || a == "-f" || a == "--format":
 			if i+1 >= len(args) {
 				fmt.Fprintln(os.Stderr, "goc: -target needs an argument (windows or linux)")
@@ -50,7 +59,7 @@ func main() {
 		}
 	}
 	if len(files) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: goc [-c|-S] [-target linux] <file.c>")
+		fmt.Fprintln(os.Stderr, "usage: goc [-c|-S] [-target linux] [-o <dir>] <file.c>")
 		os.Exit(1)
 	}
 	srcPath := files[0]
@@ -84,6 +93,15 @@ func main() {
 	}
 
 	base := strings.TrimSuffix(srcPath, filepath.Ext(srcPath))
+	if outDir != "" {
+		// -o <dir>: all outputs (.asm/.exe/ELF) go into dir/, named after the
+		// source file, instead of sitting next to the source.
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			fmt.Fprintln(os.Stderr, "goc:", err)
+			os.Exit(1)
+		}
+		base = filepath.Join(outDir, filepath.Base(base))
+	}
 	sfile := base + ".asm"
 	if err := os.WriteFile(sfile, []byte(asm), 0644); err != nil {
 		fmt.Fprintln(os.Stderr, err)

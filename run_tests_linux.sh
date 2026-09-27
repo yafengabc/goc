@@ -29,6 +29,10 @@ mkdir -p bin
 echo "== building goa =="
 (cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa .) || { echo "GOA BUILD FAILED"; exit 1; }
 
+# Fresh output dir: goc -o bin/goc-out writes every .asm/ELF here, keeping
+# src/examples/ pristine (only the .c files live there).
+rm -rf bin/goc-out
+
 pass=0
 fail=0
 
@@ -39,13 +43,13 @@ win_only=" wintest winbox "
 is_win_only() { case "$win_only" in *" $1 "*) return 0;; esac; return 1; }
 
 echo "== goc: linux targets, run on the real kernel =="
-for src in examples/*.c; do
+for src in src/examples/*.c; do
     name="$(basename "$src" .c)"
-    exp="expected/$name.txt"
-    bin="examples/$name"
+    exp="src/expected/$name.txt"
+    bin="bin/goc-out/$name"
 
     if [ ! -f "$exp" ]; then
-        echo "SKIP  $name  (no expected/$name.txt)"
+        echo "SKIP  $name  (no src/expected/$name.txt)"
         continue
     fi
 
@@ -54,7 +58,7 @@ for src in examples/*.c; do
         continue
     fi
 
-    if ! ./bin/goc -c -target linux "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
+    if ! ./bin/goc -c -target linux -o bin/goc-out "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
         echo "FAIL  $name  (compile): $(cat /tmp/gocl_$name.err)"
         fail=$((fail + 1))
         continue

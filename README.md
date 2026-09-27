@@ -10,10 +10,11 @@
 ```bash
 bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面目录结构）
 
-./bin/goc.exe examples/hello.c                  # 编译并运行（Windows）
-./bin/goc.exe -c examples/hello.c               # 只编译
-./bin/goc.exe -S examples/hello.c               # 只输出汇编（hello.asm）
-./bin/goc.exe -c -target linux examples/hello.c # 出 Linux ELF64（无后缀）
+./bin/goc.exe src/examples/hello.c                   # 编译并运行（Windows）
+./bin/goc.exe -c src/examples/hello.c                # 只编译
+./bin/goc.exe -S src/examples/hello.c                # 只输出汇编（hello.asm）
+./bin/goc.exe -c -o bin/goc-out src/examples/hello.c # 产物集中到 bin/goc-out/，不污染源码树
+./bin/goc.exe -c -target linux src/examples/hello.c  # 出 Linux ELF64（无后缀）
 ```
 
 Windows 产物**只导入 kernel32**（`ExitProcess` / `GetStdHandle` / `WriteFile`）；
@@ -30,15 +31,15 @@ syscall。两头都没有 msvcrt / glibc，也没有 gcc。
 │   │   ├── asm.go  pe.go  elf.go  main.go              #   Intel 语法子集 -> PE32+ / ELF64
 │   │   ├── examples/  expected/  run_tests.sh          #   goa 的用例与 golden
 │   │   └── README.md
-│   └── goclib/                                         # 自带的 C 库（见下「goclib」一节）
-│       ├── goclib.asm                                  #   汇编后端：一份源，#if defined(_WIN64)/#else 双平台
-│       ├── goclib.h  goclib.c                          #   跨平台 C 实现（goc 暂不能编译，stage5 启用）
-│       └── README.md                                   #   后端切换与迁移说明
+│   ├── goclib/                                         # 自带的 C 库（见下「goclib」一节）
+│   │   ├── goclib.asm                                  #   汇编后端：一份源，#if defined(_WIN64)/#else 双平台
+│   │   ├── goclib.h  goclib.c                          #   跨平台 C 实现（goc 暂不能编译，stage5 启用）
+│   │   └── README.md                                   #   后端切换与迁移说明
+│   └── examples/*.c  expected/*.txt                    # goc 的用例与 golden
 ├── tools/                                              # 验证工具（独立 go 模块）
 │   ├── elfcheck  msgboxcheck                           #   解释 ELF / 驱动 GUI 断言
 │   └── peun.py  ucrun.py                               #   PE / ucrt 逆向辅助脚本
-├── bin/                                                # 构建产物（goc / goa / elfcheck / msgboxcheck）
-├── examples/*.c   expected/*.txt                     # goc 的用例与 golden
+├── bin/                                                # 构建产物（goc / goa / elfcheck / msgboxcheck / goc-out）
 ├── build.sh  run_tests.sh  run_tests_linux.sh          # 构建 / 测试（Win 解释 / Linux 原生）
 └── .github/workflows/ci.yml                            # CI：Linux 原生端到端 + Windows 端到端
 ```
@@ -159,12 +160,12 @@ Windows 下变参从 rdx 起、栈上在 `[rbp+48]`；Linux 下从 rsi 起、栈
 ## 测试
 
 ```bash
-bash run_tests.sh           # goc 端到端 20/20（10 个 Windows + 10 个 Linux，后者用 elfcheck 解释）
-bash run_tests_linux.sh     # 真机版：在 Linux 上直接执行 ELF（CI 的 Ubuntu job 也跑它）
-cd goa && bash run_tests.sh # goa 自己的用例，14/14（11 Windows + 3 Linux）+ 1 个 GUI
+bash run_tests.sh               # goc 端到端：全部示例（Windows 原生 + Linux 用 elfcheck 解释）
+bash run_tests_linux.sh         # 真机版：在 Linux 上直接执行 ELF（CI 的 Ubuntu job 也跑它）
+cd src/goa && bash run_tests.sh # goa 自己的用例，14/14（11 Windows + 3 Linux）+ 1 个 GUI
 ```
 
-`examples/goclib.c` 把整个库跑一遍，两个平台的输出与同一份 golden 逐字节比对。
+`src/examples/goclib.c` 把整个库跑一遍，两个平台的输出与同一份 golden 逐字节比对。
 
 ## 体积对比
 

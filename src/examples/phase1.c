@@ -4,7 +4,7 @@
 // bitwise AND, prefix & postfix ++/--, casts, const, typedef, extern, and
 // global / static variables. The non-variadic goclib-style helpers are written
 // in C (no variadic macros yet) and exercised from main. Output is compared
-// against expected/phase1.txt on both the Windows-native and Linux(elfcheck)
+// against src/expected/phase1.txt on both the Windows-native and Linux(elfcheck)
 // targets, so the golden must be identical across both backends.
 
 #include <stdio.h>

@@ -1,5 +1,5 @@
-// msgboxcheck drives examples/msgbox.exe through its UI and verifies what was
-// actually displayed.
+// msgboxcheck drives src/goa/examples/msgbox.exe through its UI and verifies
+// what was actually displayed.
 //
 // A GUI program cannot be checked with the stdout golden files the other
 // examples use, so instead of guessing we ask Windows itself: find the dialog

@@ -1,7 +1,7 @@
 /* bitor.c -- exercise the bitwise-or operator (|), the compound |= and the
  * precedence relationships between |, && and ==.
  *
- * Golden file: expected/bitor.txt. Runs identically on the Windows (PE32+)
+ * Golden file: src/expected/bitor.txt. Runs identically on the Windows (PE32+)
  * and Linux (ELF64) targets.
  */
 
