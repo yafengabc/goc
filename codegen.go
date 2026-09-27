@@ -31,8 +31,10 @@ type CG struct {
 	doubleLab map[float64]string
 	label     int
 	vars      map[string]varInfo // per-function: param = +off, local = -off
-	localCnt  int                // number of stack-resident locals in current function
+	localBytes int               // bytes consumed by stack-resident locals (incl. array padding)
 	regArea   int                // bytes reserved just below rbp for saved callee-save regs
+	globals   map[string]bool    // names of program-level (global/static) variables
+	globalLab map[string]string  // name -> .data label for a global variable
 	usedRegs  []string           // callee-save registers actually used as local homes
 	tmpDepth  int                // live expression-temporary slots
 	funcs     map[string]bool    // user-defined functions (by name)
@@ -43,6 +45,15 @@ type CG struct {
 	curRet   *Type  // return type of the function being generated
 	curParam []*Type // parameter types of the current function
 	resTyp    CType           // type of the value left by the last genExprT
+	resSigned bool            // signedness of the last genExprT result (int-class only)
+	tmpSgn    []bool          // signedness of each expression-temporary slot
+	loops     []loopLabels    // active loop targets for break/continue
+}
+
+// loopLabels records the break/continue targets of the innermost loop.
+type loopLabels struct {
+	breakLbl string
+	contLbl  string
 }
 
 // argRegs returns the integer argument registers for the target ABI.
@@ -570,7 +581,7 @@ func (c *CG) newLabel(prefix string) string {
 // used to spill the left operand of a binary expression without touching
 // RSP (so 16-byte stack alignment at calls is preserved).
 func (c *CG) tmpSlot(k int) int {
-	return -(c.regArea + 8*c.localCnt + 8*k)
+	return -(c.regArea + c.localBytes + 8*k)
 }
 
 // emit writes one indented instruction line.
@@ -586,16 +597,39 @@ func (c *CG) loadVar(vi varInfo) {
 	if vi.reg != "" {
 		// Register-cached int local: value is already in the callee-save.
 		c.emit("mov rax, %s", vi.reg)
+		if vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Width == 1 {
+			if vi.typ.Signed {
+				c.emit("shl rax, 56")
+				c.emit("sar rax, 56")
+			} else {
+				c.emit("and rax, 0xff")
+			}
+		}
 		c.resTyp = TInt
+		c.resSigned = vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Signed
 		return
 	}
 	if vi.typ != nil && vi.typ.Kind == KDouble {
 		c.emit("movsd xmm0, [rbp%+d]", vi.off)
 		c.resTyp = TDouble
-	} else {
-		c.emit("mov rax, [rbp%+d]", vi.off)
-		c.resTyp = TInt
+		c.resSigned = false
+		return
 	}
+	if vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Width == 1 {
+		signed := vi.typ.Signed
+		c.emit("xor rax, rax")
+		c.emit("mov al, [rbp%+d]", vi.off)
+		if signed {
+			c.emit("shl rax, 56")
+			c.emit("sar rax, 56")
+		}
+		c.resTyp = TInt
+		c.resSigned = signed
+		return
+	}
+	c.emit("mov rax, [rbp%+d]", vi.off)
+	c.resTyp = TInt
+	c.resSigned = vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Signed
 }
 
 // storeVar emits code that stores the value currently in rax (int) or xmm0
@@ -609,6 +643,8 @@ func (c *CG) storeVar(vi varInfo) {
 	}
 	if vi.typ != nil && vi.typ.Kind == KDouble {
 		c.emit("movsd [rbp%+d], xmm0", vi.off)
+	} else if vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Width == 1 {
+		c.emit("mov byte [rbp%+d], al", vi.off)
 	} else {
 		c.emit("mov [rbp%+d], rax", vi.off)
 	}
@@ -652,6 +688,7 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		}
 		c.emit("mov rax, %d", n.Val)
 		c.resTyp = TInt
+		c.resSigned = true
 		return TInt, nil
 	case *StrLit:
 		lab, ok := c.strLab[n]
@@ -662,10 +699,21 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		}
 		c.emit("lea rax, [rip+%s]", lab)
 		c.resTyp = TInt
+		c.resSigned = false
 		return TInt, nil
 	case *Ident:
 		vi, ok := c.vars[n.Name]
 		if !ok {
+			if c.globals[n.Name] {
+				// Global / static variable: load its value via rip-relative
+				// addressing into the .data section.
+				c.emit("mov rax, [rip+%s]", c.globalLab[n.Name])
+				// Globals are modelled as 8-byte integer slots in the toy
+				// model; char/unsigned-ness does not affect the load here.
+				c.resTyp = TInt
+				c.resSigned = false
+				return TInt, nil
+			}
 			return TInt, fmt.Errorf("undefined variable %q", n.Name)
 		}
 		if vi.typ.IsArray() {
@@ -684,15 +732,52 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		if err := c.genLValue(n); err != nil {
 			return TInt, err
 		}
+		width := c.elemWidthOf(n.Base)
 		ec := c.elemClassOf(n.Base)
-		if ec == TDouble {
-			c.emit("movsd xmm0, [r10]")
-			c.resTyp = TDouble
-			return TDouble, nil
+		signed := c.elemSignedOf(n.Base)
+		c.genLoadElem("r10", width, ec, signed)
+		return c.resTyp, nil
+	case *CondExpr:
+		if _, err := c.genExprT(n.Cond); err != nil {
+			return c.resTyp, err
 		}
-		c.emit("mov rax, [r10]")
-		c.resTyp = TInt
-		return TInt, nil
+		if err := c.ensureType(TInt); err != nil {
+			return TInt, err
+		}
+		lElse := c.newLabel("else")
+		lEnd := c.newLabel("endif")
+		c.emit("cmp rax, 0")
+		c.emit("je %s", lElse)
+		tt, err := c.genExprT(n.Then)
+		if err != nil {
+			return tt, err
+		}
+		c.emit("jmp %s", lEnd)
+		c.sb.WriteString(lElse + ":\n")
+		et, err := c.genExprT(n.Else)
+		if err != nil {
+			return et, err
+		}
+		c.sb.WriteString(lEnd + ":\n")
+		if tt == TDouble || et == TDouble {
+			c.resTyp = TDouble
+		} else {
+			c.resTyp = TInt
+		}
+		return c.resTyp, nil
+	case *CastExpr:
+		t, err := c.genExprT(n.E)
+		if err != nil {
+			return t, err
+		}
+		if err := c.ensureType(n.Typ.Class()); err != nil {
+			return t, err
+		}
+		c.resTyp = n.Typ.Class()
+		c.resSigned = n.Typ.Kind == KInt && n.Typ.Signed
+		return c.resTyp, nil
+	case *IncDecExpr:
+		return c.genIncDec(n)
 	case *Call:
 		return c.genCallExpr(n)
 	}
@@ -719,7 +804,13 @@ func Gen(prog *Program, linux bool) (string, error) {
 		funcDefs:  map[string]*FuncDecl{},
 		calls:     map[string]bool{},
 		need:      map[string]bool{},
+		globals:   map[string]bool{},
+		globalLab: map[string]string{},
 		linux:     linux,
+	}
+	for _, g := range prog.Globals {
+		c.globals[g.Name] = true
+		c.globalLab[g.Name] = "G_" + g.Name
 	}
 	for _, f := range prog.Funcs {
 		c.funcs[f.Name] = true
@@ -824,6 +915,37 @@ func Gen(prog *Program, linux bool) (string, error) {
 		}
 	}
 
+	// Program-level (global / static) variables live in a writable .data
+	// section, referenced via rip. Only constant integer initialisers are
+	// supported today (c0lib's globals are all simple constants). Arrays are
+	// zero-filled for their full byte size so rip-relative indexing works.
+	if len(prog.Globals) > 0 {
+		out.WriteString("\nsection .data\n")
+		for _, g := range prog.Globals {
+			lab := c.globalLab[g.Name]
+			if g.Typ != nil && g.Typ.IsArray() {
+				ln := g.Typ.Len
+				if ln < 1 {
+					ln = 1
+				}
+				w := c.typeWidth(g.Typ) // 1 for char[], 8 otherwise
+				size := w * ln
+				n := (size + 7) / 8
+				out.WriteString(lab + " dq")
+				for i := 0; i < n; i++ {
+					out.WriteString(" 0")
+				}
+				out.WriteString("\n")
+				continue
+			}
+			val := int64(0)
+			if nl, ok := g.Init.(*NumLit); ok && nl.Kind != TDouble {
+				val = nl.Val
+			}
+			out.WriteString(fmt.Sprintf("%s dq %d\n", lab, val))
+		}
+	}
+
 	if len(c.strs) > 0 {
 		out.WriteString("\nsection .rdata\n")
 		for i := range c.strs {
@@ -901,6 +1023,17 @@ func (c *CG) findAddressTaken(f *FuncDecl) map[string]bool {
 		case *WhileStmt:
 			walkExpr(n.Cond)
 			walkStmt(n.Body)
+		case *ForStmt:
+			if n.Init != nil {
+				walkStmt(n.Init)
+			}
+			if n.Cond != nil {
+				walkExpr(n.Cond)
+			}
+			if n.Post != nil {
+				walkExpr(n.Post)
+			}
+			walkStmt(n.Body)
 		}
 	}
 	walkStmt(f.Body)
@@ -947,6 +1080,11 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			}
 		case *WhileStmt:
 			gather(n.Body)
+		case *ForStmt:
+			if n.Init != nil {
+				gather(n.Init)
+			}
+			gather(n.Body)
 		}
 	}
 	for _, st := range f.Body.Stmts {
@@ -977,29 +1115,39 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// Assign stack slots to the remaining locals (and every array). The
 	// callee-save save area sits just below rbp; locals grow downward from
 	// there, and expression temporaries (tmpSlot) sit below the locals.
+	//
+	// Element width is honoured for arrays: a char[32] occupies 32 bytes
+	// (byte-packed, matching how string literals and malloc'd buffers are
+	// laid out), while a T[] keeps the 8-byte-per-element stride. Scalars
+	// always take an 8-byte slot in this relaxed toy model.
 	regArea := 8 * len(c.usedRegs)
-	localCount := 0
+	localBytes := 0
 	for _, d := range stackDecls {
 		if d.typ != nil && d.typ.IsArray() {
 			ln := d.typ.Len
 			if ln < 1 {
 				ln = 1
 			}
-			off := -(regArea + 8*(localCount + ln))
-			localCount += ln
+			w := c.typeWidth(d.typ) // element width (1 for char, 8 otherwise)
+			size := w * ln
+			if size%8 != 0 { // keep the next local 8-byte aligned
+				size += 8 - size%8
+			}
+			off := -(regArea + localBytes + size)
+			localBytes += size
 			c.vars[d.name] = varInfo{off: off, typ: d.typ}
 		} else {
-			localCount++
-			c.vars[d.name] = varInfo{off: -(regArea + 8*localCount), typ: d.typ}
+			localBytes += 8
+			c.vars[d.name] = varInfo{off: -(regArea + localBytes), typ: d.typ}
 		}
 	}
 	c.regArea = regArea
-	c.localCnt = localCount
+	c.localBytes = localBytes
 	c.tmpDepth = 0
 
 	// shadow space (Windows only) + callee-save save area + locals +
 	// expression temporaries, all kept 16-byte aligned.
-	frame := c.shadowSpace() + regArea + 8*localCount + 8*scratchSlots
+	frame := c.shadowSpace() + regArea + localBytes + 8*scratchSlots
 	if frame%16 != 0 {
 		frame += 16 - frame%16
 	}
@@ -1112,7 +1260,7 @@ func (c *CG) genStmt(s Stmt) error {
 			c.emit("movsd [r10], xmm0")
 		} else {
 			c.emit("mov rax, [rbp%+d]", rslot)
-			c.emit("mov [r10], rax")
+			c.genStoreElem("r10", c.lvalueWidth(n.Lhs), ec)
 		}
 		c.tmpDepth--
 		return nil
@@ -1173,6 +1321,52 @@ func (c *CG) genStmt(s Stmt) error {
 		}
 		c.emit("jmp %s", lTop)
 		c.sb.WriteString(lEnd + ":\n")
+	case *ForStmt:
+		lTop := c.newLabel("for")
+		lEnd := c.newLabel("forend")
+		lCont := c.newLabel("forcont")
+		if n.Init != nil {
+			if err := c.genStmt(n.Init); err != nil {
+				return err
+			}
+		}
+		c.sb.WriteString(lTop + ":\n")
+		if n.Cond != nil {
+			if _, err := c.genExprT(n.Cond); err != nil {
+				return err
+			}
+			if err := c.ensureType(TInt); err != nil {
+				return err
+			}
+			c.emit("cmp rax, 0")
+			c.emit("je %s", lEnd)
+		}
+		// Push this loop's break/continue targets so statements inside the
+		// body (which may themselves be nested loops) can resolve them.
+		c.loops = append(c.loops, loopLabels{breakLbl: lEnd, contLbl: lCont})
+		if err := c.genStmt(n.Body); err != nil {
+			c.loops = c.loops[:len(c.loops)-1]
+			return err
+		}
+		c.loops = c.loops[:len(c.loops)-1]
+		c.sb.WriteString(lCont + ":\n")
+		if n.Post != nil {
+			if _, err := c.genExprT(n.Post); err != nil {
+				return err
+			}
+		}
+		c.emit("jmp %s", lTop)
+		c.sb.WriteString(lEnd + ":\n")
+	case *BreakStmt:
+		if len(c.loops) == 0 {
+			return fmt.Errorf("break outside a loop")
+		}
+		c.emit("jmp %s", c.loops[len(c.loops)-1].breakLbl)
+	case *ContinueStmt:
+		if len(c.loops) == 0 {
+			return fmt.Errorf("continue outside a loop")
+		}
+		c.emit("jmp %s", c.loops[len(c.loops)-1].contLbl)
 	}
 	return nil
 }
@@ -1199,14 +1393,10 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 			return TInt, err
 		}
 		ec := c.elemClassOf(n.E)
-		if ec == TDouble {
-			c.emit("movsd xmm0, [rax]")
-			c.resTyp = TDouble
-			return TDouble, nil
-		}
-		c.emit("mov rax, [rax]")
-		c.resTyp = TInt
-		return TInt, nil
+		width := c.elemWidthOf(n.E)
+		signed := c.elemSignedOf(n.E)
+		c.genLoadElem("rax", width, ec, signed)
+		return c.resTyp, nil
 	}
 	t, err := c.genExprT(n.E)
 	if err != nil {
@@ -1245,6 +1435,11 @@ func (c *CG) genLValue(e Expr) error {
 	case *Ident:
 		vi, ok := c.vars[n.Name]
 		if !ok {
+			if c.globals[n.Name] {
+				// Address of a global: rip-relative lea into .data.
+				c.emit("lea r10, [rip+%s]", c.globalLab[n.Name])
+				return nil
+			}
 			return fmt.Errorf("undefined variable %q", n.Name)
 		}
 		if vi.reg != "" {
@@ -1302,10 +1497,12 @@ func (c *CG) genLValue(e Expr) error {
 			c.emit("mov r10, rax")
 		}
 		c.emit("mov r11, [rbp%+d]", islot)
-		// byte offset = index * 8 (every slot is 8 bytes). a0 now supports
-		// imul-with-immediate, so a single scaled multiply replaces the old
-		// triple doubling-add (8 = 2^3) hack.
-		c.emit("imul r11, 8")
+		// byte offset = index * element_width. Char elements pack one byte
+		// per slot (string literals, char arrays, char* buffers); everything
+		// else keeps the 8-byte slot stride. a0 supports imul-with-immediate,
+		// so a single scaled multiply replaces the old triple doubling-add.
+		ew := c.elemWidthOf(n.Base)
+		c.emit("imul r11, %d", ew)
 		c.emit("add r10, r11")
 		c.tmpDepth--
 		return nil
@@ -1340,8 +1537,295 @@ func (c *CG) elemClassOf(e Expr) CType {
 		return TInt
 	case *Index:
 		return c.elemClassOf(n.Base)
+	case *IncDecExpr:
+		return c.elemClassOf(n.E)
 	}
 	return TInt
+}
+
+// typeWidth returns the byte width used to lay out / step over a value of type
+// t. Scalars (char/int/long/short) all occupy an 8-byte stack slot in the toy
+// model, so their layout width is 8; only the *element* stride for pointers and
+// arrays honours the true element width (1 for char, 8 otherwise).
+func (c *CG) typeWidth(t *Type) int {
+	if t == nil {
+		return 8
+	}
+	switch t.Kind {
+	case KPtr:
+		if t.Elem != nil {
+			return c.typeWidth(t.Elem)
+		}
+		return 1 // void* — byte stride (non-standard but harmless here)
+	case KArr:
+		if t.Elem != nil {
+			return c.typeWidth(t.Elem)
+		}
+		return 8
+	case KInt:
+		if t.Width == 1 {
+			return 1
+		}
+		return 8
+	}
+	return 8
+}
+
+// elemWidthOf returns the byte width of the element referenced by a pointer or
+// array expression e (1 for char, 8 otherwise).
+func (c *CG) elemWidthOf(e Expr) int {
+	switch n := e.(type) {
+	case *Ident:
+		vi, ok := c.vars[n.Name]
+		if !ok {
+			return 8
+		}
+		return c.typeWidth(vi.typ)
+	case *Unary:
+		if n.Op == "*" {
+			return c.elemWidthOf(n.E)
+		}
+		return 8
+	case *Index:
+		return c.elemWidthOf(n.Base)
+	case *IncDecExpr:
+		return c.elemWidthOf(n.E)
+	case *CastExpr:
+		return c.typeWidth(n.Typ)
+	}
+	return 8
+}
+
+// exprIsPointer reports whether e has pointer type.
+func (c *CG) exprIsPointer(e Expr) bool {
+	t := c.exprType(e)
+	if t == nil {
+		return false
+	}
+	return t.IsPtr()
+}
+
+// exprType attempts to recover the structured type of an expression from the
+// variable table / declarators the code generator already knows about.
+func (c *CG) exprType(e Expr) *Type {
+	switch n := e.(type) {
+	case *Ident:
+		if vi, ok := c.vars[n.Name]; ok {
+			return vi.typ
+		}
+	case *Unary:
+		if n.Op == "*" {
+			if t := c.exprType(n.E); t != nil && t.IsPtr() {
+				return t.Elem
+			}
+		}
+	case *Index:
+		if t := c.exprType(n.Base); t != nil {
+			if t.IsPtr() || t.IsArray() {
+				return t.Elem
+			}
+		}
+	case *IncDecExpr:
+		return c.exprType(n.E)
+	case *CastExpr:
+		return n.Typ
+	}
+	return nil
+}
+
+// elemSignedOf returns whether the element referenced by a pointer/array e has
+// a signed integer type (false for unsigned / double / pointer elements).
+func (c *CG) elemSignedOf(e Expr) bool {
+	t := c.exprType(e)
+	if t == nil {
+		return false
+	}
+	if t.IsPtr() && t.Elem != nil {
+		return t.Elem.Kind == KInt && t.Elem.Signed
+	}
+	if t.IsArray() && t.Elem != nil {
+		return t.Elem.Kind == KInt && t.Elem.Signed
+	}
+	return false
+}
+
+// genLoadElem emits code that loads the value at the address held in reg into
+// rax (int-class, width-aware) or xmm0 (double). For a 1-byte element the byte
+// is zero- or sign-extended into rax depending on signedness.
+func (c *CG) genLoadElem(reg string, width int, class CType, signed bool) {
+	if class == TDouble {
+		c.emit("movsd xmm0, [%s]", reg)
+		c.resTyp = TDouble
+		c.resSigned = false
+		return
+	}
+	if width == 1 {
+		// Load the low byte, then zero- or sign-extend in rax. We must not
+		// clear rax before the load, because reg holds the address; "mov al"
+		// writes only the low byte, so the address survives in the upper bits
+		// until the "and" clears them.
+		c.emit("mov al, [%s]", reg)
+		c.emit("and rax, 0xff")
+		if signed {
+			c.emit("shl rax, 56")
+			c.emit("sar rax, 56")
+		}
+	} else {
+		c.emit("mov rax, [%s]", reg)
+	}
+	c.resTyp = TInt
+	c.resSigned = signed
+}
+
+// genStoreElem emits code that stores the value currently in rax (int-class) or
+// xmm0 (double) into the address held in reg, honouring the element width.
+func (c *CG) genStoreElem(reg string, width int, class CType) {
+	if class == TDouble {
+		c.emit("movsd [%s], xmm0", reg)
+		return
+	}
+	if width == 1 {
+		c.emit("mov byte [%s], al", reg)
+	} else {
+		c.emit("mov [%s], rax", reg)
+	}
+}
+
+// lvalueWidth returns the byte width of the value stored at the lvalue e. This
+// is the slot width for a scalar/pointer (always 8 in the toy model, even for a
+// char scalar whose live value is a byte), and the element width for a pointer
+// dereference or array subscript (1 for char, 8 otherwise).
+func (c *CG) lvalueWidth(e Expr) int {
+	if id, ok := e.(*Ident); ok {
+		if vi, ok2 := c.vars[id.Name]; ok2 {
+			if vi.typ.IsPtr() {
+				return 8
+			}
+			if vi.typ.Kind == KInt && vi.typ.Width == 1 {
+				return 1 // char scalar: byte value in an 8-byte slot
+			}
+			return 8
+		}
+		if c.globals[id.Name] {
+			return 8
+		}
+		return 8
+	}
+	return c.elemWidthOf(e)
+}
+
+// loadDoubleConst materialises a double constant into xmm0, reusing the
+// program-level constant pool so e.g. the 1.0 used by ++/-- on a double is
+// emitted once, exactly like NumLit doubles.
+func (c *CG) loadDoubleConst(v float64) {
+	lab, ok := c.doubleLab[v]
+	if !ok {
+		lab = fmt.Sprintf("LD%dx", len(c.doubles))
+		c.doubles = append(c.doubles, v)
+		c.doubleLab[v] = lab
+	}
+	c.emit("movsd xmm0, [rip+%s]", lab)
+}
+
+// genIncDec emits the prefix (++x) or postfix (x++) increment/decrement of an
+// lvalue. It leaves the NEW value in rax/xmm0 for prefix and the OLD value for
+// postfix (the incremented value is still written back to memory either way).
+//
+// Pointers step by their element width (char* advances one byte, int* eight),
+// everything else by one. The operand may be a scalar register, a stack slot,
+// a dereferenced pointer, or an array element.
+func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
+	step := 1
+	if t := c.exprType(n.E); t != nil && t.IsPtr() && t.Elem != nil {
+		step = c.typeWidth(t.Elem)
+	}
+	signed := false
+	if t := c.exprType(n.E); t != nil && t.Kind == KInt {
+		signed = t.Signed
+	}
+
+	// Fast path: a register-cached scalar local (pointers are never
+	// register-allocated because they can be address-taken).
+	if id, ok := n.E.(*Ident); ok {
+		if vi, ok2 := c.vars[id.Name]; ok2 && vi.reg != "" {
+			if n.Prefix {
+				if step == 1 {
+					c.emit("inc %s", vi.reg)
+				} else {
+					c.emit("add %s, %d", vi.reg, step)
+				}
+				c.emit("mov rax, %s", vi.reg)
+			} else {
+				c.emit("mov rax, %s", vi.reg)
+				if step == 1 {
+					c.emit("inc %s", vi.reg)
+				} else {
+					c.emit("add %s, %d", vi.reg, step)
+				}
+			}
+			c.resTyp = TInt
+			c.resSigned = signed
+			return TInt, nil
+		}
+	}
+
+	// General lvalue path: compute the address, load the current value, modify
+	// it, and store it back.
+	if err := c.genLValue(n.E); err != nil {
+		return TInt, err
+	}
+	width := c.lvalueWidth(n.E)
+	double := false
+	if t := c.exprType(n.E); t != nil && t.Kind == KDouble {
+		double = true
+	}
+	if double {
+		c.genLoadElem("r10", 8, TDouble, false)
+		c.emit("movsd xmm1, xmm0") // keep current for postfix restore
+		c.loadDoubleConst(1.0)
+		if n.Op == "++" {
+			c.emit("addsd xmm0, xmm1")
+		} else {
+			c.emit("subsd xmm0, xmm1")
+		}
+		c.genStoreElem("r10", 8, TDouble)
+		if !n.Prefix {
+			c.emit("movsd xmm0, xmm1")
+		}
+		c.resTyp = TDouble
+		c.resSigned = false
+		return TDouble, nil
+	}
+	c.genLoadElem("r10", width, TInt, signed)
+	os := 0
+	saved := false
+	if !n.Prefix {
+		c.tmpDepth++
+		os = c.tmpSlot(c.tmpDepth)
+		c.emit("mov [rbp%+d], rax", os)
+		saved = true
+	}
+	if n.Op == "++" {
+		if step == 1 {
+			c.emit("inc rax")
+		} else {
+			c.emit("add rax, %d", step)
+		}
+	} else {
+		if step == 1 {
+			c.emit("dec rax")
+		} else {
+			c.emit("sub rax, %d", step)
+		}
+	}
+	c.genStoreElem("r10", width, TInt)
+	if saved {
+		c.emit("mov rax, [rbp%+d]", os)
+		c.tmpDepth--
+	}
+	c.resTyp = TInt
+	c.resSigned = signed
+	return TInt, nil
 }
 
 // setcc emits "rax = (left OP right)" using a conditional branch, because a0
@@ -1424,6 +1908,10 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 	if err != nil {
 		return TInt, err
 	}
+	// Signedness of the LEFT operand drives signed vs unsigned division,
+	// remainder, and right-shift (the dividend and the value being shifted
+	// are always the left operand). The right operand is only a count.
+	leftSigned := c.resSigned
 	if lt == TDouble {
 		c.emit("movsd [rbp%+d], xmm0", off)
 	} else {
@@ -1434,6 +1922,9 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		return TInt, err
 	}
 	c.tmpDepth--
+	// For symmetric comparisons the two operands normally share signedness,
+	// so the right operand's flag is an acceptable proxy there.
+	rightSigned := c.resSigned
 
 	// The right operand is now in rax (int) or xmm0 (double).
 	isDbl := lt == TDouble || rt == TDouble
@@ -1479,10 +1970,15 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		case "*":
 			c.emit("imul rax, r10")
 		case "/":
-			c.emit("mov r11, rax") // divisor
-			c.emit("mov rax, r10") // dividend
-			c.emit("cqo")
-			c.emit("idiv r11")
+			c.emit("mov r11, rax")            // divisor
+			c.emit("mov rax, r10")            // dividend
+			if leftSigned {
+				c.emit("cqo")
+				c.emit("idiv r11")
+			} else {
+				c.emit("xor edx, edx")
+				c.emit("div r11")
+			}
 		}
 		c.resTyp = TInt
 		return TInt, nil
@@ -1493,9 +1989,50 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		c.emit("mov r10, [rbp%+d]", off)
 		c.emit("mov r11, rax") // divisor
 		c.emit("mov rax, r10") // dividend
-		c.emit("cqo")
-		c.emit("idiv r11")
+		if leftSigned {
+			c.emit("cqo")
+			c.emit("idiv r11")
+		} else {
+			c.emit("xor edx, edx")
+			c.emit("div r11")
+		}
 		c.emit("mov rax, rdx")
+		c.resTyp = TInt
+		return TInt, nil
+	case "<<", ">>":
+		if isDbl {
+			return TInt, fmt.Errorf("%q requires integer operands", n.Op)
+		}
+		// Shift count must live in cl (low 8 bits of rcx); the left operand
+		// rides in a frame temporary.
+		c.emit("mov rcx, rax")             // count
+		c.emit("mov rax, [rbp%+d]", off)   // left
+		switch n.Op {
+		case "<<":
+			c.emit("shl rax, cl")
+		case ">>":
+			if leftSigned {
+				c.emit("sar rax, cl") // arithmetic (sign-extending) shift
+			} else {
+				c.emit("shr rax, cl") // logical shift
+			}
+		}
+		c.resSigned = leftSigned
+		c.resTyp = TInt
+		return TInt, nil
+	case "&", "|", "^":
+		if isDbl {
+			return TInt, fmt.Errorf("%q requires integer operands", n.Op)
+		}
+		c.emit("mov r11, [rbp%+d]", off) // left
+		switch n.Op {
+		case "&":
+			c.emit("and rax, r11")
+		case "|":
+			c.emit("or rax, r11")
+		case "^":
+			c.emit("xor rax, r11")
+		}
 		c.resTyp = TInt
 		return TInt, nil
 	case "<", ">", "<=", ">=", "==", "!=":
@@ -1527,19 +2064,38 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		} else {
 			c.emit("mov r10, [rbp%+d]", off)
 			c.emit("cmp r10, rax")
-			switch n.Op {
-			case "<":
-				jmp = "jl"
-			case ">":
-				jmp = "jg"
-			case "<=":
-				jmp = "jle"
-			case ">=":
-				jmp = "jge"
-			case "==":
-				jmp = "je"
-			case "!=":
-				jmp = "jne"
+			// Signedness selects the condition codes: signed uses jl/jg/...,
+			// unsigned uses jb/ja/... so that negative values compare right.
+			if rightSigned {
+				switch n.Op {
+				case "<":
+					jmp = "jl"
+				case ">":
+					jmp = "jg"
+				case "<=":
+					jmp = "jle"
+				case ">=":
+					jmp = "jge"
+				case "==":
+					jmp = "je"
+				case "!=":
+					jmp = "jne"
+				}
+			} else {
+				switch n.Op {
+				case "<":
+					jmp = "jb"
+				case ">":
+					jmp = "ja"
+				case "<=":
+					jmp = "jbe"
+				case ">=":
+					jmp = "jae"
+				case "==":
+					jmp = "je"
+				case "!=":
+					jmp = "jne"
+				}
 			}
 		}
 		c.emitCompare(jmp)
@@ -1688,6 +2244,11 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		ret = f.Ret.Class()
 	}
 	c.resTyp = ret
+	if f, ok := c.funcDefs[n.Name]; ok && f.Ret.Kind == KInt {
+		c.resSigned = f.Ret.Signed
+	} else {
+		c.resSigned = true
+	}
 	return ret, nil
 }
 

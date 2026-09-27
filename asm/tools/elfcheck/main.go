@@ -733,6 +733,30 @@ func (c *cpu) step() {
 		c.cf, c.of = false, false
 		return
 
+	case 0x09, 0x21: // or / and r/m64, r64  (RAX is r/m, the source operand)
+		reg, o := modrm()
+		var v uint64
+		if op == 0x09 {
+			v = getRM(o) | c.regs[reg]
+		} else {
+			v = getRM(o) & c.regs[reg]
+		}
+		setRM(o, v)
+		c.setLogicFlags(v)
+		return
+
+	case 0x0b, 0x23: // or / and r64, r/m64  (the GP register is the destination)
+		reg, o := modrm()
+		var v uint64
+		if op == 0x0b {
+			v = c.regs[reg] | getRM(o)
+		} else {
+			v = c.regs[reg] & getRM(o)
+		}
+		c.regs[reg] = v
+		c.setLogicFlags(v)
+		return
+
 	case 0x01: // add r/m, r
 		reg, o := modrm()
 		a, b := getRM(o), c.regs[reg]
@@ -796,6 +820,23 @@ func (c *cpu) step() {
 			v >>= 1
 		case 7:
 			v = uint64(int64(v) >> 1)
+		default:
+			die("unsupported shift /%d at 0x%x", shiftReg, pc)
+		}
+		setRM(o, v)
+		return
+
+	case 0xd3: // shift r/m64 by cl (rcx): /4 shl, /5 shr, /7 sar (REX.W => 64-bit)
+		shiftReg, o := modrm()
+		cnt := c.regs[1] & 0x3f // low 6 bits of rcx, as real hardware masks it
+		v := getRM(o)
+		switch shiftReg {
+		case 4: // shl / sal
+			v <<= cnt
+		case 5: // shr (logical, zero-fill)
+			v >>= cnt
+		case 7: // sar (arithmetic, sign-fill)
+			v = uint64(int64(v) >> cnt)
 		default:
 			die("unsupported shift /%d at 0x%x", shiftReg, pc)
 		}

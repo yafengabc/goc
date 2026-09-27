@@ -23,6 +23,10 @@ type Program struct {
 	// function (e.g. strlen) still triggers clib inclusion rather than being
 	// mistaken for a user definition.
 	Prototypes []*FuncDecl
+	// Globals are top-level variable declarations (with optional initialisers).
+	// They are emitted into the .data section by the code generator and are
+	// visible to every function.
+	Globals []*DeclStmt
 }
 
 type FuncDecl struct {
@@ -30,6 +34,7 @@ type FuncDecl struct {
 	Ret        *Type
 	Params     []string
 	ParamTypes []*Type
+	Variadic   bool
 	Body       *Block
 }
 
@@ -75,6 +80,20 @@ type WhileStmt struct {
 	Body Stmt
 }
 
+// ForStmt is a C for-loop: for (Init; Cond; Post) Body. Init is a Stmt
+// (typically a DeclStmt or ExprStmt); Cond and Post are expressions (either may
+// be nil, meaning "absent").
+type ForStmt struct {
+	Init Stmt
+	Cond Expr
+	Post Expr
+	Body Stmt
+}
+
+type BreakStmt struct{}
+
+type ContinueStmt struct{}
+
 type Expr interface{}
 
 type NumLit struct {
@@ -113,4 +132,27 @@ type Call struct {
 type Index struct {
 	Base Expr
 	Idx  Expr
+}
+
+// CondExpr is the ternary operator a ? b : c.
+type CondExpr struct {
+	Cond Expr
+	Then Expr
+	Else Expr
+}
+
+// CastExpr is a C-style cast (Type)E. Value-level conversion is handled by the
+// code generator (most integer widths share the 8-byte slot); only int<->double
+// and width truncation/extension actually move bits.
+type CastExpr struct {
+	Typ *Type
+	E   Expr
+}
+
+// IncDecExpr is a prefix (++x) or postfix (x++) increment/decrement. Prefix is
+// true for ++x / --x, false for x++ / x--.
+type IncDecExpr struct {
+	Op      string // "++" or "--"
+	E       Expr
+	Prefix  bool
 }

@@ -21,6 +21,9 @@ var keywords = map[string]bool{
 	"int": true, "double": true, "if": true, "else": true, "while": true, "return": true,
 	"char": true, "long": true, "short": true, "unsigned": true, "signed": true,
 	"void": true, "struct": true,
+	"for": true, "break": true, "continue": true,
+	"typedef": true, "extern": true, "static": true,
+	"const": true, "volatile": true, "restrict": true,
 }
 
 type Token struct {
@@ -29,6 +32,7 @@ type Token struct {
 	Num   int64
 	Fval  float64
 	IsDbl bool
+	IsChar bool // a 'x' character literal (carried as an integer constant in Num)
 	Str   []byte
 	Line  int
 	Space bool // true if whitespace preceded this token (separates macro name from '(' etc.)
@@ -95,10 +99,27 @@ func Lex(src string) ([]Token, error) {
 			i += 2
 		case isDigit(c):
 			start := i
+			isDbl := false
+			// Hex literal: 0x[0-9a-fA-F]+. Size suffixes (u/l/ul) are
+			// ignored, so 0xff and 1103515245UL both parse as integers.
+			if c == '0' && i+1 < n && (src[i+1] == 'x' || src[i+1] == 'X') {
+				i += 2
+				for i < n && (isDigit(src[i]) ||
+					(src[i] >= 'a' && src[i] <= 'f') ||
+					(src[i] >= 'A' && src[i] <= 'F')) {
+					i++
+				}
+				text := src[start:i]
+				v, _ := strconv.ParseInt(text[2:], 16, 64)
+				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
+					i++
+				}
+				push(Token{Kind: TNum, Text: text, Num: v, Line: line})
+				continue
+			}
 			for i < n && isDigit(src[i]) {
 				i++
 			}
-			isDbl := false
 			if i < n && src[i] == '.' {
 				isDbl = true
 				i++
@@ -113,6 +134,9 @@ func Lex(src string) ([]Token, error) {
 			} else {
 				var v int64
 				fmt.Sscanf(text, "%d", &v)
+				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
+					i++
+				}
 				push(Token{Kind: TNum, Text: text, Num: v, Line: line})
 			}
 		case isAlpha(c):
@@ -157,20 +181,55 @@ func Lex(src string) ([]Token, error) {
 			if i >= n {
 				return nil, fmt.Errorf("line %d: unterminated string literal", line)
 			}
-			i++ // closing quote
-			push(Token{Kind: TStr, Str: buf, Line: line})
-		default:
+		i++ // closing quote
+		push(Token{Kind: TStr, Str: buf, Line: line})
+	case c == '\'':
+		// Character literal 'x' (or '\n', '\0', ...). Carried as an integer
+		// constant (the byte value) so the parser/codegen need no new node.
+		i++
+		var ch byte
+		if i < n && src[i] == '\\' && i+1 < n {
+			i++
+			switch src[i] {
+			case 'n':
+				ch = '\n'
+			case 't':
+				ch = '\t'
+			case 'r':
+				ch = '\r'
+			case '\\':
+				ch = '\\'
+			case '\'':
+				ch = '\''
+			case '"':
+				ch = '"'
+			case '0':
+				ch = 0
+			default:
+				ch = src[i]
+			}
+			i++
+		} else if i < n {
+			ch = src[i]
+			i++
+		}
+		if i >= n || src[i] != '\'' {
+			return nil, fmt.Errorf("line %d: unterminated character literal", line)
+		}
+		i++ // closing quote
+		push(Token{Kind: TNum, Text: string(rune(ch)), Num: int64(ch), IsChar: true, Line: line})
+	default:
 			two := ""
 			if i+1 < n {
 				two = src[i : i+2]
 			}
 			switch two {
-			case "==", "!=", "<=", ">=", "&&", "||", "##":
+			case "==", "!=", "<=", ">=", "&&", "||", "##", "<<", ">>", "++", "--":
 				push(Token{Kind: TPunct, Text: two, Line: line})
 				i += 2
 				continue
 			}
-		if strings.IndexByte("+-*/%=<>!(){};,.[]&", c) >= 0 {
+		if strings.IndexByte("+-*/%=<>!(){};,.[]&?:", c) >= 0 {
 			push(Token{Kind: TPunct, Text: string(c), Line: line})
 			i++
 			continue

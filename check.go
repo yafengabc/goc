@@ -70,6 +70,12 @@ func Check(prog *Program) []error {
 			c.protos[f.Name] = f
 		}
 	}
+	// A persistent global scope holds the top-level variables, visible to every
+	// function. It is never popped.
+	c.scopes = append(c.scopes, &cScope{vars: map[string]*Type{}})
+	for _, g := range prog.Globals {
+		c.checkStmt(g, nil)
+	}
 	for _, f := range prog.Funcs {
 		if f.Ret.IsArray() || f.Ret.IsFunc() {
 			c.errf(0, "function %q cannot return %s", f.Name, f.Ret)
@@ -151,6 +157,25 @@ func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 	case *WhileStmt:
 		c.checkExpr(n.Cond, fn)
 		c.checkStmt(n.Body, fn)
+	case *ForStmt:
+		c.push()
+		if n.Init != nil {
+			c.checkStmt(n.Init, fn)
+		}
+		if n.Cond != nil {
+			c.checkExpr(n.Cond, fn)
+		}
+		if n.Body != nil {
+			c.checkStmt(n.Body, fn)
+		}
+		if n.Post != nil {
+			c.checkExpr(n.Post, fn)
+		}
+		c.pop()
+	case *BreakStmt:
+		// no type effect
+	case *ContinueStmt:
+		// no type effect
 	case *Block:
 		c.checkBlock(n, fn)
 	}
@@ -283,6 +308,16 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		}
 		c.errf(0, "cannot index non-array/non-pointer type %s", base)
 		return IntType()
+	case *CondExpr:
+		c.checkExpr(n.Cond, fn)
+		t := c.checkExpr(n.Then, fn)
+		c.checkExpr(n.Else, fn)
+		return t
+	case *CastExpr:
+		c.checkExpr(n.E, fn)
+		return n.Typ
+	case *IncDecExpr:
+		return c.checkExpr(n.E, fn)
 	}
 	return IntType()
 }
@@ -325,6 +360,11 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 	case "&&", "||":
 		if !(lt.IsScalar() && rt.IsScalar()) {
 			c.errf(0, "logical operator requires scalar operands, got %s and %s", lt, rt)
+		}
+		return IntType()
+	case "<<", ">>", "&", "|", "^":
+		if !(lt.IsIntClass() && rt.IsIntClass()) {
+			c.errf(0, "operator %q requires integer operands, got %s and %s", n.Op, lt, rt)
 		}
 		return IntType()
 	}

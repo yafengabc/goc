@@ -9,8 +9,29 @@ var typeKeywords = map[string]bool{
 	"unsigned": true, "signed": true, "double": true, "struct": true,
 }
 
+// qualifierKeywords are type qualifiers that decorate a specifier list but
+// carry no codegen meaning for the toy model (const/volatile/restrict).
+var qualifierKeywords = map[string]bool{
+	"const": true, "volatile": true, "restrict": true,
+}
+
+// typedefs maps a typedef name to the type it aliases. Populated during parsing
+// of "typedef" declarations and consulted by isTypeName so later declarations
+// can use the alias as a type name.
+var typedefs = map[string]*Type{}
+
 func isTypeName(tok Token) bool {
-	return tok.Kind == TKeyword && typeKeywords[tok.Text]
+	if tok.Kind == TKeyword && typeKeywords[tok.Text] {
+		return true
+	}
+	if tok.Kind == TIdent && typedefs[tok.Text] != nil {
+		return true
+	}
+	return false
+}
+
+func isQualifier(tok Token) bool {
+	return tok.Kind == TKeyword && qualifierKeywords[tok.Text]
 }
 
 // paramDecl is an intermediate result of a declarator: the declared name and
@@ -27,12 +48,14 @@ type declResult struct {
 	name       string
 	typ        *Type
 	paramNames []string
+	variadic   bool
 	line       int
 }
 
 type Parser struct {
-	toks []Token
-	pos  int
+	toks    []Token
+	pos     int
+	globals []*DeclStmt // top-level variable declarations
 }
 
 func Parse(toks []Token) (*Program, error) {
@@ -52,6 +75,7 @@ func Parse(toks []Token) (*Program, error) {
 			prog.Funcs = append(prog.Funcs, fd)
 		}
 	}
+	prog.Globals = p.globals
 	return prog, nil
 }
 
@@ -60,14 +84,46 @@ func Parse(toks []Token) (*Program, error) {
 // declarator followed by ';'). The latter is how #include'd system headers
 // declare printf, malloc, strlen, ... without a body.
 func (p *Parser) parseTopLevel() (*FuncDecl, error) {
+	// Storage-class specifiers: typedef / extern / static. These precede the
+	// type specifier list. "typedef" creates an alias and produces no symbol;
+	// extern/static only affect linkage (ignored by the toy model) and fall
+	// through to the normal declaration logic.
+	storage := ""
+	if p.cur().Kind == TKeyword && (p.cur().Text == "typedef" || p.cur().Text == "extern" || p.cur().Text == "static") {
+		storage = p.next().Text
+	}
+	if storage == "typedef" {
+		spec, err := p.parseDeclarationSpecifiers()
+		if err != nil {
+			return nil, err
+		}
+		for {
+			pd, err := p.parseDeclarator(spec, false, false)
+			if err != nil {
+				return nil, err
+			}
+			typedefs[pd.name] = pd.typ
+			if p.atPunct(",") {
+				p.next()
+				continue
+			}
+			break
+		}
+		if err := p.expect(";"); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
 	spec, err := p.parseDeclarationSpecifiers()
 	if err != nil {
 		return nil, err
 	}
-	d, err := p.parseDeclarator(spec, true)
+	d, err := p.parseDeclarator(spec, true, false)
 	if err != nil {
 		return nil, err
 	}
+	// A function definition: declarator followed by a block.
 	if p.atPunct("{") {
 		body, err := p.parseBlock()
 		if err != nil {
@@ -78,24 +134,40 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 			Ret:        d.typ.Ret,
 			Params:     d.paramNames,
 			ParamTypes: d.typ.Params,
+			Variadic:   d.variadic,
 			Body:       body,
 		}, nil
 	}
-	if p.atPunct(";") {
-		p.next()
-		if d.typ.Kind != KFunc {
-			// A non-function top-level declaration (e.g. a global variable).
-			// The toy model does not support these, so we simply drop it.
-			return nil, nil
+	// A declaration: either a function prototype (no body) or a global
+	// variable (with optional initialiser). Both end at ';'.
+	if d.typ.Kind == KFunc {
+		if !p.atPunct(";") {
+			return nil, fmt.Errorf("line %d: expected ';' after prototype", p.cur().Line)
 		}
+		p.next()
 		return &FuncDecl{
 			Name:       d.name,
 			Ret:        d.typ.Ret,
 			Params:     d.paramNames,
 			ParamTypes: d.typ.Params,
+			Variadic:   d.variadic,
 		}, nil
 	}
-	return nil, fmt.Errorf("line %d: expected '{' or ';' after declaration", p.cur().Line)
+	// Global variable declaration with optional initialiser: "T name = expr;".
+	var init Expr
+	if p.atPunct("=") {
+		p.next()
+		init, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !p.atPunct(";") {
+		return nil, fmt.Errorf("line %d: expected ';' after global declaration", p.cur().Line)
+	}
+	p.next()
+	p.globals = append(p.globals, &DeclStmt{Name: d.name, Typ: d.typ, Init: init, Line: d.line})
+	return nil, nil
 }
 
 func (p *Parser) cur() Token  { return p.toks[p.pos] }
@@ -131,7 +203,14 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	isDouble := false
 	isVoid := false
 	seen := false
-	for isTypeName(p.cur()) {
+	for {
+		if isQualifier(p.cur()) {
+			p.next()
+			continue
+		}
+		if !isTypeName(p.cur()) {
+			break
+		}
 		if p.cur().Text == "struct" {
 			return nil, fmt.Errorf("line %d: struct is not supported in stage 2", p.cur().Line)
 		}
@@ -176,7 +255,7 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 // parseDeclarator applies pointer prefixes, a direct declarator (name or
 // grouping), and array/function suffixes to base. When allowFunc is false the
 // function suffix is rejected (it only makes sense at the top level).
-func (p *Parser) parseDeclarator(base *Type, allowFunc bool) (declResult, error) {
+func (p *Parser) parseDeclarator(base *Type, allowFunc bool, abstract bool) (declResult, error) {
 	for p.atPunct("*") {
 		base = PtrType(base)
 		p.next()
@@ -185,7 +264,7 @@ func (p *Parser) parseDeclarator(base *Type, allowFunc bool) (declResult, error)
 	wasGrouped := false
 	if p.atPunct("(") {
 		p.next()
-		inner, err := p.parseDeclarator(base, allowFunc)
+		inner, err := p.parseDeclarator(base, allowFunc, abstract)
 		if err != nil {
 			return d, err
 		}
@@ -195,14 +274,16 @@ func (p *Parser) parseDeclarator(base *Type, allowFunc bool) (declResult, error)
 		d = inner
 		d.line = inner.line
 		wasGrouped = true
-	} else {
-		if p.cur().Kind != TIdent {
-			return d, fmt.Errorf("line %d: expected declarator name, got %q", p.cur().Line, p.cur().Text)
-		}
+	} else if p.cur().Kind == TIdent {
 		nameTok := p.next()
 		d.name = nameTok.Text
 		d.line = nameTok.Line
 		d.typ = base
+	} else if abstract {
+		// Abstract declarator (e.g. a cast like (char*) or (int[4])): no name.
+		d.typ = base
+	} else {
+		return d, fmt.Errorf("line %d: expected declarator name, got %q", p.cur().Line, p.cur().Text)
 	}
 	// Suffixes: array [...], function (...). A function suffix on a grouped
 	// declarator would be a function pointer, which stage 2 does not support.
@@ -224,12 +305,13 @@ func (p *Parser) parseDeclarator(base *Type, allowFunc bool) (declResult, error)
 			if wasGrouped {
 				return d, fmt.Errorf("line %d: function pointers are not supported in stage 2", p.cur().Line)
 			}
-			params, names, err := p.parseParamList()
+			params, names, variadic, err := p.parseParamList()
 			if err != nil {
 				return d, err
 			}
 			d.typ = FuncType(d.typ, params)
 			d.paramNames = names
+			d.variadic = variadic
 		} else {
 			break
 		}
@@ -315,32 +397,54 @@ func (p *Parser) constPrim() (int, error) {
 
 // parseParamList parses the (...) of a function declarator. Array parameters
 // decay to pointers, matching C. "void" as the sole parameter means empty.
-func (p *Parser) parseParamList() ([]*Type, []string, error) {
+// atEllipsis reports whether the cursor is at a "..." token sequence (three
+// consecutive '.' punctuation tokens).
+func (p *Parser) atEllipsis() bool {
+	return p.cur().Kind == TPunct && p.cur().Text == "." &&
+		p.peek().Kind == TPunct && p.peek().Text == "." &&
+		p.toks[p.pos+2].Kind == TPunct && p.toks[p.pos+2].Text == "."
+}
+
+// consumeEllipsis advances past a "..." token sequence.
+func (p *Parser) consumeEllipsis() {
+	p.next()
+	p.next()
+	p.next()
+}
+
+func (p *Parser) parseParamList() ([]*Type, []string, bool, error) {
 	if err := p.expect("("); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	var types []*Type
 	var names []string
+	variadic := false
 	if p.atPunct(")") {
 		p.next()
-		return types, names, nil
+		return types, names, variadic, nil
 	}
 	for {
+		// Bare "..." as the only parameter (e.g. f(...)).
+		if p.atEllipsis() {
+			p.consumeEllipsis()
+			variadic = true
+			break
+		}
 		spec, err := p.parseDeclarationSpecifiers()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if p.atPunct(")") {
 			// "void" alone => empty parameter list
 			if spec.IsVoid() {
 				p.next()
-				return types, names, nil
+				return types, names, variadic, nil
 			}
-			return nil, nil, fmt.Errorf("line %d: expected parameter name", p.cur().Line)
+			return nil, nil, false, fmt.Errorf("line %d: expected parameter name", p.cur().Line)
 		}
-		pd, err := p.parseDeclarator(spec, false)
+		pd, err := p.parseDeclarator(spec, false, false)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if pd.typ.IsArray() {
 			pd.typ = PtrType(pd.typ.Elem)
@@ -349,14 +453,19 @@ func (p *Parser) parseParamList() ([]*Type, []string, error) {
 		names = append(names, pd.name)
 		if p.atPunct(",") {
 			p.next()
+			if p.atEllipsis() {
+				p.consumeEllipsis()
+				variadic = true
+				break
+			}
 			continue
 		}
 		break
 	}
 	if err := p.expect(")"); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	return types, names, nil
+	return types, names, variadic, nil
 }
 
 // parseBlock parses a brace-delimited statement block.
@@ -381,6 +490,7 @@ func (p *Parser) parseBlock() (*Block, error) {
 
 func (p *Parser) parseStmt() (Stmt, error) {
 	t := p.cur()
+	var err error
 	switch {
 	case isTypeName(t):
 		return p.parseDeclaration()
@@ -440,6 +550,65 @@ func (p *Parser) parseStmt() (Stmt, error) {
 			return nil, err
 		}
 		return &WhileStmt{Cond: cond, Body: body}, nil
+	case t.Kind == TKeyword && t.Text == "for":
+		p.next()
+		if err := p.expect("("); err != nil {
+			return nil, err
+		}
+		var init Stmt
+		if !p.atPunct(";") {
+			if isTypeName(p.cur()) {
+				init, err = p.parseDeclaration()
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				e, eerr := p.parseExpr()
+				if eerr != nil {
+					return nil, eerr
+				}
+				if eerr := p.expect(";"); eerr != nil {
+					return nil, eerr
+				}
+				init = &ExprStmt{E: e}
+			}
+		} else {
+			p.next() // empty init
+		}
+		var cond Expr
+		if !p.atPunct(";") {
+			cond, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expect(";"); err != nil {
+			return nil, err
+		}
+		var post Expr
+		if !p.atPunct(")") {
+			post, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+		body, err := p.parseStmt()
+		if err != nil {
+			return nil, err
+		}
+		return &ForStmt{Init: init, Cond: cond, Post: post, Body: body}, nil
+	case t.Kind == TKeyword && (t.Text == "break" || t.Text == "continue"):
+		p.next()
+		if err := p.expect(";"); err != nil {
+			return nil, err
+		}
+		if t.Text == "break" {
+			return &BreakStmt{}, nil
+		}
+		return &ContinueStmt{}, nil
 	case p.atPunct("{"):
 		return p.parseBlock()
 	}
@@ -475,7 +644,7 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 	}
 	var decls []*DeclStmt
 	for {
-		pd, err := p.parseDeclarator(spec, false)
+		pd, err := p.parseDeclarator(spec, false, false)
 		if err != nil {
 			return nil, err
 		}
@@ -503,7 +672,32 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 	return &DeclList{Decls: decls}, nil
 }
 
-func (p *Parser) parseExpr() (Expr, error) { return p.parseOr() }
+func (p *Parser) parseExpr() (Expr, error) { return p.parseCond() }
+
+// parseCond parses the ternary operator (?:), the lowest-precedence operator
+// the toy model supports (no comma operator).
+func (p *Parser) parseCond() (Expr, error) {
+	left, err := p.parseOr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.atPunct("?") {
+		return left, nil
+	}
+	p.next() // consume '?'
+	thenE, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(":"); err != nil {
+		return nil, err
+	}
+	elseE, err := p.parseCond()
+	if err != nil {
+		return nil, err
+	}
+	return &CondExpr{Cond: left, Then: thenE, Else: elseE}, nil
+}
 
 func (p *Parser) parseOr() (Expr, error) {
 	left, err := p.parseAnd()
@@ -522,17 +716,69 @@ func (p *Parser) parseOr() (Expr, error) {
 }
 
 func (p *Parser) parseAnd() (Expr, error) {
-	left, err := p.parseEq()
+	left, err := p.parseBOr()
 	if err != nil {
 		return nil, err
 	}
 	for p.atPunct("&&") {
 		p.next()
-		right, err := p.parseEq()
+		right, err := p.parseBOr()
 		if err != nil {
 			return nil, err
 		}
 		left = &Binary{Op: "&&", L: left, R: right}
+	}
+	return left, nil
+}
+
+// parseBOr / parseXor / parseBAnd parse the bitwise operators (| ^ &), which
+// sit between logical && and equality in precedence. Prefix & (address-of) is
+// handled separately in parseUnary, so the single '&' token here is always the
+// bitwise AND; '&&' is a distinct two-character token.
+func (p *Parser) parseBOr() (Expr, error) {
+	left, err := p.parseXor()
+	if err != nil {
+		return nil, err
+	}
+	for p.atPunct("|") {
+		p.next()
+		right, err := p.parseXor()
+		if err != nil {
+			return nil, err
+		}
+		left = &Binary{Op: "|", L: left, R: right}
+	}
+	return left, nil
+}
+
+func (p *Parser) parseXor() (Expr, error) {
+	left, err := p.parseBAnd()
+	if err != nil {
+		return nil, err
+	}
+	for p.atPunct("^") {
+		p.next()
+		right, err := p.parseBAnd()
+		if err != nil {
+			return nil, err
+		}
+		left = &Binary{Op: "^", L: left, R: right}
+	}
+	return left, nil
+}
+
+func (p *Parser) parseBAnd() (Expr, error) {
+	left, err := p.parseEq()
+	if err != nil {
+		return nil, err
+	}
+	for p.atPunct("&") {
+		p.next()
+		right, err := p.parseEq()
+		if err != nil {
+			return nil, err
+		}
+		left = &Binary{Op: "&", L: left, R: right}
 	}
 	return left, nil
 }
@@ -554,11 +800,29 @@ func (p *Parser) parseEq() (Expr, error) {
 }
 
 func (p *Parser) parseRel() (Expr, error) {
-	left, err := p.parseAdd()
+	left, err := p.parseShift()
 	if err != nil {
 		return nil, err
 	}
 	for p.atPunct("<") || p.atPunct(">") || p.atPunct("<=") || p.atPunct(">=") {
+		op := p.next().Text
+		right, err := p.parseShift()
+		if err != nil {
+			return nil, err
+		}
+		left = &Binary{Op: op, L: left, R: right}
+	}
+	return left, nil
+}
+
+// parseShift parses the shift operators << and >> (below relational, above
+// additive in precedence).
+func (p *Parser) parseShift() (Expr, error) {
+	left, err := p.parseAdd()
+	if err != nil {
+		return nil, err
+	}
+	for p.atPunct("<<") || p.atPunct(">>") {
 		op := p.next().Text
 		right, err := p.parseAdd()
 		if err != nil {
@@ -626,6 +890,35 @@ func (p *Parser) parseUnary() (Expr, error) {
 		}
 		return &Unary{Op: "&", E: e}, nil
 	}
+	if p.atPunct("++") || p.atPunct("--") {
+		op := p.next().Text
+		e, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		return &IncDecExpr{Op: op, E: e, Prefix: true}, nil
+	}
+	// C-style cast: (type) operand. Only when the token after '(' is a type
+	// name; otherwise '(' is an expression-grouping parenthesis.
+	if p.atPunct("(") && isTypeName(p.peek()) {
+		p.next() // consume '('
+		spec, err := p.parseDeclarationSpecifiers()
+		if err != nil {
+			return nil, err
+		}
+		dt, err := p.parseDeclarator(spec, false, true)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+		e, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		return &CastExpr{Typ: dt.typ, E: e}, nil
+	}
 	return p.parsePostfix()
 }
 
@@ -670,6 +963,9 @@ func (p *Parser) parsePostfix() (Expr, error) {
 				return nil, err
 			}
 			e = &Index{Base: e, Idx: idx}
+		} else if p.atPunct("++") || p.atPunct("--") {
+			op := p.next().Text
+			e = &IncDecExpr{Op: op, E: e, Prefix: false}
 		} else {
 			break
 		}
