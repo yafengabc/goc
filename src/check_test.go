@@ -99,6 +99,38 @@ int main() {
 	}
 }
 
+func TestCheckStringInit(t *testing.T) {
+	// A string literal initialises a char array: the length may be inferred
+	// from the string ("char s[]") or must leave room for the trailing NUL.
+	ok := `
+int main() {
+    char s[] = "hi";
+    char t[8] = "abc";
+    char e[] = "";
+    char a[] = "x", b[] = "yz";
+    return 0;
+}`
+	if errs := checkSrc(t, ok); len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+
+	// A string longer than the array (counting the NUL) is rejected...
+	big := `int main() { char e[2] = "hi"; return 0; }`
+	if errs := checkSrc(t, big); len(errs) == 0 {
+		t.Fatal("expected an oversize-string-initialiser error")
+	}
+	// ...as is a non-char array...
+	nonchar := `int main() { int a[2] = 5; return 0; }`
+	if errs := checkSrc(t, nonchar); len(errs) == 0 {
+		t.Fatal("expected an array-initialiser error for int[]")
+	}
+	// ...and a char array initialised by something other than a string.
+	nonstr := `int main() { char s[3] = 5; return 0; }`
+	if errs := checkSrc(t, nonstr); len(errs) == 0 {
+		t.Fatal("expected an array-initialiser error for char[] = 5")
+	}
+}
+
 func TestCheckReturnFromVoid(t *testing.T) {
 	src := `void f() { return 1; } int main() { f(); return 0; }`
 	errs := checkSrc(t, src)

@@ -199,6 +199,11 @@ func (t *Type) IsFunc() bool     { return t.Kind == KFunc }
 func (t *Type) IsStruct() bool   { return t.Kind == KStruct }
 func (t *Type) IsUnion() bool    { return t.Kind == KUnion }
 
+// IsChar reports whether t is a char type. In this dialect char is a 1-byte
+// int (signed or unsigned); it is the element type a string literal can
+// initialise an array of.
+func (t *Type) IsChar() bool { return t != nil && t.Kind == KInt && t.Width == 1 }
+
 // PtrElem returns the element type of a pointer/array, or nil.
 func (t *Type) PtrElem() *Type {
 	if t.Kind == KPtr || t.Kind == KArr {

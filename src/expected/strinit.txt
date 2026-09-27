@@ -1,0 +1,15 @@
+== local ==
+s=hi sizeof=3
+t=abc t3=0 t7=0 sizeof=8
+e_len=1 e0=0
+cat=abcd sizeof=5
+esc=[q	w
+e] sizeof=6
+a=x b=yz
+i=7 j=9
+lp=lptr
+== global ==
+g=world g5=0 sizeof=6
+g8=hi g82=0 sizeof=8
+== mutate ==
+s=Hi t=abcd g8=hI

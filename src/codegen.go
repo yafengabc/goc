@@ -1371,6 +1371,23 @@ func Gen(prog *Program, linux bool) (string, error) {
 		out.WriteString("\nsection .data\n")
 		for _, g := range prog.Globals {
 			lab := c.globalLab[g.Name]
+			// A char array initialised by a string literal holds the bytes
+			// (plus NUL) directly in .data, zero-padded to the full array
+			// size ("char g[8] = \"hi\"" keeps five zero tail bytes). A
+			// global char* initialised by a string literal is NOT supported:
+			// goa's dq takes no symbol operands, so the pointer could not be
+			// relocated to the constant.
+			if g.Typ != nil && g.Typ.IsArray() && g.Typ.Elem.IsChar() {
+				if sl, ok := g.Init.(*StrLit); ok {
+					size := c.typeWidth(g.Typ)
+					out.WriteString(fmt.Sprintf("%s db \"%s\", 0", lab, encodeStr(sl.Bytes)))
+					for i := len(sl.Bytes) + 1; i < size; i++ {
+						out.WriteString(", 0")
+					}
+					out.WriteString("\n")
+					continue
+				}
+			}
 			if g.Typ != nil && (g.Typ.IsArray() || isAgg(g.Typ)) {
 				// typeWidth already returns the full byte size (elem width *
 				// len for arrays, the computed Size for structs/unions), so
@@ -2006,10 +2023,39 @@ func (c *CG) genStmt(s Stmt) error {
 				return err
 			}
 		}
+	case *DeclList:
+		// A multi-declarator declaration ("int a = 1, b = 2;") is one
+		// statement; without this case genStmt silently emitted nothing for
+		// it, leaving every initialiser unrun (all variables read as 0).
+		for _, d := range n.Decls {
+			if err := c.genStmt(d); err != nil {
+				return err
+			}
+		}
 	case *DeclStmt:
 		vi := c.vars[n.Name]
 		if vi.typ.IsArray() {
-			// Arrays are not initialised here; the checker rejects initialisers.
+			// The one array initialiser that exists is a string literal for a
+			// char array: copy the bytes (plus NUL) into the stack slot and
+			// zero-fill the tail of a larger array. Other array initialisers
+			// were rejected by the checker and never reach codegen.
+			if sl, ok := n.Init.(*StrLit); ok && vi.typ.Elem.IsChar() {
+				size := c.typeWidth(vi.typ)
+				copied := len(sl.Bytes) + 1
+				if copied > size {
+					copied = size // defensive; the checker rejects oversize
+				}
+				if _, err := c.genExprT(n.Init); err != nil {
+					return err // rax = address of the constant in .rdata
+				}
+				c.emit("mov r11, rax")
+				c.emit("lea r10, [rbp%+d]", vi.off)
+				c.copyBytes("r10", "r11", copied)
+				if size > copied {
+					c.emit("add r10, %d", copied)
+					c.zeroBytes("r10", size-copied)
+				}
+			}
 			return nil
 		}
 		if isAgg(vi.typ) {

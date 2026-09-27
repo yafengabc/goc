@@ -111,13 +111,32 @@ func (c *checker) checkBlock(b *Block, fn *FuncDecl) {
 func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 	switch n := st.(type) {
 	case *DeclStmt:
-		c.put(n.Name, n.Typ, n.Line)
+		// A char array initialised by a string literal is the one array
+		// initialiser C allows: the bytes (plus a trailing NUL) are copied
+		// in, and an incomplete "char s[]" borrows its length from the
+		// string. Any other array initialiser stays rejected.
+		strInit := false
 		if n.Typ.IsArray() && n.Init != nil {
-			c.errf(n.Line, "array %q cannot be initialised here (use memset / a loop)", n.Name)
+			if sl, ok := n.Init.(*StrLit); ok && n.Typ.Elem.IsChar() {
+				strInit = true
+				need := len(sl.Bytes) + 1
+				if n.Typ.Len == 0 {
+					n.Typ.Len = need
+				} else if n.Typ.Len < need {
+					c.errf(n.Line, "initialiser string of length %d does not fit in char array %q of %d bytes",
+						len(sl.Bytes), n.Name, n.Typ.Len)
+				}
+			} else {
+				c.errf(n.Line, "array %q cannot be initialised here (use memset / a loop)", n.Name)
+			}
 		}
+		c.put(n.Name, n.Typ, n.Line)
 		if n.Init != nil {
 			t := c.checkExpr(n.Init, fn)
-			if !assignable(n.Typ, t) {
+			// A string literal "decays" to char*, which is not assignable to
+			// the char-array type proper -- but it is the sanctioned form of
+			// array initialisation, so the mismatch is not an error here.
+			if !assignable(n.Typ, t) && !strInit {
 				c.errf(n.Line, "initialiser of type %s is not assignable to %s", t, n.Typ)
 			}
 		}
