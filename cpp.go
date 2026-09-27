@@ -335,10 +335,11 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 	if err != nil {
 		if angled {
 			// System headers that goc ships (stdio.h, stdlib.h, string.h, ...)
-			// are embedded and injected directly, with no disk lookup. An
-			// unavailable <file> is skipped rather than fatal.
-			if src, ok := builtinHeaders[path]; ok {
-				inc, perr := p.process(src, "<builtin:"+path+">")
+			// are embedded as real files under goclib/ and injected directly,
+			// with no disk lookup. An unavailable <file> is skipped rather
+			// than fatal.
+			if src, rerr := goclibHeaders.ReadFile("goclib/" + path); rerr == nil {
+				inc, perr := p.process(string(src), "<builtin:"+path+">")
 				if perr != nil {
 					return nil, perr
 				}

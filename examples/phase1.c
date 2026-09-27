@@ -11,7 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef unsigned long size_t;
+/* size_t now comes from the shipped <stddef.h> (pulled in by the headers
+ * above); keep uchar here to exercise `typedef` itself. */
 typedef unsigned char uchar;
 
 const int kAnswer = 42;

@@ -1,0 +1,9 @@
+strlen=5 size_t=5
+NULL is 1
+strcpy=abc p==buf:1
+strcmp=-1 strncmp=0 memcmp=0
+strchr found=1
+atoi=-99 abs=7
+malloc ok=1
+varargs: 1 2 3 4 5
+done
