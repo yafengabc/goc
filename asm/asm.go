@@ -902,6 +902,8 @@ func (a *Assembler) encode(mnem string, ops []Operand, ln string) error {
 		return nil
 	case "imul":
 		return a.encodeImul(ops, ln)
+	case "shl", "sal", "shr", "sar":
+		return a.encodeShift(mnem, ops, ln)
 	case "idiv":
 		return a.encodeUnary(0xF7, 7, ops, ln) // idiv r/m
 	case "div":
@@ -1459,13 +1461,80 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 // ---- imul reg, reg ---------------------------------------------------------
 
 func (a *Assembler) encodeImul(ops []Operand, ln string) error {
-	if len(ops) != 2 || ops[0].kind != K_REG || ops[1].kind != K_REG {
-		return fmt.Errorf("imul needs two registers: %q", ln)
+	if len(ops) != 2 || ops[0].kind != K_REG {
+		return fmt.Errorf("imul needs a register destination: %q", ln)
 	}
-	a.rexW(ops[0].reg, ops[1].reg)
-	a.emitByte(0x0F)
-	a.emitByte(0xAF)
-	a.emitByte(modrmRegReg(ops[0].reg, ops[1].reg)) // reg=dst, rm=src
+	dst := ops[0]
+	if ops[1].kind == K_REG {
+		// imul r64, r64 : 0F AF /r  (reg=dst, rm=src)
+		a.rexW(dst.reg, ops[1].reg)
+		a.emitByte(0x0F)
+		a.emitByte(0xAF)
+		a.emitByte(modrmRegReg(dst.reg, ops[1].reg))
+		return nil
+	}
+	if ops[1].kind == K_IMM {
+		// imul r64, imm : 6B /r ib (sign-extended imm8) or 69 /r id (imm32).
+		// The destination register occupies BOTH the reg and rm fields of the
+		// ModRM, so when dst.reg >= 8 we must set REX.R (reg field) AND REX.B
+		// (rm field) — rexW(dst, dst) does exactly that.
+		imm := ops[1].imm
+		if imm >= -128 && imm <= 127 {
+			a.rexW(dst.reg, dst.reg)
+			a.emitByte(0x6B)
+			a.emitByte(modrmRegReg(dst.reg, dst.reg))
+			a.emitByte(byte(int8(imm)))
+		} else {
+			a.rexW(dst.reg, dst.reg)
+			a.emitByte(0x69)
+			a.emitByte(modrmRegReg(dst.reg, dst.reg))
+			a.emitInt32(int32(imm))
+		}
+		return nil
+	}
+	return fmt.Errorf("imul: unsupported operands: %q", ln)
+}
+
+// ---- shift reg, imm / reg, cl ---------------------------------------------
+
+var shiftDigit = map[string]byte{
+	"shl": 4, "sal": 4,
+	"shr": 5,
+	"sar": 7,
+}
+
+func (a *Assembler) encodeShift(mnem string, ops []Operand, ln string) error {
+	dig, ok := shiftDigit[mnem]
+	if !ok {
+		return fmt.Errorf("bad shift: %q", mnem)
+	}
+	if len(ops) != 2 || ops[0].kind != K_REG {
+		return fmt.Errorf("%s needs a register and a shift count: %q", mnem, ln)
+	}
+	dst := ops[0]
+	switch {
+	case ops[1].kind == K_IMM:
+		c := ops[1].imm
+		if c < 0 || c > 63 {
+			return fmt.Errorf("%s count %d out of range [0,63]: %q", mnem, c, ln)
+		}
+		if c == 1 {
+			a.rexW(0, dst.reg)
+			a.emitByte(0xD1)
+			a.emitByte(modrmRegReg(int(dig), dst.reg))
+		} else {
+			a.rexW(0, dst.reg)
+			a.emitByte(0xC1)
+			a.emitByte(modrmRegReg(int(dig), dst.reg))
+			a.emitByte(byte(c))
+		}
+	case ops[1].kind == K_REG && ops[1].isByte && ops[1].reg == 1: // cl
+		a.rexW(0, dst.reg)
+		a.emitByte(0xD3)
+		a.emitByte(modrmRegReg(int(dig), dst.reg))
+	default:
+		return fmt.Errorf("%s: unsupported shift count: %q", mnem, ln)
+	}
 	return nil
 }
 

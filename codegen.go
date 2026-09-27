@@ -966,11 +966,10 @@ func (c *CG) genLValue(e Expr) error {
 			c.emit("mov r10, rax")
 		}
 		c.emit("mov r11, [rbp%+d]", islot)
-		// byte offset = index * 8 (every slot is 8 bytes). a0 has no imul-with-
-		// immediate and no shl, so triple a doubling add (8 = 2^3).
-		c.emit("add r11, r11")
-		c.emit("add r11, r11")
-		c.emit("add r11, r11")
+		// byte offset = index * 8 (every slot is 8 bytes). a0 now supports
+		// imul-with-immediate, so a single scaled multiply replaces the old
+		// triple doubling-add (8 = 2^3) hack.
+		c.emit("imul r11, 8")
 		c.emit("add r10, r11")
 		c.tmpDepth--
 		return nil
