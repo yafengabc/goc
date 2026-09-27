@@ -334,10 +334,19 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 	full, err := p.resolveInclude(path, filename, angled)
 	if err != nil {
 		if angled {
-			// System headers are outside c0's hosted-header scope for stage
-			// 1 (clib provides the built-ins like printf directly), so an
-			// unavailable <file> is skipped rather than fatal. A local
-			// "file" include, by contrast, must resolve.
+			// System headers that c0 ships (stdio.h, stdlib.h, string.h, ...)
+			// are embedded and injected directly, with no disk lookup. An
+			// unavailable <file> is skipped rather than fatal.
+			if src, ok := builtinHeaders[path]; ok {
+				inc, perr := p.process(src, "<builtin:"+path+">")
+				if perr != nil {
+					return nil, perr
+				}
+				if len(inc) > 0 && inc[len(inc)-1].Kind == TEOF {
+					inc = inc[:len(inc)-1]
+				}
+				return inc, nil
+			}
 			fmt.Fprintf(os.Stderr, "%s: note: skipping unavailable system header <%s>\n", filename, path)
 			return nil, nil
 		}

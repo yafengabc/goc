@@ -15,7 +15,14 @@ const (
 )
 
 type Program struct {
-	Funcs []*FuncDecl
+	Funcs []*FuncDecl // function definitions (Body != nil)
+	// Prototypes are forward declarations from #include'd headers (Body ==
+	// nil). They are used only by the type checker to validate calls; they
+	// are never emitted as code, and they are deliberately kept out of the
+	// code generator's "defined functions" set so that a prototype for a clib
+	// function (e.g. strlen) still triggers clib inclusion rather than being
+	// mistaken for a user definition.
+	Prototypes []*FuncDecl
 }
 
 type FuncDecl struct {

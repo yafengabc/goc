@@ -530,6 +530,12 @@ func Gen(prog *Program, linux bool) (string, error) {
 		c.funcs[f.Name] = true
 		c.funcDefs[f.Name] = f
 	}
+	// Prototypes (from #include'd headers) are registered only for call-site
+	// double-promotion; they are deliberately NOT added to c.funcs, so a
+	// prototype for a clib function still triggers clib inclusion.
+	for _, f := range prog.Prototypes {
+		c.funcDefs[f.Name] = f
+	}
 
 	var body strings.Builder
 	c.sb = strings.Builder{}

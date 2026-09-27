@@ -39,13 +39,63 @@ func Parse(toks []Token) (*Program, error) {
 	p := &Parser{toks: toks}
 	prog := &Program{}
 	for p.cur().Kind != TEOF {
-		fd, err := p.parseFunc()
+		fd, err := p.parseTopLevel()
 		if err != nil {
 			return nil, err
 		}
-		prog.Funcs = append(prog.Funcs, fd)
+		if fd == nil {
+			continue // top-level declaration with no definition (e.g. a global)
+		}
+		if fd.Body == nil {
+			prog.Prototypes = append(prog.Prototypes, fd)
+		} else {
+			prog.Funcs = append(prog.Funcs, fd)
+		}
 	}
 	return prog, nil
+}
+
+// parseTopLevel parses one translation-unit item: a function definition (a
+// declarator followed by a block) or a forward declaration / prototype (a
+// declarator followed by ';'). The latter is how #include'd system headers
+// declare printf, malloc, strlen, ... without a body.
+func (p *Parser) parseTopLevel() (*FuncDecl, error) {
+	spec, err := p.parseDeclarationSpecifiers()
+	if err != nil {
+		return nil, err
+	}
+	d, err := p.parseDeclarator(spec, true)
+	if err != nil {
+		return nil, err
+	}
+	if p.atPunct("{") {
+		body, err := p.parseBlock()
+		if err != nil {
+			return nil, err
+		}
+		return &FuncDecl{
+			Name:       d.name,
+			Ret:        d.typ.Ret,
+			Params:     d.paramNames,
+			ParamTypes: d.typ.Params,
+			Body:       body,
+		}, nil
+	}
+	if p.atPunct(";") {
+		p.next()
+		if d.typ.Kind != KFunc {
+			// A non-function top-level declaration (e.g. a global variable).
+			// The toy model does not support these, so we simply drop it.
+			return nil, nil
+		}
+		return &FuncDecl{
+			Name:       d.name,
+			Ret:        d.typ.Ret,
+			Params:     d.paramNames,
+			ParamTypes: d.typ.Params,
+		}, nil
+	}
+	return nil, fmt.Errorf("line %d: expected '{' or ';' after declaration", p.cur().Line)
 }
 
 func (p *Parser) cur() Token  { return p.toks[p.pos] }
@@ -309,33 +359,7 @@ func (p *Parser) parseParamList() ([]*Type, []string, error) {
 	return types, names, nil
 }
 
-// parseFunc parses a single function definition: specifiers, a function
-// declarator, and a body block.
-func (p *Parser) parseFunc() (*FuncDecl, error) {
-	ret, err := p.parseDeclarationSpecifiers()
-	if err != nil {
-		return nil, err
-	}
-	d, err := p.parseDeclarator(ret, true)
-	if err != nil {
-		return nil, err
-	}
-	if d.typ.Kind != KFunc {
-		return nil, fmt.Errorf("line %d: expected function definition", p.cur().Line)
-	}
-	body, err := p.parseBlock()
-	if err != nil {
-		return nil, err
-	}
-	return &FuncDecl{
-		Name:       d.name,
-		Ret:        d.typ.Ret,
-		Params:     d.paramNames,
-		ParamTypes: d.typ.Params,
-		Body:       body,
-	}, nil
-}
-
+// parseBlock parses a brace-delimited statement block.
 func (p *Parser) parseBlock() (*Block, error) {
 	if err := p.expect("{"); err != nil {
 		return nil, err

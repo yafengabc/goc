@@ -755,6 +755,53 @@ func (c *cpu) step() {
 		c.setFlagsSub(a, b, a-b)
 		return
 
+	case 0x69: // imul r64, r/m64, imm32   (a0's "imul reg, imm" two-operand form)
+		reg, o := modrm()
+		imm := uint64(int64(int32(c.fetch32())))
+		c.regs[reg] = uint64(int64(getRM(o)) * int64(imm))
+		c.cf, c.of = false, false
+		return
+
+	case 0x6b: // imul r64, r/m64, imm8    (sign-extended immediate)
+		reg, o := modrm()
+		imm := uint64(int64(int8(c.fetch8())))
+		c.regs[reg] = uint64(int64(getRM(o)) * int64(imm))
+		c.cf, c.of = false, false
+		return
+
+	case 0xc1: // shift r/m64 by imm8: /4 shl, /5 shr, /7 sar (REX.W => 64-bit)
+		shiftReg, o := modrm()
+		cnt := c.fetch8()
+		v := getRM(o)
+		switch shiftReg {
+		case 4: // shl / sal
+			v <<= cnt
+		case 5: // shr (logical, zero-fill)
+			v >>= cnt
+		case 7: // sar (arithmetic, sign-fill)
+			v = uint64(int64(v) >> cnt)
+		default:
+			die("unsupported shift /%d at 0x%x", shiftReg, pc)
+		}
+		setRM(o, v)
+		return
+
+	case 0xd1: // shift r/m64 by 1: /4 shl, /5 shr, /7 sar
+		shiftReg, o := modrm()
+		v := getRM(o)
+		switch shiftReg {
+		case 4:
+			v <<= 1
+		case 5:
+			v >>= 1
+		case 7:
+			v = uint64(int64(v) >> 1)
+		default:
+			die("unsupported shift /%d at 0x%x", shiftReg, pc)
+		}
+		setRM(o, v)
+		return
+
 	case 0x81, 0x83: // add/or/and/sub/xor/cmp r/m64, imm8 or imm32
 		reg, o := modrm()
 		var imm uint64

@@ -18,7 +18,8 @@ type cScope struct {
 }
 
 type checker struct {
-	funcs  map[string]*FuncDecl
+	funcs  map[string]*FuncDecl // function definitions
+	protos map[string]*FuncDecl // forward declarations from headers
 	scopes []*cScope
 	errs   []error
 }
@@ -55,9 +56,19 @@ func (c *checker) errf(line int, format string, a ...any) {
 // Check walks the whole program and returns every diagnostic found. A normal
 // (successful) run returns a nil or empty slice.
 func Check(prog *Program) []error {
-	c := &checker{funcs: map[string]*FuncDecl{}}
+	c := &checker{
+		funcs:  map[string]*FuncDecl{},
+		protos: map[string]*FuncDecl{},
+	}
 	for _, f := range prog.Funcs {
 		c.funcs[f.Name] = f
+	}
+	for _, f := range prog.Prototypes {
+		// A later prototype overrides an earlier one; a definition (in
+		// c.funcs) always wins because checkCall looks there first.
+		if _, ok := c.funcs[f.Name]; !ok {
+			c.protos[f.Name] = f
+		}
 	}
 	for _, f := range prog.Funcs {
 		if f.Ret.IsArray() || f.Ret.IsFunc() {
@@ -321,24 +332,37 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 }
 
 func (c *checker) checkCall(n *Call, fn *FuncDecl) *Type {
-	fd, ok := c.funcs[n.Name]
-	if !ok {
-		// External / clib call whose signature we do not model: accept it and
-		// assume an int result (true for every clib function c0 exposes).
-		return IntType()
+	if fd, ok := c.funcs[n.Name]; ok {
+		return c.checkCallSig(n, fn, fd, false)
 	}
-	if len(n.Args) != len(fd.ParamTypes) {
-		c.errf(0, "call to %q: expected %d arguments, got %d", n.Name, len(fd.ParamTypes), len(n.Args))
-		return fd.Ret
+	if pd, ok := c.protos[n.Name]; ok {
+		return c.checkCallSig(n, fn, pd, true)
+	}
+	// External / clib call whose signature we do not model: accept it and
+	// assume an int result (true for every clib function c0 exposes).
+	return IntType()
+}
+
+// checkCallSig validates a call against a known signature (a definition or a
+// prototype). It reports arity and argument-type mismatches. isProto only
+// affects the diagnostics wording.
+func (c *checker) checkCallSig(n *Call, fn *FuncDecl, sig *FuncDecl, isProto bool) *Type {
+	if len(n.Args) != len(sig.ParamTypes) {
+		what := "function"
+		if isProto {
+			what = "prototype"
+		}
+		c.errf(0, "call to %q (%s): expected %d arguments, got %d", n.Name, what, len(sig.ParamTypes), len(n.Args))
+		return sig.Ret
 	}
 	for i, a := range n.Args {
 		at := c.checkExpr(a, fn)
-		if !assignable(fd.ParamTypes[i], at) {
+		if !assignable(sig.ParamTypes[i], at) {
 			c.errf(0, "call to %q: argument %d has type %s, expected %s",
-				n.Name, i+1, at, fd.ParamTypes[i])
+				n.Name, i+1, at, sig.ParamTypes[i])
 		}
 	}
-	return fd.Ret
+	return sig.Ret
 }
 
 // assignable reports whether a value of src may be stored into a location of
