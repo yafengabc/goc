@@ -22,6 +22,7 @@ var keywords = map[string]bool{
 	"char": true, "long": true, "short": true, "unsigned": true, "signed": true,
 	"void": true, "struct": true, "union": true, "enum": true,
 	"for": true, "break": true, "continue": true,
+	"switch": true, "case": true, "default": true, "do": true, "goto": true,
 	"typedef": true, "extern": true, "static": true,
 	"const": true, "volatile": true, "restrict": true,
 }

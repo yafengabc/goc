@@ -146,6 +146,126 @@ int main() {
 	}
 }
 
+func TestCheckControlFlow(t *testing.T) {
+	src := `
+enum Color { RED, GREEN, BLUE };
+int main() {
+    int i = 0;
+    int n = 0;
+    switch (i) {
+    case 0:
+        n = 1;
+    case 1:
+        n = n + 10;
+        break;
+    default:
+        n = 99;
+    }
+    switch ('x') {
+    case 'a':
+        n = 0;
+        break;
+    default:
+        break;
+    }
+    switch (BLUE) {
+    case RED:
+        break;
+    case GREEN:
+        break;
+    }
+    do {
+        i = i + 1;
+        if (i == 2) { continue; }
+    } while (i < 4);
+    i = 0;
+again:
+    i = i + 1;
+    if (i < 3) { goto again; }
+    switch (i) {
+    case 1:
+        switch (n) {
+        case 0:
+            break;
+        default:
+            break;
+        }
+        break;
+    }
+    return n + i;
+}`
+	if errs := checkSrc(t, src); len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+}
+
+func TestCheckDuplicateCase(t *testing.T) {
+	src := `
+int main() {
+    int n = 0;
+    switch (n) {
+    case 1:
+        n = 1;
+        break;
+    case 1:
+        n = 2;
+        break;
+    }
+    return n;
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("expected a duplicate-case-value error")
+	}
+}
+
+func TestCheckMultipleDefault(t *testing.T) {
+	src := `
+int main() {
+    int n = 0;
+    switch (n) {
+    default:
+        n = 1;
+        break;
+    default:
+        n = 2;
+        break;
+    }
+    return n;
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("expected a more-than-one-default error")
+	}
+}
+
+func TestCheckCaseOutsideSwitch(t *testing.T) {
+	src := `
+int main() {
+    int n = 0;
+    case 1:
+    n = 2;
+    return n;
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("expected a case-outside-switch error")
+	}
+}
+
+func TestCheckGotoMissingLabel(t *testing.T) {
+	src := `
+int main() {
+    int i = 0;
+    goto nowhere;
+    return i;
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("expected a no-such-label error")
+	}
+}
+
 func TestCheckIncompatibleFunctionPointer(t *testing.T) {
 	src := `
 int add(int a, int b) { return a + b; }

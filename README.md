@@ -121,7 +121,8 @@ __goclib_ch db 0
 
 - 类型：`int` 与 `double`（都是 8 字节栈槽），函数参数最多 8 个（前 4 个走  
   寄存器，其余压栈）
-- `if` / `else` / `while` / `return`、块作用域
+- `if` / `else`、`while` / `for` / `do-while`、`switch` / `case` / `default`  
+  （含 fall-through 与中途的 `default`）、`break` / `continue`、`goto` 与标号、`return`、块作用域
 - 运算符：`+ - * / %`、`< > <= >= == !=`、`&& ||`、`& | ^ << >>`、`!`、  
   一元 `-`、三元 `?:`，以及 `+= -= *= /= %= &= |= <<= >>=` 复合赋值；操作数含  
   `double` 时 `+ - * /` 与比较自动提升，结果类型随操作数

@@ -18,10 +18,11 @@ type cScope struct {
 }
 
 type checker struct {
-	funcs  map[string]*FuncDecl // function definitions
-	protos map[string]*FuncDecl // forward declarations from headers
-	scopes []*cScope
-	errs   []error
+	funcs   map[string]*FuncDecl // function definitions
+	protos  map[string]*FuncDecl // forward declarations from headers
+	scopes  []*cScope
+	errs    []error
+	swDepth int // how many switch statements enclose the statement being checked
 }
 
 func (c *checker) push() { c.scopes = append(c.scopes, &cScope{vars: map[string]*Type{}}) }
@@ -90,6 +91,7 @@ func Check(prog *Program) []error {
 			c.put(p, f.ParamTypes[i], 0)
 		}
 		c.checkBlock(f.Body, f)
+		c.checkLabels(f.Body)
 		c.pop()
 	}
 	if _, ok := c.funcs["main"]; !ok {
@@ -172,12 +174,124 @@ func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 			c.checkExpr(n.Post, fn)
 		}
 		c.pop()
+	case *DoWhileStmt:
+		c.checkExpr(n.Cond, fn)
+		if n.Body != nil {
+			c.checkStmt(n.Body, fn)
+		}
+	case *SwitchStmt:
+		st := c.checkExpr(n.Src, fn)
+		if st != nil && st.Kind != KInt && !st.IsPtr() {
+			c.errf(n.Line, "switch quantity must be an integer, not %s", st)
+		}
+		c.swDepth++
+		c.checkSwitchBody(n, fn)
+		c.swDepth--
+	case *CaseStmt:
+		if c.swDepth == 0 {
+			c.errf(n.Line, "case label outside a switch")
+		}
+	case *DefaultStmt:
+		if c.swDepth == 0 {
+			c.errf(n.Line, "default label outside a switch")
+		}
+	case *GotoStmt:
+		// The target is validated once the whole function body is known
+		// (see checkLabels), because goto may jump forward.
+	case *LabelStmt:
+		if n.Stmt != nil {
+			c.checkStmt(n.Stmt, fn)
+		}
 	case *BreakStmt:
 		// no type effect
 	case *ContinueStmt:
 		// no type effect
 	case *Block:
 		c.checkBlock(n, fn)
+	}
+}
+
+// checkSwitchBody checks a switch body as a block, then enforces the rules C
+// puts on its labels: case values must be unique and there may be at most one
+// default. Statements before the first label are unreachable (C ignores them);
+// they are still checked, so an undeclared name there is reported.
+func (c *checker) checkSwitchBody(n *SwitchStmt, fn *FuncDecl) {
+	seen := map[int]bool{}
+	defaults := 0
+	for _, st := range n.Body.Stmts {
+		switch cs := st.(type) {
+		case *CaseStmt:
+			if seen[cs.Val] {
+				c.errf(cs.Line, "duplicate case value %d in switch", cs.Val)
+			}
+			seen[cs.Val] = true
+			continue
+		case *DefaultStmt:
+			defaults++
+			if defaults > 1 {
+				c.errf(cs.Line, "more than one default label in switch")
+			}
+			continue
+		}
+		c.checkStmt(st, fn)
+	}
+}
+
+// checkLabels verifies that every goto in a function targets a label defined in
+// that same function. C labels are function-scoped, so the whole body must be
+// collected before any goto can be validated.
+func (c *checker) checkLabels(b *Block) {
+	if b == nil {
+		return
+	}
+	defined := map[string]bool{}
+	walkStmts(b, func(s Stmt) {
+		if lab, ok := s.(*LabelStmt); ok {
+			defined[lab.Name] = true
+		}
+	})
+	walkStmts(b, func(s Stmt) {
+		g, ok := s.(*GotoStmt)
+		if !ok {
+			return
+		}
+		if !defined[g.Label] {
+			c.errf(g.Line, "goto %q: no such label in this function", g.Label)
+		}
+	})
+}
+
+// walkStmts visits every statement in a tree, including those nested inside
+// if/loop/switch bodies and labelled statements. Expression trees are not
+// visited: they contain no statements in goc's C subset.
+func walkStmts(s Stmt, visit func(Stmt)) {
+	if s == nil {
+		return
+	}
+	visit(s)
+	switch n := s.(type) {
+	case *Block:
+		for _, st := range n.Stmts {
+			walkStmts(st, visit)
+		}
+	case *DeclList:
+		for _, d := range n.Decls {
+			walkStmts(d, visit)
+		}
+	case *IfStmt:
+		walkStmts(n.Then, visit)
+		walkStmts(n.Else, visit)
+	case *WhileStmt:
+		walkStmts(n.Body, visit)
+	case *ForStmt:
+		walkStmts(n.Init, visit)
+		walkStmts(n.Body, visit)
+	case *DoWhileStmt:
+		walkStmts(n.Body, visit)
+	case *SwitchStmt:
+		walkStmts(n.Body, visit)
+	case *LabelStmt:
+		walkStmts(n.Stmt, visit)
 	}
 }
 

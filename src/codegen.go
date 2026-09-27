@@ -40,23 +40,28 @@ type CG struct {
 	tmpDepth    int                // live expression-temporary slots
 	funcs       map[string]bool    // user-defined functions (by name)
 	funcDefs    map[string]*FuncDecl
-	calls       map[string]bool // functions called that are not defined here
-	need        map[string]bool // goclib functions this program actually uses
-	linux       bool            // true -> SysV ABI + ELF output
-	curRet      *Type           // return type of the function being generated
-	curParam    []*Type         // parameter types of the current function
-	resTyp      CType           // type of the value left by the last genExprT
-	resSigned   bool            // signedness of the last genExprT result (int-class only)
-	resW        int             // semantic width of the last genExprT result: 1/2/4 (int-class), 8 (long/pointer/double)
-	tmpSgn      []bool          // signedness of each expression-temporary slot
-	loops       []loopLabels    // active loop targets for break/continue
-	saveBaseOff int             // rbp offset of the variadic save area (0 if none)
-	nFixed      int             // number of named params before "..." in the current fn
-	sretSlot    int // rbp offset of this function's hidden sret-pointer slot (0 = returns a scalar)
-	resStruct   bool    // the last call returned a struct; its value is in a tmp result buffer
-	resStructSz int     // size in bytes of that struct
-	resStructK  int     // tmpSlot index of the first result-buffer slot
-	resStructSl int     // number of tmp slots occupied by the result buffer
+	calls       map[string]bool   // functions called that are not defined here
+	need        map[string]bool   // goclib functions this program actually uses
+	linux       bool              // true -> SysV ABI + ELF output
+	curRet      *Type             // return type of the function being generated
+	curParam    []*Type           // parameter types of the current function
+	resTyp      CType             // type of the value left by the last genExprT
+	resSigned   bool              // signedness of the last genExprT result (int-class only)
+	resW        int               // semantic width of the last genExprT result: 1/2/4 (int-class), 8 (long/pointer/double)
+	tmpSgn      []bool            // signedness of each expression-temporary slot
+	loops       []loopLabels      // active loop targets for break/continue
+	breaks      []string          // active break targets: innermost loop or switch, last
+	swDepth     int               // how many switch statements enclose the code being emitted
+	swSlots     int               // switch value slots reserved in this frame (max nesting)
+	curFn       string            // name of the function being generated (label mangling)
+	labels      map[string]string // C label name -> assembly label, per function
+	saveBaseOff int               // rbp offset of the variadic save area (0 if none)
+	nFixed      int               // number of named params before "..." in the current fn
+	sretSlot    int               // rbp offset of this function's hidden sret-pointer slot (0 = returns a scalar)
+	resStruct   bool              // the last call returned a struct; its value is in a tmp result buffer
+	resStructSz int               // size in bytes of that struct
+	resStructK  int               // tmpSlot index of the first result-buffer slot
+	resStructSl int               // number of tmp slots occupied by the result buffer
 }
 
 // loopLabels records the break/continue targets of the innermost loop.
@@ -643,6 +648,15 @@ func (c *CG) newLabel(prefix string) string {
 // RSP (so 16-byte stack alignment at calls is preserved).
 func (c *CG) tmpSlot(k int) int {
 	return -(c.regArea + c.localBytes + 8*k)
+}
+
+// swSlot returns the rbp offset of the k-th (1-indexed) switch value slot.
+// A switch evaluates its controlling expression once and keeps it here while
+// the case comparisons and the bodies run, so a nested expression temporary
+// (tmpSlot) can never clobber it. These slots sit below the expression
+// temporaries and above the variadic save area.
+func (c *CG) swSlot(k int) int {
+	return -(c.regArea + c.localBytes + 8*scratchSlots + 8*k)
 }
 
 // slotWidth returns the byte width used to load/store a variable/value of type t
@@ -1481,6 +1495,14 @@ func (c *CG) findAddressTaken(f *FuncDecl) map[string]bool {
 				walkExpr(n.Post)
 			}
 			walkStmt(n.Body)
+		case *DoWhileStmt:
+			walkExpr(n.Cond)
+			walkStmt(n.Body)
+		case *SwitchStmt:
+			walkExpr(n.Src)
+			walkStmt(n.Body)
+		case *LabelStmt:
+			walkStmt(n.Stmt)
 		}
 	}
 	walkStmt(f.Body)
@@ -1521,38 +1543,51 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// so we can decide, up front, which ones live in callee-save registers
 	// and which stay on the stack.
 	var decls []localDecl
-	var gather func(Stmt)
-	gather = func(s Stmt) {
+	maxSwDepth := 0
+	var gather func(Stmt, int)
+	gather = func(s Stmt, swDepth int) {
+		if swDepth > maxSwDepth {
+			maxSwDepth = swDepth
+		}
 		switch n := s.(type) {
 		case *Block:
 			for _, st := range n.Stmts {
-				gather(st)
+				gather(st, swDepth)
 			}
 		case *DeclList:
 			for _, d := range n.Decls {
-				gather(d)
+				gather(d, swDepth)
 			}
 		case *DeclStmt:
 			if _, ok := c.vars[n.Name]; !ok {
 				decls = append(decls, localDecl{n.Name, n.Typ})
 			}
 		case *IfStmt:
-			gather(n.Then)
+			gather(n.Then, swDepth)
 			if n.Else != nil {
-				gather(n.Else)
+				gather(n.Else, swDepth)
 			}
 		case *WhileStmt:
-			gather(n.Body)
+			gather(n.Body, swDepth)
+		case *DoWhileStmt:
+			gather(n.Body, swDepth)
 		case *ForStmt:
 			if n.Init != nil {
-				gather(n.Init)
+				gather(n.Init, swDepth)
 			}
-			gather(n.Body)
+			gather(n.Body, swDepth)
+		case *SwitchStmt:
+			// A switch needs one frame slot to hold the controlling value,
+			// and it does not introduce a new scope for its labels.
+			gather(n.Body, swDepth+1)
+		case *LabelStmt:
+			gather(n.Stmt, swDepth)
 		}
 	}
 	for _, st := range f.Body.Stmts {
-		gather(st)
+		gather(st, 0)
 	}
+	c.swSlots = maxSwDepth
 
 	// A local whose address is taken (&x) cannot live in a register, doubles
 	// cannot live in a GPR, and arrays obviously need memory. Struct/union
@@ -1714,7 +1749,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	if c.linux && f.Variadic {
 		pad = 8 * len(c.argRegs())
 	}
-	frame := pad + regArea + localBytes + 8*scratchSlots + varargSave
+	frame := pad + regArea + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave
 	if frame%16 != 0 {
 		frame += 16 - frame%16
 	}
@@ -1722,8 +1757,12 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// expression temporaries. The ABI pad added to frame above pushes it up
 	// so the callee's argument-spill slots ([rsp+0..8*len(argRegs)) of the
 	// caller) stay below it.
-	c.saveBaseOff = -(regArea + localBytes + 8*scratchSlots + varargSave)
+	c.saveBaseOff = -(regArea + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave)
 
+	c.curFn = f.Name
+	c.labels = map[string]string{}
+	c.swDepth = 0
+	c.breaks = nil
 	c.sb.WriteString(f.Name + ":\n")
 	c.emit("push rbp")
 	c.emit("mov rbp, rsp")
@@ -1995,11 +2034,13 @@ func (c *CG) genStmt(s Stmt) error {
 		// (or a nested loop) resolves to this loop. continue re-checks the
 		// condition at lTop.
 		c.loops = append(c.loops, loopLabels{breakLbl: lEnd, contLbl: lTop})
-		if err := c.genStmt(n.Body); err != nil {
-			c.loops = c.loops[:len(c.loops)-1]
-			return err
-		}
+		c.breaks = append(c.breaks, lEnd)
+		bodyErr := c.genStmt(n.Body)
 		c.loops = c.loops[:len(c.loops)-1]
+		c.breaks = c.breaks[:len(c.breaks)-1]
+		if bodyErr != nil {
+			return bodyErr
+		}
 		c.emit("jmp %s", lTop)
 		c.sb.WriteString(lEnd + ":\n")
 	case *ForStmt:
@@ -2025,11 +2066,13 @@ func (c *CG) genStmt(s Stmt) error {
 		// Push this loop's break/continue targets so statements inside the
 		// body (which may themselves be nested loops) can resolve them.
 		c.loops = append(c.loops, loopLabels{breakLbl: lEnd, contLbl: lCont})
-		if err := c.genStmt(n.Body); err != nil {
-			c.loops = c.loops[:len(c.loops)-1]
-			return err
-		}
+		c.breaks = append(c.breaks, lEnd)
+		bodyErr := c.genStmt(n.Body)
 		c.loops = c.loops[:len(c.loops)-1]
+		c.breaks = c.breaks[:len(c.breaks)-1]
+		if bodyErr != nil {
+			return bodyErr
+		}
 		c.sb.WriteString(lCont + ":\n")
 		if n.Post != nil {
 			if _, err := c.genExprT(n.Post); err != nil {
@@ -2038,18 +2081,171 @@ func (c *CG) genStmt(s Stmt) error {
 		}
 		c.emit("jmp %s", lTop)
 		c.sb.WriteString(lEnd + ":\n")
-	case *BreakStmt:
-		if len(c.loops) == 0 {
-			return fmt.Errorf("break outside a loop")
+	case *DoWhileStmt:
+		// "do body while (cond);": the body runs first, so the condition is
+		// tested at the bottom. continue jumps to that test, not to the body.
+		lTop := c.newLabel("do")
+		lCont := c.newLabel("docont")
+		lEnd := c.newLabel("doend")
+		c.sb.WriteString(lTop + ":\n")
+		c.loops = append(c.loops, loopLabels{breakLbl: lEnd, contLbl: lCont})
+		c.breaks = append(c.breaks, lEnd)
+		bodyErr := c.genStmt(n.Body)
+		c.loops = c.loops[:len(c.loops)-1]
+		c.breaks = c.breaks[:len(c.breaks)-1]
+		if bodyErr != nil {
+			return bodyErr
 		}
-		c.emit("jmp %s", c.loops[len(c.loops)-1].breakLbl)
+		c.sb.WriteString(lCont + ":\n")
+		if _, err := c.genExprT(n.Cond); err != nil {
+			return err
+		}
+		if err := c.ensureType(TInt); err != nil {
+			return err
+		}
+		c.emit("cmp rax, 0")
+		c.emit("jne %s", lTop)
+		c.sb.WriteString(lEnd + ":\n")
+	case *SwitchStmt:
+		if err := c.genSwitch(n); err != nil {
+			return err
+		}
+	case *GotoStmt:
+		c.emit("jmp %s", c.labelSym(n.Label))
+	case *LabelStmt:
+		c.sb.WriteString(c.labelSym(n.Name) + ":\n")
+		if n.Stmt != nil {
+			return c.genStmt(n.Stmt)
+		}
+	case *BreakStmt:
+		// break binds to the innermost enclosing loop *or* switch; the
+		// separate stack keeps a switch from stealing a loop's continue.
+		if len(c.breaks) == 0 {
+			return fmt.Errorf("break outside a loop or switch")
+		}
+		c.emit("jmp %s", c.breaks[len(c.breaks)-1])
 	case *ContinueStmt:
 		if len(c.loops) == 0 {
 			return fmt.Errorf("continue outside a loop")
 		}
 		c.emit("jmp %s", c.loops[len(c.loops)-1].contLbl)
+	case *CaseStmt:
+		return fmt.Errorf("line %d: case label outside a switch", n.Line)
+	case *DefaultStmt:
+		return fmt.Errorf("line %d: default label outside a switch", n.Line)
 	}
 	return nil
+}
+
+// labelSym returns the assembly label for a C label, creating one on first
+// use. Goto may jump forward to a label that has not been emitted yet, so the
+// name has to be decided by whoever needs it first -- hence the cache.
+func (c *CG) labelSym(name string) string {
+	if s, ok := c.labels[name]; ok {
+		return s
+	}
+	s := c.newLabel("lbl_" + name)
+	c.labels[name] = s
+	return s
+}
+
+// swGroup is one arm of a switch: either "case N:" or "default:", plus the
+// statements that follow it up to the next label.
+type swGroup struct {
+	lbl       string
+	val       int
+	isDefault bool
+	stmts     []Stmt
+}
+
+// genSwitch lowers a switch to a chain of comparisons followed by the case
+// bodies laid out in source order:
+//
+//	mov rax, [switch value]
+//	cmp rax, V0 ; je .Lcase1
+//	cmp rax, V1 ; je .Lcase2
+//	jmp .Ldefault            (or .Lswend when there is no default)
+//	.Lcase1:  <body 0>       <- falls through into .Lcase2, as C requires
+//	.Lcase2:  <body 1>
+//	.Ldefault: <body>
+//	.Lswend:
+//
+// The controlling expression is evaluated once into a dedicated frame slot
+// (swSlot), so re-evaluating it per comparison -- which would duplicate side
+// effects -- is never necessary and expression temporaries cannot clobber it.
+func (c *CG) genSwitch(n *SwitchStmt) error {
+	if n.Body == nil {
+		return nil
+	}
+	c.swDepth++
+	if c.swDepth > c.swSlots {
+		c.swDepth--
+		return fmt.Errorf("switch nested more than %d deep", c.swSlots)
+	}
+	slot := c.swSlot(c.swDepth)
+	if _, err := c.genExprT(n.Src); err != nil {
+		c.swDepth--
+		return err
+	}
+	if err := c.ensureType(TInt); err != nil {
+		c.swDepth--
+		return err
+	}
+	c.emit("mov [rbp%+d], rax", slot)
+
+	var groups []swGroup
+	defIdx := -1
+	for _, st := range n.Body.Stmts {
+		switch cs := st.(type) {
+		case *CaseStmt:
+			groups = append(groups, swGroup{lbl: c.newLabel("case"), val: cs.Val})
+		case *DefaultStmt:
+			defIdx = len(groups)
+			groups = append(groups, swGroup{lbl: c.newLabel("dflt"), isDefault: true})
+		default:
+			// Statements before the first label are unreachable; C accepts
+			// them, so they are simply dropped rather than emitted.
+			if len(groups) == 0 {
+				continue
+			}
+			groups[len(groups)-1].stmts = append(groups[len(groups)-1].stmts, st)
+		}
+	}
+
+	lEnd := c.newLabel("swend")
+	c.emit("mov rax, [rbp%+d]", slot)
+	for _, g := range groups {
+		if g.isDefault {
+			continue
+		}
+		c.emit("cmp rax, %d", g.val)
+		c.emit("je %s", g.lbl)
+	}
+	if defIdx >= 0 {
+		c.emit("jmp %s", groups[defIdx].lbl)
+	} else {
+		c.emit("jmp %s", lEnd)
+	}
+
+	// Bodies. break inside any arm targets lEnd; continue still targets the
+	// enclosing loop, because a switch is not a loop.
+	c.breaks = append(c.breaks, lEnd)
+	var err error
+	for _, g := range groups {
+		c.sb.WriteString(g.lbl + ":\n")
+		for _, st := range g.stmts {
+			if err = c.genStmt(st); err != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	c.breaks = c.breaks[:len(c.breaks)-1]
+	c.sb.WriteString(lEnd + ":\n")
+	c.swDepth--
+	return err
 }
 
 func (c *CG) genUnary(n *Unary) (CType, error) {

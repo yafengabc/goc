@@ -1,0 +1,22 @@
+== switch ==
+c0: 100
+c2: 110
+c3: 120
+c9: 130
+two
+evals: 1
+fallthrough: 1100
+middefault: 22
+nomatch: 5
+loop: 0*0 2*2*3 4*4
+nested: 320
+B
+blue
+== do-while ==
+do: 0 1 2 3
+once: 7
+cont: 10 30 40
+dobreak: 3
+== goto ==
+back: 3
+skip: 1

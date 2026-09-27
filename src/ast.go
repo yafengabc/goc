@@ -100,6 +100,54 @@ type ForStmt struct {
 	Body Stmt
 }
 
+// DoWhileStmt is a C do-while loop: "do Body while (Cond);". The body always
+// runs at least once, and the condition is tested after it -- so continue jumps
+// to the condition rather than to the top of the body.
+type DoWhileStmt struct {
+	Body Stmt
+	Cond Expr
+}
+
+// SwitchStmt is a C switch. The body is kept flat: CaseStmt and DefaultStmt are
+// ordinary statements inside the block, exactly where the source puts them.
+// That preserves C's fall-through semantics for free -- control dropping out of
+// one case simply runs whatever statement follows it -- and it lets "default"
+// sit anywhere in the body, not just at the end.
+type SwitchStmt struct {
+	Src  Expr
+	Body *Block
+	Line int
+}
+
+// CaseStmt is a "case N:" label. The value is folded to an integer constant by
+// the parser (C requires a constant expression here), so codegen can compare
+// against an immediate.
+type CaseStmt struct {
+	Val  int
+	Line int
+}
+
+// DefaultStmt is a "default:" label.
+type DefaultStmt struct {
+	Line int
+}
+
+// GotoStmt is "goto label;". Labels are function-scoped; the checker verifies
+// that the target exists in the same function.
+type GotoStmt struct {
+	Label string
+	Line  int
+}
+
+// LabelStmt is "label: statement". Labelling a statement (rather than making a
+// label its own statement) keeps the parse tree close to the C grammar and lets
+// "x: ;" label an empty statement.
+type LabelStmt struct {
+	Name string
+	Stmt Stmt
+	Line int
+}
+
 type BreakStmt struct{}
 
 type ContinueStmt struct{}
@@ -190,10 +238,10 @@ type VaArgExpr struct {
 // must have pointer-to-struct type and the compiler dereferences it before
 // adding the member offset; in the . form the base must be a struct lvalue.
 type MemberExpr struct {
-	Base   Expr
-	Name   string
-	Arrow  bool
-	Line   int
+	Base  Expr
+	Name  string
+	Arrow bool
+	Line  int
 }
 
 // SizeofExpr is the sizeof operator: either "sizeof(Type)" or "sizeof expr". It

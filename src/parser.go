@@ -894,6 +894,76 @@ func (p *Parser) parseStmt() (Stmt, error) {
 			return nil, err
 		}
 		return &ForStmt{Init: init, Cond: cond, Post: post, Body: body}, nil
+	case t.Kind == TKeyword && t.Text == "switch":
+		p.next()
+		if err := p.expect("("); err != nil {
+			return nil, err
+		}
+		src, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+		// The body must be a block: case/default labels live inside it as
+		// ordinary statements, and codegen needs the flat list to lay out the
+		// comparison chain and the case bodies in source order.
+		body, err := p.parseBlock()
+		if err != nil {
+			return nil, err
+		}
+		return &SwitchStmt{Src: src, Body: body, Line: t.Line}, nil
+	case t.Kind == TKeyword && t.Text == "case":
+		p.next()
+		v, err := p.constAdd()
+		if err != nil {
+			return nil, fmt.Errorf("line %d: case label must be an integer constant", t.Line)
+		}
+		if err := p.expect(":"); err != nil {
+			return nil, err
+		}
+		return &CaseStmt{Val: v, Line: t.Line}, nil
+	case t.Kind == TKeyword && t.Text == "default":
+		p.next()
+		if err := p.expect(":"); err != nil {
+			return nil, err
+		}
+		return &DefaultStmt{Line: t.Line}, nil
+	case t.Kind == TKeyword && t.Text == "do":
+		p.next()
+		body, err := p.parseStmt()
+		if err != nil {
+			return nil, err
+		}
+		if !(p.cur().Kind == TKeyword && p.cur().Text == "while") {
+			return nil, fmt.Errorf("line %d: expected \"while\" after the body of do", p.cur().Line)
+		}
+		p.next()
+		if err := p.expect("("); err != nil {
+			return nil, err
+		}
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+		if err := p.expect(";"); err != nil {
+			return nil, err
+		}
+		return &DoWhileStmt{Body: body, Cond: cond}, nil
+	case t.Kind == TKeyword && t.Text == "goto":
+		p.next()
+		if p.cur().Kind != TIdent {
+			return nil, fmt.Errorf("line %d: expected a label name after goto", p.cur().Line)
+		}
+		lab := p.next()
+		if err := p.expect(";"); err != nil {
+			return nil, err
+		}
+		return &GotoStmt{Label: lab.Text, Line: t.Line}, nil
 	case t.Kind == TKeyword && (t.Text == "break" || t.Text == "continue"):
 		p.next()
 		if err := p.expect(";"); err != nil {
@@ -905,6 +975,21 @@ func (p *Parser) parseStmt() (Stmt, error) {
 		return &ContinueStmt{}, nil
 	case p.atPunct("{"):
 		return p.parseBlock()
+	// A labelled statement: "name: stmt". Disambiguated from the ternary
+	// operator (which is the only other place a ':' can follow an identifier)
+	// by the token after the name: ':' means a label, '?' does not.
+	case t.Kind == TIdent && p.peek().Kind == TPunct && p.peek().Text == ":":
+		lab := p.next()
+		p.next() // consume ':'
+		var body Stmt
+		// "name: }" -- a label on an empty statement at the end of a block.
+		if !p.atPunct("}") {
+			body, err = p.parseStmt()
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &LabelStmt{Name: lab.Text, Stmt: body, Line: t.Line}, nil
 	}
 	if p.atPunct(";") {
 		// Empty statement: a bare ";" (e.g. the body of `while (cond);`).
