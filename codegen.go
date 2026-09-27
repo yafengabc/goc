@@ -35,6 +35,7 @@ type CG struct {
 	regArea     int                // bytes reserved just below rbp for saved callee-save regs
 	globals     map[string]bool    // names of program-level (global/static) variables
 	globalLab   map[string]string  // name -> .data label for a global variable
+	globalTyp   map[string]*Type   // name -> declared type of a global variable
 	usedRegs    []string           // callee-save registers actually used as local homes
 	tmpDepth    int                // live expression-temporary slots
 	funcs       map[string]bool    // user-defined functions (by name)
@@ -46,6 +47,7 @@ type CG struct {
 	curParam    []*Type         // parameter types of the current function
 	resTyp      CType           // type of the value left by the last genExprT
 	resSigned   bool            // signedness of the last genExprT result (int-class only)
+	resW        int             // semantic width of the last genExprT result: 1/2/4 (int-class), 8 (long/pointer/double)
 	tmpSgn      []bool          // signedness of each expression-temporary slot
 	loops       []loopLabels    // active loop targets for break/continue
 	saveBaseOff int             // rbp offset of the variadic save area (0 if none)
@@ -638,6 +640,129 @@ func (c *CG) tmpSlot(k int) int {
 	return -(c.regArea + c.localBytes + 8*k)
 }
 
+// slotWidth returns the byte width used to load/store a variable/value of type t
+// as a scalar in rax: char=1, short=2, int=4, long/pointer=8. Aggregates and
+// doubles are handled by their own paths.
+func (c *CG) slotWidth(t *Type) int {
+	if t == nil {
+		return 8
+	}
+	switch t.Kind {
+	case KInt:
+		// A goc "int" is an 8-byte value slot: in goc's C subset, pointers are
+		// stored in int-typed variables, so the slot must be wide enough to
+		// hold a 64-bit address. char (1) and short (2) stay genuinely narrow
+		// because they never hold pointers. 32-bit signed/unsigned *arithmetic*
+		// semantics are still enforced at operation sites (see genBinary), not
+		// here.
+		if t.Width == 4 {
+			return 8
+		}
+		if t.Width < 1 {
+			return 1
+		}
+		return t.Width
+	case KPtr, KFunc, KDouble:
+		return 8
+	case KStruct, KUnion:
+		if t.Size != 0 {
+			return t.Size
+		}
+	}
+	return 8
+}
+
+// extendInt sign/zero-extends a value already in rax (loaded as `width` bytes)
+// to a full 64-bit value. Signedness controls which direction the extension
+// takes. width 8 (or any non-narrow value) is a no-op.
+func (c *CG) extendInt(width int, signed bool) {
+	switch width {
+	case 1:
+		if signed {
+			c.emit("shl rax, 56")
+			c.emit("sar rax, 56")
+		} else {
+			c.emit("and rax, 0xff")
+		}
+	case 2:
+		if signed {
+			c.emit("shl rax, 48")
+			c.emit("sar rax, 48")
+		} else {
+			c.emit("and rax, 0xffff")
+		}
+	case 4:
+		if signed {
+			c.emit("shl rax, 32")
+			c.emit("sar rax, 32")
+		}
+	}
+}
+
+// canonInt canonicalises the 64-bit value in rax as a 32-bit integer: signed
+// ints are sign-extended (shl/sar 32), unsigned ints are zero-extended
+// (shl/shr 32). It must be applied ONLY at operation sites whose semantic
+// result width is 4 bytes (see promotedArith) -- never at variable loads and
+// never to 8-byte results (long/unsigned long/pointer arithmetic would be
+// wrongly truncated). Callers gate it on resW == 4.
+func (c *CG) canonInt(signed bool) {
+	if signed {
+		c.emit("shl rax, 32")
+		c.emit("sar rax, 32")
+	} else {
+		c.emit("shl rax, 32")
+		c.emit("shr rax, 32")
+	}
+}
+
+// promotedArith implements the C usual arithmetic conversions for the
+// int-class operands goc supports (char/short/int/long, signed/unsigned). It
+// returns the semantic width and signedness of the promoted common type that
+// an arithmetic/bitwise/shift/comparison operation operates on:
+//
+//   - char/short operands (width 1/2) are first promoted to int (width 4,
+//     signed), because int can represent every value they can hold -- this is
+//     what makes "(unsigned char)a - (unsigned char)b" a signed-int operation.
+//   - of two differently-ranked operands the narrower is converted to the
+//     wider type, so the result takes the wider operand's signedness (e.g.
+//     unsigned long * int is unsigned long; int + long is signed long).
+//   - of two same-ranked operands, unsigned wins over signed (int + unsigned
+//     int is unsigned int).
+func promotedArith(leftW int, leftS bool, rightW int, rightS bool) (int, bool) {
+	lw, rs := leftW, leftS
+	rw, ls := rightW, rightS
+	if lw < 4 {
+		lw, rs = 4, true
+	}
+	if rw < 4 {
+		rw, ls = 4, true
+	}
+	if lw == rw {
+		// Same rank: unsigned beats signed (both must be signed for a signed result).
+		return lw, rs && ls
+	}
+	if lw > rw {
+		return lw, rs
+	}
+	return rw, ls
+}
+
+// semWOf returns the semantic width a value of type t carries in expressions:
+// char=1, short=2, int=4, long/pointer/double=8. Unlike typeWidth it is
+// already correct for pointer-typed values.
+func (c *CG) semWOf(t *Type) int {
+	if t == nil {
+		return 8
+	}
+	if t.Kind == KInt {
+		if t.Width < 1 {
+			return 1
+		}
+		return t.Width
+	}
+	return 8
+}
+
 // emit writes one indented instruction line.
 func (c *CG) emit(format string, a ...any) {
 	c.sb.WriteString("\t" + fmt.Sprintf(format, a...) + "\n")
@@ -651,39 +776,48 @@ func (c *CG) loadVar(vi varInfo) {
 	if vi.reg != "" {
 		// Register-cached int local: value is already in the callee-save.
 		c.emit("mov rax, %s", vi.reg)
-		if vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Width == 1 {
-			if vi.typ.Signed {
-				c.emit("shl rax, 56")
-				c.emit("sar rax, 56")
-			} else {
-				c.emit("and rax, 0xff")
-			}
+		// Only narrow types (char/short) are extended here: their cached
+		// value carries the raw low 8/16 bits, and extending recovers the
+		// canonical (promoted) int. A plain int (width 4) must load the full
+		// 64 bits unchanged -- int variables legitimately hold 64-bit
+		// pointers ("int s = \"hello\"; strchr(s, 'e')") that a 32-bit
+		// sign/zero-extension would truncate. Int canonicalisation happens at
+		// operation sites (genBinary/genUnary/genIncDec) and in CastExpr.
+		if vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Width < 4 {
+			c.extendInt(vi.typ.Width, vi.typ.Signed)
 		}
 		c.resTyp = TInt
 		c.resSigned = vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Signed
+		c.resW = c.semWOf(vi.typ)
 		return
 	}
 	if vi.typ != nil && vi.typ.Kind == KDouble {
 		c.emit("movsd xmm0, [rbp%+d]", vi.off)
 		c.resTyp = TDouble
 		c.resSigned = false
+		c.resW = 8
 		return
 	}
-	if vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Width == 1 {
-		signed := vi.typ.Signed
+	w := c.slotWidth(vi.typ)
+	signed := vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Signed
+	switch w {
+	case 1:
 		c.emit("xor rax, rax")
 		c.emit("mov al, [rbp%+d]", vi.off)
-		if signed {
-			c.emit("shl rax, 56")
-			c.emit("sar rax, 56")
-		}
-		c.resTyp = TInt
-		c.resSigned = signed
-		return
+		c.extendInt(1, signed)
+	case 2:
+		c.emit("mov eax, [rbp%+d]", vi.off) // low 16 bits hold the value
+		c.extendInt(2, signed)
+	default:
+		// int (8-byte slot) and pointers load full 64 bits. We deliberately do
+		// NOT sign-extend here: that would truncate 64-bit pointers that live
+		// in int variables. 32-bit signed/unsigned arithmetic canonicalisation
+		// is applied at operation sites instead (genBinary).
+		c.emit("mov rax, [rbp%+d]", vi.off)
 	}
-	c.emit("mov rax, [rbp%+d]", vi.off)
 	c.resTyp = TInt
-	c.resSigned = vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Signed
+	c.resSigned = signed
+	c.resW = c.semWOf(vi.typ)
 }
 
 // storeVar emits code that stores the value currently in rax (int) or xmm0
@@ -697,9 +831,16 @@ func (c *CG) storeVar(vi varInfo) {
 	}
 	if vi.typ != nil && vi.typ.Kind == KDouble {
 		c.emit("movsd [rbp%+d], xmm0", vi.off)
-	} else if vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Width == 1 {
+		return
+	}
+	switch c.slotWidth(vi.typ) {
+	case 1:
 		c.emit("mov byte [rbp%+d], al", vi.off)
-	} else {
+	case 2:
+		c.emit("mov word [rbp%+d], rax", vi.off)
+	default:
+		// int (8-byte slot) and pointers store the full 64-bit value so a
+		// 64-bit address survives in an int-typed variable.
 		c.emit("mov [rbp%+d], rax", vi.off)
 	}
 }
@@ -743,6 +884,12 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		c.emit("mov rax, %d", n.Val)
 		c.resTyp = TInt
 		c.resSigned = true
+		// An unsuffixed decimal literal is an int when it fits in 32 bits;
+		// larger values are long (8 bytes) and must not be truncated later.
+		c.resW = 4
+		if n.Val > 0x7fffffff || n.Val < -0x80000000 {
+			c.resW = 8
+		}
 		return TInt, nil
 	case *StrLit:
 		lab, ok := c.strLab[n]
@@ -754,26 +901,37 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		c.emit("lea rax, [rip+%s]", lab)
 		c.resTyp = TInt
 		c.resSigned = false
+		c.resW = 8 // a string literal is a pointer
 		return TInt, nil
 	case *Ident:
 		vi, ok := c.vars[n.Name]
 		if !ok {
-			if c.globals[n.Name] {
-				// Global / static variable: load its value via rip-relative
-				// addressing into the .data section.
-				c.emit("mov rax, [rip+%s]", c.globalLab[n.Name])
-				// Globals are modelled as 8-byte integer slots in the toy
-				// model; char/unsigned-ness does not affect the load here.
+		if c.globals[n.Name] {
+			// Global / static variable: load its value via rip-relative
+			// addressing into the .data section. Arrays decay to a pointer to
+			// element 0 (mirroring local arrays).
+			gt := c.globalTyp[n.Name]
+			if gt != nil && gt.IsArray() {
+				c.emit("lea rax, [rip+%s]", c.globalLab[n.Name])
 				c.resTyp = TInt
 				c.resSigned = false
+				c.resW = 8
 				return TInt, nil
 			}
+			c.emit("mov rax, [rip+%s]", c.globalLab[n.Name])
+			c.resTyp = TInt
+			c.resSigned = gt != nil && gt.Kind == KInt && gt.Signed
+			c.resW = c.semWOf(gt)
+			return TInt, nil
+		}
 			return TInt, fmt.Errorf("undefined variable %q", n.Name)
 		}
 		if vi.typ.IsArray() {
 			// An array used as a value decays to a pointer to element 0.
 			c.emit("lea rax, [rbp%+d]", vi.off)
 			c.resTyp = TInt
+			c.resSigned = false
+			c.resW = 8
 			return TInt, nil
 		}
 		c.loadVar(vi)
@@ -791,6 +949,39 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		signed := c.elemSignedOf(n.Base)
 		c.genLoadElem("r10", width, ec, signed)
 		return c.resTyp, nil
+	case *MemberExpr:
+		if err := c.genLValue(n); err != nil {
+			return TInt, err
+		}
+		t := c.memberType(n.Base, n.Name)
+		if t == nil {
+			return TInt, fmt.Errorf("unknown member %q", n.Name)
+		}
+		if t.Kind == KStruct || t.Kind == KUnion {
+			// A nested aggregate member (e.g. "s.inner") is not a scalar that
+			// fits in rax; its address is already in r10 and callers must take
+			// it from there.
+			return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
+		}
+		// Members are laid out at their C type width (MSVC x64 packs an int
+		// member as 4 bytes), not the 8-byte scalar slot width -- loading the
+		// slot width would read 4 bytes past a trailing int member.
+		width := c.typeWidth(t)
+		signed := t.Kind == KInt && t.Signed
+		c.genLoadElem("r10", width, TInt, signed)
+		return c.resTyp, nil
+	case *SizeofExpr:
+		var sz int
+		if n.Typ != nil {
+			sz = sizeOf(n.Typ)
+		} else {
+			sz = c.typeWidth(c.exprType(n.E))
+		}
+		c.emit("mov rax, %d", sz)
+		c.resTyp = TInt
+		c.resSigned = true
+		c.resW = 8 // sizeof is a size_t (8 bytes) on this target
+		return TInt, nil
 	case *CondExpr:
 		if _, err := c.genExprT(n.Cond); err != nil {
 			return c.resTyp, err
@@ -806,17 +997,24 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		if err != nil {
 			return tt, err
 		}
+		wThen, sThen := c.resW, c.resSigned
 		c.emit("jmp %s", lEnd)
 		c.sb.WriteString(lElse + ":\n")
 		et, err := c.genExprT(n.Else)
 		if err != nil {
 			return et, err
 		}
+		wElse, sElse := c.resW, c.resSigned
 		c.sb.WriteString(lEnd + ":\n")
 		if tt == TDouble || et == TDouble {
 			c.resTyp = TDouble
+			c.resSigned = false
+			c.resW = 8
 		} else {
+			// The conditional expression's type is the C common type of the
+			// two arms (integer promotions applied).
 			c.resTyp = TInt
+			c.resW, c.resSigned = promotedArith(wThen, sThen, wElse, sElse)
 		}
 		return c.resTyp, nil
 	case *CastExpr:
@@ -824,17 +1022,47 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		if err != nil {
 			return t, err
 		}
+		// Casting an int-class value to a 4-byte-or-narrower int truncates to
+		// 32 bits with the target's signedness. This is what makes
+		// "(int)someLong / (int)somePointer" take the low 32 bits. It is a
+		// no-op when the source is already a canonical 32-bit value, and it
+		// must NOT run for double sources (xmm0 holds the value, not rax) or
+		// for widening casts to long/unsigned long.
+		if t == TInt && n.Typ != nil && n.Typ.Kind == KInt && n.Typ.Width <= 4 {
+			c.canonInt(n.Typ.Signed)
+		}
 		if err := c.ensureType(n.Typ.Class()); err != nil {
 			return t, err
 		}
 		c.resTyp = n.Typ.Class()
 		c.resSigned = n.Typ.Kind == KInt && n.Typ.Signed
+		c.resW = c.semWOf(n.Typ)
 		return c.resTyp, nil
 	case *IncDecExpr:
 		return c.genIncDec(n)
 	case *Call:
 		return c.genCallExpr(n)
 	case *AssignExpr:
+		// Whole-struct/union assignment: neither side fits in a register, so
+		// there is no scalar fast path and we never load the value into rax.
+		// Copy the RHS lvalue's bytes into the LHS lvalue with a tail-call of
+		// copyBytes. This is how "s = t;" (and nested/pointed struct members)
+		// are compiled; returning the struct by value is not supported, so the
+		// assignment expression's own value is left undefined (rarely used).
+		if lt := c.exprType(n.Lhs); lt != nil && (lt.IsStruct() || lt.IsUnion()) {
+			if err := c.genLValue(n.Rhs); err != nil {
+				return lt.Class(), err
+			}
+			c.emit("mov r11, r10") // r11 = source address
+			if err := c.genLValue(n.Lhs); err != nil {
+				return lt.Class(), err
+			}
+			c.copyBytes("r10", "r11", lt.Size)
+			c.resTyp = lt.Class()
+			c.resSigned = false
+			c.resW = 8
+			return lt.Class(), nil
+		}
 		// Fast path: a simple scalar local/param on the left can be stored
 		// directly from its home register/stack slot, with no address needed.
 		if id, ok := n.Lhs.(*Ident); ok {
@@ -847,6 +1075,9 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 					return rt, err
 				}
 				c.storeVar(vi)
+				c.resTyp = vi.typ.Class()
+				c.resSigned = vi.typ.Kind == KInt && vi.typ.Signed
+				c.resW = c.semWOf(vi.typ)
 				return vi.typ.Class(), nil
 			}
 		}
@@ -911,11 +1142,13 @@ func Gen(prog *Program, linux bool) (string, error) {
 		need:      map[string]bool{},
 		globals:   map[string]bool{},
 		globalLab: map[string]string{},
+		globalTyp: map[string]*Type{},
 		linux:     linux,
 	}
 	for _, g := range prog.Globals {
 		c.globals[g.Name] = true
 		c.globalLab[g.Name] = "G_" + g.Name
+		c.globalTyp[g.Name] = g.Typ
 	}
 	for _, f := range prog.Funcs {
 		c.funcs[f.Name] = true
@@ -1214,8 +1447,9 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	}
 
 	// A local whose address is taken (&x) cannot live in a register, doubles
-	// cannot live in a GPR, and arrays obviously need memory. Everything else
-	// that is a small int is a candidate for a callee-save register home.
+	// cannot live in a GPR, and arrays obviously need memory. Struct/union
+	// aggregates likewise never live in a register. Everything else that is a
+	// small int is a candidate for a callee-save register home.
 	addrTaken := c.findAddressTaken(f)
 	regPool := []string{"rbx", "r12", "r13", "r14"}
 	c.usedRegs = nil
@@ -1223,7 +1457,8 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	ri := 0
 	stackDecls := make([]localDecl, 0, len(decls))
 	for _, d := range decls {
-		intClass := d.typ != nil && !d.typ.IsArray() && d.typ.Kind != KDouble
+		intClass := d.typ != nil && !d.typ.IsArray() && d.typ.Kind != KDouble &&
+			d.typ.Kind != KStruct && d.typ.Kind != KUnion
 		if intClass && !addrTaken[d.name] && ri < len(regPool) {
 			regOf[d.name] = regPool[ri]
 			c.usedRegs = append(c.usedRegs, regPool[ri])
@@ -1250,7 +1485,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			if ln < 1 {
 				ln = 1
 			}
-			w := c.typeWidth(d.typ) // element width (1 for char, 8 otherwise)
+			w := c.typeWidth(d.typ.Elem) // element width (1 for char, 8 otherwise)
 			size := w * ln
 			if size%8 != 0 { // keep the next local 8-byte aligned
 				size += 8 - size%8
@@ -1259,7 +1494,19 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			localBytes += size
 			c.vars[d.name] = varInfo{off: off, typ: d.typ}
 		} else {
-			localBytes += 8
+			// Scalar (or struct/union aggregate) slot. The slot width MUST
+			// match the width used by loadVar/storeVar/lvalueWidth, which all
+			// go through slotWidth: char=1, short=2, int=8 (a goc "int" slot
+			// is 8 bytes so it can hold a 64-bit pointer stored in an int
+			// variable), long/pointer=8, double=8, aggregates=Size. Using
+			// typeWidth here (int=4) would space int locals 4 bytes apart
+			// while the 8-byte loads/stores overlap them -- a silent memory
+			// corruption seen as garbled print_int output on both backends.
+			w := c.slotWidth(d.typ)
+			if w < 1 {
+				w = 1
+			}
+			localBytes += w
 			c.vars[d.name] = varInfo{off: -(regArea + localBytes), typ: d.typ}
 		}
 	}
@@ -1569,6 +1816,8 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 			c.emit("mov rax, r10")
 		}
 		c.resTyp = TInt
+		c.resSigned = false
+		c.resW = 8 // address-of yields a pointer value
 		return TInt, nil
 	case "*":
 		// Dereference: n.E evaluates to the pointer value (in rax).
@@ -1591,9 +1840,20 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 			c.emit("xorpd xmm1, xmm1")
 			c.emit("subsd xmm1, xmm0")
 			c.emit("movsd xmm0, xmm1")
-		} else {
-			c.emit("neg rax")
+	} else {
+		c.emit("neg rax")
+		// Integer promotion: a narrow operand (char/short) negates as a
+		// signed int; an int keeps its own signedness; an 8-byte value
+		// (long/unsigned long) keeps the full 64-bit result.
+		w, s := c.resW, c.resSigned
+		if w < 4 {
+			w, s = 4, true
 		}
+		c.resW = w
+		if w == 4 {
+			c.canonInt(s)
+		}
+	}
 		return t, nil
 	}
 	// "!" -- force the operand to int, then rax = (rax == 0)
@@ -1609,6 +1869,9 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 	c.sb.WriteString(lTrue + ":\n")
 	c.emit("mov rax, 1")
 	c.sb.WriteString(lEnd + ":\n")
+	c.resTyp = TInt
+	c.resSigned = true
+	c.resW = 4 // !x yields a (signed) int
 	return TInt, nil
 }
 
@@ -1689,6 +1952,41 @@ func (c *CG) genLValue(e Expr) error {
 		c.emit("add r10, r11")
 		c.tmpDepth--
 		return nil
+	case *MemberExpr:
+		// Resolve the struct/union type behind the base so we can look the
+		// member offset up. For "->" the base is a pointer to struct.
+		var st *Type
+		if n.Arrow {
+			if _, err := c.genExprT(n.Base); err != nil {
+				return err
+			}
+			c.emit("mov r10, rax")
+			if bt := c.exprType(n.Base); bt != nil && bt.Elem != nil {
+				st = bt.Elem
+			}
+		} else {
+			if err := c.genLValue(n.Base); err != nil {
+				return err
+			}
+			st = c.exprType(n.Base)
+		}
+		if st == nil || (st.Kind != KStruct && st.Kind != KUnion) {
+			return fmt.Errorf("member access %q on non-struct type", n.Name)
+		}
+		off := 0
+		found := false
+		for _, m := range st.Members {
+			if m.Name == n.Name {
+				off = m.Offset
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("no member %q in %s", n.Name, st.String())
+		}
+		c.emit("add r10, %d", off)
+		return nil
 	}
 	return fmt.Errorf("expression is not an lvalue")
 }
@@ -1720,6 +2018,11 @@ func (c *CG) elemClassOf(e Expr) CType {
 		return TInt
 	case *Index:
 		return c.elemClassOf(n.Base)
+	case *MemberExpr:
+		if mt := c.memberType(n.Base, n.Name); mt != nil {
+			return mt.Class()
+		}
+		return TInt
 	case *IncDecExpr:
 		return c.elemClassOf(n.E)
 	}
@@ -1727,54 +2030,32 @@ func (c *CG) elemClassOf(e Expr) CType {
 }
 
 // typeWidth returns the byte width used to lay out / step over a value of type
-// t. Scalars (char/int/long/short) all occupy an 8-byte stack slot in the toy
-// model, so their layout width is 8; only the *element* stride for pointers and
-// arrays honours the true element width (1 for char, 8 otherwise).
+// t: char=1, short=2, int/long=4/8, double/pointer=8, array=element*len,
+// struct/union=its computed Size.
 func (c *CG) typeWidth(t *Type) int {
 	if t == nil {
 		return 8
 	}
 	switch t.Kind {
-	case KPtr:
-		if t.Elem != nil {
-			return c.typeWidth(t.Elem)
-		}
-		return 1 // void* — byte stride (non-standard but harmless here)
+	case KPtr, KFunc:
+		return 8
+	case KDouble:
+		return 8
 	case KArr:
 		if t.Elem != nil {
-			return c.typeWidth(t.Elem)
+			return c.typeWidth(t.Elem) * t.Len
 		}
 		return 8
 	case KInt:
-		if t.Width == 1 {
+		if t.Width < 1 {
 			return 1
 		}
-		return 8
-	}
-	return 8
-}
-
-// elemWidthOf returns the byte width of the element referenced by a pointer or
-// array expression e (1 for char, 8 otherwise).
-func (c *CG) elemWidthOf(e Expr) int {
-	switch n := e.(type) {
-	case *Ident:
-		vi, ok := c.vars[n.Name]
-		if !ok {
-			return 8
-		}
-		return c.typeWidth(vi.typ)
-	case *Unary:
-		if n.Op == "*" {
-			return c.elemWidthOf(n.E)
+		return t.Width
+	case KStruct, KUnion:
+		if t.Size != 0 {
+			return t.Size
 		}
 		return 8
-	case *Index:
-		return c.elemWidthOf(n.Base)
-	case *IncDecExpr:
-		return c.elemWidthOf(n.E)
-	case *CastExpr:
-		return c.typeWidth(n.Typ)
 	}
 	return 8
 }
@@ -1786,6 +2067,26 @@ func (c *CG) exprIsPointer(e Expr) bool {
 		return false
 	}
 	return t.IsPtr()
+}
+
+// memberType resolves the type of a struct/union member accessed as
+// base.name. base may itself be a struct value (`.`) or a pointer to struct
+// (`->`); in the latter case exprType(base) is the pointer and we dereference
+// its Elem. Returns nil if base is not a struct/union or the member is absent.
+func (c *CG) memberType(base Expr, name string) *Type {
+	t := c.exprType(base)
+	if t != nil && t.Kind == KPtr && t.Elem != nil {
+		t = t.Elem
+	}
+	if t == nil || (t.Kind != KStruct && t.Kind != KUnion) {
+		return nil
+	}
+	for _, m := range t.Members {
+		if m.Name == name {
+			return m.Type
+		}
+	}
+	return nil
 }
 
 // exprType attempts to recover the structured type of an expression from the
@@ -1810,10 +2111,54 @@ func (c *CG) exprType(e Expr) *Type {
 		}
 	case *IncDecExpr:
 		return c.exprType(n.E)
+	case *MemberExpr:
+		return c.memberType(n.Base, n.Name)
 	case *CastExpr:
 		return n.Typ
 	}
 	return nil
+}
+
+// elemWidthOf returns the byte width of the element referenced by a pointer or
+// array expression e (1 for char, 2 for short, 4 for int, 8 otherwise). For a
+// bare scalar (the value itself, not a container) it returns that scalar's
+// storage width -- but the common use is indexing a pointer/array, where the
+// stride must be the *element* width, never the 8-byte pointer width.
+func (c *CG) elemWidthOf(e Expr) int {
+	switch n := e.(type) {
+	case *Ident:
+		vi, ok := c.vars[n.Name]
+		if !ok {
+			return 8
+		}
+		if vi.typ != nil && (vi.typ.IsPtr() || vi.typ.IsArray()) && vi.typ.Elem != nil {
+			return c.typeWidth(vi.typ.Elem)
+		}
+		return c.typeWidth(vi.typ)
+	case *Unary:
+		if n.Op == "*" {
+			return c.elemWidthOf(n.E)
+		}
+		return 8
+	case *Index:
+		return c.elemWidthOf(n.Base)
+	case *MemberExpr:
+		if mt := c.memberType(n.Base, n.Name); mt != nil {
+			if (mt.IsPtr() || mt.IsArray()) && mt.Elem != nil {
+				return c.typeWidth(mt.Elem)
+			}
+			// A scalar member (int/long/char/short) is stepped over and
+			// loaded/stored at its *layout* width (MSVC x64 packs int as 4
+			// bytes), not the 8-byte scalar slot width.
+			return c.typeWidth(mt)
+		}
+		return 8
+	case *IncDecExpr:
+		return c.elemWidthOf(n.E)
+	case *CastExpr:
+		return c.typeWidth(n.Typ)
+	}
+	return 8
 }
 
 // elemSignedOf returns whether the element referenced by a pointer/array e has
@@ -1829,6 +2174,9 @@ func (c *CG) elemSignedOf(e Expr) bool {
 	if t.IsArray() && t.Elem != nil {
 		return t.Elem.Kind == KInt && t.Elem.Signed
 	}
+	if t.Kind == KInt {
+		return t.Signed
+	}
 	return false
 }
 
@@ -1840,21 +2188,29 @@ func (c *CG) genLoadElem(reg string, width int, class CType, signed bool) {
 		c.emit("movsd xmm0, [%s]", reg)
 		c.resTyp = TDouble
 		c.resSigned = false
+		c.resW = 8
 		return
 	}
-	if width == 1 {
+	switch width {
+	case 1:
 		// Load the low byte, then zero- or sign-extend in rax. We must not
 		// clear rax before the load, because reg holds the address; "mov al"
 		// writes only the low byte, so the address survives in the upper bits
 		// until the "and" clears them.
 		c.emit("mov al, [%s]", reg)
-		c.emit("and rax, 0xff")
-		if signed {
-			c.emit("shl rax, 56")
-			c.emit("sar rax, 56")
-		}
-	} else {
+		c.extendInt(1, signed)
+		c.resW = 1
+	case 2:
+		c.emit("mov ax, [%s]", reg) // 16-bit load, zero-extended to 32 by the CPU
+		c.extendInt(2, signed)
+		c.resW = 2
+	case 4:
+		c.emit("mov eax, [%s]", reg)
+		c.extendInt(4, signed)
+		c.resW = 4
+	default:
 		c.emit("mov rax, [%s]", reg)
+		c.resW = 8
 	}
 	c.resTyp = TInt
 	c.resSigned = signed
@@ -1867,25 +2223,59 @@ func (c *CG) genStoreElem(reg string, width int, class CType) {
 		c.emit("movsd [%s], xmm0", reg)
 		return
 	}
-	if width == 1 {
+	switch width {
+	case 1:
 		c.emit("mov byte [%s], al", reg)
-	} else {
+	case 2:
+		c.emit("mov word [%s], rax", reg)
+	case 4:
+		c.emit("mov dword [%s], eax", reg)
+	default:
 		c.emit("mov [%s], rax", reg)
 	}
 }
 
-// lvalueWidth returns the byte width of the value stored at the lvalue e. This
-// is the slot width for a scalar/pointer (always 8 in the toy model, even for a
-// char scalar whose live value is a byte), and the element width for a pointer
-// dereference or array subscript (1 for char, 8 otherwise).
+// copyBytes emits code that copies n bytes from the memory at src to the memory
+// at dst, register-to-register. It is used for whole-struct/union assignment,
+// where the value is too large to live in a single GP register. The copy is
+// unrolled in 8-byte chunks (rax scratch) followed by a byte-wise tail for any
+// remainder, so no loop counter or extra registers beyond rax are needed and it
+// works regardless of whether n is a multiple of 8 (struct sizes are multiples
+// of their alignment, but a struct with only sub-8-aligned members can leave a
+// 1/2/4-byte tail).
+func (c *CG) copyBytes(dst, src string, n int) {
+	if n <= 0 {
+		return
+	}
+	off := 0
+	for off+8 <= n {
+		c.emit("mov rax, [%s+%d]", src, off)
+		c.emit("mov [%s+%d], rax", dst, off)
+		off += 8
+	}
+	rem := n - off
+	for i := 0; i < rem; i++ {
+		c.emit("mov al, byte [%s+%d]", src, off+i)
+		c.emit("mov byte [%s+%d], al", dst, off+i)
+	}
+}
+
+// lvalueWidth returns the byte width of the value stored at the lvalue e. For a
+// scalar/pointer this is its slot width (char=1, short=2, int=4, pointer=8);
+// for a member/pointer-deref/array-subscript it is the element width.
 func (c *CG) lvalueWidth(e Expr) int {
 	if id, ok := e.(*Ident); ok {
 		if vi, ok2 := c.vars[id.Name]; ok2 {
 			if vi.typ.IsPtr() {
 				return 8
 			}
-			if vi.typ.Kind == KInt && vi.typ.Width == 1 {
-				return 1 // char scalar: byte value in an 8-byte slot
+			if vi.typ.Kind == KInt {
+				// char/short stay narrow; int becomes an 8-byte slot so it can
+				// hold a 64-bit pointer that was stored in an int variable.
+				return c.slotWidth(vi.typ)
+			}
+			if vi.typ.Kind == KStruct || vi.typ.Kind == KUnion {
+				return vi.typ.Size
 			}
 			return 8
 		}
@@ -1929,6 +2319,8 @@ func (c *CG) genVaArg(n *VaArgExpr) (CType, error) {
 		c.emit("add rcx, 8")
 		c.emit("mov [r10], rcx")
 		c.resTyp = TDouble
+		c.resSigned = false
+		c.resW = 8
 		return TDouble, nil
 	}
 	c.emit("mov rax, [rcx]")
@@ -1936,6 +2328,7 @@ func (c *CG) genVaArg(n *VaArgExpr) (CType, error) {
 	c.emit("mov [r10], rcx")
 	c.resTyp = n.Typ.Class()
 	c.resSigned = n.Typ.Kind == KInt && n.Typ.Signed
+	c.resW = c.semWOf(n.Typ)
 	return c.resTyp, nil
 }
 
@@ -1960,37 +2353,59 @@ func (c *CG) loadDoubleConst(v float64) {
 // everything else by one. The operand may be a scalar register, a stack slot,
 // a dereferenced pointer, or an array element.
 func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
+	et := c.exprType(n.E)
 	step := 1
-	if t := c.exprType(n.E); t != nil && t.IsPtr() && t.Elem != nil {
-		step = c.typeWidth(t.Elem)
+	if et != nil && et.IsPtr() && et.Elem != nil {
+		step = c.typeWidth(et.Elem)
 	}
 	signed := false
-	if t := c.exprType(n.E); t != nil && t.Kind == KInt {
-		signed = t.Signed
+	if et != nil && et.Kind == KInt {
+		signed = et.Signed
+	}
+	resW := 4
+	if et != nil {
+		resW = c.semWOf(et)
 	}
 
 	// Fast path: a register-cached scalar local (pointers are never
 	// register-allocated because they can be address-taken).
 	if id, ok := n.E.(*Ident); ok {
 		if vi, ok2 := c.vars[id.Name]; ok2 && vi.reg != "" {
-			if n.Prefix {
-				if step == 1 {
-					c.emit("inc %s", vi.reg)
-				} else {
-					c.emit("add %s, %d", vi.reg, step)
-				}
-				c.emit("mov rax, %s", vi.reg)
+		if n.Prefix {
+			if step == 1 {
+				c.emit("inc %s", vi.reg)
 			} else {
-				c.emit("mov rax, %s", vi.reg)
-				if step == 1 {
-					c.emit("inc %s", vi.reg)
-				} else {
-					c.emit("add %s, %d", vi.reg, step)
-				}
+				c.emit("add %s, %d", vi.reg, step)
 			}
-			c.resTyp = TInt
-			c.resSigned = signed
-			return TInt, nil
+			c.emit("mov rax, %s", vi.reg)
+			if resW == 4 {
+				// Canonicalise both the result and the cached register: an
+				// int wraps at 32 bits, and the register must stay canonical
+				// for later loads of this variable.
+				c.canonInt(signed)
+				c.emit("mov %s, rax", vi.reg)
+			}
+		} else {
+			c.emit("mov rax, %s", vi.reg) // old value (already canonical)
+			if step == 1 {
+				c.emit("inc %s", vi.reg)
+			} else {
+				c.emit("add %s, %d", vi.reg, step)
+			}
+			if resW == 4 {
+				// Canonicalise the register's new value through a scratch
+				// round-trip; rax keeps returning the old value.
+				c.emit("mov rdx, rax") // save old value
+				c.emit("mov rax, %s", vi.reg)
+				c.canonInt(signed)
+				c.emit("mov %s, rax", vi.reg)
+				c.emit("mov rax, rdx") // restore old value as the result
+			}
+		}
+		c.resTyp = TInt
+		c.resSigned = signed
+		c.resW = resW
+		return TInt, nil
 		}
 	}
 
@@ -2019,6 +2434,7 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 		}
 		c.resTyp = TDouble
 		c.resSigned = false
+		c.resW = 8
 		return TDouble, nil
 	}
 	c.genLoadElem("r10", width, TInt, signed)
@@ -2050,6 +2466,13 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 	}
 	c.resTyp = TInt
 	c.resSigned = signed
+	c.resW = resW
+	if resW == 4 {
+		// Keep the result a canonical 32-bit int (prefix results wrap at 32
+		// bits; the postfix old value was already canonical, so this is a
+		// no-op there).
+		c.canonInt(signed)
+	}
 	return TInt, nil
 }
 
@@ -2093,6 +2516,8 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		c.emit("mov rax, 0")
 		c.sb.WriteString(lEnd + ":\n")
 		c.resTyp = TInt
+		c.resSigned = true
+		c.resW = 4
 		return TInt, nil
 	case "||":
 		lTrue := c.newLabel("ort")
@@ -2119,6 +2544,8 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		c.emit("mov rax, 1")
 		c.sb.WriteString(lEnd + ":\n")
 		c.resTyp = TInt
+		c.resSigned = true
+		c.resW = 4
 		return TInt, nil
 	}
 
@@ -2137,6 +2564,7 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 	// remainder, and right-shift (the dividend and the value being shifted
 	// are always the left operand). The right operand is only a count.
 	leftSigned := c.resSigned
+	leftW := c.resW
 	if lt == TDouble {
 		c.emit("movsd [rbp%+d], xmm0", off)
 	} else {
@@ -2150,6 +2578,7 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 	// For symmetric comparisons the two operands normally share signedness,
 	// so the right operand's flag is an acceptable proxy there.
 	rightSigned := c.resSigned
+	rightW := c.resW
 
 	// The right operand is now in rax (int) or xmm0 (double).
 	isDbl := lt == TDouble || rt == TDouble
@@ -2185,6 +2614,10 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 			c.resTyp = TDouble
 			return TDouble, nil
 		}
+		// Usual arithmetic conversions decide the promoted width/sign of the
+		// operation. Only a 4-byte result is canonicalised afterwards; an
+		// 8-byte result (long/unsigned long) keeps its full 64-bit value.
+		w, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
 		c.emit("mov r10, [rbp%+d]", off) // left -> r10, right -> rax
 		switch n.Op {
 		case "+":
@@ -2197,13 +2630,24 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		case "/":
 			c.emit("mov r11, rax") // divisor
 			c.emit("mov rax, r10") // dividend
-			if leftSigned {
+			if resSign {
+				if w == 4 {
+					c.canonInt(true)
+				}
 				c.emit("cqo")
 				c.emit("idiv r11")
 			} else {
+				if w == 4 {
+					c.canonInt(false)
+				}
 				c.emit("xor rdx, rdx")
 				c.emit("div r11")
 			}
+		}
+		c.resSigned = resSign
+		c.resW = w
+		if w == 4 {
+			c.canonInt(resSign)
 		}
 		c.resTyp = TInt
 		return TInt, nil
@@ -2211,44 +2655,72 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		if isDbl {
 			return TInt, fmt.Errorf("%% requires integer operands")
 		}
+		w, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
 		c.emit("mov r10, [rbp%+d]", off)
 		c.emit("mov r11, rax") // divisor
 		c.emit("mov rax, r10") // dividend
-		if leftSigned {
+		if resSign {
+			if w == 4 {
+				c.canonInt(true)
+			}
 			c.emit("cqo")
 			c.emit("idiv r11")
 		} else {
+			if w == 4 {
+				c.canonInt(false)
+			}
 			c.emit("xor rdx, rdx")
 			c.emit("div r11")
 		}
 		c.emit("mov rax, rdx")
+		c.resSigned = resSign
+		c.resW = w
+		if w == 4 {
+			c.canonInt(resSign)
+		}
 		c.resTyp = TInt
 		return TInt, nil
 	case "<<", ">>":
 		if isDbl {
 			return TInt, fmt.Errorf("%q requires integer operands", n.Op)
 		}
+		// C: each shift operand is individually integer-promoted and the
+		// result type is the promoted LEFT operand's type; the right operand
+		// is only a count. So width/sign come from the left side alone --
+		// promotedArith must NOT be used here (int << someLong is still int).
+		lw, ls := leftW, leftSigned
+		if lw < 4 {
+			lw, ls = 4, true
+		}
 		// Shift count must live in cl (low 8 bits of rcx); the left operand
 		// rides in a frame temporary.
 		c.emit("mov rcx, rax")           // count
 		c.emit("mov rax, [rbp%+d]", off) // left
+		if lw == 4 {
+			c.canonInt(ls)
+		}
 		switch n.Op {
 		case "<<":
 			c.emit("shl rax, cl")
 		case ">>":
-			if leftSigned {
+			if ls {
 				c.emit("sar rax, cl") // arithmetic (sign-extending) shift
 			} else {
 				c.emit("shr rax, cl") // logical shift
 			}
 		}
-		c.resSigned = leftSigned
+		c.resSigned = ls
+		c.resW = lw
+		if lw == 4 {
+			c.canonInt(ls)
+		}
 		c.resTyp = TInt
 		return TInt, nil
 	case "&", "|", "^":
 		if isDbl {
 			return TInt, fmt.Errorf("%q requires integer operands", n.Op)
 		}
+		w, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
 		c.emit("mov r11, [rbp%+d]", off) // left
 		switch n.Op {
 		case "&":
@@ -2257,6 +2729,11 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 			c.emit("or rax, r11")
 		case "^":
 			c.emit("xor rax, r11")
+		}
+		c.resSigned = resSign
+		c.resW = w
+		if w == 4 {
+			c.canonInt(resSign)
 		}
 		c.resTyp = TInt
 		return TInt, nil
@@ -2287,11 +2764,14 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 				jmp = "jne"
 			}
 		} else {
+			_, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
 			c.emit("mov r10, [rbp%+d]", off)
 			c.emit("cmp r10, rax")
 			// Signedness selects the condition codes: signed uses jl/jg/...,
 			// unsigned uses jb/ja/... so that negative values compare right.
-			if rightSigned {
+			// The promoted common type decides which -- a negative int
+			// compared against an unsigned long must read as unsigned.
+			if resSign {
 				switch n.Op {
 				case "<":
 					jmp = "jl"
@@ -2325,6 +2805,8 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		}
 		c.emitCompare(jmp)
 		c.resTyp = TInt
+		c.resSigned = true
+		c.resW = 4 // a comparison yields a (signed) int
 		return TInt, nil
 	}
 	return TInt, fmt.Errorf("unsupported operator %q", n.Op)
@@ -2382,9 +2864,12 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	if nargs > maxArgs {
 		return TInt, fmt.Errorf("%s: too many arguments (max %d)", n.Name, maxArgs)
 	}
-	// Anything past the register arguments goes on the stack: at [rsp+32]
-	// and up on Windows (above the 32-byte shadow space), at [rsp] and up on
-	// Linux. The extra space is rounded up to 16 so RSP stays aligned.
+	// Anything past the register arguments goes on the stack. On Windows the
+	// stack arguments live at [rsp+32] and up, *above* the 32-byte shadow
+	// space the callee is allowed to spill its register params into, so the
+	// caller must reserve that shadow space too. On Linux there is no shadow
+	// space (args at [rsp]). The total is rounded up to 16 so RSP stays
+	// aligned at every call site.
 	stackArgs := nargs - len(argRegs)
 	if stackArgs < 0 {
 		stackArgs = 0
@@ -2392,9 +2877,14 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	extra := 0
 	if stackArgs > 0 {
 		extra = 8 * stackArgs
-		if extra%16 != 0 {
-			extra += 8
-		}
+	}
+	if !c.linux {
+		// Windows requires a 32-byte shadow space below the stack arguments
+		// for every call, regardless of how many args spill.
+		extra += 32
+	}
+	if extra > 0 && extra%16 != 0 {
+		extra += 8
 	}
 
 	// Resolve the callee. A goclib function may live under a different symbol
@@ -2505,10 +2995,22 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		ret = f.Ret.Class()
 	}
 	c.resTyp = ret
-	if f, ok := c.funcDefs[n.Name]; ok && f.Ret.Kind == KInt {
-		c.resSigned = f.Ret.Signed
+	if f, ok := c.funcDefs[n.Name]; ok {
+		switch {
+		case f.Ret.Kind == KInt:
+			c.resSigned = f.Ret.Signed
+			c.resW = f.Ret.Width
+		case f.Ret.Kind == KPtr || f.Ret.Kind == KFunc:
+			c.resSigned = false
+			c.resW = 8
+		default:
+			c.resSigned = true
+			c.resW = 4
+		}
 	} else {
+		// goclib and extern calls are declared as returning int.
 		c.resSigned = true
+		c.resW = 4
 	}
 	return ret, nil
 }

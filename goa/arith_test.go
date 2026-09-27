@@ -65,3 +65,64 @@ func TestShiftByCL(t *testing.T) {
 		t.Errorf("shl r11, cl = %v, want %v", got, want)
 	}
 }
+
+func TestMovDwordMem(t *testing.T) {
+	cases := []struct {
+		line string
+		want []byte
+	}{
+		// mov rax, dword [rbp-8]: 8B /r, mod=01(disp8), rm=rbp => 0x45, disp -8.
+		{"mov rax, dword [rbp-8]", []byte{0x8B, 0x45, 0xF8}},
+		// mov dword [rbp-8], rax: 89 /r, same ModRM.
+		{"mov dword [rbp-8], rax", []byte{0x89, 0x45, 0xF8}},
+		// High reg in the R slot forces a REX prefix (0x44 = REX.R), no W bit.
+		{"mov r10, dword [rbx+4]", []byte{0x44, 0x8B, 0x53, 0x04}},
+		{"mov dword [rbx+4], r10", []byte{0x44, 0x89, 0x53, 0x04}},
+		// Base r12 (12) needs REX.B + a SIB byte (base=100 in rm => 0x04).
+		{"mov dword [r12], rax", []byte{0x41, 0x89, 0x04, 0x24}},
+		// Base r10 (10) needs REX.B, no SIB: mod=00, rm=r10&7=2.
+		{"mov rax, dword [r10]", []byte{0x41, 0x8B, 0x02}},
+		// dword imm32 store: C7 /0, no REX.W (vs qword which is 48 C7).
+		{"mov dword [rbp-8], 5", []byte{0xC7, 0x45, 0xF8, 0x05, 0x00, 0x00, 0x00}},
+		{"mov qword [rbp-8], 5", []byte{0x48, 0xC7, 0x45, 0xF8, 0x05, 0x00, 0x00, 0x00}},
+		// High base register with imm32: REX.B (0x41), no W.
+		{"mov dword [r12+8], 7", []byte{0x41, 0xC7, 0x44, 0x24, 0x08, 0x07, 0x00, 0x00, 0x00}},
+	}
+	for _, c := range cases {
+		if got := encAsm(t, c.line); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s = %v, want %v", c.line, got, c.want)
+		}
+	}
+}
+
+func TestMovDwordRip(t *testing.T) {
+	// RIP-relative dword load/store: no REX.W, disp32 fixup placeholder.
+	want := []byte{0x8B, 0x05, 0x00, 0x00, 0x00, 0x00}
+	if got := encAsm(t, "mov rax, dword [rip+g]"); !reflect.DeepEqual(got, want) {
+		t.Errorf("mov rax, dword [rip+g] = %v, want %v", got, want)
+	}
+	want = []byte{0x89, 0x05, 0x00, 0x00, 0x00, 0x00}
+	if got := encAsm(t, "mov dword [rip+g], rax"); !reflect.DeepEqual(got, want) {
+		t.Errorf("mov dword [rip+g], rax = %v, want %v", got, want)
+	}
+}
+
+func TestMovWordMem(t *testing.T) {
+	cases := []struct {
+		line string
+		want []byte
+	}{
+		// 16-bit access uses the 0x66 operand-size prefix; a 64-bit GPR is
+		// still the destination (low 16 bits written/read).
+		{"mov rax, word [rbp-8]", []byte{0x66, 0x8B, 0x45, 0xF8}},
+		{"mov word [rbp-8], rax", []byte{0x66, 0x89, 0x45, 0xF8}},
+		{"mov word [rbp-8], 5", []byte{0x66, 0xC7, 0x45, 0xF8, 0x05, 0x00}},
+		// High base register with a 16-bit store.
+		{"mov word [r12], rax", []byte{0x66, 0x41, 0x89, 0x04, 0x24}},
+	}
+	for _, c := range cases {
+		if got := encAsm(t, c.line); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s = %v, want %v", c.line, got, c.want)
+		}
+	}
+}

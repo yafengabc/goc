@@ -174,3 +174,22 @@ type VaArgExpr struct {
 	Ap  Expr
 	Typ *Type
 }
+
+// MemberExpr is the field access operator: "base.member" (. form) when Arrow is
+// false, or "base->member" (-> form) when Arrow is true. In the -> form the base
+// must have pointer-to-struct type and the compiler dereferences it before
+// adding the member offset; in the . form the base must be a struct lvalue.
+type MemberExpr struct {
+	Base   Expr
+	Name   string
+	Arrow  bool
+	Line   int
+}
+
+// SizeofExpr is the sizeof operator: either "sizeof(Type)" or "sizeof expr". It
+// is folded to a constant by the parser/checker where possible and lowered to a
+// plain integer literal by the code generator.
+type SizeofExpr struct {
+	Typ *Type // non-nil when the operand is a type name
+	E   Expr  // non-nil when the operand is an expression
+}

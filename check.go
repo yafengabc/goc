@@ -231,8 +231,38 @@ func (c *checker) checkLValue(e Expr, fn *FuncDecl) (*Type, bool) {
 		}
 		c.errf(0, "cannot index non-array/non-pointer type %s", base)
 		return IntType(), false
+	case *MemberExpr:
+		return c.checkMemberLValue(n, fn)
 	}
 	c.errf(0, "expression is not an lvalue")
+	return IntType(), false
+}
+
+// checkMemberLValue resolves the lvalue type of a struct/union member access
+// (base.name or base->name) and reports an error if the base is not a
+// struct/union (or pointer to one) or the member does not exist.
+func (c *checker) checkMemberLValue(n *MemberExpr, fn *FuncDecl) (*Type, bool) {
+	bt := c.checkExpr(n.Base, fn)
+	var st *Type
+	if n.Arrow {
+		if !bt.IsPtr() {
+			c.errf(n.Line, "left of '->' must be a pointer to struct/union, got %s", bt)
+			return IntType(), false
+		}
+		st = bt.Elem
+	} else {
+		st = bt
+	}
+	if st == nil || (st.Kind != KStruct && st.Kind != KUnion) {
+		c.errf(n.Line, "member access on non-struct/union type %s", st)
+		return IntType(), false
+	}
+	for _, m := range st.Members {
+		if m.Name == n.Name {
+			return m.Type, true
+		}
+	}
+	c.errf(n.Line, "no member %q in %s", n.Name, st.String())
 	return IntType(), false
 }
 
@@ -318,6 +348,25 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		return n.Typ
 	case *IncDecExpr:
 		return c.checkExpr(n.E, fn)
+	case *MemberExpr:
+		_, ok := c.checkMemberLValue(n, fn)
+		if !ok {
+			return IntType()
+		}
+		// Re-resolve the member type (checkMemberLValue already validated it).
+		bt := c.checkExpr(n.Base, fn)
+		st := bt
+		if n.Arrow {
+			st = bt.Elem
+		}
+		for _, m := range st.Members {
+			if m.Name == n.Name {
+				return m.Type
+			}
+		}
+		return IntType()
+	case *SizeofExpr:
+		return IntType()
 	case *AssignExpr:
 		// Assignment "a = b" (statement-level or in expression position) must
 		// have a modifiable lvalue on the left. Statement-level assignments are
@@ -463,6 +512,10 @@ func assignable(dst, src *Type) bool {
 		return true // int -> pointer (e.g. 0 / NULL)
 	case dst.IsIntClass() && src.IsPtr():
 		return true // pointer -> int
+	case dst.IsStruct() && src.IsStruct():
+		return typesEqual(dst, src) // whole-struct assignment
+	case dst.IsUnion() && src.IsUnion():
+		return typesEqual(dst, src)
 	}
 	return false
 }
@@ -477,6 +530,24 @@ func typesEqual(a, b *Type) bool {
 	switch a.Kind {
 	case KPtr, KArr:
 		return typesEqual(a.Elem, b.Elem)
+	case KStruct, KUnion:
+		// Named structs/unions compare by tag; anonymous ones compare
+		// member-for-member.
+		if a.Tag != "" || b.Tag != "" {
+			return a.Tag == b.Tag
+		}
+		if len(a.Members) != len(b.Members) {
+			return false
+		}
+		for i := range a.Members {
+			if a.Members[i].Name != b.Members[i].Name {
+				return false
+			}
+			if !typesEqual(a.Members[i].Type, b.Members[i].Type) {
+				return false
+			}
+		}
+		return true
 	case KFunc:
 		if !typesEqual(a.Ret, b.Ret) {
 			return false

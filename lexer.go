@@ -235,7 +235,7 @@ func Lex(src string) ([]Token, error) {
 			}
 			switch two {
 			case "==", "!=", "<=", ">=", "&&", "||", "##", "<<", ">>", "++", "--",
-				"+=", "-=", "*=", "/=", "%=", "&=", "|=":
+				"+=", "-=", "*=", "/=", "%=", "&=", "|=", "->":
 				push(Token{Kind: TPunct, Text: two, Line: line})
 				i += 2
 				continue

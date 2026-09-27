@@ -3,10 +3,10 @@ package main
 import "fmt"
 
 // typeKeywords are the keywords the parser treats as the start of a type
-// specifier. "struct" is recognised but rejected (not implemented in stage 2).
+// specifier.
 var typeKeywords = map[string]bool{
 	"void": true, "char": true, "int": true, "long": true, "short": true,
-	"unsigned": true, "signed": true, "double": true, "struct": true,
+	"unsigned": true, "signed": true, "double": true, "struct": true, "union": true,
 }
 
 // qualifierKeywords are type qualifiers that decorate a specifier list but
@@ -19,6 +19,11 @@ var qualifierKeywords = map[string]bool{
 // of "typedef" declarations and consulted by isTypeName so later declarations
 // can use the alias as a type name.
 var typedefs = map[string]*Type{}
+
+// structs maps a struct/union tag to its (possibly incomplete) type. A forward
+// declaration "struct S;" creates the type; a later definition "struct S {...}"
+// fills in the members in place so every reference shares the same *Type.
+var structs = map[string]*Type{}
 
 func isTypeName(tok Token) bool {
 	if tok.Kind == TKeyword && typeKeywords[tok.Text] {
@@ -61,9 +66,8 @@ type Parser struct {
 func Parse(toks []Token) (*Program, error) {
 	// va_list is the cursor type for <stdarg.h> variadic access. goc implements
 	// variadics with a contiguous register/stack save area and walks it with a
-	// plain char* cursor, so va_list is just a pointer typedef (no struct is
-	// needed, and the toy model has no struct support yet).
-	typedefs["va_list"] = PtrType(IntType())
+	// plain char* cursor, so va_list is just a pointer typedef.
+	typedefs["va_list"] = PtrType(CharType())
 	p := &Parser{toks: toks}
 	prog := &Program{}
 	for p.cur().Kind != TEOF {
@@ -217,8 +221,12 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		if !isTypeName(p.cur()) {
 			break
 		}
-		if p.cur().Text == "struct" {
-			return nil, fmt.Errorf("line %d: struct is not supported in stage 2", p.cur().Line)
+		if p.cur().Text == "struct" || p.cur().Text == "union" {
+			t, err := p.parseStructSpecifier(p.cur().Text == "union")
+			if err != nil {
+				return nil, err
+			}
+			return t, nil
 		}
 		// A typedef name carries its own (possibly pointer) type; reuse it
 		// verbatim rather than re-synthesising one from width/signedness.
@@ -261,7 +269,7 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		return VoidType(), nil
 	}
 	if width == 0 {
-		width = 8 // bare "signed"/"unsigned" means int
+		width = 4 // bare "signed"/"unsigned" means int
 	}
 	if tdType != nil {
 		// The specifier list was a typedef alias (e.g. va_list, size_t). The
@@ -270,6 +278,97 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		return tdType, nil
 	}
 	return &Type{Kind: KInt, Width: width, Signed: signed}, nil
+}
+
+// parseStructSpecifier parses a struct or union type specifier:
+//
+//	"struct"        -> forward reference to (or definition of) tag ""
+//	"struct S"      -> named tag reference / definition
+//	"struct S {..}" -> definition (reusing a pre-registered incomplete type so
+//	                  the body may reference the tag recursively)
+//
+// The completed type's Size/Align are computed immediately.
+func (p *Parser) parseStructSpecifier(isUnion bool) (*Type, error) {
+	p.next() // consume "struct"/"union"
+	tag := ""
+	if p.cur().Kind == TIdent {
+		tag = p.next().Text
+	}
+	if p.atPunct("{") {
+		p.next()
+		// Pre-register an incomplete type so members can name the tag
+		// recursively (e.g. struct Node { struct Node* next; }).
+		var t *Type
+		if tag != "" {
+			if existing, ok := structs[tag]; ok {
+				t = existing
+			} else {
+				t = &Type{}
+				structs[tag] = t
+			}
+		} else {
+			t = &Type{}
+		}
+		members, err := p.parseStructMembers()
+		if err != nil {
+			return nil, err
+		}
+		if isUnion {
+			t.Kind = KUnion
+		} else {
+			t.Kind = KStruct
+		}
+		t.Members = members
+		t.Tag = tag
+		t.computeLayout()
+		return t, nil
+	}
+	// No body: this is a tag reference (possibly forward declaration).
+	if tag == "" {
+		return nil, fmt.Errorf("line %d: anonymous struct/union requires a body", p.cur().Line)
+	}
+	if t, ok := structs[tag]; ok {
+		return t, nil
+	}
+	t := &Type{Tag: tag}
+	structs[tag] = t
+	return t, nil
+}
+
+// parseStructMembers parses the ";"-terminated member declarations between the
+// struct braces. Each declaration is a normal type specifier followed by one or
+// more comma-separated declarators (names with optional pointer / array
+// suffixes). Anonymous members are not supported yet (every member is named).
+func (p *Parser) parseStructMembers() ([]*Member, error) {
+	var members []*Member
+	for !p.atPunct("}") {
+		spec, err := p.parseDeclarationSpecifiers()
+		if err != nil {
+			return nil, err
+		}
+		for {
+			d, err := p.parseDeclarator(spec, false, false)
+			if err != nil {
+				return nil, err
+			}
+			if d.typ == nil {
+				return nil, fmt.Errorf("line %d: expected struct member name", p.cur().Line)
+			}
+			members = append(members, &Member{Name: d.name, Type: d.typ})
+			if p.atPunct(",") {
+				p.next()
+				continue
+			}
+			break
+		}
+		if err := p.expect(";"); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expect("}"); err != nil {
+		return nil, err
+	}
+	return members, nil
 }
 
 // parseDeclarator applies pointer prefixes, a direct declarator (name or
@@ -936,6 +1035,34 @@ func (p *Parser) parseMul() (Expr, error) {
 }
 
 func (p *Parser) parseUnary() (Expr, error) {
+	// sizeof is a unary operator with two forms: "sizeof(Type)" (the operand
+	// is a type name, parsed by an abstract declarator) and "sizeof expr"
+	// (the operand is an ordinary expression). We peek at the token after a
+	// '(' to disambiguate: only when it begins a type specifier do we treat
+	// the parentheses as enclosing a type rather than a grouped expression.
+	if p.cur().Text == "sizeof" {
+		p.next() // consume "sizeof"
+		if p.atPunct("(") && (isTypeName(p.peek()) || isQualifier(p.peek())) {
+			p.next() // consume '('
+			spec, err := p.parseDeclarationSpecifiers()
+			if err != nil {
+				return nil, err
+			}
+			dt, err := p.parseDeclarator(spec, false, true)
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expect(")"); err != nil {
+				return nil, err
+			}
+			return &SizeofExpr{Typ: dt.typ}, nil
+		}
+		e, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		return &SizeofExpr{E: e}, nil
+	}
 	if p.atPunct("-") || p.atPunct("!") {
 		op := p.next().Text
 		e, err := p.parseUnary()
@@ -1059,6 +1186,18 @@ func (p *Parser) parsePostfix() (Expr, error) {
 				return nil, err
 			}
 			e = &Index{Base: e, Idx: idx}
+		} else if p.atPunct(".") || p.atPunct("->") {
+			arrow := p.cur().Text == "->"
+			p.next()
+			if p.cur().Kind != TIdent {
+				sep := "."
+				if arrow {
+					sep = "->"
+				}
+				return nil, fmt.Errorf("line %d: expected member name after %q", p.cur().Line, sep)
+			}
+			name := p.next().Text
+			e = &MemberExpr{Base: e, Name: name, Arrow: arrow, Line: p.cur().Line}
 		} else if p.atPunct("++") || p.atPunct("--") {
 			op := p.next().Text
 			e = &IncDecExpr{Op: op, E: e, Prefix: false}

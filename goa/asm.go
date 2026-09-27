@@ -24,6 +24,8 @@ type Operand struct {
 	kind       int
 	reg        int    // register index 0..15 (K_REG, K_MEM reg-indirect)
 	isByte     bool   // register is an 8-bit register (al/cl/dl/bl/...b)
+	is16       bool   // register is a 16-bit register (ax/cx/.../r15w)
+	is32       bool   // register is a 32-bit register (eax/ecx/.../r15d)
 	isXMM      bool   // register is an XMM register (xmm0..xmm15)
 	imm        int64  // K_IMM
 	memReg     int    // K_MEM register-indirect register index ([reg] form)
@@ -34,6 +36,7 @@ type Operand struct {
 	memScale   int    // K_MEM index scale (1,2,4,8)
 	memDisp    int    // K_MEM displacement
 	memHasDisp bool   // K_MEM: a displacement was explicitly provided (even if 0)
+	memWidth   int    // K_MEM: explicit operand width from byte/word/dword/qword prefix (0 = infer)
 	isRip      bool   // K_MEM: true => [rip+sym], false => register-based memory
 	sym        string // K_SYM
 }
@@ -146,6 +149,20 @@ func NewAssembler() *Assembler {
 var regIndexMap = map[string]int{
 	"rax": 0, "rcx": 1, "rdx": 2, "rbx": 3, "rsp": 4, "rbp": 5, "rsi": 6, "rdi": 7,
 	"r8": 8, "r9": 9, "r10": 10, "r11": 11, "r12": 12, "r13": 13, "r14": 14, "r15": 15,
+}
+
+// reg32Map / reg16Map map the 32-bit and 16-bit register aliases to the same
+// index as their 64-bit counterpart. They let the compiler emit "mov eax,
+// [rbp+16]" (a 4-byte load) without a dword prefix, and the assembler infers
+// the access width from the register name.
+var reg32Map = map[string]int{
+	"eax": 0, "ecx": 1, "edx": 2, "ebx": 3, "esp": 4, "ebp": 5, "esi": 6, "edi": 7,
+	"r8d": 8, "r9d": 9, "r10d": 10, "r11d": 11, "r12d": 12, "r13d": 13, "r14d": 14, "r15d": 15,
+}
+
+var reg16Map = map[string]int{
+	"ax": 0, "cx": 1, "dx": 2, "bx": 3, "sp": 4, "bp": 5, "si": 6, "di": 7,
+	"r8w": 8, "r9w": 9, "r10w": 10, "r11w": 11, "r12w": 12, "r13w": 13, "r14w": 14, "r15w": 15,
 }
 
 func regIndex(s string) (int, bool) {
@@ -443,15 +460,20 @@ func (a *Assembler) processLine(ln string) error {
 func (a *Assembler) parseOperand(tok string) (Operand, error) {
 	tok = strings.TrimSpace(tok)
 	// Strip NASM-style size prefixes (byte/word/dword/qword) and the
-	// redundant "ptr" keyword. The actual operand size is inferred from the
-	// register used (al/bl => 8-bit, rax/rbx => 64-bit), so dropping the
-	// keyword is always safe.
+	// redundant "ptr" keyword. The actual operand size is usually inferred
+	// from the register used (al/bl => 8-bit, rax/rbx => 64-bit), so for
+	// byte/qword dropping the keyword is safe. But an explicit prefix on a
+	// *memory* operand (e.g. "mov dword [rbp-8], eax" style, written by the
+	// compiler with 64-bit GPRs) is the only way to request a narrower
+	// access, so it is recorded in memWidth instead of being discarded.
+	sizeKw := 0
 	for {
 		lower := strings.ToLower(tok)
 		stripped := false
-		for _, kw := range []string{"byte", "word", "dword", "qword"} {
+		for i, kw := range []string{"byte", "word", "dword", "qword"} {
 			if strings.HasPrefix(lower, kw+" ") || strings.HasPrefix(lower, kw+"[") {
 				tok = strings.TrimSpace(tok[len(kw):])
+				sizeKw = []int{1, 2, 4, 8}[i]
 				stripped = true
 				break
 			}
@@ -477,6 +499,12 @@ func (a *Assembler) parseOperand(tok string) (Operand, error) {
 	if ri, ok := xmmRegMap[tok]; ok {
 		return Operand{kind: K_REG, reg: ri, isXMM: true}, nil
 	}
+	if ri, ok := reg16Map[tok]; ok {
+		return Operand{kind: K_REG, reg: ri, is16: true}, nil
+	}
+	if ri, ok := reg32Map[tok]; ok {
+		return Operand{kind: K_REG, reg: ri, is32: true}, nil
+	}
 	if ri, ok := regIndex(tok); ok {
 		return Operand{kind: K_REG, reg: ri}, nil
 	}
@@ -486,7 +514,7 @@ func (a *Assembler) parseOperand(tok string) (Operand, error) {
 		innerStripped := strings.ReplaceAll(inner, "RIP+", "")
 		innerStripped = strings.ReplaceAll(innerStripped, "rip+", "")
 		if innerStripped != inner {
-			return Operand{kind: K_MEM, memSym: a.qualify(strings.TrimSpace(innerStripped)), isRip: true, memIndex: -1}, nil
+			return Operand{kind: K_MEM, memSym: a.qualify(strings.TrimSpace(innerStripped)), isRip: true, memIndex: -1, memWidth: sizeKw}, nil
 		}
 		// Simple register-indirect: [reg]. Normalize it onto memBase (with
 		// memScale = 1) so planMem sees a well-formed operand -- leaving
@@ -494,16 +522,17 @@ func (a *Assembler) parseOperand(tok string) (Operand, error) {
 		if !strings.ContainsAny(inner, "+-*") {
 			if ri, ok := regIndex(inner); ok {
 				return Operand{kind: K_MEM, memReg: ri, memBase: ri, memHasBase: true,
-					isRip: false, memIndex: -1, memScale: 1}, nil
+					isRip: false, memIndex: -1, memScale: 1, memWidth: sizeKw}, nil
 			}
 			// a bare symbol => RIP-relative data reference ([sym])
-			return Operand{kind: K_MEM, memSym: a.qualify(inner), isRip: true, memIndex: -1}, nil
+			return Operand{kind: K_MEM, memSym: a.qualify(inner), isRip: true, memIndex: -1, memWidth: sizeKw}, nil
 		}
 		// Complex: [base+index*scale+disp], [base+disp], [index*scale], ...
 		o, err := parseMemInner(inner)
 		if err != nil {
 			return Operand{}, err
 		}
+		o.memWidth = sizeKw
 		return o, nil
 	}
 	// immediate (literal or constant name)
@@ -731,7 +760,8 @@ func (a *Assembler) emitMemEnc(e memEnc) {
 
 // encodeMovRegMem emits mov between a register and a register-based memory
 // operand (no RIP-relative / no symbol fixup). store=true => mem <- reg.
-func (a *Assembler) encodeMovRegMem(regOp Operand, memOp Operand, store, isByte bool) error {
+// width is 1 (byte), 4 (dword), or 8 (qword).
+func (a *Assembler) encodeMovRegMem(regOp Operand, memOp Operand, store bool, width int) error {
 	regField := regOp.reg
 	e, err := a.planMem(regField, memOp)
 	if err != nil {
@@ -739,7 +769,7 @@ func (a *Assembler) encodeMovRegMem(regOp Operand, memOp Operand, store, isByte 
 	}
 	// Build REX.
 	var opcode byte
-	if isByte {
+	if width == 1 {
 		if store {
 			opcode = 0x88 // MOV r/m8, r8
 		} else {
@@ -760,11 +790,36 @@ func (a *Assembler) encodeMovRegMem(regOp Operand, memOp Operand, store, isByte 
 		if rex != 0x40 || (regField >= 4 && regField <= 7) {
 			a.emitByte(rex)
 		}
+	} else if width == 2 || width == 4 {
+		// 16-bit / 32-bit: no REX.W. The 0x66 operand-size prefix selects
+		// 16 bits; 32-bit needs no prefix. REX is only emitted when a high
+		// register (8..15) appears in the R/X/B slot.
+		if width == 2 {
+			a.emitByte(0x66)
+		}
+		if store {
+			opcode = 0x89 // MOV r/m16|32, r16|32
+		} else {
+			opcode = 0x8B // MOV r16|32, r/m16|32
+		}
+		var rex byte = 0x40
+		if e.rexR {
+			rex |= 0x04
+		}
+		if e.rexX {
+			rex |= 0x02
+		}
+		if e.rexB {
+			rex |= 0x01
+		}
+		if rex != 0x40 {
+			a.emitByte(rex)
+		}
 	} else {
 		if store {
-			opcode = 0x89 // MOV r/m, r
+			opcode = 0x89 // MOV r/m64, r64
 		} else {
-			opcode = 0x8B // MOV r, r/m
+			opcode = 0x8B // MOV r64, r/m64
 		}
 		rex := byte(0x48)
 		if e.rexR {
@@ -1272,17 +1327,50 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 			}
 			a.emitByte(0x8A) // mov r8, r/m8 (mod=11)
 			a.emitByte(modrmRegReg(dst.reg, src.reg))
-		} else {
-			a.rexW(dst.reg, src.reg)
-			a.emitByte(0x8B) // load: reg=dst, rm=src
-			a.emitByte(modrmRegReg(dst.reg, src.reg))
+			return nil
 		}
+		// 16-bit or 32-bit register move: no REX.W, no operand-size prefix for
+		// 32-bit; a 0x66 prefix selects 16 bits. REX is only needed when a high
+		// register (8..15) appears.
+		if dst.is16 || src.is16 || dst.is32 || src.is32 {
+			needRex := dst.reg >= 8 || src.reg >= 8
+			if needRex {
+				rex := byte(0x40)
+				if dst.reg >= 8 {
+					rex |= 0x04
+				}
+				if src.reg >= 8 {
+					rex |= 0x01
+				}
+				a.emitByte(rex)
+			}
+			if dst.is16 || src.is16 {
+				a.emitByte(0x66) // operand-size prefix => 16-bit
+			}
+			a.emitByte(0x8B) // load: reg=dst, rm=src (same opcode for 16/32)
+			a.emitByte(modrmRegReg(dst.reg, src.reg))
+			return nil
+		}
+		a.rexW(dst.reg, src.reg)
+		a.emitByte(0x8B) // load: reg=dst, rm=src
+		a.emitByte(modrmRegReg(dst.reg, src.reg))
 		return nil
 	}
 
-	// mov reg, [rip+sym]   (64-bit load)
+	// mov reg, [rip+sym]   (load; width from `dword`/`word` prefix or 64-bit)
 	if dst.kind == K_REG && !dst.isByte && src.kind == K_MEM && src.isRip {
-		a.rexW(dst.reg, 0)
+		width := src.memWidth
+		if width == 0 {
+			width = 8
+		}
+		if width == 2 {
+			a.emitByte(0x66) // operand-size prefix => 16-bit
+		}
+		if width == 8 {
+			a.rexW(dst.reg, 0)
+		} else if dst.reg >= 8 {
+			a.emitByte(0x44) // REX.R only
+		}
 		a.emitByte(0x8B)
 		a.emitByte(modrmRip(dst.reg))
 		off := a.curOff()
@@ -1291,22 +1379,37 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 		return nil
 	}
 
-	// mov [rip+sym], reg   (64-bit or 8-bit store)
+	// mov [rip+sym], reg   (store; width from `dword`/`word` prefix, `byte`
+	// register, or 64-bit)
 	if dst.kind == K_MEM && dst.isRip && src.kind == K_REG {
-		if src.isByte {
-			// 0x88 = mov r/m8, r8: modrm reg field = src -> REX.R (0x44), not REX.B.
-			// spl/bpl/sil/dil (4..7) also need a bare REX (0x40) or they decode as ah/ch/dh/bh.
+		width := dst.memWidth
+		if width == 0 {
+			if src.isByte {
+				width = 1
+			} else {
+				width = 8
+			}
+		}
+		if width == 1 {
+			// 0x88 = mov r/m8, r8: only REX.R (0x44) or the spl/bpl/sil/dil
+			// bare REX (0x40) is needed.
 			if src.reg >= 8 {
 				a.emitByte(0x44)
 			} else if src.reg >= 4 {
 				a.emitByte(0x40)
 			}
-			a.emitByte(0x88) // store r/m8, r8
+			a.emitByte(0x88)
 			a.emitByte(modrmRip(src.reg))
 		} else {
-			// 0x89 = mov r/m64, r64: modrm reg field = src, rm = RIP.
-			a.rexW(src.reg, 0)
-			a.emitByte(0x89) // store r/m, r
+			if width == 2 {
+				a.emitByte(0x66)
+			}
+			if width == 8 {
+				a.rexW(src.reg, 0)
+			} else if src.reg >= 8 {
+				a.emitByte(0x44) // REX.R only
+			}
+			a.emitByte(0x89) // store r/m16|32|64, r16|32|64
 			a.emitByte(modrmRip(src.reg))
 		}
 		off := a.curOff()
@@ -1347,37 +1450,80 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 		return nil
 	}
 
-	// mov [base+disp], imm  (64-bit, sign-extended imm32) -- stack slots
+	// mov [base+disp], imm  (64-bit sign-extended imm32, or 32-bit imm32
+	// when prefixed `dword`) -- stack slots / struct member stores.
 	if dst.kind == K_MEM && !dst.isRip && dst.memHasBase && src.kind == K_IMM {
-		return a.encodeMovMemImm(dst.memBase, dst.memDisp, src.imm, ln)
+		width := dst.memWidth
+		if width == 0 {
+			width = 8
+		}
+		return a.encodeMovMemImm(dst.memBase, dst.memDisp, src.imm, width, ln)
 	}
 
-	// mov reg, [mem]   (64-bit load, register-based memory)
+	// mov reg, [mem]   (load; width from `dword`/`word`/`byte` prefix, or
+	// inferred from the destination register width)
 	if dst.kind == K_REG && !dst.isByte && src.kind == K_MEM && !src.isRip {
-		return a.encodeMovRegMem(dst, src, false, false)
+		width := src.memWidth
+		if width == 0 {
+			if dst.is16 {
+				width = 2
+			} else if dst.is32 {
+				width = 4
+			} else {
+				width = 8
+			}
+		}
+		return a.encodeMovRegMem(dst, src, false, width)
 	}
 
 	// mov reg8, [mem]  (8-bit load)
 	if dst.kind == K_REG && dst.isByte && src.kind == K_MEM && !src.isRip {
-		return a.encodeMovRegMem(dst, src, false, true)
+		width := src.memWidth
+		if width == 0 {
+			width = 1
+		}
+		return a.encodeMovRegMem(dst, src, false, width)
 	}
 
-	// mov [mem], reg / mov [mem], reg8  (store; byte-ness taken from src)
+	// mov [mem], reg / mov [mem], reg8  (store; width from `dword`/`word`/`byte`
+	// prefix, or inferred from the source register width)
 	if dst.kind == K_MEM && !dst.isRip && src.kind == K_REG {
-		return a.encodeMovRegMem(src, dst, true, src.isByte)
+		width := dst.memWidth
+		if width == 0 {
+			if src.isByte {
+				width = 1
+			} else if src.is16 {
+				width = 2
+			} else if src.is32 {
+				width = 4
+			} else {
+				width = 8
+			}
+		}
+		return a.encodeMovRegMem(src, dst, true, width)
 	}
 
 	return fmt.Errorf("mov: unsupported operand combination: %q", ln)
 }
 
-// encodeMovMemImm emits: mov [base+disp], imm32 (sign-extended to 64-bit via REX.W).
-func (a *Assembler) encodeMovMemImm(base, disp int, imm int64, ln string) error {
-	rex := byte(0x48)
+// encodeMovMemImm emits: mov [base+disp], imm (imm16 under a 0x66 prefix for
+// width==2, imm32 -- sign-extended to 64 bits by REX.W -- for width==8, plain
+// imm32 for width==4).
+func (a *Assembler) encodeMovMemImm(base, disp int, imm int64, width int, ln string) error {
+	if width == 2 {
+		a.emitByte(0x66) // operand-size prefix => 16-bit immediate
+	}
+	rex := byte(0x40)
+	if width == 8 {
+		rex = 0x48
+	}
 	if base >= 8 {
 		rex |= 0x01
 	}
-	a.emitByte(rex)
-	a.emitByte(0xC7) // mov r/m, imm32
+	if width == 8 || base >= 8 {
+		a.emitByte(rex)
+	}
+	a.emitByte(0xC7) // mov r/m, imm32 (or imm16 under 0x66)
 	useSIB := base == 4 || base == 12
 	var modrm byte
 	if !useSIB {
@@ -1411,7 +1557,12 @@ func (a *Assembler) encodeMovMemImm(base, disp int, imm int64, ln string) error 
 	default:
 		a.emitInt32(int32(disp))
 	}
-	a.emitInt32(int32(imm))
+	if width == 2 {
+		a.emitByte(byte(int16(imm)))
+		a.emitByte(byte(int16(imm) >> 8))
+	} else {
+		a.emitInt32(int32(imm))
+	}
 	return nil
 }
 
