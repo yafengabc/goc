@@ -77,14 +77,16 @@ class UcLinux:
         self.brk_cur = ldr.brk_start()
         self.heap_top = self.brk_cur
 
-        # Map load segments.
+        # Map load segments. Unicorn maps whole pages, so start from the page
+        # *containing* p_vaddr -- note this is align-DOWN, not align-up: mapping
+        # from the next page boundary silently unmaps the first bytes of any
+        # segment whose p_vaddr is not page-aligned, which then shows up as a
+        # bogus UC_ERR_READ_UNMAPPED once the code touches them.
         for p_offset, p_vaddr, p_filesz, p_memsz, p_flags in ldr.segs:
-            base = align_up(p_vaddr, PAGE)  # start of the page containing p_vaddr
-            seg_start = p_vaddr
-            seg_end = align_up(p_vaddr + p_memsz, PAGE)
-            if base < seg_start:
-                # p_vaddr may not be page aligned; map one page earlier.
-                base = seg_start & ~(PAGE - 1)
+            base = p_vaddr & ~(PAGE - 1)
+            seg_end = align_up(p_vaddr + max(p_memsz, p_filesz), PAGE)
+            if seg_end <= base:
+                continue
             prot = 0
             if p_flags & 4:
                 prot |= UC_PROT_READ
@@ -144,6 +146,13 @@ class UcLinux:
 
     def hook_invalid(self, mu, access, address, size, value, ud):
         rip = mu.reg_read(UC_X86_REG_RIP)
+        print(
+            "ucrun: unmapped %s at 0x%x (size %d) rip=0x%x\n"
+            "       mapped: code/heap below 0x%x, stack [0x%x,0x%x)"
+            % ("read" if access in (16, 17, 18) else "access", address, size, rip,
+               self.heap_top, STACK_TOP - STACK_SIZE, STACK_TOP),
+            file=sys.stderr,
+        )
         raise Trap(1)  # segfault -> exit 1, printed by caller
 
     def hook_code(self, mu, address, size, ud):
@@ -153,7 +162,7 @@ class UcLinux:
         if code != b"\x0f\x05":  # syscall
             return
         n = mu.reg_read(UC_X86_REG_RAX)
-        if n == 60:  # exit
+        if n == 60 or n == 231:  # exit / exit_group
             raise Trap(mu.reg_read(UC_X86_REG_RDI))
         elif n == 1:  # write
             buf = mu.reg_read(UC_X86_REG_RSI)

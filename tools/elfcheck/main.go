@@ -1,16 +1,13 @@
-// elfcheck verifies a Linux ELF64 binary produced by goa and then *runs* it
-// by interpreting its instructions. Native execution needs a Linux kernel;
-// this gets as close as a Windows box can:
+// elfcheck verifies the *structure* of a Linux ELF64 binary produced by goa:
+// every header field and every PT_LOAD entry the kernel's loader actually
+// reads. That job is orthogonal to semantics, and it stays here.
 //
-//  1. structural check -- every header field the loader actually reads
-//  2. load the image the way the kernel would (PT_LOAD -> virtual memory)
-//  3. interpret from the entry point, emulating write/exit syscalls
-//
-// The program's own output goes to stdout (so it can be diffed against a
-// golden file exactly like a real run); diagnostics go to stderr.
-//
-// The interpreter covers the instruction subset goa emits. Anything else is a
-// loud "unsupported opcode" failure, never a silent wrong answer.
+// It can still run the image through a hand-written interpreter, but that mode
+// no longer decides whether a program's output is correct: an interpreter we
+// wrote can only ever agree with our own ideas about what x86-64 should do.
+// ucrun.py executes the same ELF on QEMU's CPU core (TCG, via Unicorn), and
+// that is the authority this project defers to. Pass -structure-only for the
+// ordinary check; the golden-output comparison belongs to the QEMU leg.
 package main
 
 import (
@@ -22,11 +19,16 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: elfcheck [-v] <elf>")
+		fmt.Fprintln(os.Stderr, "usage: elfcheck [-v|-structure-only] <elf>")
 		os.Exit(2)
 	}
 	path := os.Args[len(os.Args)-1]
 	verbose := len(os.Args) > 2 && os.Args[1] == "-v"
+	// Structure-only mode stops after the header/segment checks. Deciding what a
+	// program *prints* is no longer this tool's job: ucrun.py runs the ELF on
+	// QEMU's CPU core (TCG), whose instruction semantics we did not hand-write.
+	structureOnly := len(os.Args) > 2 &&
+		(os.Args[1] == "-structure-only" || os.Args[1] == "--structure-only")
 
 	f, err := os.ReadFile(path)
 	if err != nil {
@@ -41,6 +43,9 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "elfcheck: %s: ELF64 ok, entry=0x%x, %d sections\n",
 		path, img.entry, img.shnum)
+	if structureOnly {
+		os.Exit(0)
+	}
 
 	c := newCPU(img, verbose)
 	code := c.run()

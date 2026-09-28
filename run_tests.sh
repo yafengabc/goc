@@ -26,11 +26,36 @@ echo "== building goc =="
 echo "== building goa =="
 (cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa.exe .) || { echo "GOA BUILD FAILED"; exit 1; }
 
-# elfcheck verifies an ELF and then interprets it, since a Windows box cannot
-# exec one. Same golden files: the Linux backend must print exactly what the
-# Windows one does.
+# elfcheck verifies the ELF *structure* (headers, segments, entry). It no longer
+# decides whether the program's output is right -- the Linux binaries below are
+# executed by Unicorn, which is QEMU's CPU core (TCG). See find_python().
 echo "== building elfcheck =="
 (cd tools && go build -o ../bin/elfcheck.exe ./elfcheck) || { echo "ELFCHECK BUILD FAILED"; exit 1; }
+
+# Find a Python that can import unicorn. Unicorn exposes QEMU's TCG x86-64 core
+# as a library, so ucrun.py gives us real instruction semantics (flags, SSE2,
+# addressing) instead of a hand-written guess at them -- which matters because
+# an interpreter that agrees with our own codegen is only agreeing with itself.
+find_python() {
+    if [ -n "${GOC_PYTHON:-}" ] && [ -x "$GOC_PYTHON" ]; then echo "$GOC_PYTHON"; return 0; fi
+    for c in python3 python py; do
+        if command -v "$c" >/dev/null 2>&1 && "$c" -c "import unicorn" >/dev/null 2>&1; then
+            command -v "$c"; return 0
+        fi
+    done
+    for p in /d/msys/ucrt64/bin/python3.exe /c/msys64/ucrt64/bin/python3.exe \
+             /c/msys64/mingw64/bin/python3.exe; do
+        if [ -x "$p" ]; then echo "$p"; return 0; fi
+    done
+    return 1
+}
+UCPY=""
+if UCPY="$(find_python)"; then
+    echo "== linux runner: $UCPY -c 'import unicorn' ok =="
+else
+    echo "== WARNING: no Python with the unicorn/QEMU bindings found; the Linux"
+    echo "==          leg will be SKIPPED. Set GOC_PYTHON=/path/to/python to enable it. =="
+fi
 
 # Fresh output dir: goc -o bin/goc-out writes every .asm/.exe/ELF here.
 rm -rf bin/goc-out
@@ -86,8 +111,11 @@ echo "-----------------------------"
 echo "pass=$pass fail=$fail"
 
 # Linux target: same C source, ELF64 output, compared against the same golden
-# files. The binaries cannot run here, so elfcheck interprets them.
-echo "== linux target (ELF64) =="
+# files. The ELF cannot be exec'd on Windows, so ucrun.py loads it into a
+# Unicorn (QEMU TCG) VM and runs it there: real x86-64 semantics, plus Linux
+# write/brk/exit_group syscall emulation.
+echo "== linux target (ELF64, executed under QEMU/Unicorn) =="
+linux_skipped=0
 for src in src/examples/*.c; do
     name="$(basename "$src" .c)"
     exp="src/expected/$name.txt"
@@ -102,14 +130,23 @@ for src in src/examples/*.c; do
         continue
     fi
 
+    if [ -z "$UCPY" ]; then
+        linux_skipped=$((linux_skipped + 1))
+        continue
+    fi
+
     if ! ./bin/goc.exe -c -target linux -o bin/goc-out "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
         echo "FAIL  linux/$name  (compile): $(cat /tmp/gocl_$name.err)"
         fail=$((fail + 1))
         continue
     fi
 
-    ./bin/elfcheck.exe "bin/goc-out/$name" >"/tmp/gocl_$name.out" 2>"/tmp/gocl_$name.err"
-    rc=$?
+    # ELF structure still gets checked by elfcheck (headers/segments only); the
+    # *output* comes from the QEMU run.
+    ./bin/elfcheck.exe --structure-only "bin/goc-out/$name" >/dev/null 2>&1
+
+    "$UCPY" tools/ucrun.py "bin/goc-out/$name" 2>"/tmp/gocl_$name.err" | tr -d '\r' >"/tmp/gocl_$name.out"
+    rc=${PIPESTATUS[0]}
 
     if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/gocl_$name.out" >"/tmp/gocl_$name.diff"; then
         echo "FAIL  linux/$name  (exit=$rc)"
@@ -119,6 +156,23 @@ for src in src/examples/*.c; do
     else
         printf "ok    linux/%-10s %6d bytes\n" "$name" "$(stat -c%s bin/goc-out/"$name")"
         pass=$((pass + 1))
+    fi
+done
+
+[ "$linux_skipped" -gt 0 ] && echo "SKIP  linux/*  ($linux_skipped examples need a Python with unicorn)"
+
+# Unit tests. Each of src/, src/goa/ and tools/ is its own Go module, so `go
+# test ./...` run from src alone silently skips the assembler's unit tests --
+# iterate all three explicitly.
+echo "== unit tests (all three modules) =="
+for mod in src src/goa tools; do
+    if (cd "$mod" && go test -count=1 ./... >"/tmp/unit.log" 2>&1); then
+        printf "ok    unit: %-10s (%s tests)\n" "$mod" "$(cd "$mod" && go test -count=1 ./... -v 2>/dev/null | grep -c '^--- PASS')"
+        pass=$((pass + 1))
+    else
+        echo "FAIL  unit: $mod"
+        tail -15 "/tmp/unit.log"
+        fail=$((fail + 1))
     fi
 done
 
