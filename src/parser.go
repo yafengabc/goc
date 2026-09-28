@@ -83,6 +83,22 @@ type Parser struct {
 }
 
 func Parse(toks []Token) (*Program, error) {
+	// Each call parses one translation unit, and the type-name tables below
+	// are per-translation-unit state: every TU that needs a header includes
+	// it, so the tables must start fresh. Without the reset, compiling the
+	// same header twice (the built-in library TUs run before the user's) sees
+	// "typedef unsigned long size_t;" with size_t already a type name -- the
+	// specifier parser then swallows the alias and the declarator is left
+	// with no name.
+	for k := range typedefs {
+		delete(typedefs, k)
+	}
+	for k := range structs {
+		delete(structs, k)
+	}
+	for k := range enumConsts {
+		delete(enumConsts, k)
+	}
 	// va_list is the cursor type for <stdarg.h> variadic access. goc implements
 	// variadics with a contiguous register/stack save area and walks it with a
 	// plain char* cursor, so va_list is just a pointer typedef.

@@ -64,13 +64,32 @@ type Preprocessor struct {
 }
 
 // Preprocess runs the full preprocessing pipeline on src (already read from
-// filename) and returns the expanded token stream.
+// filename) and returns the expanded token stream. The target platform
+// defaults to Windows; PreprocessTarget selects it explicitly.
 func Preprocess(src, filename string) ([]Token, error) {
+	return PreprocessTarget(src, filename, false)
+}
+
+// PreprocessTarget is Preprocess with an explicit target platform. The target
+// only decides which platform macros are predefined -- _WIN32/_WIN64 for the
+// Windows x64 backend, __linux__ (and __linux) for the ELF backend -- so
+// library sources and user programs can write portable
+// "#if defined(_WIN32) ... #else ... #endif" branches.
+func PreprocessTarget(src, filename string, linux bool) ([]Token, error) {
 	src = spliceContinuations(src)
 	p := &Preprocessor{
 		macros:     map[string]*Macro{},
 		inExpand:   map[string]bool{},
 		searchDirs: []string{},
+	}
+	// Platform macros, mirroring what real compilers predefine: object-like
+	// macros with body "1", visible to #ifdef, defined() and plain expansion.
+	if linux {
+		p.macros["__linux__"] = &Macro{Name: "__linux__", Body: []Token{tokNum(1, 0)}}
+		p.macros["__linux"] = &Macro{Name: "__linux", Body: []Token{tokNum(1, 0)}}
+	} else {
+		p.macros["_WIN32"] = &Macro{Name: "_WIN32", Body: []Token{tokNum(1, 0)}}
+		p.macros["_WIN64"] = &Macro{Name: "_WIN64", Body: []Token{tokNum(1, 0)}}
 	}
 	p.baseDir = filepath.Dir(filename)
 	p.searchDirs = append(p.searchDirs, p.baseDir, ".")
@@ -412,21 +431,25 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 
 	full, err := p.resolveInclude(path, filename, angled)
 	if err != nil {
-		if angled {
-			// System headers that goc ships (stdio.h, stdlib.h, string.h, ...)
-			// are embedded as real files under goclib/ and injected directly,
-			// with no disk lookup. An unavailable <file> is skipped rather
-			// than fatal.
-			if src, rerr := goclibHeaders.ReadFile("goclib/" + path); rerr == nil {
-				inc, perr := p.process(string(src), "<builtin:"+path+">")
-				if perr != nil {
-					return nil, perr
-				}
-				if len(inc) > 0 && inc[len(inc)-1].Kind == TEOF {
-					inc = inc[:len(inc)-1]
-				}
-				return inc, nil
+		// Headers that goc ships (stdio.h, stddef.h, ...) are embedded as
+		// real files under goclib/ and injected directly, with no disk
+		// lookup. The fallback serves BOTH the <file> and "file" spellings:
+		// sources that live only inside the embedded FS -- the built-in
+		// goclib itself -- include their own headers by name, and a quoted
+		// include from an on-disk file must still resolve when the compiler
+		// runs outside the source tree. An unavailable <file> is skipped
+		// rather than fatal.
+		if src, rerr := goclibHeaders.ReadFile("goclib/" + path); rerr == nil {
+			inc, perr := p.process(string(src), "<builtin:"+path+">")
+			if perr != nil {
+				return nil, perr
 			}
+			if len(inc) > 0 && inc[len(inc)-1].Kind == TEOF {
+				inc = inc[:len(inc)-1]
+			}
+			return inc, nil
+		}
+		if angled {
 			fmt.Fprintf(os.Stderr, "%s: note: skipping unavailable system header <%s>\n", filename, path)
 			return nil, nil
 		}
@@ -479,6 +502,30 @@ func (p *Preprocessor) expandAt(raw []Token, i int, filename string, line int) (
 			return []Token{tokNum(int64(p.logicalLine(line)), t.Line)}, i + 1
 		case "__goc__":
 			return []Token{tokNum(1, t.Line)}, i + 1
+		case "defined":
+			// Pass "defined NAME" / "defined(NAME)" through verbatim: the
+			// name operand must NOT be macro-expanded (C standard, #if
+			// rules). Without this guard "defined(FOO)" expands to
+			// "defined(1)" and cePrimary looks up the macro "1" -- always
+			// false -- so every defined() test on a real macro broke.
+			out := []Token{t}
+			i++
+			if i < len(raw) && raw[i].Text == "(" {
+				out = append(out, raw[i])
+				i++
+				if i < len(raw) {
+					out = append(out, raw[i]) // the name, unexpanded
+					i++
+				}
+				if i < len(raw) && raw[i].Text == ")" {
+					out = append(out, raw[i])
+					i++
+				}
+			} else if i < len(raw) && raw[i].Kind == TIdent {
+				out = append(out, raw[i])
+				i++
+			}
+			return out, i
 		}
 		if m, ok := p.macros[t.Text]; ok && !p.inExpand[t.Text] && p.active() {
 			if !m.IsFunc {

@@ -69,7 +69,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	toks, err := Preprocess(string(src), srcPath)
+	toks, err := PreprocessTarget(string(src), srcPath, linux)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "preprocess error:", err)
 		os.Exit(1)

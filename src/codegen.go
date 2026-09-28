@@ -52,7 +52,15 @@ type CG struct {
 	funcDefs    map[string]*FuncDecl
 	calls       map[string]bool   // functions called that are not defined here
 	need        map[string]bool   // goclib functions this program actually uses
-	linux       bool              // true -> SysV ABI + ELF output
+	// Built-in C library (clibCStore): needed C functions are emitted through
+	// genFunc (which marks more needs, so Gen iterates to a fixpoint), and the
+	// library's file-scope variables join the .data pool -- but only those the
+	// program actually references (libGlobUsed).
+	libEmitted   map[string]bool
+	libGlobNames map[string]bool
+	libGlobUsed  map[string]bool
+	libGlobals   []*DeclStmt
+	linux        bool              // true -> SysV ABI + ELF output
 	curRet      *Type             // return type of the function being generated
 	curParam    []*Type           // parameter types of the current function
 	resTyp      CType             // type of the value left by the last genExprT
@@ -221,6 +229,9 @@ var goclibFS embed.FS
 //go:embed goclib/*.def
 var goclibDefFS embed.FS
 
+//go:embed goclib/*.c
+var goclibCFS embed.FS
+
 type goclibFunc struct {
 	name string
 	deps []string // other goclib functions required
@@ -256,7 +267,19 @@ func goclibStore(linux bool) (map[string]*goclibFunc, *[]string, *[]goclibDataBl
 	return goclibFuncsWin, &goclibOrderWin, &goclibBlocksWin
 }
 
-func init() { goclibErr = loadClib() }
+func init() {
+	// Compile the built-in C library first, for both targets: the assembly
+	// loader below needs the C function set to retire the assembly twins.
+	clibCWin, clibCErr = buildClibC(false)
+	if clibCErr == nil {
+		clibCLinux, clibCErr = buildClibC(true)
+	}
+	if clibCErr != nil {
+		goclibErr = clibCErr
+		return
+	}
+	goclibErr = loadClib()
+}
 
 func loadClib() error {
 	// The same embedded file is loaded twice, once per target; selectPlatform
@@ -298,6 +321,111 @@ func loadClibDir(fs embed.FS, dir string, linux bool) error {
 // name would collide with an goa syscall stub of the same name.
 var goclibAliasLinux = map[string]string{
 	"exit": "__goclib_exit",
+}
+
+// ---------------------------------------------------------------------------
+// goclib in C: the embedded library is compiled by goc itself
+// ---------------------------------------------------------------------------
+//
+// goclib.c (plus the headers it includes) is a plain C translation unit that
+// goc compiles at start-up exactly like a user program. The resulting function
+// bodies REPLACE the assembly versions of the same name: a function defined in
+// the C library is emitted through the regular code generator (genFunc) when a
+// program needs it, and the assembly tables are only consulted for functions
+// the C library does not define -- currently the five __goclib_* platform
+// primitives, which touch the OS directly.
+//
+// Function implementations may live either in a declaration header or in a .c
+// file: the umbrella goclib.h is processed as its own translation unit first
+// (collecting any definitions placed in the headers it includes), then every
+// goclib/*.c. A later definition of the same name wins, so a .c definition
+// overrides a header one and duplicates never reach the linker.
+
+// clibCProgram is the compiled built-in library for one target.
+type clibCProgram struct {
+	funcs   map[string]*FuncDecl // defined functions, by name
+	order   []string             // definition order, for stable output
+	protos  []*FuncDecl          // prototypes declared by the library headers
+	globals []*DeclStmt          // file-scope variables (e.g. rand_state)
+}
+
+var (
+	clibCWin   *clibCProgram
+	clibCLinux *clibCProgram
+	clibCErr   error
+)
+
+// clibCStore picks the compiled C library for a target.
+func clibCStore(linux bool) *clibCProgram {
+	if linux {
+		return clibCLinux
+	}
+	return clibCWin
+}
+
+// buildClibC compiles the embedded goclib sources into a Program for one
+// target. The umbrella header goes first (its includes pull in the standard
+// headers, so definitions placed there are collected too), then the .c files
+// in name order. The library has no main(), so that one checker diagnostic is
+// expected and filtered; anything else is a hard error -- the library must
+// compile for every program.
+func buildClibC(linux bool) (*clibCProgram, error) {
+	lib := &clibCProgram{funcs: map[string]*FuncDecl{}}
+	compile := func(name, src string) error {
+		toks, err := PreprocessTarget(src, "goclib/"+name, linux)
+		if err != nil {
+			return fmt.Errorf("goclib/%s: %v", name, err)
+		}
+		prog, err := Parse(toks)
+		if err != nil {
+			return fmt.Errorf("goclib/%s: %v", name, err)
+		}
+		for _, e := range Check(prog) {
+			if strings.Contains(e.Error(), "program has no main()") {
+				continue // the library is not a program
+			}
+			return fmt.Errorf("goclib/%s: %v", name, e)
+		}
+		lib.protos = append(lib.protos, prog.Prototypes...)
+		for _, g := range prog.Globals {
+			lib.globals = append(lib.globals, g)
+		}
+		// Definitions: later files win over earlier ones (a .c definition
+		// overrides a header definition of the same name).
+		for _, f := range prog.Funcs {
+			if _, dup := lib.funcs[f.Name]; !dup {
+				lib.order = append(lib.order, f.Name)
+			}
+			lib.funcs[f.Name] = f
+		}
+		return nil
+	}
+	if b, err := goclibHeaders.ReadFile("goclib/goclib.h"); err != nil {
+		return nil, err
+	} else if err := compile("goclib.h", string(b)); err != nil {
+		return nil, err
+	}
+	entries, err := goclibCFS.ReadDir("goclib")
+	if err != nil {
+		return nil, err
+	}
+	var cfiles []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".c") {
+			cfiles = append(cfiles, e.Name())
+		}
+	}
+	sort.Strings(cfiles)
+	for _, f := range cfiles {
+		b, err := goclibCFS.ReadFile("goclib/" + f)
+		if err != nil {
+			return nil, err
+		}
+		if err := compile(f, string(b)); err != nil {
+			return nil, err
+		}
+	}
+	return lib, nil
 }
 
 // selectPlatform evaluates a small subset of C conditional compilation over the
@@ -493,6 +621,7 @@ func parseClib(file, src string, linux bool) error {
 	var data []string
 	var dataNeeds []string
 	inData := false
+	skipping := false // inside a @func block retired by the C library
 	flush := func() error {
 		if inData {
 			*blocks = append(*blocks, goclibDataBlock{
@@ -515,6 +644,16 @@ func parseClib(file, src string, linux bool) error {
 	}
 	for _, raw := range strings.Split(src, "\n") {
 		t := strings.TrimSpace(raw)
+		// Inside a retired (C-superseded) function block: drop everything
+		// up to and including the matching "; @end" -- its @deps/@extern
+		// directives and body lines belong to a function that will never
+		// be linked from assembly.
+		if skipping {
+			if t == "; @end" {
+				skipping = false
+			}
+			continue
+		}
 		switch {
 		case t == "; @end":
 			if err := flush(); err != nil {
@@ -541,6 +680,15 @@ func parseClib(file, src string, linux bool) error {
 				return fmt.Errorf("@func without a name")
 			}
 			cur = &goclibFunc{name: name, file: file}
+			// A function the built-in C library defines is generated from C
+			// code; the assembly body is retired rather than linked, so the
+			// two implementations can never both reach an output binary.
+			if lib := clibCStore(linux); lib != nil {
+				if _, isC := lib.funcs[name]; isC {
+					cur = nil
+					skipping = true
+				}
+			}
 		case strings.HasPrefix(t, "; @deps"):
 			if cur == nil {
 				return fmt.Errorf("@deps outside a function")
@@ -634,6 +782,15 @@ func goclibNames(linux bool) []string {
 		}
 		out = append(out, n)
 	}
+	if lib := clibCStore(linux); lib != nil {
+		for _, n := range lib.order {
+			if strings.HasPrefix(n, "__") {
+				continue
+			}
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -1012,6 +1169,7 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 			if c.globals[n.Name] {
 				// Global variable: load its value via rip-relative addressing
 				// into the .data section (arrays decay to a pointer to element
+				c.useLibGlobal(n.Name)
 				// 0, mirroring local arrays).
 				return c.loadGlobal(c.globalLab[n.Name], c.globalTyp[n.Name])
 			}
@@ -1324,12 +1482,43 @@ func Gen(prog *Program, linux bool) (string, error) {
 		globalLab: map[string]string{},
 		globalTyp: map[string]*Type{},
 		staticVars: map[string]string{},
+		libEmitted:   map[string]bool{},
+		libGlobNames: map[string]bool{},
+		libGlobUsed:  map[string]bool{},
 		linux:     linux,
 	}
 	for _, g := range prog.Globals {
 		c.globals[g.Name] = true
 		c.globalLab[g.Name] = "G_" + g.Name
 		c.globalTyp[g.Name] = g.Typ
+	}
+	// The built-in C library joins the program: its file-scope variables
+	// (rand_state, ...) share the global pool unless the user declared their
+	// own of the same name, and its prototypes/definitions feed call-site
+	// double promotion for every caller, user or library-internal. Registering
+	// happens BEFORE the user's own functions so a user definition always
+	// overwrites the library entry in funcDefs.
+	if lib := clibCStore(linux); lib != nil {
+		for _, g := range lib.globals {
+			if c.globals[g.Name] {
+				continue // user global of the same name wins
+			}
+			c.globals[g.Name] = true
+			c.globalLab[g.Name] = "G_" + g.Name
+			c.globalTyp[g.Name] = g.Typ
+			c.libGlobNames[g.Name] = true
+			c.libGlobals = append(c.libGlobals, g)
+		}
+		for _, pr := range lib.protos {
+			if _, dup := c.funcDefs[pr.Name]; !dup {
+				c.funcDefs[pr.Name] = pr
+			}
+		}
+		for _, name := range lib.order {
+			if _, dup := c.funcDefs[name]; !dup {
+				c.funcDefs[name] = lib.funcs[name]
+			}
+		}
 	}
 	for _, f := range prog.Funcs {
 		c.funcs[f.Name] = true
@@ -1349,15 +1538,31 @@ func Gen(prog *Program, linux bool) (string, error) {
 			return "", err
 		}
 	}
+	// Emit every needed built-in C library function through the regular code
+	// generator. genFunc of a library function marks more needs (its own
+	// calls: library-internal helpers and the assembly platform primitives),
+	// so the pass runs to a fixpoint.
+	if err := c.genClibFuncs(); err != nil {
+		return "", err
+	}
 	body.WriteString(c.sb.String())
 
 	if _, ok := c.funcs["main"]; !ok {
 		return "", fmt.Errorf("program has no main()")
 	}
 
-	// Pull in exactly the goclib functions this program calls, plus whatever
-	// those depend on.
-	order, goclibExts, dataBlock, err := goclibUsed(c.need, c.linux)
+	// Pull in exactly the assembly goclib functions this program still needs
+	// (the platform primitives, plus whatever they depend on). Functions the
+	// C library defined were already emitted above and stay out of the
+	// assembly tables.
+	lib := clibCStore(c.linux)
+	asmNeed := map[string]bool{}
+	for name := range c.need {
+		if _, isC := lib.funcs[name]; !isC {
+			asmNeed[name] = true
+		}
+	}
+	order, goclibExts, dataBlock, err := goclibUsed(asmNeed, c.linux)
 	if err != nil {
 		return "", err
 	}
@@ -1438,7 +1643,9 @@ func Gen(prog *Program, linux bool) (string, error) {
 	// section, referenced via rip. Only constant integer initialisers are
 	// supported today (goclib's globals are all simple constants). Arrays are
 	// zero-filled for their full byte size so rip-relative indexing works.
-	if len(prog.Globals) > 0 || len(c.staticList) > 0 {
+	// Built-in library globals come last, and only those the program actually
+	// referenced (useLibGlobal).
+	if len(prog.Globals) > 0 || len(c.staticList) > 0 || len(c.libGlobUsed) > 0 {
 		out.WriteString("\nsection .data\n")
 		for _, g := range prog.Globals {
 			if err := c.emitGlobalVar(&out, g, c.globalLab[g.Name]); err != nil {
@@ -1447,6 +1654,14 @@ func Gen(prog *Program, linux bool) (string, error) {
 		}
 		for _, se := range c.staticList {
 			if err := c.emitGlobalVar(&out, se.d, se.lab); err != nil {
+				return "", err
+			}
+		}
+		for _, g := range c.libGlobals {
+			if !c.libGlobUsed[g.Name] {
+				continue
+			}
+			if err := c.emitGlobalVar(&out, g, c.globalLab[g.Name]); err != nil {
 				return "", err
 			}
 		}
@@ -1467,6 +1682,47 @@ func Gen(prog *Program, linux bool) (string, error) {
 		}
 	}
 	return out.String(), nil
+}
+
+// genClibFuncs emits every built-in C library function reachable from c.need
+// through the regular code generator. Emitting one can mark more needs (the
+// function's own calls: library-internal helpers and the assembly platform
+// primitives), so the pass repeats until a round adds nothing.
+func (c *CG) genClibFuncs() error {
+	lib := clibCStore(c.linux)
+	if lib == nil {
+		return nil
+	}
+	for {
+		var batch []string
+		for name := range c.need {
+			if c.libEmitted[name] {
+				continue
+			}
+			if _, ok := lib.funcs[name]; ok {
+				batch = append(batch, name)
+			}
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		sort.Strings(batch) // stable emission order
+		for _, name := range batch {
+			c.libEmitted[name] = true
+			if err := c.genFunc(lib.funcs[name]); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// useLibGlobal records that the program referenced a built-in library global
+// (e.g. rand_state), so Gen emits it into .data. Library globals the program
+// never touches stay out of the binary.
+func (c *CG) useLibGlobal(name string) {
+	if c.libGlobNames[name] {
+		c.libGlobUsed[name] = true
+	}
 }
 
 // foldConstInit folds the constant initialiser of a global variable down to an
@@ -2610,6 +2866,7 @@ func (c *CG) genLValue(e Expr) error {
 			}
 			if c.globals[n.Name] {
 				// Address of a global: rip-relative lea into .data.
+				c.useLibGlobal(n.Name)
 				c.emit("lea r10, [rip+%s]", c.globalLab[n.Name])
 				return nil
 			}
@@ -2658,6 +2915,7 @@ func (c *CG) genLValue(e Expr) error {
 					if gt == nil || !gt.IsArray() {
 						return fmt.Errorf("cannot index non-array global %q", id.Name)
 					}
+					c.useLibGlobal(id.Name)
 					c.emit("lea r10, [rip+%s]", c.globalLab[id.Name])
 				} else {
 					return fmt.Errorf("undefined variable %q", id.Name)
@@ -4368,6 +4626,12 @@ func (c *CG) funcAddrSym(name string) (string, bool) {
 		c.need[sym] = true
 		return sym, true
 	}
+	if lib := clibCStore(c.linux); lib != nil {
+		if _, ok := lib.funcs[sym]; ok {
+			c.need[sym] = true
+			return sym, true
+		}
+	}
 	return "", false
 }
 
@@ -4538,6 +4802,12 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 			funcs, _, _ := goclibStore(c.linux)
 			if _, ok := funcs[target]; ok {
 				c.need[target] = true
+			} else if lib := clibCStore(c.linux); lib != nil {
+				if _, ok := lib.funcs[target]; ok {
+					c.need[target] = true // built-in C library function
+				} else {
+					c.calls[name] = true
+				}
 			} else {
 				c.calls[name] = true
 			}

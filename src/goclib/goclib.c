@@ -192,9 +192,21 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             p++;
             continue;
         }
-        /* optional length modifier */
-        int is_long = 0;
-        if (*p == 'l') { is_long = 1; p++; }
+        /* optional field width: parsed and ignored, exactly like the asm
+         * vfmt ("%10.2f" prints "1.23", unpadded) */
+        while (*p >= '0' && *p <= '9') p++;
+        /* optional precision: ".NN" digits, or a bare "." for zero.
+         * Only %f consumes it (fractional digit count); default 6. */
+        int prec = 6;
+        if (*p == '.') {
+            p++;
+            prec = 0;
+            while (*p >= '0' && *p <= '9') { prec = prec * 10 + (*p - '0'); p++; }
+        }
+        /* length modifiers select long/short forms; every va slot is 8
+         * bytes, so skipping the whole run is enough (same as the asm). */
+        while (*p == 'l' || *p == 'h' || *p == 'L' ||
+               *p == 'z' || *p == 'j' || *p == 't') p++;
         char spec = *p++;
         if (spec == 's') {
             const char *s = va_arg(ap, const char *);
@@ -266,11 +278,13 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                 if (limit < 0 || n < limit) out[n] = tmp[t];
                 n++;
             }
-            /* decimal point + 6 fractional digits */
-            if (limit < 0 || n < limit) out[n] = '.';
-            n++;
+            /* decimal point + prec fractional digits (prec 0: no point) */
+            if (prec > 0) {
+                if (limit < 0 || n < limit) out[n] = '.';
+                n++;
+            }
             int k;
-            for (k = 0; k < 6; k++) {
+            for (k = 0; k < prec; k++) {
                 frac *= 10.0;
                 int d = (int)frac;
                 frac -= (double)d;
