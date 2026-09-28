@@ -226,23 +226,25 @@ cd src/goa && bash run_tests.sh     # 只跑汇编器自己的用例
 1. 构建 goc / goa / elfcheck
 2. 找一个能 `import unicorn` 的 Python（`GOC_PYTHON` 可覆盖；找不到就**大声跳过**
    Linux 腿而不是假装通过）
-3. **Windows 腿**：42 项 —— 40 个例子 vs golden 逐字节比对，另有 `winbox`（MessageBox）
-   和 `winreg`（注册窗口类 + `GetMessage` 消息循环 + WM_PAINT）两个 GUI demo 刻意没有
-   golden，只验证 user32 那些导入能编译链接
-4. **Linux 腿**：39 项 —— 同一批例子出 ELF，先用 `elfcheck --structure-only` 校验结构，
-   再由 `tools/ucrun.py` 在 Unicorn（QEMU TCG）里执行，与**同一份** golden 比对。
-   依赖 Win32 DLL 的 3 个例子跳过。没有 unicorn 时这一腿整段跳过（见下）
+3. **Windows 腿 ×2**（-O0 与 -O1 各 42 项）—— 40 个例子 vs golden 逐字节比对，另有
+   `winbox`（MessageBox）和 `winreg`（注册窗口类 + `GetMessage` 消息循环 + WM_PAINT）
+   两个 GUI demo 刻意没有 golden，只验证 user32 那些导入能编译链接。-O1 腿是优化
+   轨道的行为护栏：**与 -O0 比对同一份 golden**，任何 pass 改变可观察输出都在这里炸
+4. **Linux 腿 ×2**（-O0 与 -O1 各 39 项）—— 同一批例子出 ELF，先用
+   `elfcheck --structure-only` 校验结构，再由 `tools/ucrun.py` 在 Unicorn（QEMU TCG）
+   里执行，与**同一份** golden 比对。依赖 Win32 DLL 的 3 个例子跳过。没有 unicorn
+   时这一对腿整段跳过（见下）
 5. **委托 `src/goa/run_tests.sh`**：11 个 Windows 例子 + 3 个 Linux 例子 + 1 个 GUI
    （`msgboxcheck` 真的去点对话框的「是」）
-6. **三个 Go module 各自跑单测**：src 49 项、src/goa 33 项
+6. **三个 Go module 各自跑单测**：src 54 项、src/goa 33 项
 
-本机（Windows 11 + MSYS2 的 Python 带 unicorn 2.1.4）现状 **`pass=85 fail=0`**。
+本机（Windows 11 + MSYS2 的 Python 带 unicorn 2.1.4）现状 **`pass=166 fail=0`**。
 
 CI 里两个 job 是分工关系，不是重复：
 
 | | Windows runner | Ubuntu runner |
 | --- | --- | --- |
-| 执行内容 | 42 项 Windows 目标 + 委托的 goa 套件 + 三个模块单测 | `run_tests_linux.sh`：ELF 直接跑在**真实内核**上 |
+| 执行内容 | 84 项 Windows 目标（-O0/-O1 各 42）+ 委托的 goa 套件 + 三个模块单测 | `run_tests_linux.sh`：ELF 直接跑在**真实内核**上 |
 | Linux 目标 | 需要 Python + unicorn，runner 没装，于是**明确跳过**（脚本会打 WARNING，不会静默算通过） | **39 个 goc 例子 + 3 个 goa 例子全跑**，逐字节比对同一份 golden |
 | GUI 用例 | `GOC_SKIP_MSGBOX=1` 跳过（需要交互式桌面） | —— |
 
@@ -269,6 +271,25 @@ CI 跑来验证过。修好后第一次跑就是 42/42 全绿，而且产物字�
 
 关于 Linux 腿为什么换成 QEMU，见上面「Linux 目标」那一节 —— 一句话：手写解释器
 最多证明 codegen 和自己一致，证明不了程序真的对。
+
+## 优化
+
+`-O` 系列被真正解析（拼法照 gcc 语义映射：`-O`/`-Og`→1、`-O0..3`→数字、`-Os`/`-Oz`→2、
+`-Ofast`→3，认识不了的照旧忽略）。护栏是硬性的：**`-O0`（默认）输出与历史管线逐字节
+相同**，所以上面 85 项 golden 永远成立；`-O1` 起才在函数体的指令流上跑优化 pass，
+`run_tests.sh` 的 -O1 腿拿**同一份** golden 裁定行为。
+
+`-O1` 现在做的事（IR 级窥孔）：
+
+- `mov <reg>, 0` → `xor <reg32>, <reg32>`（2 字节且清零整个 64 位寄存器；`rbp`/`rsp` 除外）
+- 消除紧邻的冗余访存：`x=y; z=x` 这类赋值链里「存 `[x]` 后立刻读回 `[x]` 到同一寄存器」
+  的 load 直接删掉；相邻重复的同一 load 也删
+- 内联 `__asm{}` 一律不碰 —— 其中指令的 flags 语义只有作者知道（-O0 的文本窥孔会改写
+  用户 asm 里的 `mov eax, 0`，-O1 不会）
+
+更高档位当前与 `-O1` 等价；常量传播/DCE、小函数内联、寄存器分配按此顺序逐个接入。
+指令流是结构化的（`[]Inst`，标签/内联 asm 边界显式），pass 只做局部改写、绝不跨标签
+移动代码。
 
 ## 体积对比
 

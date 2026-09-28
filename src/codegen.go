@@ -1170,6 +1170,13 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 	if err := c.genClibFuncs(); err != nil {
 		return "", err
 	}
+	// -O1 and above: structured peephole over the body stream. It sees real
+	// instructions only; inline __asm is off limits (its flag effects are
+	// the author's business). -O0 keeps the legacy textual pass so its
+	// output stays byte-identical.
+	if c.opt >= 1 {
+		c.insts = peepholeIR(c.insts)
+	}
 	body.WriteString(printASM(c.insts))
 
 	if _, ok := c.funcs["main"]; !ok {
@@ -1306,13 +1313,131 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 		}
 	}
 	asm := out.String()
-	asm = peepholeASM(asm)
+	if c.opt == 0 {
+		asm = peepholeASM(asm)
+	}
 	return asm, nil
 }
 
+// parsedLine is a body instruction split the way the peephole rules need it:
+// mnemonic plus comma-separated operands, whitespace-trimmed. Only lines that
+// parse cleanly take part in a pattern; everything else is left alone.
+type parsedLine struct {
+	op       string
+	operands []string
+}
+
+// parseBodyLine splits an instruction line "\tmov rax, [rbp-8]" into its
+// mnemonic and operands. ok is false for anything the peephole does not
+// model: operand-less instructions ("ret", "leave"), and defensively any
+// line carrying a label or comment marker (instructions never contain those,
+// but the rules only run on what they can read).
+func parseBodyLine(text string) (parsedLine, bool) {
+	s := strings.TrimSpace(strings.TrimPrefix(text, "\t"))
+	sp := strings.IndexAny(s, " \t")
+	if sp <= 0 || strings.ContainsAny(s, ":;#") {
+		return parsedLine{}, false
+	}
+	ops := strings.Split(s[sp+1:], ",")
+	for i := range ops {
+		ops[i] = strings.TrimSpace(ops[i])
+	}
+	return parsedLine{op: s[:sp], operands: ops}, true
+}
+
+func isMemOperand(s string) bool {
+	return strings.HasPrefix(s, "[")
+}
+
+// isLoadForm reports whether pl is `mov <reg>, [<mem>]` and isStoreForm
+// whether it is `mov [<mem>], <reg>` -- the two shapes around every
+// stack-resident variable access, and the shapes the pair rules match on.
+// Sized forms like `mov byte [rbp-3], al` do not match (the first operand
+// does not start with '['), which is exactly the wanted conservatism.
+func (pl parsedLine) isLoadForm() bool {
+	return pl.op == "mov" && len(pl.operands) == 2 &&
+		!isMemOperand(pl.operands[0]) && isMemOperand(pl.operands[1])
+}
+
+func (pl parsedLine) isStoreForm() bool {
+	return pl.op == "mov" && len(pl.operands) == 2 &&
+		isMemOperand(pl.operands[0]) && !isMemOperand(pl.operands[1])
+}
+
+// peepholeIR rewrites the instruction stream with safe, local patterns. It
+// runs at -O1 and above, replacing the textual peepholeASM (which stays for
+// -O0 so that level keeps emitting byte-identical legacy output). Unlike the
+// textual pass it only ever touches instInstr lines: inline __asm keeps its
+// bytes, whose flag effects only the author knows about.
+//
+// Every rule is window-limited to the instruction immediately before, and a
+// label, an inline-asm line, or anything unparseable closes the window:
+//
+//	mov <reg>, 0     ->  xor <reg32>, <reg32>  (2 bytes, zeroes the full reg)
+//	mov <reg>, [<m>]       \  second identical load dropped: nothing between
+//	mov <reg>, [<m>]       /  the two can write <m> or clobber <reg>
+//	mov [<m>], <reg>       \
+//	mov <reg>, [<m>]       /  load dropped: <reg> already holds the value
+//
+// The load rules require the *same register spelling* on both sides.
+// `mov [m], eax` followed by `mov rax, [m]` reads 8 bytes of which only 4
+// were written, so forwarding that pair would change semantics and is not
+// done. Loads do not write flags, so dropping one never moves a flag boundary.
+func peepholeIR(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	last := -1 // index in out of the previous instruction line, -1 if none
+	for _, in := range insts {
+		if in.Kind != instInstr {
+			out = append(out, in)
+			last = -1
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			out = append(out, in)
+			last = -1
+			continue
+		}
+		// mov <reg>, 0 -> xor <reg32>, <reg32>. gpReg32 refuses rsp/rbp and
+		// the FP registers, exactly like the textual pass did.
+		if pl.op == "mov" && len(pl.operands) == 2 && pl.operands[1] == "0" {
+			if r := gpReg32(pl.operands[0]); r != "" {
+				in = Inst{Kind: instInstr, Text: "\txor " + r + ", " + r}
+				pl, _ = parseBodyLine(in.Text)
+			}
+		}
+		if last >= 0 {
+			if prev, ok := parseBodyLine(out[last].Text); ok {
+				// Duplicate load: `mov rax, [m]; mov rax, [m]` -- the second
+				// reads what the first already brought in.
+				if prev.isLoadForm() && pl.isLoadForm() &&
+					prev.operands[0] == pl.operands[0] &&
+					prev.operands[1] == pl.operands[1] {
+					continue
+				}
+				// Store into a slot followed by loading that very slot back
+				// into the very register it came from: the register already
+				// holds the value.
+				if prev.isStoreForm() && pl.isLoadForm() &&
+					prev.operands[0] == pl.operands[1] &&
+					prev.operands[1] == pl.operands[0] {
+					continue
+				}
+			}
+		}
+		out = append(out, in)
+		last = len(out) - 1
+	}
+	return out
+}
+
 // peepholeASM applies a few safe, textual optimisations to the generated
-// assembly before it reaches goa. They are purely local rewrites of individual
-// instructions and never touch labels, offsets, or control flow. The main one
+// assembly before it reaches goa. It is the -O0 path: rewriting the final
+// text keeps that level byte-identical to the legacy pipeline. -O1 and above
+// run peepholeIR on the instruction stream instead (and leave inline __asm
+// alone, unlike this pass, which happily rewrites a user's "mov eax, 0").
+// The rewrites are purely local and never touch labels, offsets, or control
+// flow. The main one
 // replaces `mov <reg>, 0` with `xor <reg32>, <reg32>`: the latter zeroes the
 // whole 64-bit register (high bits included) in 2 bytes instead of the 7-byte
 // `mov rax, 0`, and goc emits an enormous number of these.

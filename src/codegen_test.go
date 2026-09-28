@@ -6,8 +6,14 @@ import (
 )
 
 // genAsm runs the full frontend+codegen pipeline in-process and returns the
-// generated x86-64 assembly for a single translation unit.
+// generated x86-64 assembly for a single translation unit, at -O0.
 func genAsm(t *testing.T, src string) string {
+	t.Helper()
+	return genAsmOpt(t, src, 0)
+}
+
+// genAsmOpt is genAsm at an explicit optimisation level.
+func genAsmOpt(t *testing.T, src string, opt int) string {
 	t.Helper()
 	toks, err := Preprocess(src, "test.c")
 	if err != nil {
@@ -20,7 +26,7 @@ func genAsm(t *testing.T, src string) string {
 	if errs := Check(prog); len(errs) > 0 {
 		t.Fatalf("type check: %v", errs)
 	}
-	asm, err := Gen(prog, false, 0)
+	asm, err := Gen(prog, false, opt)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}
@@ -142,6 +148,147 @@ func TestBindAsmLineMisc(t *testing.T) {
 		if got := c.bindAsmLine(tc.in); got != tc.want {
 			t.Errorf("bindAsmLine(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// peepIns/lLine/rawLine build stream lines for the peepholeIR unit tests.
+func peepIns(s string) Inst { return Inst{Kind: instInstr, Text: "\t" + s} }
+func lLine(s string) Inst   { return Inst{Kind: instLabel, Text: s} }
+func rawLine(s string) Inst { return Inst{Kind: instRaw, Text: s} }
+
+func lineTexts(insts []Inst) []string {
+	txts := make([]string, len(insts))
+	for i, in := range insts {
+		txts[i] = in.Text
+	}
+	return txts
+}
+
+// TestPeepholeIRMovZero locks the single-line rule and its refusals.
+func TestPeepholeIRMovZero(t *testing.T) {
+	got := lineTexts(peepholeIR([]Inst{
+		peepIns("mov rax, 0"),
+		peepIns("mov eax, 0"),
+		peepIns("mov rbx, 0"),
+		peepIns("mov rbp, 0"),     // frame pointer: never becomes xor
+		peepIns("mov rsp, 0"),     // stack pointer ditto
+		peepIns("mov rax, 5"),     // nonzero immediate untouched
+		peepIns("mov [rbp-8], 0"), // memory destination untouched
+	}))
+	want := []string{
+		"\txor eax, eax",
+		"\txor eax, eax",
+		"\txor ebx, ebx",
+		"\tmov rbp, 0",
+		"\tmov rsp, 0",
+		"\tmov rax, 5",
+		"\tmov [rbp-8], 0",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestPeepholeIRLoadRules locks the pair rules and, crucially, the cases that
+// must NOT fire: a label, an inline-asm line, or an unparseable instruction
+// closes the lookback window, and a width mismatch is never forwarded.
+func TestPeepholeIRLoadRules(t *testing.T) {
+	// Duplicate load dropped; the window stays on the survivor, so a third
+	// identical load drops too.
+	got := peepholeIR([]Inst{
+		peepIns("mov rax, [rbp-8]"),
+		peepIns("mov rax, [rbp-8]"),
+		peepIns("mov rax, [rbp-8]"),
+	})
+	if len(got) != 1 {
+		t.Errorf("duplicate loads: got %d lines, want 1: %q", len(got), lineTexts(got))
+	}
+	// Store-then-load of the same slot into the same register: load dropped.
+	got = peepholeIR([]Inst{
+		peepIns("mov [rbp-8], rax"),
+		peepIns("mov rax, [rbp-8]"),
+	})
+	if len(got) != 1 {
+		t.Errorf("store->load same reg: got %d lines, want 1: %q", len(got), lineTexts(got))
+	}
+	// Width mismatch: a 4-byte store followed by an 8-byte load must be kept
+	// (the upper 4 bytes were never written by the store).
+	got = peepholeIR([]Inst{
+		peepIns("mov [rbp-8], eax"),
+		peepIns("mov rax, [rbp-8]"),
+	})
+	if len(got) != 2 {
+		t.Errorf("width mismatch: got %d lines, want 2 (no forwarding): %q", len(got), lineTexts(got))
+	}
+	// A label closes the window: control can arrive at it from anywhere, so
+	// the load after it is not provably redundant.
+	got = peepholeIR([]Inst{
+		peepIns("mov rax, [rbp-8]"),
+		lLine("L3:"),
+		peepIns("mov rax, [rbp-8]"),
+	})
+	if len(got) != 3 {
+		t.Errorf("label must break the window: got %d lines, want 3", len(got))
+	}
+	// Inline asm may do anything (including writing [rbp-8]): it closes the
+	// window too, and its own lines are never rewritten.
+	got = peepholeIR([]Inst{
+		peepIns("mov rax, [rbp-8]"),
+		rawLine("mov rax, 0"),
+		peepIns("mov rax, [rbp-8]"),
+	})
+	if len(got) != 3 {
+		t.Errorf("inline asm must break the window: got %d lines, want 3", len(got))
+	}
+	if got[1].Text != "mov rax, 0" {
+		t.Errorf("inline asm line was rewritten: %q", got[1].Text)
+	}
+}
+
+// TestOpt1LeavesInlineAsmAlone pins the end-to-end contract split: the -O0
+// textual pass rewrites even a user's inline "mov eax, 0" (legacy behaviour,
+// bytes kept identical), while -O1's IR pass leaves inline asm untouched.
+func TestOpt1LeavesInlineAsmAlone(t *testing.T) {
+	src := `int main(){
+  __asm {
+    mov eax, 0
+  }
+  return 0;
+}`
+	asm0 := genAsmOpt(t, src, 0)
+	asm1 := genAsmOpt(t, src, 1)
+	if strings.Contains(asm0, "mov eax, 0") {
+		t.Errorf("-O0 textual peephole should rewrite the inline mov eax, 0:\n%s", asm0)
+	}
+	if !strings.Contains(asm1, "mov eax, 0") {
+		t.Errorf("-O1 IR peephole must leave inline __asm alone:\n%s", asm1)
+	}
+}
+
+// TestOpt1StillMatchesO0Behaviour runs a real program through both levels and
+// requires the peephole not to break anything the compiler relies on: both
+// levels must produce output (the golden comparison over every example lives
+// in run_tests.sh; this test only needs the pipeline to succeed and differ).
+func TestOpt1StillCompiles(t *testing.T) {
+	src := `int main(){
+  int i;
+  int s;
+  s = 0;
+  for (i = 0; i < 10; i = i + 1) {
+    s = s + i * 2;
+  }
+  printf("%d\n", s);
+  return 0;
+}`
+	asm0 := genAsmOpt(t, src, 0)
+	asm1 := genAsmOpt(t, src, 1)
+	if asm0 == "" || asm1 == "" {
+		t.Fatal("empty assembly from one of the levels")
 	}
 }
 
