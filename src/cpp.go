@@ -360,8 +360,15 @@ func (p *Preprocessor) doElif(rest []Token) {
 		return
 	}
 	cond := p.constExpr(rest) != 0
+	// This #elif branch is selected only when no earlier branch in the chain
+	// fired and its own condition holds. Every other case must leave the
+	// frame INACTIVE -- including the case where an earlier #if/#elif fired,
+	// which left the frame active: without the explicit deactivation the
+	// #elif body would be emitted in addition to the taken branch.
 	if !f.branchTaken && cond {
 		f.active = true
+	} else {
+		f.active = false
 	}
 	f.branchTaken = f.branchTaken || cond
 	p.condStack[len(p.condStack)-1] = f

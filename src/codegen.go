@@ -1540,8 +1540,20 @@ func Gen(prog *Program, linux bool) (string, error) {
 	}
 	// Emit every needed built-in C library function through the regular code
 	// generator. genFunc of a library function marks more needs (its own
-	// calls: library-internal helpers and the assembly platform primitives),
-	// so the pass runs to a fixpoint.
+	// calls: library-internal helpers and the extern OS primitives), so the
+	// pass runs to a fixpoint.
+	//
+	// On Linux the entry stub below terminates through `call exit`. When the
+	// C library provides exit, that call must reach the C function (whose
+	// label would collide with an extern syscall stub of the same name), so
+	// pull its body in here rather than importing the symbol.
+	if c.linux {
+		if lib := clibCStore(c.linux); lib != nil {
+			if _, isC := lib.funcs["exit"]; isC {
+				c.need["exit"] = true
+			}
+		}
+	}
 	if err := c.genClibFuncs(); err != nil {
 		return "", err
 	}
@@ -1571,7 +1583,15 @@ func Gen(prog *Program, linux bool) (string, error) {
 	// whatever the C code calls directly, and whatever goclib pulled in.
 	importSet := map[string]bool{}
 	if c.linux {
-		importSet["exit"] = true
+		// The C library's exit (if compiled in) replaced the extern stub --
+		// see the need["exit"] pull-in above.
+		if lib := clibCStore(c.linux); lib != nil {
+			if _, isC := lib.funcs["exit"]; !isC {
+				importSet["exit"] = true
+			}
+		} else {
+			importSet["exit"] = true
+		}
 	} else {
 		importSet["ExitProcess"] = true
 	}
