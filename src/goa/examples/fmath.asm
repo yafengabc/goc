@@ -51,7 +51,7 @@ _start:
 
     ; sqrt(4.0) = 2.0
     movsd xmm0, [rip+C4_0]
-    sqtsd xmm0, xmm0
+    sqrtsd xmm0, xmm0
     cvttsd2si rax, xmm0
     call write_digit
 

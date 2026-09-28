@@ -1264,7 +1264,7 @@ func (a *Assembler) encode(mnem string, ops []Operand, ln string) error {
 		a.emitByte(0x0F)
 		a.emitByte(0x05)
 		return nil
-	case "movsd", "movss", "addsd", "subsd", "mulsd", "divsd", "sqtsd",
+	case "movsd", "movss", "addsd", "subsd", "mulsd", "divsd", "sqrtsd",
 		"xorpd", "ucomisd", "cvtsi2sd", "cvttsd2si", "cvtss2sd", "cvtsd2ss", "movq":
 		return a.encodeSSE(mnem, ops, ln)
 	}
@@ -2213,7 +2213,7 @@ var sseSpec = map[string]struct {
 	"subsd":     {0xF2, 0x5C, false, false},
 	"mulsd":     {0xF2, 0x59, false, false},
 	"divsd":     {0xF2, 0x5E, false, false},
-	"sqtsd":     {0xF2, 0x51, false, false},
+	"sqrtsd":    {0xF2, 0x51, false, false},
 	"xorpd":     {0x66, 0x57, false, false},
 	"ucomisd":   {0x66, 0x2E, false, false},
 	"cvtsi2sd":  {0xF2, 0x2A, true, false},
