@@ -231,12 +231,32 @@ cd src/goa && bash run_tests.sh     # 只跑汇编器自己的用例
    golden，只验证 user32 那些导入能编译链接
 4. **Linux 腿**：39 项 —— 同一批例子出 ELF，先用 `elfcheck --structure-only` 校验结构，
    再由 `tools/ucrun.py` 在 Unicorn（QEMU TCG）里执行，与**同一份** golden 比对。
-   依赖 Win32 DLL 的 3 个例子跳过
+   依赖 Win32 DLL 的 3 个例子跳过。没有 unicorn 时这一腿整段跳过（见下）
 5. **委托 `src/goa/run_tests.sh`**：11 个 Windows 例子 + 3 个 Linux 例子 + 1 个 GUI
    （`msgboxcheck` 真的去点对话框的「是」）
 6. **三个 Go module 各自跑单测**：src 49 项、src/goa 33 项
 
-现状 **`pass=85 fail=0`**。
+本机（Windows 11 + MSYS2 的 Python 带 unicorn 2.1.4）现状 **`pass=85 fail=0`**。
+
+CI 里两个 job 是分工关系，不是重复：
+
+| | Windows runner | Ubuntu runner |
+| --- | --- | --- |
+| 执行内容 | 42 项 Windows 目标 + 委托的 goa 套件 + 三个模块单测 | `run_tests_linux.sh`：ELF 直接跑在**真实内核**上 |
+| Linux 目标 | 需要 Python + unicorn，runner 没装，于是**明确跳过**（脚本会打 WARNING，不会静默算通过） | **39 个 goc 例子 + 3 个 goa 例子全跑**，逐字节比对同一份 golden |
+| GUI 用例 | `GOC_SKIP_MSGBOX=1` 跳过（需要交互式桌面） | —— |
+
+Ubuntu 那一腿值得多说一句：**它以前从来没真正跑过。** job 的构建步骤里混进了
+`tools/msgboxcheck` —— 它是驱动真实 Windows 对话框的程序，只存在于 Windows，于是 Linux
+上 `go build` 直接「build constraints exclude all Go files」失败，整个 job 在到达 e2e
+之前就结束了。也就是说，过去所有「Linux 目标经过真内核验证」的说法，其实没有任何一次
+CI 跑来验证过。修好后第一次跑就是 42/42 全绿，而且产物字节数与本机 Unicorn 下逐个
+相同（`fp` 两边都是 14392、`phase1` 都是 4030）——代码生成是确定的，无关宿主。
+
+顺带一个 goc 用法的坑：`-o` 的语义照抄 gcc，**路径不存在时它表示的是输出文件名而不是
+目录**。所以测试脚本必须先 `mkdir -p bin/goc-out`；少了这一步，第一个例子会写出一个叫
+`bin/goc-out` 的**文件**，后面所有例子都 `Not a directory`（这就是 `run_tests_linux.sh`
+当年的实际状况）。
 
 两个环境变量：
 

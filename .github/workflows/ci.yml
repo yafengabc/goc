@@ -49,12 +49,17 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-      # Every example, both targets. run_tests.sh delegates goa's own examples
-      # to src/goa/run_tests.sh, so there is one definition of that suite.
+      # Windows targets here; Linux targets are the Ubuntu job's, which execs
+      # the ELFs on a real kernel instead of relying on this runner having a
+      # Python with unicorn. It does not, so run_tests.sh skips that leg with
+      # a loud WARNING rather than pretending it passed.
+      #
+      # Every example, both goals above plus unit tests for all three modules
+      # and the assembler's own suite (run_tests.sh delegates to
+      # src/goa/run_tests.sh, so there is one definition of that suite).
       #
       # GOC_SKIP_MSGBOX: the GUI example is driven by msgboxcheck, which needs
-      # an interactive desktop; runners do not have one. Otherwise the leg is
-      # "16 checks: 8 examples x (Windows exe + Linux ELF)", now much larger.
+      # an interactive desktop; runners do not have one.
       - name: goc end-to-end
         run: bash run_tests.sh
         env:
