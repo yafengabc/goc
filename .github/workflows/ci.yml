@@ -29,12 +29,16 @@ jobs:
           mkdir -p bin
           (cd src && go build -o ../bin/goc .)
           (cd src/goa && go build -o ../../bin/goa .)
-          (cd tools && go build ./elfcheck)
+          (cd tools && go build -o ../bin/elfcheck ./elfcheck)
           # msgboxcheck drives a real Windows dialog box, so it only exists as
           # a Windows program: building it here without GOOS fails with "build
           # constraints exclude all Go files" -- which silently took the whole
           # Linux job down once. Cross-compile instead of skipping it.
-          (cd tools && GOOS=windows go build ./msgboxcheck)
+          (cd tools && GOOS=windows go build -o ../bin/msgboxcheck.exe ./msgboxcheck)
+          # -o with a real target rather than `go build ./elfcheck`: the latter
+          # wants to write a file named elfcheck right beside the directory
+          # of the same name, and refuses with 'already exists and is a
+          # directory'.
       - name: native Linux e2e (real kernel, real SSE2)
         run: bash run_tests_linux.sh
 
