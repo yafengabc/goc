@@ -17,9 +17,9 @@ bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面�
 ./bin/goc.exe -c -target linux src/examples/hello.c  # 出 Linux ELF64（无后缀）
 ```
 
-Windows 产物只导入 **Windows 系统 DLL**（`win32.def` 列出的 kernel32/user32/gdi32  
-导出，按程序实际调用取子集）；Linux 产物是静态 ELF，一条动态链接都没有，只用  
-syscall（`write` / `read` / `brk` / `exit_group`）。两头都没有 msvcrt / glibc，  
+Windows 产物只导入 **Windows 系统 DLL**（`win32.def` 列出的 kernel32/user32/gdi32
+导出，按程序实际调用取子集）；Linux 产物是静态 ELF，一条动态链接都没有，只用
+syscall（`write` / `read` / `brk` / `exit_group`）。两头都没有 msvcrt / glibc，
 也没有 gcc。
 
 ## 目录结构
@@ -27,66 +27,92 @@ syscall（`write` / `read` / `brk` / `exit_group`）。两头都没有 msvcrt / 
 ```
 .
 ├── src/                                                # 编译器源码（go 模块 goc）
-│   ├── lexer.go  parser.go  ast.go  codegen.go  main.go
+│   ├── lexer.go  parser.go  ast.go  types.go  headers.go
+│   ├── check.go  codegen.go  cpp.go  main.go
 │   ├── goa/                                            # goa：汇编器（独立 go 模块）
 │   │   ├── asm.go  pe.go  elf.go  main.go              #   Intel 语法子集 -> PE32+ / ELF64
 │   │   ├── examples/  expected/  run_tests.sh          #   goa 的用例与 golden
-│   │   └── README.md
+│   │   └── README.md                                   #   汇编器自己的文档
 │   ├── goclib/                                         # 自带的 C 库（见下「goclib」一节）
-│   │   ├── goclib.c                                    #   唯一实现：纯 C，goc 启动时按目标平台自行编译
-│   │   ├── goclib.h + 内置标准头 stddef/stdarg/stdio/stdlib/string.h
-│   │   └── README.md                                   #   机制说明
+│   │   ├── os.c                                        #   5 个平台原语，唯一碰 OS 的文件
+│   │   ├── stdio.c  stdlib.c  string.c  ctype.c        #   45 个库函数
+│   │   ├── goclib.h                                    #   伞头
+│   │   ├── stddef.h  stdarg.h  stdio.h  stdlib.h       #   内置标准头（可被 #include）
+│   │   │   string.h  ctype.h
+│   │   ├── windows.h  windef.h  winbase.h  wingdi.h  winuser.h
+│   │   ├── win32.def                                   #   Windows 导入名 -> DLL（embed 进 goc）
+│   │   └── README.md                                   #   库的实现机制
 │   └── examples/*.c  expected/*.txt                    # goc 的用例与 golden
 ├── tools/                                              # 验证工具（独立 go 模块）
-│   ├── elfcheck  msgboxcheck                           #   解释 ELF / 驱动 GUI 断言
-│   └── peun.py  ucrun.py                               #   PE / ucrt 逆向辅助脚本
+│   ├── elfcheck                                        #   ELF 结构校验（不再解释执行）
+│   ├── msgboxcheck                                     #   驱动 GUI 对话框并断言
+│   └── ucrun.py  peun.py                               #   ELF / PE 的 Unicorn(QEMU) 运行器
 ├── bin/                                                # 构建产物（goc / goa / elfcheck / msgboxcheck / goc-out）
-├── build.sh  run_tests.sh  run_tests_linux.sh          # 构建 / 测试（Win 解释 / Linux 原生）
+├── build.sh  run_tests.sh  run_tests_linux.sh          # 构建 / 测试（本机 / Linux 真内核）
 └── .github/workflows/ci.yml                            # CI：Linux 原生端到端 + Windows 端到端
 ```
 
-`src/goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，  
-直接出 exe，不需要 goc。
+`src/goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
+直接出 exe，不需要 goc。同理 `src/`、`src/goa/`、`tools/` 是**三个** Go 模块，
+在 `src/` 里跑 `go test ./...` 是看不到 goa 的单测的。
 
 ## Linux 目标
 
 `-target linux` 会让 goc 换一套东西：
 
-- **调用约定**从 Win64（rcx/rdx/r8/r9 + 32 字节 shadow space）切成 SysV  
+- **调用约定**从 Win64（rcx/rdx/r8/r9 + 32 字节 shadow space）切成 SysV
   （rdi/rsi/rdx/rcx/r8/r9，无 shadow space）。
-- **goclib 编译走 goclib.c 的 Linux 分支**（`#elif defined(__linux__)` 那段）—— 同名  
-  同语义的另一套实现：`__goclib_write` 走 `write` syscall，堆分配用 `brk` 做 bump  
-  allocator（`__goclib_heap_free` 是空操作，进程退出时一起还），`exit` 转调  
-  `exit_group`(231)。
+- **goclib 按 `__linux__` 分支编译**（`#if defined(_WIN32) / #elif defined(__linux__)`）：
+  `__goclib_write` 走 `write` syscall，堆分配用 `brk` 做 bump allocator
+  （`__goclib_heap_free` 是空操作，进程退出时一起还），`exit` 转调 `exit_group`(231)。
 - 参数上限相应从「4 个寄存器 + 栈」变成「6 个寄存器 + 栈」。
 
-有个坑值得一提：Linux 下 goa 给每个 extern 生成的 syscall 桩**就叫 extern 的名字**，  
-所以库若自带 `exit`，就不能再 import 同名 extern 桩（符号冲突 + 无限递归）。现在的  
-做法：入口桩的 `call exit` 通过 need 闭包拉取 C 版 `exit` 函数体，且仅当 C 库**不**  
+有个坑值得一提：Linux 下 goa 给每个 extern 生成的 syscall 桩**就叫 extern 的名字**，
+所以库若自带 `exit`，就不能再 import 同名 extern 桩（符号冲突 + 无限递归）。现在的
+做法：入口桩的 `call exit` 通过 need 闭包拉取 C 版 `exit` 函数体，且仅当 C 库**不**
 提供 `exit` 时才注入该 extern。
 
-Windows 上没法 exec ELF，所以本机测试用 `tools/elfcheck` 加载并解释执行  
-（校验 ELF 头/程序头，然后真的解释指令、模拟 write/exit/brk）。同一份 golden  
-文件：Linux 后端的输出必须和 Windows 逐字节一致。
+Windows 上没法 exec ELF，所以本机这一腿交给 **QEMU 的 CPU 核心**：`tools/ucrun.py`
+用 Unicorn（QEMU 的 TCG 翻译核心做成库）把 ELF 映射进去真跑 — 真指令语义、真
+标志位、真 SSE2、真地址越界报错。这不是可选的锦上添花：历史上 `phase1.c` 有一段
+把栈指针塞进 `int` 的未定义行为，手写解释器对未映射地址一律返回 0，于是「输出
+逐字节正确、退出码 0」地掩盖了它；换 Unicorn 跑第一次就段错误在 `0xffffffffffe78`
+（Linux 栈地址超过 2³¹，32 位截断后符号扩展成了负地址），这才修掉。
 
-真正的内核验证交给 CI：`.github/workflows/ci.yml` 的 Ubuntu job 会用  
-`run_tests_linux.sh` **直接执行**所有 Linux ELF 目标（不走解释器），真实内核 +  
-真实 SSE2，这才是 double 支持最硬的证明。
+所以职责是这样分的：
+
+- `tools/elfcheck` 用 `-structure-only` 只做**结构**校验（magic / class / 类型 / 机器 /
+  entry 是否落在可执行段内 / `p_vaddr ≡ p_offset (mod p_align)` / 节表与 `.shstrtab`
+  是否自洽）。这一层与指令语义正交，并且是我们自己的断言。
+- **`tools/ucrun.py`（Unicorn/QEMU）裁定程序输出是否正确。** 解释器就算跑对了，
+  证明的也只是「和我们对 ISA 的理解一致」。
+
+真正的内核验证交给 CI：`.github/workflows/ci.yml` 的 Ubuntu job 会用
+`run_tests_linux.sh` **直接执行**所有 Linux ELF 目标（不走任何模拟），真实内核 +
+真实 SSE2 + 真实栈随机化，这才是双目标最硬的证明。
 
 ## goclib：自带的 C 库
 
-`printf` 不是编译器里的一段魔法字符串，而是一个真正的库。整套库是**纯 C**  
-（`src/goclib/goclib.c` + 伞头 `goclib.h`），平台差异封在文件顶部的  
-`#if defined(_WIN32) / #elif defined(__linux__)` 里（Windows 走 kernel32、Linux 走  
-syscall）——跟普通 C 库用 `#ifdef` 隔离平台相关代码是一个思路：跨平台的部分只写  
-一遍，只把 OS 相关的部分封进 `#ifdef`。
+`printf` 不是编译器里的一段魔法字符串，而是一个真正的库。整套库是**纯 C**，
+按标准头拆成四个文件，全部 platform-specific 的东西收在第五个文件里：
 
-goc 在启动时把 goclib 当普通 C 程序编译**两次**（每个目标一次），函数体经常规  
-代码生成器按需发射：程序**实际调用到**的函数（及其传递闭包）才会进产物，只用  
-`putchar` 的程序不会背上 `printf` 的 512 字节输出缓冲。库全局变量（如 `rand_state`）  
-同样按引用打标后发射。
+| 文件 | 内容 | 个数 |
+| --- | --- | --- |
+| `os.c` | 平台原语：`__goclib_write` / `_read` / `_exit` / `_heap_alloc` / `_heap_free` | 5 |
+| `stdio.c` | `printf` `sprintf` `puts` `putchar` `getchar` | 5 |
+| `stdlib.c` | `malloc` `free` `calloc` `atoi` `abs` `strtol` `rand` `srand` `exit` | 9 |
+| `string.c` | `strlen` `strcpy` `strncpy` `strcmp` `strncmp` `strcat` `strncat` `strchr` `strrchr` `strstr` `strspn` `strcspn` `strpbrk` `strtok` `memset` `memcpy` `memmove` `memcmp` | 18 |
+| `ctype.c` | `isalpha` `isdigit` `isalnum` `isspace` `isupper` `islower` `isxdigit` `ispunct` `isprint` `isgraph` `iscntrl` `tolower` `toupper` | 13 |
 
-| 原语（碰 OS 的唯一层面） | Windows（kernel32 extern 直调） | Linux（goa syscall 桩） |
+平台差异封在每个文件顶部的 `#if defined(_WIN32) / #elif defined(__linux__)` 里
+（Windows 走 kernel32、Linux 走 syscall）—— 跟普通 C 库用 `#ifdef` 隔离平台相关
+代码是一个思路：跨平台的部分只写一遍，只把 OS 相关的部分封进 `#ifdef`。
+goc 启动时会注入 `_WIN32`/`_WIN64` 或 `__linux__`/`__linux`，所以库源码自己不需要
+在命令行上被告知目标平台。
+
+只有 `os.c` 里的 5 个原语碰操作系统：
+
+| 原语 | Windows（kernel32 extern 直调） | Linux（goa syscall 桩） |
 | --- | --- | --- |
 | `__goclib_write(buf,len)` | `GetStdHandle`+`WriteFile` | `write`(fd=1) |
 | `__goclib_exit(code)` | `ExitProcess` | `exit_group`(231) |
@@ -94,74 +120,149 @@ goc 在启动时把 goclib 当普通 C 程序编译**两次**（每个目标一�
 | `__goclib_heap_free(p)` | `HeapFree` | 空操作（进程退出一起还） |
 | `__goclib_read(buf,len)` | `GetStdHandle`+`ReadFile` | `read`(fd=0) |
 
-Windows 侧原语只建立在 kernel32 之上，所以**依赖表里依然没有 msvcrt**；Linux 侧  
-只依赖 syscall。Win 侧 extern 的 DLL 归属由 `goclib/win32.def`（embed 进二进制）  
-回答——改了它必须重建 goc。
+Windows 侧原语只建立在 kernel32 之上，所以**依赖表里依然没有 msvcrt**；Linux 侧
+只依赖 syscall。Win 侧 extern 的 DLL 归属由 `goclib/win32.def`（embed 进二进制）
+回答 —— 改了它必须重建 goc。
 
-已知限制：`printf` 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界  
-检查（缓冲区归调用方管）；格式化支持 `%d %i %u %lu %llu %ld %x %s %c %f %p %%`  
-与宽度/精度（`%02x`、`%.6f`、`%10.2f` 等）；`%f` 按**四舍五入到偶数**输出指定位数的  
-小数；`%p` 输出 `0x` + 16 位十六进制地址。
+goc 在启动时把整个库当普通 C 程序编译**两次**（每个目标一次），函数体经常规代码
+生成器按需发射：程序**实际调用到**的函数（及其传递闭包）才会进产物，只用
+`putchar` 的程序不会背上 `printf` 的 512 字节输出缓冲。库全局变量（如 `rand_state`）
+同样按引用打标后发射。
+
+printf 的已知边界：
+
+- 支持 `%d %i %u %o %x %X %s %c %f %p %%`；长度修饰符 `l h L z j t` 被解析（所有变参
+  槽位都是 8 字节，所以解析掉即等价）。
+- **宽度一概忽略**：`%5d` 打 `42`、`%02x` 打 `7`，不会补空格或前导零 —— 这是与标准 C
+  明确的差异（代码里有意为之，见 `stdio.c` 里 vfmt 的注释）。
+- 精度只有 `%f` 认：`%.6f` 默认 6 位，`%.0f` 到 `%.17f` 都行。
+- 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界检查（缓冲区归调用方管）。
+- 没有 `%e %g %a %n`。
+- 库里没有 `scanf`、没有文件 I/O、没有 `math.h`、没有 `time.h`。
 
 ## 支持的语言子集
 
-- 类型：`int` 与 `double`（都是 8 字节栈槽），函数参数最多 16 个（前 4 个走  
-  寄存器，其余压栈）
-- `if` / `else`、`while` / `for` / `do-while`、`switch` / `case` / `default`  
-  （含 fall-through 与中途的 `default`）、`break` / `continue`、`goto` 与标号、`return`、块作用域
-- 运算符：`+ - * / %`、`< > <= >= == !=`、`&& ||`、`& | ^ << >>`、`!`、  
-  一元 `-`、三元 `?:`，以及 `+= -= *= /= %= &= |= <<= >>=` 复合赋值；操作数含  
-  `double` 时 `+ - * /` 与比较自动提升，结果类型随操作数
-- 字符串字面量、`printf` 调用（`%d %s %c %x %f %%`）
+- **标量类型**：`char` `short` `int` `long` 及其 `signed`/`unsigned` 组合、`float`、
+  `double`、`_Bool`、`void`；`long double` 落到 `double`
+- **聚合类型**：`struct`（嵌套、按值传参、按值返回、成员为数组或结构体）、`union`、
+  `enum`、多维数组、指针、函数指针、`typedef`
+- **位域**：MSVC 布局规则（跨存储单元分配、`:0` 强制开新单元、无名位域做填充），
+  读写走读-改-写
+- **初始化**：`{}` 初始化列表（嵌套、指定初始化器 `.field =`、数组长度推断）、
+  字符数组用字符串字面量初始化、`char *p = "str"`（含全局）
+- **存储类与限定符**：`static`（局部持久化，且只初始化一次）、`extern`、`typedef`；
+  `const` / `volatile` / `restrict` 接受为限定符，`register` / `auto` 接受为 no-op
+  （编译器不做优化，含义上无事可做）
+- **控制流**：`if`/`else`、`while`、`for`、`do-while`、`switch`/`case`/`default`
+  （含 fall-through 与中途的 `default`）、`break`/`continue`、`goto` 与标号、`return`、
+  块作用域、逗号运算符
+- **运算符**：`+ - * / %`、`< > <= >= == !=`、`&& ||`、`& | ^ ~ << >>`、`!`、一元
+  `- +`、三元 `?:`，以及 `+= -= *= /= %= &= |= ^= <<= >>=` 复合赋值；含操作数的整型
+  提升，以及任一操作数为 `double` 时的算术/比较提升
+- **`sizeof`**（作用于类型和表达式）
+- **变参**：`va_list` / `va_start` / `va_arg` / `va_end`（`stdarg.h`），可以自己写
+  printf 风格的函数（`src/examples/variadic.c`）
+- **预处理**：`#include`（含自己的头）、`#define`/`#undef`（含函数式宏）、
+  `#if`/`#elif`/`#else`/`#endif`、`#ifndef`、`#error`、`#line`（含 GNU 三元组形式）
+- **内联汇编**：`__asm { ... }` 块，块内的裸 C 变量名会被绑定成对应的内存操作数 ——
+  参数/局部变量 → `[rbp±off]`，全局/static → `[rip+G_x]`；自己写括号的 `[x]` 保持
+  原样展开成 `[rbp-8]`（不会套成 `[[rbp-8]]`）
+
+还没到的地方：
+
+- **单编译单元，没有链接器**：不能消费 `.o`，也不能把多个 TU 链到一起
+- 没有 `long long`、VLA、复合字面量、`_Generic` 等 C99+ 特性
+- 没有数组指定初始化器 `[i] = v`
+- 库只有上面那 45 个函数
 
 ## double 支持
 
-`double` 走 SSE2 标量指令：参数放在 xmm0..xmm3（Windows）或 xmm0..xmm7（SysV），  
-算术用 `addsd` / `subsd` / `mulsd` / `divsd`，整型↔浮点转换用 `cvtsi2sd` /  
-`cvttsd2si`（截断），比较用 `ucomisd` 再跟无符号跳转（jb/ja/jbe/jae/je/jne）。  
+`double` 走 SSE2 标量指令：参数放在 xmm0..xmm3（Windows）或 xmm0..xmm7（SysV），
+算术用 `addsd` / `subsd` / `mulsd` / `divsd`，整型↔浮点转换用 `cvtsi2sd` /
+`cvttsd2si`（截断），比较用 `ucomisd` 再跟无符号跳转（jb/ja/jbe/jae/je/jne）。
 常量落在 `.data` 的 `dq` 里，RIP 相对寻址读取。
 
-goclib 的 `%f` 先截出整数位，再把小数部分乘 10 逐位压出，最后一位按**四舍五入到偶数**  
-进位（必要时向整数位进位）；小数位数由精度指定（默认 6 位，即 `%.6f`，支持 `%.Nf` /  
-`%.0f`，精度上限 17 位）。
-`%f` 的变参槽位传的是 8 字节 IEEE-754 位模式（`movq rax, xmm0`）。
+`float` 内部统一当成「有效宽度等于 double」处理，`cvtsd2ss` 收窄后必须紧跟
+`cvtss2sd` 重新拓宽，免得中间结果丢精度。
 
-Windows 上没法直接执行 SSE2 验证编码，所以 elfcheck 解释器补了 F2/66 前缀解析和  
-这套指令的解释执行 —— Linux 目标的 fp 用例与 Windows 输出逐字节一致。CI 的  
-Ubuntu job 还会把 `fp` 的 Linux ELF **直接跑在真实内核上**再比一次，覆盖  
-解释器验证不到的地方（真实 syscall、栈对齐、16 字节 xorpd 等）。
+goclib 的 `%f` 先截出整数位，再把小数部分乘 10 逐位压出，第 prec 位按**四舍五
+入到偶数**进位（必要时向整数位进位）。`%f` 的变参槽位传的是 8 字节 IEEE-754 位
+模式（`movq rax, xmm0`）。
+
+浮点语义的裁定同样交给 QEMU：Windows 上由 Unicorn 执行 Linux 目标，与 Windows
+和 Windows 目标的 golden 逐字节比对；CI 的 Ubuntu job 还会把 `fp` 的 Linux ELF
+**直接跑在真实内核上**再比一次，覆盖模拟器验证不到的地方（真实 syscall、栈布局、
+`and rsp,-16` 对齐后的 16 字节 `xorpd` 等）。
 
 ## 调用约定
 
-默认遵循 Windows x64 ABI：整数参数走 RCX/RDX/R8/R9，第 5 个起放 `[rsp+32]`；  
-调用者预留 32 字节 shadow space，每个 `call` 处 RSP 保持 16 字节对齐。压栈参数  
-时多申请的空间会向上取整到 16，对齐才不会被破坏。二元表达式的左操作数溢出到  
+默认遵循 Windows x64 ABI：整数参数走 RCX/RDX/R8/R9，第 5 个起放 `[rsp+32]`；
+调用者预留 32 字节 shadow space，每个 `call` 处 RSP 保持 16 字节对齐。压栈参数
+时多申请的空间会向上取整到 16，对齐才不会被破坏。二元表达式的左操作数溢出到
 rbp 相对栈槽（而不是 `push`/`pop`），也是同一个原因。
 
-`-target linux` 时走 SysV AMD64：参数走 RDI/RSI/RDX/RCX/R8/R9，第 7 个起放  
+`-target linux` 时走 SysV AMD64：参数走 RDI/RSI/RDX/RCX/R8/R9，第 7 个起放
 `[rsp]`（没有 shadow space）。栈帧里因此少算 32 字节。
 
-goclib 的变参函数（`printf` / `sprintf`）在入口处把寄存器里的变参和栈上的一起  
-收集到 `__goclib_va`，然后才做第一次 `call` —— 否则寄存器里的变参会先被冲掉。  
+结构体按值传递时，实参传的是「值的地址」，被调方把它逐字节拷进自己的帧；返回
+结构体走隐藏指针（`argRegs[0]`）。两边相同。寄存器参数都会被溢出到被调方**自己的**
+帧里，不依赖调用方的暂存区。
+
+goclib 的变参函数（`printf` / `sprintf`）在入口处把寄存器里的变参和栈上的一起
+收集到 `__goclib_va`，然后才做第一次 `call` —— 否则寄存器里的变参会先被冲掉。
 Windows 下变参从 rdx 起、栈上在 `[rbp+48]`；Linux 下从 rsi 起、栈上在 `[rbp+16]`。
 
 ## 测试
 
 ```bash
-bash run_tests.sh               # goc 端到端：全部示例（Windows 原生 + Linux 用 elfcheck 解释）
-bash run_tests_linux.sh         # 真机版：在 Linux 上直接执行 ELF（CI 的 Ubuntu job 也跑它）
-cd src/goa && bash run_tests.sh # goa 自己的用例，14/14（11 Windows + 3 Linux）+ 1 个 GUI
+bash build.sh                       # 构建 goc / goa / elfcheck / msgboxcheck
+bash run_tests.sh                   # 本机全量（见下）
+bash run_tests_linux.sh             # 在真 Linux 上直接 exec ELF（CI 的 Ubuntu job 跑它）
+cd src/goa && bash run_tests.sh     # 只跑汇编器自己的用例
 ```
 
-`src/examples/goclib.c` 把整个库跑一遍，两个平台的输出与同一份 golden 逐字节比对。
+`bash run_tests.sh` 一次做六件事，最后一律汇总 `pass=N fail=M`，非零 fail 退出码非 0：
+
+1. 构建 goc / goa / elfcheck
+2. 找一个能 `import unicorn` 的 Python（`GOC_PYTHON` 可覆盖；找不到就**大声跳过**
+   Linux 腿而不是假装通过）
+3. **Windows 腿**：42 项 —— 40 个例子 vs golden 逐字节比对，另有 `winbox`（MessageBox）
+   和 `winreg`（注册窗口类 + `GetMessage` 消息循环 + WM_PAINT）两个 GUI demo 刻意没有
+   golden，只验证 user32 那些导入能编译链接
+4. **Linux 腿**：39 项 —— 同一批例子出 ELF，先用 `elfcheck --structure-only` 校验结构，
+   再由 `tools/ucrun.py` 在 Unicorn（QEMU TCG）里执行，与**同一份** golden 比对。
+   依赖 Win32 DLL 的 3 个例子跳过
+5. **委托 `src/goa/run_tests.sh`**：11 个 Windows 例子 + 3 个 Linux 例子 + 1 个 GUI
+   （`msgboxcheck` 真的去点对话框的「是」）
+6. **三个 Go module 各自跑单测**：src 49 项、src/goa 33 项
+
+现状 **`pass=85 fail=0`**。
+
+两个环境变量：
+
+- `GOC_PYTHON=/path/to/python` —— 指定带 unicorn 绑定的解释器
+- `GOC_SKIP_MSGBOX=1` —— 跳过 GUI 对话框用例；它需要交互式桌面，CI runner 没有，
+  Windows job 里设了这个
+
+`src/examples/goclib.c` / `goclib2.c` / `goclib_test.c` 把整个库跑一遍，两个平台的
+输出与同一份 golden 逐字节比对。
+
+关于 Linux 腿为什么换成 QEMU，见上面「Linux 目标」那一节 —— 一句话：手写解释器
+最多证明 codegen 和自己一致，证明不了程序真的对。
 
 ## 体积对比
 
-|            | gcc 后端   | goc + goa   |
-| ---------- | -------- | ----------- |
-| `stress.c` | 72611 字节 | **4096 字节** |
+同一份 Windows PE32+ 源码，gcc 16.2.0（MSYS2 ucrt64，`-O2`，加不加 `-static` 结果
+一样）与 goc+goa：
 
-差了约 17 倍 —— gcc 那个把整个 CRT 启动代码和 msvcrt 都链进去了。
+| | gcc -O2 | goc + goa |
+| --- | --- | --- |
+| `hello`（printf 一行） | 38989 字节 | **12800 字节** |
+| `src/examples/stress.c` | 40784 字节 | **14848 字节** |
+
+差 2.7~3 倍 —— 大头是 CRT 启动代码和整个 printf 家族。goc 侧按需发射，用到什么
+发什么：`phase1.c` 的 ELF 只有 4030 字节。汇编器自己的产物更小，`src/goa/examples/
+hello.exe` 是 **1536 字节**（做法见 `src/goa/README.md` 的「输出体积」一节）。
 
 ## 许可
 
