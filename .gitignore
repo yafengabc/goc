@@ -18,8 +18,15 @@
 src/examples/*
 !src/examples/*.c
 
-# goclib/*.asm is embedded into goc with go:embed and must stay in the
-# repository -- it is source, not a build product.
+# Same rule for goa's own examples. src/goa/run_tests.sh assembles each example
+# where it lives: Windows .exe output is already caught by the *.exe rule above,
+# but the Linux ELF output has no suffix, so name it explicitly.
+src/goa/examples/linux/*
+!src/goa/examples/linux/*.asm
+
+# goclib/*.c and goclib/*.def are embedded into goc with go:embed (via the
+# patterns in src/codegen.go), so they are source, not build products -- and
+# the *.exe rule above does not reach them anyway.
 
 # Local agent workspace, not part of the project.
 .workbuddy/

@@ -40,11 +40,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-      # 16 checks: 8 examples x (Windows exe + Linux ELF interpreted by
-      # elfcheck). No interactive desktop here, so the goa GUI example is not
-      # part of CI.
+      # Every example, both targets. run_tests.sh delegates goa's own examples
+      # to src/goa/run_tests.sh, so there is one definition of that suite.
+      #
+      # GOC_SKIP_MSGBOX: the GUI example is driven by msgboxcheck, which needs
+      # an interactive desktop; runners do not have one. Otherwise the leg is
+      # "16 checks: 8 examples x (Windows exe + Linux ELF)", now much larger.
       - name: goc end-to-end
         run: bash run_tests.sh
-      - name: goa (non-GUI)
-        run: bash src/goa/run_tests.sh
-        continue-on-error: true   # msgbox example needs an interactive desktop
+        env:
+          GOC_SKIP_MSGBOX: '1'

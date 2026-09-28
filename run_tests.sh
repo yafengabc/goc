@@ -161,6 +161,19 @@ done
 
 [ "$linux_skipped" -gt 0 ] && echo "SKIP  linux/*  ($linux_skipped examples need a Python with unicorn)"
 
+# goa's own assembler examples have their own suite (src/goa/run_tests.sh),
+# covering the Windows examples natively, the GUI one through msgboxcheck, and
+# the Linux ones under QEMU. Run it rather than growing a second copy here --
+# it already reports exit codes separately from stdout, which catches a crash
+# that happens to print the right prefix.
+echo "== goa examples (via src/goa/run_tests.sh) =="
+if GOC_PYTHON="${UCPY:-}" bash src/goa/run_tests.sh; then
+    pass=$((pass + 1))
+else
+    echo "FAIL  goa examples suite"
+    fail=$((fail + 1))
+fi
+
 # Unit tests. Each of src/, src/goa/ and tools/ is its own Go module, so `go
 # test ./...` run from src alone silently skips the assembler's unit tests --
 # iterate all three explicitly.
