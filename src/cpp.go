@@ -17,7 +17,9 @@ package main
 //   - #line N ["file"] (and the GNU "# N ["file"]" form), affecting __LINE__,
 //     __FILE__ and diagnostic line numbers
 //   - predefined macros __FILE__, __LINE__, __goc__
-//   - backslash line continuations inside macro definitions
+//   - backslash line continuations inside macro definitions (and in any file,
+//     main source or #include -- spliceContinuations runs per file in process)
+//   - // and /* */ comments (stripped by Lex)
 //
 // Things deliberately left for a later stage: #pragma beyond ignoring it,
 // and most of the hosted-header ecosystem.
@@ -101,7 +103,12 @@ func spliceContinuations(src string) string {
 // process tokenises one file and scans it. It owns a fresh conditional-compile
 // stack and #line state (an #if or #line inside an included file does not
 // affect the includer), but shares the macro table so definitions are global.
+//
+// src is run through spliceContinuations here, not just at the Preprocess
+// entry point, so that a file pulled in by #include gets its backslash-newline
+// pairs removed too (phase 2 must apply to every file, not just the main one).
 func (p *Preprocessor) process(src, filename string) ([]Token, error) {
+	src = spliceContinuations(src)
 	save := p.condStack
 	saveFile := p.logicalFile
 	saveDelta := p.lineDelta

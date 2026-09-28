@@ -180,6 +180,8 @@ __goclib_vfmt_pf_done:
     je __goclib_vfmt_hex
     cmp rax, 0x66                ; 'f'
     je __goclib_vfmt_flt
+    cmp rax, 0x75                ; 'u' (also %lu / %llu / %hu)
+    je __goclib_vfmt_uns
     cmp rax, 0x25                ; '%'
     je __goclib_vfmt_esc
     mov bl, 0x25                 ; unknown spec: emit it verbatim
@@ -255,6 +257,24 @@ __goclib_vfmt_em:
     inc r12
     cmp r12, r14
     jge __goclib_vfmt_done
+    jmp __goclib_vfmt_em
+__goclib_vfmt_uns:
+    ; %u / %lu / %llu / %hu: the va slot is always 8 bytes, print unsigned.
+    ; Must use unsigned div (not idiv) or values with the high bit set get
+    ; treated as negative.
+    mov rax, [r13]
+    add r13, 8
+    lea r15, [rip+__goclib_digits]
+    xor rcx, rcx                 ; digit count
+__goclib_vfmt_udv:
+    xor rdx, rdx
+    mov rbx, 10
+    div rbx                      ; unsigned division
+    add rdx, 0x30
+    mov [r15+rcx], dl
+    inc rcx
+    cmp rax, 0
+    jne __goclib_vfmt_udv
     jmp __goclib_vfmt_em
 __goclib_vfmt_hex:
     mov rax, [r13]
@@ -1263,6 +1283,8 @@ __goclib_vfmt_pf_done:
     je __goclib_vfmt_hex
     cmp rax, 0x66                ; 'f'
     je __goclib_vfmt_flt
+    cmp rax, 0x75                ; 'u' (also %lu / %llu / %hu)
+    je __goclib_vfmt_uns
     cmp rax, 0x25                ; '%'
     je __goclib_vfmt_esc
     mov bl, 0x25                 ; unknown spec: emit it verbatim
@@ -1329,6 +1351,24 @@ __goclib_vfmt_dv:
     inc rcx
     cmp rax, 0
     jne __goclib_vfmt_dv
+    jmp __goclib_vfmt_em
+__goclib_vfmt_uns:
+    ; %u / %lu / %llu / %hu: the va slot is always 8 bytes, print unsigned.
+    ; Must use unsigned div (not idiv) or values with the high bit set get
+    ; treated as negative.
+    mov rax, [r13]
+    add r13, 8
+    lea rbx, [rip+__goclib_digits]
+    xor rcx, rcx                 ; digit count
+__goclib_vfmt_udv:
+    xor rdx, rdx
+    mov r11, 10
+    div r11                      ; unsigned division
+    add rdx, 0x30
+    mov [rbx+rcx], dl
+    inc rcx
+    cmp rax, 0
+    jne __goclib_vfmt_udv
     jmp __goclib_vfmt_em
 __goclib_vfmt_hex:
     mov rax, [r13]

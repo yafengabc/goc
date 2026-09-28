@@ -40,7 +40,7 @@ fail=0
 
 # Windows-only examples import Win32 DLLs (kernel32/user32/gdi32), so the
 # Linux (ELF64) leg must skip them: they cannot compile without those DLLs.
-win_only=" wintest winbox "
+win_only=" wintest winbox winreg "
 is_win_only() { case "$win_only" in *" $1 "*) return 0;; esac; return 1; }
 
 for src in src/examples/*.c; do

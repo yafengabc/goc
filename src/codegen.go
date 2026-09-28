@@ -124,83 +124,59 @@ func (c *CG) shadowSpace() int {
 	return 32
 }
 
-// maxArgs is the number of integer arguments goc can pass. Four go in
-// RCX/RDX/R8/R9; the rest are spilled onto the stack at [rsp+32] and up,
-// which is what lets printf() take more than three varargs.
-const maxArgs = 8
+// maxArgs is the number of arguments goc can pass to any call. The first
+// len(argRegs) go in the integer argument registers (4 on Windows x64,
+// 6 on SysV AMD64); the rest are spilled onto the stack. 16 covers the
+// longest Win32 API (CreateWindowExA, 12 args) plus the shadow-space
+// margin Windows needs, and the variadic save area / stack-copy loops in
+// the prologue follow this constant automatically.
+const maxArgs = 16
 
 // scratchSlots is the number of 8-byte stack slots reserved for spilling
 // the left operand of nested binary expressions. 32 is plenty for toy code.
 const scratchSlots = 32
 
-// externDLL resolves an imported symbol to the DLL that exports it.
-// Anything not listed here is a hard error rather than a silent guess.
-// The C library itself (printf, strlen, malloc, ...) is implemented in pure
-// assembly on top of kernel32 (Windows) or syscalls (Linux). The one source is
-// goclib/goclib.asm, conditionally compiled per target (see selectPlatform); the
-// portable C version goclib/goclib.c is the intended replacement once goc can
-// compile it, but goc cannot today. There is no msvcrt anywhere in the pipeline.
-var externDLL = map[string]string{
-	// kernel32
-	"GetStdHandle":            "kernel32",
-	"WriteFile":               "kernel32",
-	"ReadFile":                "kernel32",
-	"ExitProcess":             "kernel32",
-	"GetProcessHeap":          "kernel32",
-	"HeapAlloc":               "kernel32",
-	"HeapFree":                "kernel32",
-	"GetLastError":            "kernel32",
-	"SetLastError":            "kernel32",
-	"GetFileType":             "kernel32",
-	"GetConsoleMode":          "kernel32",
-	"SetConsoleMode":          "kernel32",
-	"WriteConsoleA":           "kernel32",
-	"CloseHandle":             "kernel32",
-	"FlushFileBuffers":        "kernel32",
-	"GetModuleHandleA":        "kernel32",
-	"GetModuleFileNameA":      "kernel32",
-	"GetCommandLineA":         "kernel32",
-	"GetEnvironmentVariableA": "kernel32",
-	"SetEnvironmentVariableA": "kernel32",
-	"GetCurrentDirectoryA":    "kernel32",
-	"SetCurrentDirectoryA":    "kernel32",
-	"GetTempPathA":            "kernel32",
-	"GetComputerNameA":        "kernel32",
-	"LoadLibraryA":            "kernel32",
-	"FreeLibrary":             "kernel32",
-	"GetTickCount":            "kernel32",
-	"Sleep":                   "kernel32",
-	// user32
-	"GetSystemMetrics":     "user32",
-	"MessageBoxA":          "user32",
-	"MessageBoxW":          "user32",
-	"FindWindowA":          "user32",
-	"GetWindowTextA":       "user32",
-	"GetWindowTextLengthA": "user32",
-	"SetWindowTextA":       "user32",
-	"GetForegroundWindow":  "user32",
-	"GetDesktopWindow":     "user32",
-	"IsWindow":             "user32",
-	"EnableWindow":         "user32",
-	"ShowWindow":           "user32",
-	"SetFocus":             "user32",
-	"SetCursorPos":         "user32",
-	"GetSysColor":          "user32",
-	"GetDoubleClickTime":   "user32",
-	"SendMessageA":         "user32",
-	"PostMessageA":         "user32",
-	"GetDC":                "user32",
-	"ReleaseDC":            "user32",
-	// gdi32
-	"GetStockObject": "gdi32",
-	"SelectObject":   "gdi32",
-	"SetBkColor":     "gdi32",
-	"SetTextColor":   "gdi32",
-	"TextOutA":       "gdi32",
-	"LineTo":         "gdi32",
-	"Rectangle":      "gdi32",
-	"Ellipse":        "gdi32",
-	"PatBlt":         "gdi32",
+// externDLL resolves an imported symbol to the DLL that exports it. The
+// ownership table lives in goclib/win32.def (embedded, parsed by
+// loadWin32Def), so adding a Windows API is a one-line data change -- no Go
+// source edit, no recompile. Anything not listed there is a hard error rather
+// than a silent guess.
+//
+// The C library itself (printf, strlen, malloc, ...) is implemented on top of
+// kernel32 (Windows) or syscalls (Linux); see goclib/goclib.asm. The portable
+// C version goclib/goclib.c is the intended replacement once goc can compile
+// it. There is no msvcrt anywhere in the pipeline.
+var externDLL = loadWin32Def()
+
+// loadWin32Def parses the embedded goclib/win32.def table. A "# <dll>" line
+// starts a group; every following bare line is an exported function name of
+// that DLL. ";" comments and blanks are ignored. This is the single source of
+// truth for the "extern Name, dll" imports Gen emits for the PE target.
+func loadWin32Def() map[string]string {
+	b, err := goclibDefFS.ReadFile("goclib/win32.def")
+	if err != nil {
+		panic("goc: goclib/win32.def missing from embedded FS: " + err.Error())
+	}
+	m := map[string]string{}
+	dll := ""
+	for _, ln := range strings.Split(string(b), "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" || strings.HasPrefix(t, ";") {
+			continue
+		}
+		if strings.HasPrefix(t, "#") {
+			dll = strings.TrimSpace(strings.TrimPrefix(t, "#"))
+			continue
+		}
+		if dll == "" {
+			panic("goc: win32.def: function " + t + " appears before any '# dll' group")
+		}
+		if _, dup := m[t]; dup {
+			panic("goc: win32.def: duplicate function " + t)
+		}
+		m[t] = dll
+	}
+	return m
 }
 
 // externLinux lists the syscall names an ELF-target program may reach for.
@@ -241,6 +217,9 @@ var externLinux = map[string]bool{
 
 //go:embed goclib/*.asm
 var goclibFS embed.FS
+
+//go:embed goclib/*.def
+var goclibDefFS embed.FS
 
 type goclibFunc struct {
 	name string
@@ -1410,7 +1389,7 @@ func Gen(prog *Program, linux bool) (string, error) {
 		}
 		dll, ok := externDLL[name]
 		if !ok {
-			return "", fmt.Errorf("unknown function %q: not in goclib (%s), and not in externDLL",
+			return "", fmt.Errorf("unknown function %q: not in goclib (%s), and not in win32.def",
 				name, strings.Join(goclibNames(c.linux), ", "))
 		}
 		imports = append(imports, fmt.Sprintf("extern %s, %s\n", name, dll))
@@ -3637,9 +3616,14 @@ func (c *CG) releaseResStruct() {
 	}
 }
 
-// lvalueWidth returns the byte width of the value stored at the lvalue e. For a
-// scalar/pointer this is its slot width (char=1, short=2, int=4, pointer=8);
-// for a member/pointer-deref/array-subscript it is the element width.
+// lvalueWidth returns the byte width of the value stored at the lvalue e. For
+// a bare scalar variable this is its slot width (char=1, short=2, int=4,
+// pointer=8); for a member/pointer-deref/array-subscript it is the layout
+// width of the stored object. A pointer-typed lvalue ALWAYS stores at pointer
+// width (8): the value being stored is the pointer itself, not the thing it
+// points at. Getting this wrong truncates `s.charPtrField = "str"` to a
+// single byte (elemWidthOf returns the element *stride*, which is the right
+// answer for p[i] indexing but wrong for storing the pointer).
 func (c *CG) lvalueWidth(e Expr) int {
 	if id, ok := e.(*Ident); ok {
 		if vi, ok2 := c.vars[id.Name]; ok2 {
@@ -3665,6 +3649,11 @@ func (c *CG) lvalueWidth(e Expr) int {
 			}
 			return 8
 		}
+		return 8
+	}
+	// Pointer-typed lvalues (s.charPtrField, char *arr[i], *pp, ...): the
+	// assignment stores the 8-byte pointer value itself.
+	if t := c.exprType(e); t != nil && t.IsPtr() {
 		return 8
 	}
 	return c.elemWidthOf(e)
