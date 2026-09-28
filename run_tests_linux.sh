@@ -31,7 +31,12 @@ echo "== building goa =="
 
 # Fresh output dir: goc -o bin/goc-out writes every .asm/ELF here, keeping
 # src/examples/ pristine (only the .c files live there).
+# The mkdir matters: goc's -o follows gcc, so a path that does not exist yet
+# is taken as an output *file* name, not a directory. Without it the first
+# example writes a file called bin/goc-out and every later one dies with
+# "Not a directory" (exit 126) before ever reaching the kernel.
 rm -rf bin/goc-out
+mkdir -p bin/goc-out
 
 pass=0
 fail=0
