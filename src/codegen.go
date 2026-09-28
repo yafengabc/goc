@@ -4,6 +4,7 @@ import (
 	"embed"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1218,7 +1219,67 @@ func Gen(prog *Program, linux bool) (string, error) {
 			out.WriteString(fmt.Sprintf("%s dq %s\n", lab, formatDouble(v)))
 		}
 	}
-	return out.String(), nil
+	asm := out.String()
+	asm = peepholeASM(asm)
+	return asm, nil
+}
+
+// peepholeASM applies a few safe, textual optimisations to the generated
+// assembly before it reaches goa. They are purely local rewrites of individual
+// instructions and never touch labels, offsets, or control flow. The main one
+// replaces `mov <reg>, 0` with `xor <reg32>, <reg32>`: the latter zeroes the
+// whole 64-bit register (high bits included) in 2 bytes instead of the 7-byte
+// `mov rax, 0`, and goc emits an enormous number of these.
+var zeroMovRe = regexp.MustCompile(`(?m)^(\s*)mov\s+([a-z0-9]+)\s*,\s*0\s*$`)
+
+func peepholeASM(s string) string {
+	return zeroMovRe.ReplaceAllStringFunc(s, func(line string) string {
+		m := zeroMovRe.FindStringSubmatch(line)
+		if m == nil {
+			return line
+		}
+		if r := gpReg32(m[2]); r != "" {
+			return m[1] + "xor " + r + ", " + r
+		}
+		return line
+	})
+}
+
+// gpReg32 maps a general-purpose integer register (either spelling) to its
+// 32-bit form, or "" if the operand is not a rewritable integer register
+// (a memory operand, rsp/rbp, or an FP register).
+func gpReg32(reg string) string {
+	switch reg {
+	case "rax", "eax":
+		return "eax"
+	case "rbx", "ebx":
+		return "ebx"
+	case "rcx", "ecx":
+		return "ecx"
+	case "rdx", "edx":
+		return "edx"
+	case "rsi", "esi":
+		return "esi"
+	case "rdi", "edi":
+		return "edi"
+	case "r8", "r8d":
+		return "r8d"
+	case "r9", "r9d":
+		return "r9d"
+	case "r10", "r10d":
+		return "r10d"
+	case "r11", "r11d":
+		return "r11d"
+	case "r12", "r12d":
+		return "r12d"
+	case "r13", "r13d":
+		return "r13d"
+	case "r14", "r14d":
+		return "r14d"
+	case "r15", "r15d":
+		return "r15d"
+	}
+	return ""
 }
 
 // genClibFuncs emits every built-in C library function reachable from c.need
@@ -1836,9 +1897,32 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			return err
 		}
 	}
-	// Safety epilogue in case a path has no explicit return.
-	c.emitEpilogue()
+	// Safety epilogue in case a path has no explicit return. If the body's
+	// last reachable statement is already a return, that ReturnStmt emitted a
+	// full epilogue, so emitting another here would leave dead code after the
+	// ret (e.g. `mov rsp, rbp; pop rbp; ret` that can never execute).
+	if !c.blockEndsWithReturn(f.Body) {
+		c.emitEpilogue()
+	}
 	return nil
+}
+
+// blockEndsWithReturn reports whether the last reachable statement of a block is
+// an unconditional return, recursing through a trailing nested block. It is
+// conservative: a trailing if/while/for (without a guaranteed return) yields
+// false so the safety epilogue is retained.
+func (c *CG) blockEndsWithReturn(b *Block) bool {
+	if b == nil || len(b.Stmts) == 0 {
+		return false
+	}
+	s := b.Stmts[len(b.Stmts)-1]
+	if _, ok := s.(*ReturnStmt); ok {
+		return true
+	}
+	if nb, ok := s.(*Block); ok {
+		return c.blockEndsWithReturn(nb)
+	}
+	return false
 }
 
 // emitEpilogue restores the saved callee-save registers, then returns.
