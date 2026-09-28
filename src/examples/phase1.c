@@ -22,8 +22,7 @@ static unsigned long rand_state = 1;  // global static (LCG state)
 
 // ---- C implementations of a few goclib functions (non-variadic subset) ----
 
-size_t my_strlen(int s) {
-    char* p = (char*)s;
+size_t my_strlen(char* p) {
     size_t n = 0;
     while (p[n] != 0) {
         n = n + 1;
@@ -31,9 +30,7 @@ size_t my_strlen(int s) {
     return n;
 }
 
-int my_strcmp(int a, int b) {
-    char* pa = (char*)a;
-    char* pb = (char*)b;
+int my_strcmp(char* pa, char* pb) {
     int i = 0;
     while (1) {
         char ca = pa[i];
@@ -101,7 +98,7 @@ int print_int(int v) {
         hi = hi - 1;
     }
     p[i] = 0;                         // null terminate
-    puts((int)p);
+    puts(p);
     return i;
 }
 
