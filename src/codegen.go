@@ -26,7 +26,8 @@ type varInfo struct {
 }
 
 type CG struct {
-	sb         strings.Builder
+	insts      []Inst // the function-body instruction stream (see Inst)
+	opt        int    // optimisation level from -O; 0 keeps the legacy output
 	strs       []StrLit
 	strLab     map[*StrLit]string
 	doubles    []float64
@@ -510,9 +511,56 @@ func (c *CG) semWOf(t *Type) int {
 	return 8
 }
 
-// emit writes one indented instruction line.
+// instKind tells optimisation passes what a body line is, and therefore what
+// they may legally do with it.
+type instKind uint8
+
+const (
+	instInstr instKind = iota // "\tmov ..." etc. -- a real instruction
+	instLabel                 // "L3:" -- a branch target; never move code across one
+	instRaw                   // verbatim passthrough (inline __asm lines)
+)
+
+// Inst is one line of the generated function-body assembly. Text is the exact
+// line as it will print, without the trailing newline: the legacy pipeline
+// wrote these very strings straight into a strings.Builder, so rendering the
+// stream with printASM reproduces the old output byte for byte. Structured
+// operands arrive with the passes that need them; the stream's value today is
+// that label boundaries and inline-asm regions are explicit.
+type Inst struct {
+	Kind instKind
+	Text string
+}
+
+// printASM renders the instruction stream as goa-ready assembly text. Every
+// line is printed exactly as stored, newline-terminated: with no optimisation
+// pass in between, the result is byte-for-byte what the strings.Builder
+// pipeline produced. Passes that rewrite the stream must keep lines in order
+// and never move an instruction across an instLabel.
+func printASM(insts []Inst) string {
+	var b strings.Builder
+	for _, in := range insts {
+		b.WriteString(in.Text)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// emit appends one indented instruction line to the body stream.
 func (c *CG) emit(format string, a ...any) {
-	c.sb.WriteString("\t" + fmt.Sprintf(format, a...) + "\n")
+	c.insts = append(c.insts, Inst{Kind: instInstr, Text: "\t" + fmt.Sprintf(format, a...)})
+}
+
+// line appends a verbatim body line that is not an instruction: a label, an
+// inline-__asm passthrough line, and similar. A trailing colon marks the line
+// a label, so a pass can see a branch-target boundary without parsing asm.
+func (c *CG) line(s string) {
+	s = strings.TrimSuffix(s, "\n")
+	k := instRaw
+	if strings.HasSuffix(s, ":") {
+		k = instLabel
+	}
+	c.insts = append(c.insts, Inst{Kind: k, Text: s})
 }
 
 // loadGlobal loads the value of a program-level variable (true global or static
@@ -858,13 +906,13 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		}
 		wThen, sThen := c.resW, c.resSigned
 		c.emit("jmp %s", lEnd)
-		c.sb.WriteString(lElse + ":\n")
+		c.line(lElse + ":\n")
 		et, err := c.genExprT(n.Else)
 		if err != nil {
 			return et, err
 		}
 		wElse, sElse := c.resW, c.resSigned
-		c.sb.WriteString(lEnd + ":\n")
+		c.line(lEnd + ":\n")
 		if tt == TDouble || et == TDouble {
 			c.resTyp = TDouble
 			c.resSigned = false
@@ -1027,7 +1075,11 @@ func (c *CG) genExpr(e Expr) error {
 
 // Gen produces the full assembly source for a program. linux selects the
 // SysV ABI and the Linux goclib; otherwise Windows x64 conventions are used.
-func Gen(prog *Program, linux bool) (string, error) {
+// Gen lowers the checked program to goa assembly for the given target. opt is
+// the -O optimisation level; today no pass consumes it, so every level
+// produces identical output (the IR seed keeps it a documented no-op until
+// the first real pass lands).
+func Gen(prog *Program, linux bool, opt int) (string, error) {
 	if goclibErr != nil {
 		return "", goclibErr
 	}
@@ -1047,6 +1099,7 @@ func Gen(prog *Program, linux bool) (string, error) {
 		libGlobNames: map[string]bool{},
 		libGlobUsed:  map[string]bool{},
 		linux:        linux,
+		opt:          opt,
 	}
 	for _, g := range prog.Globals {
 		c.globals[g.Name] = true
@@ -1093,7 +1146,6 @@ func Gen(prog *Program, linux bool) (string, error) {
 	}
 
 	var body strings.Builder
-	c.sb = strings.Builder{}
 	for _, f := range prog.Funcs {
 		if err := c.genFunc(f); err != nil {
 			return "", err
@@ -1118,7 +1170,7 @@ func Gen(prog *Program, linux bool) (string, error) {
 	if err := c.genClibFuncs(); err != nil {
 		return "", err
 	}
-	body.WriteString(c.sb.String())
+	body.WriteString(printASM(c.insts))
 
 	if _, ok := c.funcs["main"]; !ok {
 		return "", fmt.Errorf("program has no main()")
@@ -1850,7 +1902,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	c.labels = map[string]string{}
 	c.swDepth = 0
 	c.breaks = nil
-	c.sb.WriteString(f.Name + ":\n")
+	c.line(f.Name + ":\n")
 	c.emit("push rbp")
 	c.emit("mov rbp, rsp")
 	c.emit("sub rsp, %d", frame)
@@ -2191,18 +2243,18 @@ func (c *CG) genStmt(s Stmt) error {
 		}
 		if n.Else != nil {
 			c.emit("jmp %s", lEnd)
-			c.sb.WriteString(lElse + ":\n")
+			c.line(lElse + ":\n")
 			if err := c.genStmt(n.Else); err != nil {
 				return err
 			}
-			c.sb.WriteString(lEnd + ":\n")
+			c.line(lEnd + ":\n")
 		} else {
-			c.sb.WriteString(lElse + ":\n")
+			c.line(lElse + ":\n")
 		}
 	case *WhileStmt:
 		lTop := c.newLabel("while")
 		lEnd := c.newLabel("wend")
-		c.sb.WriteString(lTop + ":\n")
+		c.line(lTop + ":\n")
 		if _, err := c.genExprT(n.Cond); err != nil {
 			return err
 		}
@@ -2223,7 +2275,7 @@ func (c *CG) genStmt(s Stmt) error {
 			return bodyErr
 		}
 		c.emit("jmp %s", lTop)
-		c.sb.WriteString(lEnd + ":\n")
+		c.line(lEnd + ":\n")
 	case *ForStmt:
 		lTop := c.newLabel("for")
 		lEnd := c.newLabel("forend")
@@ -2233,7 +2285,7 @@ func (c *CG) genStmt(s Stmt) error {
 				return err
 			}
 		}
-		c.sb.WriteString(lTop + ":\n")
+		c.line(lTop + ":\n")
 		if n.Cond != nil {
 			if _, err := c.genExprT(n.Cond); err != nil {
 				return err
@@ -2254,21 +2306,21 @@ func (c *CG) genStmt(s Stmt) error {
 		if bodyErr != nil {
 			return bodyErr
 		}
-		c.sb.WriteString(lCont + ":\n")
+		c.line(lCont + ":\n")
 		if n.Post != nil {
 			if _, err := c.genExprT(n.Post); err != nil {
 				return err
 			}
 		}
 		c.emit("jmp %s", lTop)
-		c.sb.WriteString(lEnd + ":\n")
+		c.line(lEnd + ":\n")
 	case *DoWhileStmt:
 		// "do body while (cond);": the body runs first, so the condition is
 		// tested at the bottom. continue jumps to that test, not to the body.
 		lTop := c.newLabel("do")
 		lCont := c.newLabel("docont")
 		lEnd := c.newLabel("doend")
-		c.sb.WriteString(lTop + ":\n")
+		c.line(lTop + ":\n")
 		c.loops = append(c.loops, loopLabels{breakLbl: lEnd, contLbl: lCont})
 		c.breaks = append(c.breaks, lEnd)
 		bodyErr := c.genStmt(n.Body)
@@ -2277,7 +2329,7 @@ func (c *CG) genStmt(s Stmt) error {
 		if bodyErr != nil {
 			return bodyErr
 		}
-		c.sb.WriteString(lCont + ":\n")
+		c.line(lCont + ":\n")
 		if _, err := c.genExprT(n.Cond); err != nil {
 			return err
 		}
@@ -2286,7 +2338,7 @@ func (c *CG) genStmt(s Stmt) error {
 		}
 		c.emit("cmp rax, 0")
 		c.emit("jne %s", lTop)
-		c.sb.WriteString(lEnd + ":\n")
+		c.line(lEnd + ":\n")
 	case *SwitchStmt:
 		if err := c.genSwitch(n); err != nil {
 			return err
@@ -2294,7 +2346,7 @@ func (c *CG) genStmt(s Stmt) error {
 	case *GotoStmt:
 		c.emit("jmp %s", c.labelSym(n.Label))
 	case *LabelStmt:
-		c.sb.WriteString(c.labelSym(n.Name) + ":\n")
+		c.line(c.labelSym(n.Name) + ":\n")
 		if n.Stmt != nil {
 			return c.genStmt(n.Stmt)
 		}
@@ -2307,7 +2359,7 @@ func (c *CG) genStmt(s Stmt) error {
 		// trims each line and skips blanks, so empty lines from the block
 		// (after '{' / before '}') are harmless.
 		for _, ln := range strings.Split(n.Text, "\n") {
-			c.sb.WriteString(c.bindAsmLine(ln) + "\n")
+			c.line(c.bindAsmLine(ln) + "\n")
 		}
 	case *BreakStmt:
 		// break binds to the innermost enclosing loop *or* switch; the
@@ -2641,7 +2693,7 @@ func (c *CG) genSwitch(n *SwitchStmt) error {
 	c.breaks = append(c.breaks, lEnd)
 	var err error
 	for _, g := range groups {
-		c.sb.WriteString(g.lbl + ":\n")
+		c.line(g.lbl + ":\n")
 		for _, st := range g.stmts {
 			if err = c.genStmt(st); err != nil {
 				break
@@ -2652,7 +2704,7 @@ func (c *CG) genSwitch(n *SwitchStmt) error {
 		}
 	}
 	c.breaks = c.breaks[:len(c.breaks)-1]
-	c.sb.WriteString(lEnd + ":\n")
+	c.line(lEnd + ":\n")
 	c.swDepth--
 	return err
 }
@@ -2731,9 +2783,9 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 	c.emit("je %s", lTrue)
 	c.emit("mov rax, 0")
 	c.emit("jmp %s", lEnd)
-	c.sb.WriteString(lTrue + ":\n")
+	c.line(lTrue + ":\n")
 	c.emit("mov rax, 1")
-	c.sb.WriteString(lEnd + ":\n")
+	c.line(lEnd + ":\n")
 	c.resTyp = TInt
 	c.resSigned = true
 	c.resW = 4 // !x yields a (signed) int
@@ -4222,9 +4274,9 @@ func (c *CG) emitCompare(jmpIfTrue string) {
 	c.emit("%s %s", jmpIfTrue, lTrue)
 	c.emit("mov rax, 0")
 	c.emit("jmp %s", lEnd)
-	c.sb.WriteString(lTrue + ":\n")
+	c.line(lTrue + ":\n")
 	c.emit("mov rax, 1")
-	c.sb.WriteString(lEnd + ":\n")
+	c.line(lEnd + ":\n")
 }
 
 // normalizeBool canonicalises the 64-bit value in rax to exactly 0 or 1 using
@@ -4238,9 +4290,9 @@ func (c *CG) normalizeBool() {
 	c.emit("je %s", lFalse)
 	c.emit("mov rax, 1")
 	c.emit("jmp %s", lEnd)
-	c.sb.WriteString(lFalse + ":\n")
+	c.line(lFalse + ":\n")
 	c.emit("mov rax, 0")
-	c.sb.WriteString(lEnd + ":\n")
+	c.line(lEnd + ":\n")
 }
 
 func (c *CG) genBinary(n *Binary) (CType, error) {
@@ -4266,9 +4318,9 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		c.emit("je %s", lFalse)
 		c.emit("mov rax, 1")
 		c.emit("jmp %s", lEnd)
-		c.sb.WriteString(lFalse + ":\n")
+		c.line(lFalse + ":\n")
 		c.emit("mov rax, 0")
-		c.sb.WriteString(lEnd + ":\n")
+		c.line(lEnd + ":\n")
 		c.resTyp = TInt
 		c.resSigned = true
 		c.resW = 4
@@ -4294,9 +4346,9 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		c.emit("jne %s", lTrue)
 		c.emit("mov rax, 0")
 		c.emit("jmp %s", lEnd)
-		c.sb.WriteString(lTrue + ":\n")
+		c.line(lTrue + ":\n")
 		c.emit("mov rax, 1")
-		c.sb.WriteString(lEnd + ":\n")
+		c.line(lEnd + ":\n")
 		c.resTyp = TInt
 		c.resSigned = true
 		c.resW = 4

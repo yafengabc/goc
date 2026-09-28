@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -104,7 +105,7 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	asm, err := Gen(prog, cfg.linux)
+	asm, err := Gen(prog, cfg.linux, cfg.opt)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "codegen error:", err)
 		os.Exit(1)
@@ -191,10 +192,30 @@ func main() {
 type buildCfg struct {
 	mode    string // run | compile | asm | preprocess
 	linux   bool
+	opt     int // optimisation level from -O<level> (0 = none)
 	outFile string
 	defines []string
 	incDirs []string
 	inputs  []string
+}
+
+// optFromSuffix maps the suffix of an -O flag to a numeric optimisation
+// level: -O/-Og mean 1 (gcc semantics), -O0..-O3 the number itself, -Os/-Oz
+// 2, -Ofast 3. -1 means "not a level we model": the flag stays
+// accepted-and-ignored, like every unimplemented gcc option.
+func optFromSuffix(s string) int {
+	switch s {
+	case "", "g":
+		return 1
+	case "s", "z":
+		return 2
+	case "fast":
+		return 3
+	}
+	if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 3 {
+		return n
+	}
+	return -1
 }
 
 // parseArgs turns os.Args[1:] into a buildCfg, tolerating gcc/clang options.
@@ -243,7 +264,8 @@ func parseArgs(args []string) (buildCfg, bool) {
 			continue
 		}
 		// Attached-value single-letter forms: -ofile -Dname -Ipath -lfoo -Ldir,
-		// plus whole families we accept-and-ignore: -O -W -m -f -g -s.
+		// plus whole families we accept-and-ignore: -W -m -f -g -s. (-O is
+		// parsed for real: see optFromSuffix.)
 		if len(arg) > 2 {
 			switch arg[1] {
 			case 'o':
@@ -255,7 +277,15 @@ func parseArgs(args []string) (buildCfg, bool) {
 			case 'I':
 				cfg.incDirs = append(cfg.incDirs, arg[2:])
 				continue
-			case 'l', 'L', 'm', 'O', 'W', 'f', 'g', 's':
+			case 'O':
+				// -O0/-O1/-O2/-O3/-Os/-Og/-Ofast: the level selects the
+				// optimisation pipeline. Unknown suffixes stay
+				// accepted-and-ignored, like every unimplemented gcc option.
+				if lvl := optFromSuffix(arg[2:]); lvl >= 0 {
+					cfg.opt = lvl
+				}
+				continue
+			case 'l', 'L', 'm', 'W', 'f', 'g', 's':
 				// link lib / lib dir / machine / optimise / warning / feature /
 				// debug / strip: ignored.
 				continue
@@ -285,7 +315,12 @@ func parseArgs(args []string) (buildCfg, bool) {
 		// The following are accepted and ignored: they only make sense for a
 		// real multi-stage toolchain (separate linking, full warnings,
 		// alternate standards, ...). goc is a single-pass compiler.
-		case "-O", "-Wall", "-Wextra", "-Werror", "-Wshadow", "-w",
+		case "-O":
+			// Bare -O means -O1 (gcc); an "=level" value is honoured too.
+			if lvl := optFromSuffix(val); lvl >= 0 {
+				cfg.opt = lvl
+			}
+		case "-Wall", "-Wextra", "-Werror", "-Wshadow", "-w",
 			"-std", "-m", "-g", "-static", "-shared", "-pthread",
 			"-pipe", "-v", "-pedantic", "-ansi", "-M", "-MM", "-MD", "-MP",
 			"-save-temps", "-ffreestanding", "-fno-builtin", "-fPIC", "-fpic",

@@ -20,7 +20,7 @@ func genAsm(t *testing.T, src string) string {
 	if errs := Check(prog); len(errs) > 0 {
 		t.Fatalf("type check: %v", errs)
 	}
-	asm, err := Gen(prog, false)
+	asm, err := Gen(prog, false, 0)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}

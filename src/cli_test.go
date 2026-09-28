@@ -69,6 +69,33 @@ func TestParseArgsAttached(t *testing.T) {
 	}
 }
 
+// TestParseArgsOptLevels locks how -O variants map to the numeric level that
+// selects the optimisation pipeline.
+func TestParseArgsOptLevels(t *testing.T) {
+	old := os.Args
+	defer func() { os.Args = old }()
+	os.Args = []string{"goc"}
+
+	cases := []struct {
+		flag string
+		want int
+	}{
+		{"-O0", 0}, {"-O1", 1}, {"-O2", 2}, {"-O3", 3},
+		{"-O", 1}, {"-Og", 1}, {"-Os", 2}, {"-Oz", 2}, {"-Ofast", 3},
+	}
+	for _, tc := range cases {
+		cfg, _ := parseArgs([]string{"-c", tc.flag, "a.c"})
+		if cfg.opt != tc.want {
+			t.Errorf("%s: opt = %d, want %d", tc.flag, cfg.opt, tc.want)
+		}
+	}
+	// Unknown suffixes stay accepted-and-ignored (level untouched, i.e. 0).
+	cfg, _ := parseArgs([]string{"-c", "-Owebsite", "a.c"})
+	if cfg.opt != 0 {
+		t.Errorf("-Owebsite: opt = %d, want 0 (ignored)", cfg.opt)
+	}
+}
+
 // TestInjectDefines confirms -DNAME defaults to 1 and -DNAME=val keeps the val.
 func TestInjectDefines(t *testing.T) {
 	got := injectDefines("int x;\n", nil)
