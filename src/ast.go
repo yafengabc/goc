@@ -53,6 +53,12 @@ type DeclStmt struct {
 	Name string
 	Typ  *Type
 	Init Expr // may be nil
+	// Storage is the storage-class specifier on the declaration: "", "static",
+	// "extern", "register", "auto", or "typedef" (typedef is handled
+	// separately and never reaches codegen). goc is a non-optimising,
+	// single-translation-unit compiler, so register/auto are accepted as no-ops
+	// and extern/static only matter for the static-local lifetime rule.
+	Storage string
 	Line int
 }
 
@@ -69,6 +75,16 @@ type AssignStmt struct {
 type AssignExpr struct {
 	Lhs Expr // must be an lvalue
 	Rhs Expr
+}
+
+// CommaExpr is the comma operator a, b, c: each operand is evaluated in turn
+// (left to right) and the value of the whole expression is that of the
+// rightmost operand. It is the lowest-precedence operator in C, below even
+// assignment, so it only appears where a full expression is expected (statement
+// expressions, the heads/tails of for-loops, the middle of a ternary).
+type CommaExpr struct {
+	Left  Expr
+	Right Expr
 }
 
 type ExprStmt struct {

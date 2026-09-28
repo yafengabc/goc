@@ -16,6 +16,14 @@ var qualifierKeywords = map[string]bool{
 	"const": true, "volatile": true, "restrict": true,
 }
 
+// storageKeywords are the storage-class specifiers C89 defines. register and
+// auto are accepted as no-ops (the variable is an ordinary automatic local);
+// static and extern are accepted and their storage semantics are implemented
+// in codegen (static locals live in .data, extern locals reference globals).
+var storageKeywords = map[string]bool{
+	"typedef": true, "extern": true, "static": true, "register": true, "auto": true,
+}
+
 // typedefs maps a typedef name to the type it aliases. Populated during parsing
 // of "typedef" declarations and consulted by isTypeName so later declarations
 // can use the alias as a type name.
@@ -44,6 +52,10 @@ func isTypeName(tok Token) bool {
 
 func isQualifier(tok Token) bool {
 	return tok.Kind == TKeyword && qualifierKeywords[tok.Text]
+}
+
+func isStorageClass(tok Token) bool {
+	return tok.Kind == TKeyword && storageKeywords[tok.Text]
 }
 
 // paramDecl is an intermediate result of a declarator: the declared name and
@@ -105,7 +117,7 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 	// extern/static only affect linkage (ignored by the toy model) and fall
 	// through to the normal declaration logic.
 	storage := ""
-	if p.cur().Kind == TKeyword && (p.cur().Text == "typedef" || p.cur().Text == "extern" || p.cur().Text == "static") {
+	if p.cur().Kind == TKeyword && (p.cur().Text == "typedef" || p.cur().Text == "extern" || p.cur().Text == "static" || p.cur().Text == "register" || p.cur().Text == "auto") {
 		storage = p.next().Text
 	}
 	if storage == "typedef" {
@@ -186,7 +198,9 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 		if p.atPunct("{") {
 			init, err = p.parseBraceInit()
 		} else {
-			init, err = p.parseExpr()
+			// An initialiser is an assignment-expression: the top-level comma
+			// separates declarators ("int a = 1, b = 2;"), not a comma-op.
+			init, err = p.parseAssign()
 		}
 		if err != nil {
 			return nil, err
@@ -875,7 +889,7 @@ func (p *Parser) parseStmt() (Stmt, error) {
 	t := p.cur()
 	var err error
 	switch {
-	case isTypeName(t) || isQualifier(t):
+	case isTypeName(t) || isQualifier(t) || isStorageClass(t):
 		return p.parseDeclaration()
 	case t.Kind == TKeyword && t.Text == "return":
 		p.next()
@@ -1102,6 +1116,36 @@ func (p *Parser) parseStmt() (Stmt, error) {
 // parseDeclaration parses one declaration specifier list followed by a
 // comma-separated list of initialised declarators: "int a = 1, b[3];".
 func (p *Parser) parseDeclaration() (Stmt, error) {
+	// Storage-class specifiers: typedef / extern / static / register / auto.
+	// "typedef" creates an alias and produces no variable; the rest only shape
+	// the lifetime/linkage of the locals below and are otherwise no-ops in this
+	// non-optimising, single-translation-unit compiler.
+	storage := ""
+	if p.cur().Kind == TKeyword && (p.cur().Text == "typedef" || p.cur().Text == "extern" || p.cur().Text == "static" || p.cur().Text == "register" || p.cur().Text == "auto") {
+		storage = p.next().Text
+	}
+	if storage == "typedef" {
+		spec, err := p.parseDeclarationSpecifiers()
+		if err != nil {
+			return nil, err
+		}
+		for {
+			pd, err := p.parseDeclarator(spec, true, false)
+			if err != nil {
+				return nil, err
+			}
+			typedefs[pd.name] = pd.typ
+			if p.atPunct(",") {
+				p.next()
+				continue
+			}
+			break
+		}
+		if err := p.expect(";"); err != nil {
+			return nil, err
+		}
+		return &DeclList{}, nil
+	}
 	spec, err := p.parseDeclarationSpecifiers()
 	if err != nil {
 		return nil, err
@@ -1121,13 +1165,15 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 			if p.atPunct("{") {
 				init, err = p.parseBraceInit()
 			} else {
-				init, err = p.parseExpr()
+				// assignment-expression, not comma-expression: the top-level
+				// comma separates declarators (int a = 1, b = 2;).
+				init, err = p.parseAssign()
 			}
 			if err != nil {
 				return nil, err
 			}
 		}
-		decls = append(decls, &DeclStmt{Name: pd.name, Typ: declType(pd.typ), Init: init, Line: pd.line})
+		decls = append(decls, &DeclStmt{Name: pd.name, Typ: declType(pd.typ), Init: init, Storage: storage, Line: pd.line})
 		if p.atPunct(",") {
 			p.next()
 			continue
@@ -1143,7 +1189,28 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 	return &DeclList{Decls: decls}, nil
 }
 
-func (p *Parser) parseExpr() (Expr, error) { return p.parseAssign() }
+func (p *Parser) parseExpr() (Expr, error) { return p.parseComma() }
+
+// parseComma parses the comma operator (the lowest-precedence operator in C,
+// below even assignment). "a, b, c" evaluates each operand left to right and
+// yields the value of the rightmost one. It only matters where a full
+// expression is expected; the comma separating function-call arguments and the
+// one separating declarators are handled elsewhere.
+func (p *Parser) parseComma() (Expr, error) {
+	left, err := p.parseAssign()
+	if err != nil {
+		return nil, err
+	}
+	for p.atPunct(",") {
+		p.next() // consume ','
+		right, err := p.parseAssign()
+		if err != nil {
+			return nil, err
+		}
+		left = &CommaExpr{Left: left, Right: right}
+	}
+	return left, nil
+}
 
 // parseBraceInit parses a braced initialiser "{ a, .x = b, { c } }" found in
 // the initialiser position of a declaration. Elements are assignment
@@ -1545,7 +1612,7 @@ func (p *Parser) parsePostfix() (Expr, error) {
 			// expression, so it cannot go through the normal comma-expression
 			// parsing. Build a dedicated VaArgExpr node instead.
 			if id != nil && id.Name == "va_arg" {
-				ap, err := p.parseExpr()
+				ap, err := p.parseAssign()
 				if err != nil {
 					return nil, err
 				}
@@ -1566,10 +1633,14 @@ func (p *Parser) parsePostfix() (Expr, error) {
 				e = &VaArgExpr{Ap: ap, Typ: dt.typ}
 				continue
 			}
-			var args []Expr
-			if !p.atPunct(")") {
-				for {
-					a, err := p.parseExpr()
+				var args []Expr
+				if !p.atPunct(")") {
+					for {
+						// C89 argument expressions are assignment-expressions,
+						// not comma-expressions: the top-level commas separate
+						// arguments. Parenthesised sub-expressions still parse
+						// the full comma-expression via parseExpr inside.
+						a, err := p.parseAssign()
 					if err != nil {
 						return nil, err
 					}

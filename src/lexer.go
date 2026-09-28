@@ -24,6 +24,7 @@ var keywords = map[string]bool{
 	"for": true, "break": true, "continue": true,
 	"switch": true, "case": true, "default": true, "do": true, "goto": true,
 	"typedef": true, "extern": true, "static": true,
+	"register": true, "auto": true,
 	"const": true, "volatile": true, "restrict": true,
 }
 

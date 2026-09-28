@@ -571,6 +571,11 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		t := c.checkExpr(n.Then, fn)
 		c.checkExpr(n.Else, fn)
 		return t
+	case *CommaExpr:
+		// Evaluate the left operand (for its side effects / errors) and keep
+		// the type of the right one as the result, exactly like C.
+		c.checkExpr(n.Left, fn)
+		return c.checkExpr(n.Right, fn)
 	case *CastExpr:
 		c.checkExpr(n.E, fn)
 		return n.Typ

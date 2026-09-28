@@ -37,6 +37,15 @@ type CG struct {
 	globals     map[string]bool    // names of program-level (global/static) variables
 	globalLab   map[string]string  // name -> .data label for a global variable
 	globalTyp   map[string]*Type   // name -> declared type of a global variable
+	// Static locals: a "static int x;" inside a function gets a unique .data
+	// label (collision-free even when two functions name their static "x") and
+	// persists across calls. c.staticVars maps the source name to that label
+	// for the function currently being generated; c.staticList accumulates every
+	// static local across all functions so emitAssembly can lay them out in
+	// .data. staticSeq gives each a unique label.
+	staticVars map[string]string
+	staticList []staticEmit
+	staticSeq  int
 	usedRegs    []string           // callee-save registers actually used as local homes
 	tmpDepth    int                // live expression-temporary slots
 	funcs       map[string]bool    // user-defined functions (by name)
@@ -73,6 +82,13 @@ type CG struct {
 type loopLabels struct {
 	breakLbl string
 	contLbl  string
+}
+
+// staticEmit pairs a static-local declaration with the unique .data label it is
+// laid out under. Accumulated in c.staticList and emitted by emitAssembly.
+type staticEmit struct {
+	lab string
+	d   *DeclStmt
 }
 
 // argRegs returns the integer argument registers for the target ABI.
@@ -802,6 +818,45 @@ func (c *CG) emit(format string, a ...any) {
 	c.sb.WriteString("\t" + fmt.Sprintf(format, a...) + "\n")
 }
 
+// loadGlobal loads the value of a program-level variable (true global or static
+// local) whose .data label is lab and whose declared type is gt, leaving the
+// result in rax (int-class) or xmm0 (float). Arrays decay to a pointer to
+// element 0, mirroring local arrays; whole aggregates cannot be loaded and
+// yield an error (consumers must go through genLValue instead).
+func (c *CG) loadGlobal(lab string, gt *Type) (CType, error) {
+	if gt != nil && gt.IsArray() {
+		c.emit("lea rax, [rip+%s]", lab)
+		c.resTyp = TInt
+		c.resSigned = false
+		c.resW = 8
+		return TInt, nil
+	}
+	if isAgg(gt) {
+		// A whole struct/union value cannot be loaded into rax; consumers
+		// must go through genLValue (see structSrcAddr).
+		return TInt, fmt.Errorf("cannot load struct/union value at %q directly", lab)
+	}
+	if gt != nil && gt.IsFloating() {
+		// A float global is stored as a 4-byte single and widened on the way
+		// in, exactly like a float local.
+		if gt.Kind == KFloat {
+			c.emit("movss xmm0, [rip+%s]", lab)
+			c.emit("cvtss2sd xmm0, xmm0")
+		} else {
+			c.emit("movsd xmm0, [rip+%s]", lab)
+		}
+		c.resTyp = TDouble
+		c.resSigned = false
+		c.resW = 8
+		return TDouble, nil
+	}
+	c.emit("mov rax, [rip+%s]", lab)
+	c.resTyp = TInt
+	c.resSigned = gt != nil && gt.Kind == KInt && gt.Signed
+	c.resW = c.semWOf(gt)
+	return TInt, nil
+}
+
 // loadVar emits code that loads variable vi's value into rax (int) or xmm0
 // (double), and records the resulting type in c.resTyp.
 // movsd (not movq) is used for the XMM <-> memory moves: goa only knows the
@@ -970,42 +1025,16 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		}
 		vi, ok := c.vars[n.Name]
 		if !ok {
+			if lab, ok2 := c.staticVars[n.Name]; ok2 {
+				// Static local: loaded from its .data label, exactly like a
+				// true global.
+				return c.loadGlobal(lab, c.globalTyp[lab])
+			}
 			if c.globals[n.Name] {
-				// Global / static variable: load its value via rip-relative
-				// addressing into the .data section. Arrays decay to a pointer
-				// to element 0 (mirroring local arrays).
-				gt := c.globalTyp[n.Name]
-				if gt != nil && gt.IsArray() {
-					c.emit("lea rax, [rip+%s]", c.globalLab[n.Name])
-					c.resTyp = TInt
-					c.resSigned = false
-					c.resW = 8
-					return TInt, nil
-				}
-				if isAgg(gt) {
-					// A whole struct/union value cannot be loaded into rax;
-					// consumers must go through genLValue (see structSrcAddr).
-					return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
-				}
-				if gt != nil && gt.IsFloating() {
-					// A float global is stored as a 4-byte single and widened
-					// on the way in, exactly like a float local.
-					if gt.Kind == KFloat {
-						c.emit("movss xmm0, [rip+%s]", c.globalLab[n.Name])
-						c.emit("cvtss2sd xmm0, xmm0")
-					} else {
-						c.emit("movsd xmm0, [rip+%s]", c.globalLab[n.Name])
-					}
-					c.resTyp = TDouble
-					c.resSigned = false
-					c.resW = 8
-					return TDouble, nil
-				}
-				c.emit("mov rax, [rip+%s]", c.globalLab[n.Name])
-				c.resTyp = TInt
-				c.resSigned = gt != nil && gt.Kind == KInt && gt.Signed
-				c.resW = c.semWOf(gt)
-				return TInt, nil
+				// Global variable: load its value via rip-relative addressing
+				// into the .data section (arrays decay to a pointer to element
+				// 0, mirroring local arrays).
+				return c.loadGlobal(c.globalLab[n.Name], c.globalTyp[n.Name])
 			}
 			if ev, ok := enumConsts[n.Name]; ok {
 				// An enumerator is a compile-time integer constant.
@@ -1145,10 +1174,18 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		} else {
 			// The conditional expression's type is the C common type of the
 			// two arms (integer promotions applied).
-			c.resTyp = TInt
-			c.resW, c.resSigned = promotedArith(wThen, sThen, wElse, sElse)
+		c.resTyp = TInt
+		c.resW, c.resSigned = promotedArith(wThen, sThen, wElse, sElse)
 		}
 		return c.resTyp, nil
+	case *CommaExpr:
+		// Evaluate the left operand (discarding its value) and yield the right
+		// operand's value, exactly like C's comma operator. Both sides run
+		// through genExprT; the right side overwrites the result state.
+		if _, err := c.genExprT(n.Left); err != nil {
+			return c.resTyp, err
+		}
+		return c.genExprT(n.Right)
 	case *CastExpr:
 		t, err := c.genExprT(n.E)
 		if err != nil {
@@ -1307,6 +1344,7 @@ func Gen(prog *Program, linux bool) (string, error) {
 		globals:   map[string]bool{},
 		globalLab: map[string]string{},
 		globalTyp: map[string]*Type{},
+		staticVars: map[string]string{},
 		linux:     linux,
 	}
 	for _, g := range prog.Globals {
@@ -1421,74 +1459,17 @@ func Gen(prog *Program, linux bool) (string, error) {
 	// section, referenced via rip. Only constant integer initialisers are
 	// supported today (goclib's globals are all simple constants). Arrays are
 	// zero-filled for their full byte size so rip-relative indexing works.
-	if len(prog.Globals) > 0 {
+	if len(prog.Globals) > 0 || len(c.staticList) > 0 {
 		out.WriteString("\nsection .data\n")
 		for _, g := range prog.Globals {
-			lab := c.globalLab[g.Name]
-			// A braced initialiser lays out the aggregate as a byte image and
-			// emits it as db bytes; non-foldable leaves stay zero, matching
-			// the scalar-global behaviour below.
-			if bi, ok := g.Init.(*BraceInit); ok {
-				if err := c.emitGlobalBrace(&out, g.Typ, bi, lab); err != nil {
-					return "", err
-				}
-				continue
+			if err := c.emitGlobalVar(&out, g, c.globalLab[g.Name]); err != nil {
+				return "", err
 			}
-			// A char array initialised by a string literal holds the bytes
-			// (plus NUL) directly in .data, zero-padded to the full array
-			// size ("char g[8] = \"hi\"" keeps five zero tail bytes). A
-			// global char* initialised by a string literal is NOT supported:
-			// goa's dq takes no symbol operands, so the pointer could not be
-			// relocated to the constant.
-			if g.Typ != nil && g.Typ.IsArray() && g.Typ.Elem.IsChar() {
-				if sl, ok := g.Init.(*StrLit); ok {
-					size := c.typeWidth(g.Typ)
-					out.WriteString(fmt.Sprintf("%s db \"%s\", 0", lab, encodeStr(sl.Bytes)))
-					for i := len(sl.Bytes) + 1; i < size; i++ {
-						out.WriteString(", 0")
-					}
-					out.WriteString("\n")
-					continue
-				}
+		}
+		for _, se := range c.staticList {
+			if err := c.emitGlobalVar(&out, se.d, se.lab); err != nil {
+				return "", err
 			}
-			if g.Typ != nil && (g.Typ.IsArray() || isAgg(g.Typ)) {
-				// typeWidth already returns the full byte size (elem width *
-				// len for arrays, the computed Size for structs/unions), so
-				// that IS the size to zero-fill.
-				size := c.typeWidth(g.Typ)
-				if size < 1 {
-					size = 1
-				}
-				n := (size + 7) / 8
-				out.WriteString(lab + " dq 0")
-				for i := 1; i < n; i++ {
-					out.WriteString(", 0")
-				}
-				out.WriteString("\n")
-				continue
-			}
-			if g.Typ != nil && g.Typ.IsFloating() {
-				// A float global is 4 bytes of IEEE single; a double is a
-				// quad. Only a literal initialiser (optionally negated) is
-				// foldable here; anything else falls back to zero.
-				f := 0.0
-				if v, ok := foldFloatInit(g.Init); ok {
-					f = v
-				}
-				if g.Typ.Kind == KFloat {
-					bits := math.Float32bits(float32(f))
-					out.WriteString(fmt.Sprintf("%s db %d, %d, %d, %d\n", lab,
-						bits&0xff, (bits>>8)&0xff, (bits>>16)&0xff, (bits>>24)&0xff))
-				} else {
-					out.WriteString(fmt.Sprintf("%s dq %s\n", lab, formatDouble(f)))
-				}
-				continue
-			}
-			val := int64(0)
-			if v, ok := foldConstInit(g.Init); ok {
-				val = v
-			}
-			out.WriteString(fmt.Sprintf("%s dq %d\n", lab, val))
 		}
 	}
 
@@ -1717,6 +1698,7 @@ func (c *CG) findAddressTaken(f *FuncDecl) map[string]bool {
 
 func (c *CG) genFunc(f *FuncDecl) error {
 	c.vars = map[string]varInfo{}
+	c.staticVars = map[string]string{} // fresh per function: static-local names do not leak across functions
 	c.curRet = f.Ret
 	c.curParam = f.ParamTypes
 	c.sretSlot = 0
@@ -1765,7 +1747,23 @@ func (c *CG) genFunc(f *FuncDecl) error {
 				gather(d, swDepth)
 			}
 		case *DeclStmt:
-			if _, ok := c.vars[n.Name]; !ok {
+			if n.Storage == "static" {
+				// Static local: lives in .data under a unique label, persists
+				// across calls, and is initialised once at load time. No frame
+				// slot is allocated; loadVar/genLValue resolve it via
+				// c.staticVars.
+				lab := fmt.Sprintf("G_st%d_%s", c.staticSeq, n.Name)
+				c.staticSeq++
+				c.globals[lab] = true
+				c.globalLab[lab] = lab
+				c.globalTyp[lab] = n.Typ
+				c.staticVars[n.Name] = lab
+				c.staticList = append(c.staticList, staticEmit{lab: lab, d: n})
+			} else if n.Storage == "extern" {
+				// Extern local: a reference to a file-scope global of the same
+				// name. No frame slot; loadVar/genLValue fall through to
+				// c.globals to resolve it.
+			} else if _, ok := c.vars[n.Name]; !ok {
 				decls = append(decls, localDecl{n.Name, n.Typ})
 			}
 		case *IfStmt:
@@ -2100,6 +2098,12 @@ func (c *CG) genStmt(s Stmt) error {
 			}
 		}
 	case *DeclStmt:
+		// Static locals are initialised once at load time in .data, and extern
+		// locals have no storage of their own; neither needs run-time
+		// initialisation, so skip the frame-storing code below.
+		if n.Storage == "static" || n.Storage == "extern" {
+			return nil
+		}
 		vi := c.vars[n.Name]
 		if bi, ok := n.Init.(*BraceInit); ok {
 			// A braced initialiser stores each leaf directly into its frame
@@ -2620,6 +2624,11 @@ func (c *CG) genLValue(e Expr) error {
 		}
 		vi, ok := c.vars[n.Name]
 		if !ok {
+			if lab, ok2 := c.staticVars[n.Name]; ok2 {
+				// Address of a static local: rip-relative lea into .data.
+				c.emit("lea r10, [rip+%s]", lab)
+				return nil
+			}
 			if c.globals[n.Name] {
 				// Address of a global: rip-relative lea into .data.
 				c.emit("lea r10, [rip+%s]", c.globalLab[n.Name])
@@ -2657,7 +2666,14 @@ func (c *CG) genLValue(e Expr) error {
 		if id, ok := n.Base.(*Ident); ok {
 			vi, ok2 := c.vars[id.Name]
 			if !ok2 {
-				if c.globals[id.Name] {
+				if lab, ok3 := c.staticVars[id.Name]; ok3 {
+					// Static-local array: rip-relative lea of element 0.
+					gt := c.globalTyp[lab]
+					if gt == nil || !gt.IsArray() {
+						return fmt.Errorf("cannot index non-array static local %q", id.Name)
+					}
+					c.emit("lea r10, [rip+%s]", lab)
+				} else if c.globals[id.Name] {
 					// Global array: rip-relative lea of element 0.
 					gt := c.globalTyp[id.Name]
 					if gt == nil || !gt.IsArray() {
@@ -3357,6 +3373,74 @@ func (c *CG) braceElemLocal(t *Type, e Expr, off int) error {
 	}
 	c.emit("lea r10, [rbp%+d]", off)
 	c.genStoreElem("r10", w, t.Class())
+	return nil
+}
+
+// emitGlobalVar lays out one program-level variable (true global or static
+// local) in .data under the given label. The emission mirrors the rules the
+// .data loop used for globals: a braced initialiser is rendered as a byte
+// image; a char array from a string literal keeps its bytes (NUL-padded); an
+// aggregate/array with no brace is zero-filled for its full byte size; a float
+// is 4 bytes of IEEE single or a double quad; everything else is an integer
+// dq (zero when the initialiser does not fold).
+func (c *CG) emitGlobalVar(out *strings.Builder, g *DeclStmt, lab string) error {
+	if bi, ok := g.Init.(*BraceInit); ok {
+		return c.emitGlobalBrace(out, g.Typ, bi, lab)
+	}
+	// A char array initialised by a string literal holds the bytes (plus NUL)
+	// directly in .data, zero-padded to the full array size ("char g[8] =
+	// \"hi\"" keeps five zero tail bytes). A global char* initialised by a
+	// string literal is NOT supported: goa's dq takes no symbol operands, so
+	// the pointer could not be relocated to the constant.
+	if g.Typ != nil && g.Typ.IsArray() && g.Typ.Elem.IsChar() {
+		if sl, ok := g.Init.(*StrLit); ok {
+			size := c.typeWidth(g.Typ)
+			out.WriteString(fmt.Sprintf("%s db \"%s\", 0", lab, encodeStr(sl.Bytes)))
+			for i := len(sl.Bytes) + 1; i < size; i++ {
+				out.WriteString(", 0")
+			}
+			out.WriteString("\n")
+			return nil
+		}
+	}
+	if g.Typ != nil && (g.Typ.IsArray() || isAgg(g.Typ)) {
+		// typeWidth already returns the full byte size (elem width * len for
+		// arrays, the computed Size for structs/unions), so that IS the size
+		// to zero-fill.
+		size := c.typeWidth(g.Typ)
+		if size < 1 {
+			size = 1
+		}
+		n := (size + 7) / 8
+		out.WriteString(lab + " dq 0")
+		for i := 1; i < n; i++ {
+			out.WriteString(", 0")
+		}
+		out.WriteString("\n")
+		return nil
+	}
+	if g.Typ != nil && g.Typ.IsFloating() {
+		// A float global is 4 bytes of IEEE single; a double is a quad. Only a
+		// literal initialiser (optionally negated) is foldable here; anything
+		// else falls back to zero.
+		f := 0.0
+		if v, ok := foldFloatInit(g.Init); ok {
+			f = v
+		}
+		if g.Typ.Kind == KFloat {
+			bits := math.Float32bits(float32(f))
+			out.WriteString(fmt.Sprintf("%s db %d, %d, %d, %d\n", lab,
+				bits&0xff, (bits>>8)&0xff, (bits>>16)&0xff, (bits>>24)&0xff))
+		} else {
+			out.WriteString(fmt.Sprintf("%s dq %s\n", lab, formatDouble(f)))
+		}
+		return nil
+	}
+	val := int64(0)
+	if v, ok := foldConstInit(g.Init); ok {
+		val = v
+	}
+	out.WriteString(fmt.Sprintf("%s dq %d\n", lab, val))
 	return nil
 }
 
