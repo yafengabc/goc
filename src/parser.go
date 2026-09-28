@@ -183,7 +183,11 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 	var init Expr
 	if p.atPunct("=") {
 		p.next()
-		init, err = p.parseExpr()
+		if p.atPunct("{") {
+			init, err = p.parseBraceInit()
+		} else {
+			init, err = p.parseExpr()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1042,7 +1046,11 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 		var init Expr
 		if p.atPunct("=") {
 			p.next()
-			init, err = p.parseExpr()
+			if p.atPunct("{") {
+				init, err = p.parseBraceInit()
+			} else {
+				init, err = p.parseExpr()
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -1064,6 +1072,59 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 }
 
 func (p *Parser) parseExpr() (Expr, error) { return p.parseAssign() }
+
+// parseBraceInit parses a braced initialiser "{ a, .x = b, { c } }" found in
+// the initialiser position of a declaration. Elements are assignment
+// expressions, nested braces, or designated members (". name ="), separated by
+// commas with an optional trailing comma. Array designators ("[2] = ...") are
+// not supported and are rejected with a clear message.
+func (p *Parser) parseBraceInit() (Expr, error) {
+	line := p.cur().Line
+	p.next() // consume '{'
+	bi := &BraceInit{Line: line}
+	for {
+		if p.atPunct("}") {
+			p.next()
+			break
+		}
+		el := InitElem{}
+		if p.atPunct(".") {
+			p.next()
+			if p.cur().Kind != TIdent {
+				return nil, fmt.Errorf("line %d: expected member name after '.' in initialiser", p.cur().Line)
+			}
+			el.Desig = p.next().Text
+			if err := p.expect("="); err != nil {
+				return nil, err
+			}
+		} else if p.atPunct("[") {
+			return nil, fmt.Errorf("line %d: array designators ([i] = ...) are not supported in initialisers", p.cur().Line)
+		}
+		if p.atPunct("{") {
+			e, err := p.parseBraceInit()
+			if err != nil {
+				return nil, err
+			}
+			el.E = e
+		} else {
+			e, err := p.parseAssign()
+			if err != nil {
+				return nil, err
+			}
+			el.E = e
+		}
+		bi.Elems = append(bi.Elems, el)
+		if p.atPunct(",") {
+			p.next()
+			continue
+		}
+		if err := p.expect("}"); err != nil {
+			return nil, err
+		}
+		break
+	}
+	return bi, nil
+}
 
 // parseAssign parses an assignment expression. Simple "=" binds the value of the
 // right side (and yields it), while the compound operators (+= -= *= /= %= &=

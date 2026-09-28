@@ -165,6 +165,23 @@ type StrLit struct {
 	Bytes []byte
 }
 
+// InitElem is one element of a brace initialiser. Desig holds the member
+// name for a designated initialiser (".x = 1") and is "" for positional
+// initialisation; E is the value, which may itself be a *BraceInit for a
+// nested aggregate.
+type InitElem struct {
+	Desig string
+	E     Expr
+}
+
+// BraceInit is a braced initialiser "{ ... }" for an array, struct, union or
+// (C allows it) a scalar. It only appears in the initialiser position of a
+// declaration, never inside a general expression.
+type BraceInit struct {
+	Elems []InitElem
+	Line  int
+}
+
 type Ident struct {
 	Name string
 	Line int

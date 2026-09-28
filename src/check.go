@@ -111,11 +111,11 @@ func (c *checker) checkBlock(b *Block, fn *FuncDecl) {
 func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 	switch n := st.(type) {
 	case *DeclStmt:
-		// A char array initialised by a string literal is the one array
-		// initialiser C allows: the bytes (plus a trailing NUL) are copied
-		// in, and an incomplete "char s[]" borrows its length from the
-		// string. Any other array initialiser stays rejected.
-		strInit := false
+		// Initialiser forms, in order of specificity: a string literal for a
+		// char array (the one array initialiser C allows outside braces), a
+		// braced initialiser for any aggregate (or scalar), and everything
+		// else through the normal expression/assignable path.
+		strInit, braceInit := false, false
 		if n.Typ.IsArray() && n.Init != nil {
 			if sl, ok := n.Init.(*StrLit); ok && n.Typ.Elem.IsChar() {
 				strInit = true
@@ -126,12 +126,18 @@ func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 					c.errf(n.Line, "initialiser string of length %d does not fit in char array %q of %d bytes",
 						len(sl.Bytes), n.Name, n.Typ.Len)
 				}
+			} else if _, ok := n.Init.(*BraceInit); ok {
+				braceInit = true
+				c.checkBraceInit(n.Typ, n.Init.(*BraceInit), fn, n.Line)
 			} else {
 				c.errf(n.Line, "array %q cannot be initialised here (use memset / a loop)", n.Name)
 			}
+		} else if bi, ok := n.Init.(*BraceInit); ok {
+			braceInit = true
+			c.checkBraceInit(n.Typ, bi, fn, n.Line)
 		}
 		c.put(n.Name, n.Typ, n.Line)
-		if n.Init != nil {
+		if n.Init != nil && !strInit && !braceInit {
 			t := c.checkExpr(n.Init, fn)
 			// A string literal "decays" to char*, which is not assignable to
 			// the char-array type proper -- but it is the sanctioned form of
@@ -539,6 +545,12 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		}
 		for _, m := range st.Members {
 			if m.Name == n.Name {
+				// An array member used as a value decays to a pointer to its
+				// element 0, exactly like a bare array identifier ("char *q =
+				// s.name" must type-check the same way "char *q = s" does).
+				if m.Type.IsArray() && m.Type.Elem != nil {
+					return PtrType(m.Type.Elem)
+				}
 				return m.Type
 			}
 		}
@@ -756,6 +768,141 @@ func assignable(dst, src *Type) bool {
 		return typesEqual(dst, src)
 	}
 	return false
+}
+
+// checkBraceInit validates a braced initialiser against type t. An incomplete
+// array ("int a[] = {...}") borrows its length from the number of top-level
+// elements; every byte not explicitly initialised is zero (C semantics).
+func (c *checker) checkBraceInit(t *Type, bi *BraceInit, fn *FuncDecl, line int) {
+	switch {
+	case t.IsArray():
+		if t.Len == 0 {
+			if len(bi.Elems) == 0 {
+				c.errf(line, "empty initialiser for array of incomplete length")
+				return
+			}
+			t.Len = len(bi.Elems)
+		}
+		if len(bi.Elems) > t.Len {
+			c.errf(line, "too many initialisers for array of %d element(s)", t.Len)
+		}
+		for i, el := range bi.Elems {
+			if el.Desig != "" {
+				c.errf(line, "member designator %q is only valid in a struct/union initialiser", el.Desig)
+				continue
+			}
+			if i >= t.Len {
+				break
+			}
+			c.checkBraceElem(t.Elem, el.E, fn, line)
+		}
+	case t.IsStruct():
+		c.checkStructBrace(t, bi, fn, line)
+	case t.IsUnion():
+		if len(bi.Elems) > 1 {
+			c.errf(line, "too many initialisers for union (at most one member)")
+		}
+		if len(bi.Elems) == 0 {
+			return
+		}
+		el := bi.Elems[0]
+		mi := 0
+		if el.Desig != "" {
+			mi = memberIndex(t, el.Desig)
+			if mi < 0 {
+				c.errf(line, "union has no member %q", el.Desig)
+				return
+			}
+		}
+		if mi < len(t.Members) {
+			c.checkBraceElem(t.Members[mi].Type, el.E, fn, line)
+		}
+	default:
+		// C allows a scalar to be initialised from a single braced value.
+		if len(bi.Elems) != 1 || bi.Elems[0].Desig != "" {
+			c.errf(line, "invalid initialiser for scalar type %s", t)
+			return
+		}
+		c.checkBraceElem(t, bi.Elems[0].E, fn, line)
+	}
+}
+
+// checkStructBrace validates a struct initialiser, either all-positional or
+// all-designated (".x = ..."); mixing the two styles is rejected.
+func (c *checker) checkStructBrace(t *Type, bi *BraceInit, fn *FuncDecl, line int) {
+	allDesig := true
+	for _, el := range bi.Elems {
+		if el.Desig == "" {
+			allDesig = false
+			break
+		}
+	}
+	if allDesig {
+		for _, el := range bi.Elems {
+			mi := memberIndex(t, el.Desig)
+			if mi < 0 {
+				c.errf(line, "struct has no member %q", el.Desig)
+				continue
+			}
+			c.checkBraceElem(t.Members[mi].Type, el.E, fn, line)
+		}
+		return
+	}
+	for i, el := range bi.Elems {
+		if i >= len(t.Members) {
+			c.errf(line, "too many initialisers for struct %s", t)
+			break
+		}
+		if el.Desig != "" {
+			// C99 allows continuing after a designator positionally, but
+			// implementing that partial-order rule on top of the positional
+			// walk would silently overwrite; reject the mix instead.
+			c.errf(line, "cannot mix positional and designated (\".%s =\") initialisers", el.Desig)
+			return
+		}
+		c.checkBraceElem(t.Members[i].Type, el.E, fn, line)
+	}
+}
+
+// checkBraceElem validates one element of a braced initialiser: either a
+// nested brace for an aggregate target, a string for a char array (or char*),
+// or an ordinary expression checked through the normal expression path.
+func (c *checker) checkBraceElem(t *Type, e Expr, fn *FuncDecl, line int) {
+	if nbi, ok := e.(*BraceInit); ok {
+		if t.IsArray() || t.IsStruct() || t.IsUnion() {
+			c.checkBraceInit(t, nbi, fn, line)
+			return
+		}
+		c.errf(line, "braced initialiser for scalar type %s", t)
+		return
+	}
+	if sl, ok := e.(*StrLit); ok {
+		if t.IsArray() && t.Elem.IsChar() {
+			if t.Len != 0 && t.Len < len(sl.Bytes)+1 {
+				c.errf(line, "string of length %d does not fit in char array of %d bytes", len(sl.Bytes), t.Len)
+			}
+			return
+		}
+		if t.IsPtr() && t.Elem.IsChar() {
+			return // a char* member/element may hold a string literal
+		}
+		c.errf(line, "string literal cannot initialise %s", t)
+		return
+	}
+	tt := c.checkExpr(e, fn)
+	if !assignable(t, tt) {
+		c.errf(line, "initialiser element of type %s is not assignable to %s", tt, t)
+	}
+}
+
+// memberIndex returns the index of the named member, or -1.
+func memberIndex(t *Type, name string) int {
+	for i, m := range t.Members {
+		if m.Name == name {
+			return i
+		}
+	}
+	return -1
 }
 
 func typesEqual(a, b *Type) bool {

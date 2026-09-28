@@ -1,0 +1,21 @@
+== local ==
+a: 10 20 0 0
+full: 3 sizeof=12
+p: 3 4
+l: 5 6 7 8
+mx: hi 9 1.25
+z: 0 0
+pd: 8 9
+uu: 68 65
+lp0: 7 7 lp1: 8 8
+rows: ab cd
+lt: 3 4
+== global ==
+ia: 1 2 3 0
+m22: 1 2 3 4
+gp: 7 8
+gl: 1 2 3 4
+gm: ab 5 2.50
+path: 1 1 0 0
+gt: box 5 6
+sizeof rows=12

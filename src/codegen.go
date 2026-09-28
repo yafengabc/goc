@@ -1027,6 +1027,17 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		if err := c.genLValue(n); err != nil {
 			return TInt, err
 		}
+		// An element that is itself an array ("rows[0]" of char rows[2][6])
+		// used as a value decays to a pointer to ITS element 0: the address
+		// genLValue left in r10 is the value -- loading bytes here would
+		// yield a garbage pointer (and crash %s marshalling).
+		if et := c.exprType(n); et != nil && et.IsArray() {
+			c.emit("mov rax, r10")
+			c.resTyp = TInt
+			c.resSigned = false
+			c.resW = 8
+			return TInt, nil
+		}
 		width := c.elemWidthOf(n.Base)
 		ec := c.elemClassOf(n.Base)
 		signed := c.elemSignedOf(n.Base)
@@ -1045,6 +1056,16 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 			// fits in rax; its address is already in r10 and callers must take
 			// it from there.
 			return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
+		}
+		if t.Kind == KArr {
+			// An array member used as a value decays to a pointer to element
+			// 0: the address genLValue left in r10 IS the value -- loading
+			// bytes here would yield garbage (and crash %s arg marshalling).
+			c.emit("mov rax, r10")
+			c.resTyp = TInt
+			c.resSigned = false
+			c.resW = 8
+			return TInt, nil
 		}
 		// Members are laid out at their C type width (MSVC x64 packs an int
 		// member as 4 bytes), not the 8-byte scalar slot width -- loading the
@@ -1371,6 +1392,15 @@ func Gen(prog *Program, linux bool) (string, error) {
 		out.WriteString("\nsection .data\n")
 		for _, g := range prog.Globals {
 			lab := c.globalLab[g.Name]
+			// A braced initialiser lays out the aggregate as a byte image and
+			// emits it as db bytes; non-foldable leaves stay zero, matching
+			// the scalar-global behaviour below.
+			if bi, ok := g.Init.(*BraceInit); ok {
+				if err := c.emitGlobalBrace(&out, g.Typ, bi, lab); err != nil {
+					return "", err
+				}
+				continue
+			}
 			// A char array initialised by a string literal holds the bytes
 			// (plus NUL) directly in .data, zero-padded to the full array
 			// size ("char g[8] = \"hi\"" keeps five zero tail bytes). A
@@ -1586,6 +1616,10 @@ func (c *CG) findAddressTaken(f *FuncDecl) map[string]bool {
 		case *AssignExpr:
 			walkExpr(n.Lhs)
 			walkExpr(n.Rhs)
+		case *BraceInit:
+			for _, el := range n.Elems {
+				walkExpr(el.E)
+			}
 		case *VaArgExpr:
 			if id, ok := n.Ap.(*Ident); ok {
 				taken[id.Name] = true
@@ -2034,6 +2068,24 @@ func (c *CG) genStmt(s Stmt) error {
 		}
 	case *DeclStmt:
 		vi := c.vars[n.Name]
+		if bi, ok := n.Init.(*BraceInit); ok {
+			// A braced initialiser stores each leaf directly into its frame
+			// slot and zero-fills what it leaves uncovered. A scalar target
+			// ("int x = {5}") just initialises from its single element.
+			if isAgg(vi.typ) || vi.typ.IsArray() {
+				return c.genBraceInitLocal(vi.typ, bi, vi.off)
+			}
+			if len(bi.Elems) == 1 {
+				if _, err := c.genExprT(bi.Elems[0].E); err != nil {
+					return err
+				}
+				if err := c.ensureType(vi.typ.Class()); err != nil {
+					return err
+				}
+				c.storeVar(vi)
+			}
+			return nil
+		}
 		if vi.typ.IsArray() {
 			// The one array initialiser that exists is a string literal for a
 			// char array: copy the bytes (plus NUL) into the stack slot and
@@ -2591,6 +2643,14 @@ func (c *CG) genLValue(e Expr) error {
 				return err
 			}
 			// r10 already holds the base element address
+		} else if bt := c.exprType(n.Base); bt != nil && bt.IsArray() {
+			// The base is an array lvalue (a struct member array, e.g.
+			// "mx.name[i]"): it decays to the address of its element 0, so
+			// its ADDRESS is the base -- loading its value would read the
+			// array bytes as a garbage pointer and crash the store.
+			if err := c.genLValue(n.Base); err != nil {
+				return err
+			}
 		} else {
 			if _, err := c.genExprT(n.Base); err != nil {
 				return err
@@ -3055,6 +3115,258 @@ func (c *CG) zeroBytes(dst string, n int) {
 	for i := off; i < n; i++ {
 		c.emit("mov byte [%s+%d], al", dst, i)
 	}
+}
+
+// genBraceInitLocal initialises a local aggregate (array/struct/union) from a
+// braced initialiser. The whole aggregate is zeroed first (C semantics: every
+// byte not explicitly initialised is zero -- and with designated or partial
+// initialisers the uncovered bytes are NOT a contiguous tail), then each leaf
+// is evaluated and stored directly into its frame slot.
+func (c *CG) genBraceInitLocal(t *Type, bi *BraceInit, off int) error {
+	c.emit("lea r10, [rbp%+d]", off)
+	c.zeroBytes("r10", c.typeWidth(t))
+	return c.braceWalkLocal(t, bi, off)
+}
+
+// braceWalkLocal stores the explicit elements of bi for the aggregate t based
+// at frame offset off. Every leaf lands at its layout offset; uncovered bytes
+// were already zeroed by the caller.
+func (c *CG) braceWalkLocal(t *Type, bi *BraceInit, off int) error {
+	if t.IsArray() {
+		ew := c.typeWidth(t.Elem)
+		for i, el := range bi.Elems {
+			if i >= t.Len {
+				break
+			}
+			if err := c.braceElemLocal(t.Elem, el.E, off+i*ew); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if t.IsStruct() {
+		allDesig := len(bi.Elems) > 0
+		for _, el := range bi.Elems {
+			if el.Desig == "" {
+				allDesig = false
+				break
+			}
+		}
+		if allDesig {
+			for _, el := range bi.Elems {
+				mi := memberIndex(t, el.Desig)
+				if mi < 0 {
+					return fmt.Errorf("struct has no member %q", el.Desig)
+				}
+				m := t.Members[mi]
+				if err := c.braceElemLocal(m.Type, el.E, off+m.Offset); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for i, el := range bi.Elems {
+			if i >= len(t.Members) {
+				break
+			}
+			if el.Desig != "" {
+				return fmt.Errorf("cannot mix positional and designated (\".%s =\") initialisers", el.Desig)
+			}
+			m := t.Members[i]
+			if err := c.braceElemLocal(m.Type, el.E, off+m.Offset); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if t.IsUnion() {
+		if len(bi.Elems) == 0 {
+			return nil
+		}
+		el := bi.Elems[0]
+		m := t.Members[0]
+		if el.Desig != "" {
+			if mi := memberIndex(t, el.Desig); mi >= 0 {
+				m = t.Members[mi]
+			}
+		}
+		return c.braceElemLocal(m.Type, el.E, off+m.Offset)
+	}
+	// Scalar target: a single braced value.
+	if len(bi.Elems) != 1 {
+		return fmt.Errorf("invalid braced initialiser for scalar type %s", t)
+	}
+	return c.braceElemLocal(t, bi.Elems[0].E, off)
+}
+
+// braceElemLocal initialises one element of type t at frame offset off from
+// the expression e -- a leaf value, a string literal for a char array, or a
+// nested brace.
+func (c *CG) braceElemLocal(t *Type, e Expr, off int) error {
+	if nbi, ok := e.(*BraceInit); ok {
+		return c.braceWalkLocal(t, nbi, off)
+	}
+	w := c.typeWidth(t)
+	if sl, ok := e.(*StrLit); ok && t.IsArray() && t.Elem.IsChar() {
+		copied := len(sl.Bytes) + 1
+		if copied > w {
+			copied = w
+		}
+		if _, err := c.genExprT(e); err != nil {
+			return err
+		}
+		c.emit("mov r11, rax")
+		c.emit("lea r10, [rbp%+d]", off)
+		c.copyBytes("r10", "r11", copied)
+		return nil
+	}
+	if _, err := c.genExprT(e); err != nil {
+		return err
+	}
+	if err := c.ensureType(t.Class()); err != nil {
+		return err
+	}
+	c.emit("lea r10, [rbp%+d]", off)
+	c.genStoreElem("r10", w, t.Class())
+	return nil
+}
+
+// emitGlobalBrace lays out a global aggregate from a braced initialiser as a
+// byte image and emits it as db bytes. Bytes not explicitly initialised stay
+// zero. Pointer elements cannot take a string literal: goa has no data
+// relocations, so the pointer value could not be resolved.
+func (c *CG) emitGlobalBrace(out *strings.Builder, t *Type, bi *BraceInit, lab string) error {
+	size := c.typeWidth(t)
+	if size < 1 {
+		size = 1
+	}
+	img := make([]byte, size)
+	if err := c.fillBraceImage(t, bi, img, 0); err != nil {
+		return err
+	}
+	out.WriteString(fmt.Sprintf("%s db %d", lab, img[0]))
+	for _, b := range img[1:] {
+		out.WriteString(fmt.Sprintf(", %d", b))
+	}
+	out.WriteString("\n")
+	return nil
+}
+
+// fillBraceImage fills the image of a global aggregate at byte offset off
+// from a braced initialiser, mirroring the layout the local emitter uses
+// (arrays by element index, structs by member Offset, unions by first member).
+func (c *CG) fillBraceImage(t *Type, bi *BraceInit, img []byte, off int) error {
+	if t.IsArray() {
+		ew := c.typeWidth(t.Elem)
+		for i, el := range bi.Elems {
+			if i >= t.Len {
+				break
+			}
+			if err := c.fillBraceElem(t.Elem, el.E, img, off+i*ew); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if t.IsStruct() {
+		allDesig := len(bi.Elems) > 0
+		for _, el := range bi.Elems {
+			if el.Desig == "" {
+				allDesig = false
+				break
+			}
+		}
+		if allDesig {
+			for _, el := range bi.Elems {
+				mi := memberIndex(t, el.Desig)
+				if mi < 0 {
+					return fmt.Errorf("struct has no member %q", el.Desig)
+				}
+				m := t.Members[mi]
+				if err := c.fillBraceElem(m.Type, el.E, img, off+m.Offset); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for i, el := range bi.Elems {
+			if i >= len(t.Members) {
+				break
+			}
+			if el.Desig != "" {
+				return fmt.Errorf("cannot mix positional and designated (\".%s =\") initialisers", el.Desig)
+			}
+			m := t.Members[i]
+			if err := c.fillBraceElem(m.Type, el.E, img, off+m.Offset); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if t.IsUnion() {
+		if len(bi.Elems) == 0 {
+			return nil
+		}
+		el := bi.Elems[0]
+		m := t.Members[0]
+		if el.Desig != "" {
+			if mi := memberIndex(t, el.Desig); mi >= 0 {
+				m = t.Members[mi]
+			}
+		}
+		return c.fillBraceElem(m.Type, el.E, img, off+m.Offset)
+	}
+	if len(bi.Elems) != 1 {
+		return fmt.Errorf("invalid braced initialiser for scalar type %s", t)
+	}
+	return c.fillBraceElem(t, bi.Elems[0].E, img, off)
+}
+
+// fillBraceElem writes one element into the image: a nested brace recurses, a
+// string fills a char array, and scalars fold to their IEEE/integer bytes.
+// Anything non-foldable stays zero, matching existing global behaviour.
+func (c *CG) fillBraceElem(t *Type, e Expr, img []byte, off int) error {
+	if nbi, ok := e.(*BraceInit); ok {
+		return c.fillBraceImage(t, nbi, img, off)
+	}
+	w := c.typeWidth(t)
+	if off+w > len(img) {
+		return fmt.Errorf("initialiser overflows global of %d bytes", len(img))
+	}
+	if sl, ok := e.(*StrLit); ok {
+		if t.IsArray() && t.Elem.IsChar() {
+			b := append(append([]byte(nil), sl.Bytes...), 0)
+			if len(b) > w {
+				b = b[:w]
+			}
+			copy(img[off:], b)
+			return nil
+		}
+		if t.Kind == KPtr {
+			return fmt.Errorf("global pointer initialiser from a string literal is not supported (goa has no data relocations)")
+		}
+	}
+	switch t.Kind {
+	case KFloat:
+		f, _ := foldFloatInit(e)
+		bits := math.Float32bits(float32(f))
+		for i := 0; i < 4; i++ {
+			img[off+i] = byte(bits >> (8 * i))
+		}
+		return nil
+	case KDouble:
+		f, _ := foldFloatInit(e)
+		bits := math.Float64bits(f)
+		for i := 0; i < 8; i++ {
+			img[off+i] = byte(bits >> (8 * i))
+		}
+		return nil
+	}
+	v, _ := foldConstInit(e)
+	for i := 0; i < w && i < 8; i++ {
+		img[off+i] = byte(v >> (8 * i))
+	}
+	return nil
 }
 
 // structSrcAddr emits code that leaves the address of the struct/union value
