@@ -252,7 +252,9 @@ func (t *Type) Class() CType {
 	return TInt
 }
 
-func (t *Type) IsArith() bool    { return t.Kind == KInt || t.Kind == KDouble || t.Kind == KFloat || t.Kind == KBool }
+func (t *Type) IsArith() bool {
+	return t.Kind == KInt || t.Kind == KDouble || t.Kind == KFloat || t.Kind == KBool
+}
 func (t *Type) IsIntClass() bool { return t.Kind == KInt || t.Kind == KBool }
 func (t *Type) IsScalar() bool   { return t.IsArith() || t.Kind == KPtr || t.Kind == KBool }
 func (t *Type) IsVoid() bool     { return t.Kind == KVoid }

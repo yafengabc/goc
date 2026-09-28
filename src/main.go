@@ -189,7 +189,7 @@ func main() {
 
 // buildCfg holds the result of parsing the command line.
 type buildCfg struct {
-	mode    string   // run | compile | asm | preprocess
+	mode    string // run | compile | asm | preprocess
 	linux   bool
 	outFile string
 	defines []string
