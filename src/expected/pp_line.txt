@@ -1,0 +1,4 @@
+chars=1
+a=101
+b=301 virtual.c
+c=501

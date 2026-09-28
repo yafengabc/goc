@@ -167,3 +167,58 @@ func TestFunctionVsObjectMacro(t *testing.T) {
 		t.Fatalf("object macro with spaced '(' should keep parens: %q", got)
 	}
 }
+
+func TestIfCharConstant(t *testing.T) {
+	// Character literals in #if evaluate to their byte value ('A'=65, '\n'=10).
+	src := "#if 'A' == 65 && '\\n' == 10 && '0' == 48\nint yes;\n#else\nint no;\n#endif\n"
+	got := pptext(t, src)
+	if !strings.Contains(got, "int yes ;") || strings.Contains(got, "int no ;") {
+		t.Fatalf("#if char constant branch wrong: %q", got)
+	}
+}
+
+func TestLineDirective(t *testing.T) {
+	// #line N makes the NEXT source line logically N+1.
+	got := pptext(t, "#line 100\n__LINE__\n")
+	if !strings.Contains(got, "101") {
+		t.Fatalf("#line: got %q, want __LINE__ to be 101", got)
+	}
+	// Optional filename, which __FILE__ then reports.
+	got2 := pptext(t, "#line 200 \"gen.c\"\n__FILE__ __LINE__\n")
+	if !strings.Contains(got2, `"gen.c"`) || !strings.Contains(got2, "201") {
+		t.Fatalf("#line with file: got %q", got2)
+	}
+}
+
+func TestGnuLineDirective(t *testing.T) {
+	// GNU form "# N \"file\"" (as produced by cpp / gcc -E).
+	got := pptext(t, "# 42 \"x.c\"\n__LINE__ __FILE__\n")
+	if !strings.Contains(got, "43") || !strings.Contains(got, `"x.c"`) {
+		t.Fatalf("GNU #line: got %q", got)
+	}
+}
+
+func TestLineDirectiveDoesNotLeakIntoIncludes(t *testing.T) {
+	dir := t.TempDir()
+	// A #line inside an included file must not renumber the includer.
+	if err := os.WriteFile(filepath.Join(dir, "h.h"), []byte("#line 900\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	src := "#include \"h.h\"\n__LINE__\n"
+	toks, err := Preprocess(src, filepath.Join(dir, "m.c"))
+	if err != nil {
+		t.Fatalf("preprocess: %v", err)
+	}
+	var parts []string
+	for _, tok := range toks {
+		if tok.Kind == TEOF {
+			break
+		}
+		parts = append(parts, spell(tok))
+	}
+	got := strings.Join(parts, " ")
+	// The __LINE__ in m.c sits on physical line 2 and must stay 2, not 901.
+	if !strings.Contains(got, "2") || strings.Contains(got, "901") {
+		t.Fatalf("#line leaked out of the include: %q", got)
+	}
+}

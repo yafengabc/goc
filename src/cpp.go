@@ -14,11 +14,13 @@ package main
 //   - #if / #ifdef / #ifndef / #else / #elif / #endif  (constant expressions,
 //     including the defined() operator)
 //   - #error   (raised only when the branch is active)
+//   - #line N ["file"] (and the GNU "# N ["file"]" form), affecting __LINE__,
+//     __FILE__ and diagnostic line numbers
 //   - predefined macros __FILE__, __LINE__, __goc__
 //   - backslash line continuations inside macro definitions
 //
 // Things deliberately left for a later stage: #pragma beyond ignoring it,
-// #line, character constants in #if, and most of the hosted-header ecosystem.
+// and most of the hosted-header ecosystem.
 
 import (
 	"fmt"
@@ -52,6 +54,11 @@ type Preprocessor struct {
 	condStack  []condFrame
 	searchDirs []string
 	baseDir    string
+	// #line state: a logical file name (empty = the real source file) and the
+	// offset such that logicalLine = physicalLine + lineDelta. Reset per file
+	// in process, so a #line inside an #include cannot leak into the includer.
+	logicalFile string
+	lineDelta   int
 }
 
 // Preprocess runs the full preprocessing pipeline on src (already read from
@@ -92,12 +99,20 @@ func spliceContinuations(src string) string {
 }
 
 // process tokenises one file and scans it. It owns a fresh conditional-compile
-// stack (an #if inside an included file does not affect the includer), but
-// shares the macro table so definitions are global.
+// stack and #line state (an #if or #line inside an included file does not
+// affect the includer), but shares the macro table so definitions are global.
 func (p *Preprocessor) process(src, filename string) ([]Token, error) {
 	save := p.condStack
+	saveFile := p.logicalFile
+	saveDelta := p.lineDelta
 	p.condStack = nil
-	defer func() { p.condStack = save }()
+	p.logicalFile = ""
+	p.lineDelta = 0
+	defer func() {
+		p.condStack = save
+		p.logicalFile = saveFile
+		p.lineDelta = saveDelta
+	}()
 
 	raw, err := Lex(src)
 	if err != nil {
@@ -180,6 +195,11 @@ func isDirectiveStart(raw []Token, i int) bool {
 // execDirective runs one directive and returns any tokens it produces (only
 // #include produces tokens).
 func (p *Preprocessor) execDirective(name string, rest []Token, line int, filename string) ([]Token, error) {
+	// GNU extension: "# 100 \"file\"" is the same as "#line 100 \"file\"".
+	if isAllDigits(name) {
+		n, _ := strconv.ParseInt(name, 10, 64)
+		return p.doLine(n, rest, line, filename)
+	}
 	switch name {
 	case "include":
 		if !p.active() {
@@ -211,14 +231,66 @@ func (p *Preprocessor) execDirective(name string, rest []Token, line int, filena
 		}
 	case "error":
 		if p.active() {
-			return nil, fmt.Errorf("%s:%d: #error", filename, line)
+			return nil, fmt.Errorf("%s:%d: #error", p.logicalFileName(filename), p.logicalLine(line))
 		}
-	case "warning", "pragma", "line":
+	case "line":
+		if !p.active() {
+			return nil, nil
+		}
+		if len(rest) == 0 || rest[0].Kind != TNum {
+			return nil, fmt.Errorf("%s:%d: #line needs a line number", p.logicalFileName(filename), p.logicalLine(line))
+		}
+		return p.doLine(rest[0].Num, rest[1:], line, filename)
+	case "warning", "pragma":
 		// Ignored for now.
 	default:
 		if p.active() {
-			return nil, fmt.Errorf("%s:%d: unknown preprocessing directive #%s", filename, line, name)
+			return nil, fmt.Errorf("%s:%d: unknown preprocessing directive #%s", p.logicalFileName(filename), p.logicalLine(line), name)
 		}
+	}
+	return nil, nil
+}
+
+// isAllDigits reports whether s is a non-empty digit sequence (the GNU
+// "# <digits>" directive name).
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// logicalLine and logicalFileName apply the current #line state to a physical
+// source position, for __LINE__ / __FILE__ and for diagnostics.
+func (p *Preprocessor) logicalLine(line int) int { return line + p.lineDelta }
+
+func (p *Preprocessor) logicalFileName(filename string) string {
+	if p.logicalFile != "" {
+		return p.logicalFile
+	}
+	return filename
+}
+
+// doLine implements #line N ["file"]: from the next source line on, __LINE__
+// reports N+1 for the line after the directive, and __FILE__ (if given) the
+// new name. Applies only when the branch is active.
+func (p *Preprocessor) doLine(n int64, rest []Token, line int, filename string) ([]Token, error) {
+	if !p.active() {
+		return nil, nil
+	}
+	if n <= 0 {
+		return nil, fmt.Errorf("%s:%d: #line line number must be positive", p.logicalFileName(filename), p.logicalLine(line))
+	}
+	// The directive sits on physical line `line`; the next physical line is
+	// logically N+1, so the offset is N - line.
+	p.lineDelta = int(n) - line
+	if len(rest) > 0 && rest[0].Kind == TStr {
+		p.logicalFile = string(rest[0].Str)
 	}
 	return nil, nil
 }
@@ -395,9 +467,9 @@ func (p *Preprocessor) expandAt(raw []Token, i int, filename string, line int) (
 	if t.Kind == TIdent {
 		switch t.Text {
 		case "__FILE__":
-			return []Token{tokStr(filename, t.Line)}, i + 1
+			return []Token{tokStr(p.logicalFileName(filename), t.Line)}, i + 1
 		case "__LINE__":
-			return []Token{tokNum(int64(line), t.Line)}, i + 1
+			return []Token{tokNum(int64(p.logicalLine(line)), t.Line)}, i + 1
 		case "__goc__":
 			return []Token{tokNum(1, t.Line)}, i + 1
 		}
@@ -606,7 +678,8 @@ func tokNum(v int64, line int) Token {
 }
 
 // constExpr evaluates a (pre-expanded) integer constant expression used by
-// #if / #elif. Undefined identifiers and character/string constants are 0.
+// #if / #elif. Undefined identifiers and string constants are 0; character
+// literals carry their byte value (the lexer emits them as TNum).
 func (p *Preprocessor) constExpr(toks []Token) int64 {
 	if len(toks) == 0 {
 		return 0
