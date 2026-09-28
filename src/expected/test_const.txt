@@ -1,0 +1,4 @@
+const use: 101
+via const ptr: 101
+const bool true
+read const ptr: 1 3

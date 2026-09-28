@@ -7,7 +7,7 @@ import "fmt"
 var typeKeywords = map[string]bool{
 	"void": true, "char": true, "int": true, "long": true, "short": true,
 	"unsigned": true, "signed": true, "double": true, "float": true,
-	"struct": true, "union": true, "enum": true,
+	"struct": true, "union": true, "enum": true, "_Bool": true,
 }
 
 // qualifierKeywords are type qualifiers that decorate a specifier list but
@@ -232,10 +232,15 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	width := 0
 	var fp *Type // set when a floating-point specifier (float/double) is seen
 	isVoid := false
+	isBool := false
+	isConst := false // a "const" qualifier appeared anywhere in the list
 	seen := false
 	var tdType *Type // a typedef alias, if this specifier list names one
 	for {
 		if isQualifier(p.cur()) {
+			if p.cur().Text == "const" {
+				isConst = true
+			}
 			p.next()
 			continue
 		}
@@ -247,6 +252,12 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 			if err != nil {
 				return nil, err
 			}
+			if isConst {
+				// Never mutate the shared tagged type; stamp a copy instead.
+				t2 := *t
+				t2.Const = true
+				return &t2, nil
+			}
 			return t, nil
 		}
 		if p.cur().Text == "enum" {
@@ -254,7 +265,18 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 			if err != nil {
 				return nil, err
 			}
+			if isConst {
+				t2 := *t
+				t2.Const = true
+				return &t2, nil
+			}
 			return t, nil
+		}
+		if p.cur().Text == "_Bool" {
+			p.next()
+			seen = true
+			isBool = true
+			continue
 		}
 		// A typedef name carries its own (possibly pointer) type; reuse it
 		// verbatim rather than re-synthesising one from width/signedness.
@@ -293,21 +315,42 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		return nil, fmt.Errorf("line %d: expected type specifier, got %q", p.cur().Line, p.cur().Text)
 	}
 	if fp != nil {
+		if isConst {
+			t2 := *fp
+			t2.Const = true
+			return &t2, nil
+		}
 		return fp, nil
 	}
 	if isVoid {
 		return VoidType(), nil
 	}
-	if width == 0 {
-		width = 4 // bare "signed"/"unsigned" means int
+	if isBool {
+		if isConst {
+			return &Type{Kind: KBool, Width: 1, Signed: true, Const: true}, nil
+		}
+		return &Type{Kind: KBool, Width: 1, Signed: true}, nil
 	}
 	if tdType != nil {
 		// The specifier list was a typedef alias (e.g. va_list, size_t). The
 		// pointer/array suffixes are applied later by parseDeclarator, so just
-		// hand back the alias's underlying type.
+		// hand back the alias's underlying type. A const-qualified typedef use
+		// is stamped onto a copy so the alias itself is never polluted.
+		if isConst {
+			t2 := *tdType
+			t2.Const = true
+			return &t2, nil
+		}
 		return tdType, nil
 	}
-	return &Type{Kind: KInt, Width: width, Signed: signed}, nil
+	if width == 0 {
+		width = 4 // bare "signed"/"unsigned" means int
+	}
+	t := &Type{Kind: KInt, Width: width, Signed: signed}
+	if isConst {
+		t.Const = true
+	}
+	return t, nil
 }
 
 // parseStructSpecifier parses a struct or union type specifier:
@@ -377,14 +420,43 @@ func (p *Parser) parseStructMembers() ([]*Member, error) {
 			return nil, err
 		}
 		for {
-			d, err := p.parseDeclarator(spec, true, false)
-			if err != nil {
-				return nil, err
+			var d declResult
+			if p.atPunct(":") {
+				// Anonymous bit-field ("int : 3;", "int : 0;"): no declarator
+				// name, the width follows the colon. d.typ is the base type.
+				d = declResult{typ: spec}
+			} else {
+				var err error
+				d, err = p.parseDeclarator(spec, true, false)
+				if err != nil {
+					return nil, err
+				}
+				if d.typ == nil {
+					return nil, fmt.Errorf("line %d: expected struct member name", p.cur().Line)
+				}
 			}
-			if d.typ == nil {
-				return nil, fmt.Errorf("line %d: expected struct member name", p.cur().Line)
+			// Check for bitfield width after declarator name
+			bitWidth := 0
+			if p.atPunct(":") {
+				p.next()
+				if p.cur().Kind != TNum {
+					return nil, fmt.Errorf("line %d: expected bit width number after ':'", p.cur().Line)
+				}
+				bitWidth = int(p.cur().Num)
+				p.next()
+				bt := declType(d.typ)
+				if bt == nil || !bt.IsIntClass() {
+					return nil, fmt.Errorf("line %d: bit-field base type must be an integer type, got %s", p.cur().Line, bt)
+				}
+				if bitWidth == 0 {
+					if d.name != "" {
+						return nil, fmt.Errorf("line %d: named bit-field %q cannot have zero width", p.cur().Line, d.name)
+					}
+				} else if bitWidth > sizeOf(bt)*8 {
+					return nil, fmt.Errorf("line %d: bit-field width %d exceeds storage unit of %d bits", p.cur().Line, bitWidth, sizeOf(bt)*8)
+				}
 			}
-			members = append(members, &Member{Name: d.name, Type: declType(d.typ)})
+			members = append(members, &Member{Name: d.name, Type: declType(d.typ), BitWidth: bitWidth})
 			if p.atPunct(",") {
 				p.next()
 				continue

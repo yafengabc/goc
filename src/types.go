@@ -20,6 +20,7 @@ const (
 	KFunc
 	KStruct
 	KUnion
+	KBool // for _Bool type
 )
 
 // Member is a single field of a struct or union.
@@ -47,6 +48,7 @@ type Type struct {
 	Size     int       // KStruct / KUnion: total size in bytes (aligned)
 	Align    int       // KStruct / KUnion: required alignment (0 = not computed)
 	Tag      string    // KStruct / KUnion: optional struct tag (named structs)
+	Const    bool      // declared with a top-level "const" qualifier
 }
 
 // --- constructors -----------------------------------------------------------
@@ -87,6 +89,8 @@ func alignOf(t *Type) int {
 	switch t.Kind {
 	case KInt:
 		return t.Width // 1, 2, 4, or 8
+	case KBool:
+		return 1
 	case KFloat:
 		return 4
 	case KDouble, KPtr, KFunc:
@@ -109,6 +113,8 @@ func sizeOf(t *Type) int {
 	switch t.Kind {
 	case KInt:
 		return t.Width
+	case KBool:
+		return 1
 	case KFloat:
 		return 4
 	case KDouble, KPtr, KFunc:
@@ -150,19 +156,82 @@ func (t *Type) computeLayout() {
 		return
 	}
 	off := 0
+	// Bit-fields are allocated inside the storage unit of their declared type
+	// (int => a 4-byte unit, char => 1 byte, ...), packing low-bit-first from
+	// the start of each unit. A bit-field that would cross its unit's boundary
+	// is pushed into the next aligned unit instead (MSVC rule: bit-fields never
+	// straddle their base type). A zero-width unnamed bit-field occupies no
+	// storage but forces the following member into a fresh unit. `end` tracks
+	// the furthest byte actually occupied so a trailing bit-field unit is
+	// counted in the struct's size.
+	end := 0
+	bitOff := 0
+	unitSize := 0 // byte size of the open bit-field storage unit (0 = none open)
 	for _, m := range t.Members {
 		a := alignOf(m.Type)
 		if a > align {
 			align = a
+		}
+		if m.BitWidth > 0 {
+			u := sizeOf(m.Type) // storage-unit size in bytes (int=4, char=1, ...)
+			ub := u * 8
+			// A bit-field starts a fresh storage unit when none is open, when
+			// it would straddle the current unit, or when its declared base
+			// type's storage size differs from the open unit's (each base type
+			// keeps its own allocation unit -- MSVC rule).
+			if bitOff != 0 && (bitOff+m.BitWidth > ub || u != unitSize) {
+				off += unitSize
+				bitOff = 0
+			}
+			if bitOff == 0 {
+				if off%a != 0 {
+					off += a - (off % a)
+				}
+				unitSize = u
+			}
+			m.Offset = off
+			m.BitOff = bitOff
+			bitOff += m.BitWidth
+			if off+u > end {
+				end = off + u
+			}
+			continue
+		}
+		// A zero-width unnamed bit-field (e.g. "int : 0;") occupies no storage
+		// but forces the following member into a fresh storage unit of its own
+		// base type (MSVC: "beginning of the next allocation unit").
+		if m.BitWidth == 0 && m.Name == "" {
+			if bitOff != 0 {
+				off += unitSize
+				bitOff = 0
+			}
+			u := sizeOf(m.Type)
+			if off%u != 0 {
+				off += u - (off % u)
+			}
+			unitSize = 0
+			m.Offset = off
+			m.BitOff = 0
+			continue
+		}
+		// Ordinary member: normal alignment, and it closes any open bit-field
+		// unit (the unit's bytes are part of the layout).
+		if bitOff != 0 {
+			off += unitSize
+			bitOff = 0
+			unitSize = 0
 		}
 		if off%a != 0 {
 			off += a - (off % a)
 		}
 		m.Offset = off
 		off += sizeOf(m.Type)
+		if off > end {
+			end = off
+		}
 	}
 	t.Align = align
-	size := off
+	size := end
 	if align != 0 && size%align != 0 {
 		size += align - (size % align)
 	}
@@ -183,9 +252,9 @@ func (t *Type) Class() CType {
 	return TInt
 }
 
-func (t *Type) IsArith() bool    { return t.Kind == KInt || t.Kind == KDouble || t.Kind == KFloat }
-func (t *Type) IsIntClass() bool { return t.Kind == KInt }
-func (t *Type) IsScalar() bool   { return t.IsArith() || t.Kind == KPtr }
+func (t *Type) IsArith() bool    { return t.Kind == KInt || t.Kind == KDouble || t.Kind == KFloat || t.Kind == KBool }
+func (t *Type) IsIntClass() bool { return t.Kind == KInt || t.Kind == KBool }
+func (t *Type) IsScalar() bool   { return t.IsArith() || t.Kind == KPtr || t.Kind == KBool }
 func (t *Type) IsVoid() bool     { return t.Kind == KVoid }
 func (t *Type) IsPtr() bool      { return t.Kind == KPtr }
 func (t *Type) IsFloat() bool    { return t.Kind == KFloat }
@@ -203,6 +272,7 @@ func (t *Type) IsUnion() bool    { return t.Kind == KUnion }
 // int (signed or unsigned); it is the element type a string literal can
 // initialise an array of.
 func (t *Type) IsChar() bool { return t != nil && t.Kind == KInt && t.Width == 1 }
+func (t *Type) IsBool() bool { return t != nil && t.Kind == KBool }
 
 // PtrElem returns the element type of a pointer/array, or nil.
 func (t *Type) PtrElem() *Type {
@@ -217,6 +287,8 @@ func (t *Type) String() string {
 	switch t.Kind {
 	case KVoid:
 		return "void"
+	case KBool:
+		return "bool"
 	case KDouble:
 		return "double"
 	case KFloat:

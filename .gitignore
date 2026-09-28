@@ -27,3 +27,6 @@ src/examples/*
 # Ad-hoc build artifacts and local scratch space from debugging sessions.
 goclib_out.bin
 scratch/
+
+# Go build cache written next to the project when GOCACHE points here.
+.gocache/

@@ -342,6 +342,10 @@ func (c *checker) checkLValue(e Expr, fn *FuncDecl) (*Type, bool) {
 			c.errf(n.Line, "function %q is not a modifiable lvalue", n.Name)
 			return t, false
 		}
+		if t.Const {
+			c.errf(n.Line, "cannot assign to const-typed %q", n.Name)
+			return t, false
+		}
 		return t, true
 	case *Unary:
 		if n.Op != "*" {
@@ -403,11 +407,40 @@ func (c *checker) checkMemberLValue(n *MemberExpr, fn *FuncDecl) (*Type, bool) {
 	}
 	for _, m := range st.Members {
 		if m.Name == n.Name {
+			if m.Type.Const {
+				c.errf(n.Line, "cannot assign to const member %q", n.Name)
+				return m.Type, false
+			}
 			return m.Type, true
 		}
 	}
 	c.errf(n.Line, "no member %q in %s", n.Name, st.String())
 	return IntType(), false
+}
+
+// findStructMember resolves the *Member of a MemberExpr without reporting
+// errors (used by the address-of check to reject bit-field members, and by
+// brace-initialisation to reject initialising bit-fields).
+func (c *checker) findStructMember(n *MemberExpr, fn *FuncDecl) *Member {
+	bt := c.checkExpr(n.Base, fn)
+	var st *Type
+	if n.Arrow {
+		if !bt.IsPtr() || bt.Elem == nil {
+			return nil
+		}
+		st = bt.Elem
+	} else {
+		st = bt
+	}
+	if st == nil || (st.Kind != KStruct && st.Kind != KUnion) {
+		return nil
+	}
+	for _, m := range st.Members {
+		if m.Name == n.Name {
+			return m
+		}
+	}
+	return nil
 }
 
 func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
@@ -456,7 +489,10 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			}
 			return t
 		case "!":
-			c.checkExpr(n.E, fn)
+			t := c.checkExpr(n.E, fn)
+			if !t.IsScalar() {
+				c.errf(0, "operand of '!' must be scalar, got %s", t)
+			}
 			return IntType()
 		case "&":
 			// Taking the address of a function designator is how a function
@@ -472,6 +508,14 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 					// are lvalues for the purpose of taking their address even
 					// though they are not modifiable lvalues.
 					return PtrType(t)
+				}
+			}
+			// A bit-field member has no address of its own: "&s.bf" is an
+			// error in C.
+			if me, ok := n.E.(*MemberExpr); ok {
+				if m := c.findStructMember(me, fn); m != nil && m.BitWidth > 0 {
+					c.errf(me.Line, "cannot take address of bit-field member %q", me.Name)
+					return IntType()
 				}
 			}
 			lt, ok := c.checkLValue(n.E, fn)
@@ -531,7 +575,17 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		c.checkExpr(n.E, fn)
 		return n.Typ
 	case *IncDecExpr:
-		return c.checkExpr(n.E, fn)
+		// ++/-- operate in place, so the operand must be a modifiable lvalue
+		// (this also rejects const-typed and bit-field operands through
+		// checkLValue).
+		lt, ok := c.checkLValue(n.E, fn)
+		if !ok {
+			return IntType()
+		}
+		if !lt.IsArith() && !lt.IsPtr() && !lt.IsBool() {
+			c.errf(0, "operand of %s must be arithmetic or pointer, got %s", n.Op, lt)
+		}
+		return lt
 	case *MemberExpr:
 		_, ok := c.checkMemberLValue(n, fn)
 		if !ok {
@@ -752,6 +806,10 @@ func assignable(dst, src *Type) bool {
 	switch {
 	case dst.IsArith() && src.IsArith():
 		return true
+	case dst.IsBool() && src.IsIntClass():
+		return true // int -> bool conversion (0/1)
+	case dst.IsIntClass() && src.IsBool():
+		return true // bool -> int conversion
 	case dst.IsPtr() && src.IsPtr():
 		de, se := dst.Elem, src.Elem
 		if de == nil || se == nil || de.IsVoid() || se.IsVoid() {
@@ -815,6 +873,10 @@ func (c *checker) checkBraceInit(t *Type, bi *BraceInit, fn *FuncDecl, line int)
 			}
 		}
 		if mi < len(t.Members) {
+			if t.Members[mi].BitWidth > 0 {
+				c.errf(line, "cannot brace-initialise bit-field member %q", t.Members[mi].Name)
+				return
+			}
 			c.checkBraceElem(t.Members[mi].Type, el.E, fn, line)
 		}
 	default:
@@ -844,6 +906,10 @@ func (c *checker) checkStructBrace(t *Type, bi *BraceInit, fn *FuncDecl, line in
 				c.errf(line, "struct has no member %q", el.Desig)
 				continue
 			}
+			if t.Members[mi].BitWidth > 0 {
+				c.errf(line, "cannot brace-initialise bit-field member %q", el.Desig)
+				continue
+			}
 			c.checkBraceElem(t.Members[mi].Type, el.E, fn, line)
 		}
 		return
@@ -859,6 +925,10 @@ func (c *checker) checkStructBrace(t *Type, bi *BraceInit, fn *FuncDecl, line in
 			// walk would silently overwrite; reject the mix instead.
 			c.errf(line, "cannot mix positional and designated (\".%s =\") initialisers", el.Desig)
 			return
+		}
+		if t.Members[i].BitWidth > 0 {
+			c.errf(line, "cannot brace-initialise bit-field member %q", t.Members[i].Name)
+			continue
 		}
 		c.checkBraceElem(t.Members[i].Type, el.E, fn, line)
 	}

@@ -49,6 +49,10 @@ type CG struct {
 	resTyp      CType             // type of the value left by the last genExprT
 	resSigned   bool              // signedness of the last genExprT result (int-class only)
 	resW        int               // semantic width of the last genExprT result: 1/2/4 (int-class), 8 (long/pointer/double)
+	lvBitWidth  int               // bit width of the bit-field lvalue addressed by the last genLValue (0 = not a bit-field)
+	lvBitOff    int               // bit offset of that bit-field within its storage unit
+	lvBitUnit   int               // storage-unit size in bytes (1/2/4/8) of that bit-field's base type
+	lvBitSigned bool              // signedness of that bit-field's base type (for sign extension)
 	tmpSgn      []bool            // signedness of each expression-temporary slot
 	loops       []loopLabels      // active loop targets for break/continue
 	breaks      []string          // active break targets: innermost loop or switch, last
@@ -682,6 +686,8 @@ func (c *CG) slotWidth(t *Type) int {
 			return 1
 		}
 		return t.Width
+	case KBool:
+		return 1 // bool stored as 1 byte
 	case KFloat:
 		// A float scalar really is 4 bytes in memory: it is stored as an IEEE
 		// single and widened to double on every read. (A double stays 8.)
@@ -701,25 +707,26 @@ func (c *CG) slotWidth(t *Type) int {
 // takes. width 8 (or any non-narrow value) is a no-op.
 func (c *CG) extendInt(width int, signed bool) {
 	switch width {
-	case 1:
+	case 1: // char or bool
 		if signed {
 			c.emit("shl rax, 56")
 			c.emit("sar rax, 56")
 		} else {
 			c.emit("and rax, 0xff")
 		}
-	case 2:
+	case 2: // short
 		if signed {
 			c.emit("shl rax, 48")
 			c.emit("sar rax, 48")
 		} else {
 			c.emit("and rax, 0xffff")
 		}
-	case 4:
+	case 4: // int
 		if signed {
 			c.emit("shl rax, 32")
 			c.emit("sar rax, 32")
 		}
+	// case 8 for long/pointer is no-op, fall through
 	}
 }
 
@@ -783,6 +790,9 @@ func (c *CG) semWOf(t *Type) int {
 			return 1
 		}
 		return t.Width
+	}
+	if t.Kind == KBool {
+		return 1
 	}
 	return 8
 }
@@ -857,6 +867,9 @@ func (c *CG) storeVar(vi varInfo) {
 	if vi.reg != "" {
 		// Register-cached int local: keep it in the callee-save (which
 		// survives function calls, so no spill is needed).
+		if vi.typ != nil && vi.typ.Kind == KBool {
+			c.normalizeBool()
+		}
 		c.emit("mov %s, rax", vi.reg)
 		return
 	}
@@ -870,6 +883,9 @@ func (c *CG) storeVar(vi varInfo) {
 			c.emit("movsd [rbp%+d], xmm0", vi.off)
 		}
 		return
+	}
+	if vi.typ != nil && vi.typ.Kind == KBool {
+		c.normalizeBool()
 	}
 	switch c.slotWidth(vi.typ) {
 	case 1:
@@ -1067,6 +1083,13 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 			c.resW = 8
 			return TInt, nil
 		}
+		if c.lvBitWidth > 0 {
+			// Bit-field member: genLValue armed the field geometry (bit
+			// offset/width inside the storage unit at r10); extract with
+			// sign or zero extension per the member's signedness.
+			c.genLoadBitfield(c.lvBitUnit, c.lvBitOff, c.lvBitWidth, c.lvBitSigned)
+			return c.resTyp, nil
+		}
 		// Members are laid out at their C type width (MSVC x64 packs an int
 		// member as 4 bytes), not the 8-byte scalar slot width -- loading the
 		// slot width would read 4 bytes past a trailing int member. Double
@@ -1242,7 +1265,17 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		} else {
 			c.emit("mov rax, [rbp%+d]", rslot)
 		}
-		c.genStoreElem("r10", width, class)
+		if c.lvBitWidth > 0 {
+			// Bit-field store: RMW inside the storage unit; the truncated
+			// field value stays in rax as the assignment's result. Bit-fields
+			// are never floating point, so rt is necessarily TInt here.
+			c.genStoreBitfield(c.lvBitUnit, c.lvBitOff, c.lvBitWidth, c.lvBitSigned)
+		} else {
+			if lt := c.exprType(n.Lhs); lt != nil && lt.Kind == KBool {
+				c.normalizeBool()
+			}
+			c.genStoreElem("r10", width, class)
+		}
 		c.tmpDepth--
 		return rt, nil
 	case *VaArgExpr:
@@ -2227,6 +2260,10 @@ func (c *CG) genStmt(s Stmt) error {
 			if c.curRet != nil && c.curRet.Kind == KFloat {
 				c.emit("cvtsd2ss xmm0, xmm0")
 			}
+			// A _Bool return must be exactly 0 or 1 (C semantics).
+			if c.curRet != nil && c.curRet.Kind == KBool {
+				c.normalizeBool()
+			}
 		} else {
 			c.emit("mov rax, 0")
 		}
@@ -2570,6 +2607,9 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 
 // genLValue emits code that leaves the address of the lvalue e in r10.
 func (c *CG) genLValue(e Expr) error {
+	// Most lvalues are not bit-fields; the MemberExpr branch below re-arms
+	// these when it addresses one.
+	c.lvBitWidth, c.lvBitOff, c.lvBitUnit, c.lvBitSigned = 0, 0, 0, false
 	switch n := e.(type) {
 	case *Ident:
 		// Address of a function designator: "&add" is just another spelling of
@@ -2702,6 +2742,17 @@ func (c *CG) genLValue(e Expr) error {
 		for _, m := range st.Members {
 			if m.Name == n.Name {
 				off = m.Offset
+				if m.BitWidth > 0 {
+					// A bit-field member: r10 points at the START of its
+					// storage unit after the add below; the field lives at
+					// bit offset BitOff inside it. Consumers (MemberExpr
+					// loads, assignment stores, inc/dec) branch on
+					// lvBitWidth and use the bit address, not a plain load.
+					c.lvBitWidth = m.BitWidth
+					c.lvBitOff = m.BitOff
+					c.lvBitUnit = sizeOf(m.Type)
+					c.lvBitSigned = m.Type.Kind == KInt && m.Type.Signed
+				}
 				found = true
 				break
 			}
@@ -2798,6 +2849,8 @@ func (c *CG) typeWidth(t *Type) int {
 			return 1
 		}
 		return t.Width
+	case KBool:
+		return 1
 	case KStruct, KUnion:
 		if t.Size != 0 {
 			return t.Size
@@ -3068,6 +3121,79 @@ func (c *CG) genStoreElem(reg string, width int, class CType) {
 	}
 }
 
+// genLoadBitfield loads the bit-field whose storage unit starts at [r10] into
+// rax, zero- or sign-extended to 64 bits. unitW is the storage-unit width in
+// bytes, bitOff the field's bit offset inside it, bitW the field width. The
+// extract is: load the whole unit, shift the field down, then clear the bits
+// above it (a shift-out-and-back doubles as the mask, because goa has no
+// movzx and no easy large immediates; the final shl/sar or shl/shr also
+// performs the sign/zero extension).
+func (c *CG) genLoadBitfield(unitW, bitOff, bitW int, signed bool) {
+	c.genLoadElem("r10", unitW, TInt, false) // rax = zero-extended storage unit
+	c.emit("shr rax, %d", bitOff)            // field now in the low bitW bits
+	if signed {
+		// Sign-extend: move the field to the top, then arithmetic-shift back.
+		c.emit("shl rax, %d", 64-bitW)
+		c.emit("sar rax, %d", 64-bitW)
+	} else {
+		// Zero-extend: shift the field to the top and back.
+		c.emit("shl rax, %d", 64-bitW)
+		c.emit("shr rax, %d", 64-bitW)
+	}
+	c.resTyp = TInt
+	c.resSigned = signed
+	c.resW = 8
+}
+
+// genStoreBitfield writes the new bit-field value (currently in rax) into the
+// bit-field whose storage unit starts at [r10], preserving all other bits of
+// the unit (read-modify-write: clear the field's bits, OR in the positioned
+// new value, store the unit back). The new value is truncated to bitW bits,
+// matching C's "the value is reduced modulo 2^bitW" rule. r11/rdx are scratch.
+//
+// On return rax holds the truncated field value (sign-extended when signed),
+// which is the C result of the enclosing assignment/inc-dec expression -- the
+// value stored, not the whole unit. The caller's resTyp/resSigned/resW state
+// is preserved.
+func (c *CG) genStoreBitfield(unitW, bitOff, bitW int, signed bool) {
+	saveTyp, saveSgn, saveW := c.resTyp, c.resSigned, c.resW
+	// rdx = new value, masked to bitW bits and shifted into position.
+	c.emit("mov rdx, rax")
+	c.emit("shl rdx, %d", 64-bitW)
+	c.emit("shr rdx, %d", 64-bitW)
+	c.emit("shl rdx, %d", bitOff)
+	// rax = old storage unit (zero-extended).
+	c.genLoadElem("r10", unitW, TInt, false)
+	// r11 = old unit with the low bitOff+bitW bits cleared (field removed).
+	c.emit("mov r11, rax")
+	if bitOff+bitW < 64 {
+		c.emit("shr r11, %d", bitOff+bitW)
+		c.emit("shl r11, %d", bitOff+bitW)
+	} else {
+		// The field reaches the top of a 64-bit unit: nothing survives above it.
+		c.emit("xor r11, r11")
+	}
+	// rax = old unit's low bits below the field (kept untouched).
+	if bitOff > 0 {
+		c.emit("shl rax, %d", 64-bitOff)
+		c.emit("shr rax, %d", 64-bitOff)
+	} else {
+		c.emit("xor rax, rax")
+	}
+	c.emit("or rax, r11")
+	c.emit("or rax, rdx")
+	c.genStoreElem("r10", unitW, TInt)
+	// Leave the truncated field value in rax; sign-extend a signed field so
+	// the rvalue matches a fresh load of it.
+	c.emit("shr rdx, %d", bitOff)
+	c.emit("mov rax, rdx")
+	if signed {
+		c.emit("shl rax, %d", 64-bitW)
+		c.emit("sar rax, %d", 64-bitW)
+	}
+	c.resTyp, c.resSigned, c.resW = saveTyp, saveSgn, saveW
+}
+
 // copyBytes emits code that copies n bytes from the memory at src to the memory
 // at dst, register-to-register. It is used for whole-struct/union assignment,
 // where the value is too large to live in a single GP register. The copy is
@@ -3226,6 +3352,9 @@ func (c *CG) braceElemLocal(t *Type, e Expr, off int) error {
 	if err := c.ensureType(t.Class()); err != nil {
 		return err
 	}
+	if t.Kind == KBool {
+		c.normalizeBool()
+	}
 	c.emit("lea r10, [rbp%+d]", off)
 	c.genStoreElem("r10", w, t.Class())
 	return nil
@@ -3353,6 +3482,15 @@ func (c *CG) fillBraceElem(t *Type, e Expr, img []byte, off int) error {
 		for i := 0; i < 4; i++ {
 			img[off+i] = byte(bits >> (8 * i))
 		}
+		return nil
+	case KBool:
+		// A _Bool keeps exactly 0 or 1 even as a global (C semantics: any
+		// non-zero initialiser becomes 1).
+		v, _ := foldConstInit(e)
+		if v != 0 {
+			v = 1
+		}
+		img[off] = byte(v)
 		return nil
 	case KDouble:
 		f, _ := foldFloatInit(e)
@@ -3535,6 +3673,37 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 	// register-allocated because they can be address-taken).
 	if id, ok := n.E.(*Ident); ok {
 		if vi, ok2 := c.vars[id.Name]; ok2 && vi.reg != "" {
+			if et != nil && et.Kind == KBool {
+				// _Bool keeps exactly 0/1: normalise the register after the
+				// increment/decrement. Prefix returns the new (normalised)
+				// value; postfix returns the old value.
+				c.emit("mov rax, %s", vi.reg) // old value
+				if n.Prefix {
+					if step == 1 {
+						c.emit("inc %s", vi.reg)
+					} else {
+						c.emit("add %s, %d", vi.reg, step)
+					}
+					c.emit("mov rax, %s", vi.reg)
+					c.normalizeBool()
+					c.emit("mov %s, rax", vi.reg)
+				} else {
+					c.emit("mov rdx, rax") // save old value
+					if step == 1 {
+						c.emit("inc %s", vi.reg)
+					} else {
+						c.emit("add %s, %d", vi.reg, step)
+					}
+					c.emit("mov rax, %s", vi.reg)
+					c.normalizeBool()
+					c.emit("mov %s, rax", vi.reg)
+					c.emit("mov rax, rdx") // restore old value as the result
+				}
+				c.resTyp = TInt
+				c.resSigned = false
+				c.resW = 1
+				return TInt, nil
+			}
 			if n.Prefix {
 				if step == 1 {
 					c.emit("inc %s", vi.reg)
@@ -3603,6 +3772,37 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 		c.resW = 8
 		return TDouble, nil
 	}
+	if c.lvBitWidth > 0 {
+		// Bit-field: load with extract, modify, RMW back. genStoreBitfield
+		// leaves the truncated new field value in rax (the prefix result);
+		// for postfix the old value was spilled below and is restored.
+		c.genLoadBitfield(c.lvBitUnit, c.lvBitOff, c.lvBitWidth, c.lvBitSigned)
+		os := 0
+		saved := false
+		if !n.Prefix {
+			c.tmpDepth++
+			os = c.tmpSlot(c.tmpDepth)
+			c.emit("mov [rbp%+d], rax", os)
+			saved = true
+		}
+		if n.Op == "++" {
+			c.emit("inc rax")
+		} else {
+			c.emit("dec rax")
+		}
+		c.genStoreBitfield(c.lvBitUnit, c.lvBitOff, c.lvBitWidth, c.lvBitSigned)
+		if saved {
+			c.emit("mov rax, [rbp%+d]", os)
+			c.tmpDepth--
+		}
+		c.resTyp = TInt
+		c.resSigned = c.lvBitSigned
+		c.resW = resW
+		if resW == 4 {
+			c.canonInt(c.lvBitSigned)
+		}
+		return TInt, nil
+	}
 	c.genLoadElem("r10", width, TInt, signed)
 	os := 0
 	saved := false
@@ -3624,6 +3824,9 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 		} else {
 			c.emit("sub rax, %d", step)
 		}
+	}
+	if et != nil && et.Kind == KBool {
+		c.normalizeBool()
 	}
 	c.genStoreElem("r10", width, TInt)
 	if saved {
@@ -3652,6 +3855,22 @@ func (c *CG) emitCompare(jmpIfTrue string) {
 	c.emit("jmp %s", lEnd)
 	c.sb.WriteString(lTrue + ":\n")
 	c.emit("mov rax, 1")
+	c.sb.WriteString(lEnd + ":\n")
+}
+
+// normalizeBool canonicalises the 64-bit value in rax to exactly 0 or 1 using
+// a conditional branch (goa has no setcc). It is applied whenever a _Bool is
+// stored: C semantics say any non-zero value becomes 1. It is idempotent on
+// already-normalised values (1 -> 1, 0 -> 0).
+func (c *CG) normalizeBool() {
+	lFalse := c.newLabel("bnf")
+	lEnd := c.newLabel("bne")
+	c.emit("cmp rax, 0")
+	c.emit("je %s", lFalse)
+	c.emit("mov rax, 1")
+	c.emit("jmp %s", lEnd)
+	c.sb.WriteString(lFalse + ":\n")
+	c.emit("mov rax, 0")
 	c.sb.WriteString(lEnd + ":\n")
 }
 

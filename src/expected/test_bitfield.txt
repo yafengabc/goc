@@ -1,0 +1,13 @@
+a=5, b=17, c=-3
+after truncate: a=0, b=8, c=-3
+expr: 0 6 1
+signed read: c=-3 (want -3)
+wrap: a=0 (want 0)
+incdec: a=0 (want 0)
+signed inc: c=0 (want 0)
+straddle: a=5 b=123456789 c=17
+anon: a=3 b=1 b2=2 b3=3
+mixed: a=7 x=1234 b=9
+char: lo=5 hi=31
+union: raw=52651 lo=171 hi=205
+sizes: 4 12 12 12 1

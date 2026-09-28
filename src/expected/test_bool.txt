@@ -1,0 +1,14 @@
+b0=0
+b5=1
+bneg=1
+b100=1
+cmp: 1 0 1
+arith: 2 1 -1
+fn: 1 0
+b is true
+struct: 1 42
+bb=1
+bm_assign=1
+bm_inc=1
+bm_dec=0
+global: 1 42
