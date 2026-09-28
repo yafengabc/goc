@@ -1,0 +1,3 @@
+sum=7 g=7
+swap a=2 b=1
+lea v=8

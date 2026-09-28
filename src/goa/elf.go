@@ -102,21 +102,17 @@ func (a *Assembler) BuildELF(outPath string) error {
 	}
 
 	// Apply fixups. The displacement is measured from the byte after the
-	// 4-byte field, plus any trailing bytes the instruction has (f.ripAdj).
+	// displacement field itself, plus any trailing bytes the instruction has
+	// (f.ripAdj). Short jumps carry a 1-byte rel8 instead of a disp32.
 	for _, f := range a.fixups {
 		t, ok := symVA[f.sym]
 		if !ok {
 			return fmt.Errorf("undefined symbol referenced: %s", f.sym)
 		}
 		s := a.sections[f.sect]
-		if f.off+4 > len(s.Data) {
-			return fmt.Errorf("fixup out of range for %s", f.sym)
+		if err := applyFixup(s, f, t, elfBase+secOff[s]); err != nil {
+			return err
 		}
-		disp := int32(t - (elfBase + secOff[s] + f.off + 4 + f.ripAdj))
-		s.Data[f.off] = byte(disp)
-		s.Data[f.off+1] = byte(disp >> 8)
-		s.Data[f.off+2] = byte(disp >> 16)
-		s.Data[f.off+3] = byte(disp >> 24)
 	}
 
 	entryVA, ok := symVA[a.entry]

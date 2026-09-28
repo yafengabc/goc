@@ -26,24 +26,30 @@ type varInfo struct {
 }
 
 type CG struct {
-	sb          strings.Builder
-	strs        []StrLit
-	strLab      map[*StrLit]string
-	doubles     []float64
-	doubleLab   map[float64]string
-	label       int
-	vars        map[string]varInfo // per-function: param = +off, local = -off
-	localBytes  int                // bytes consumed by stack-resident locals (incl. array padding)
-	regArea     int                // bytes reserved just below rbp for saved callee-save regs
-	globals     map[string]bool    // names of program-level (global/static) variables
-	globalLab   map[string]string  // name -> .data label for a global variable
-	globalTyp   map[string]*Type   // name -> declared type of a global variable
-	// globalStrInits records globals of pointer type initialised by a string
-	// literal ("char *p = "str""). The pointer cannot live in .data as a
-	// relocation (goa has none), so the entry stub writes it at startup with
-	// `lea rax,[rip+<str>]; mov [<global>],rax` -- glab is the .data label,
-	// slab the .rdata label of the string constant.
-	globalStrInits []struct{ glab, slab string }
+	sb         strings.Builder
+	strs       []StrLit
+	strLab     map[*StrLit]string
+	doubles    []float64
+	doubleLab  map[float64]string
+	label      int
+	vars       map[string]varInfo // per-function: param = +off, local = -off
+	localBytes int                // bytes consumed by stack-resident locals (incl. array padding)
+	regArea    int                // bytes reserved just below rbp for saved callee-save regs
+	globals    map[string]bool    // names of program-level (global/static) variables
+	globalLab  map[string]string  // name -> .data label for a global variable
+	globalTyp  map[string]*Type   // name -> declared type of a global variable
+	// globalStrInits records every pointer slot initialised by a string literal
+	// -- top-level "char *p = "str"", a static local, or a char* member nested
+	// anywhere inside a braced initialiser. The pointer value cannot live in
+	// .data as a relocation (goa has none), so the entry stub writes each one
+	// at startup with `lea rax,[rip+<global>]; lea rdx,[rip+<str>];
+	// mov [rax+<off>],rdx` -- glab is the .data label of the object, off the
+	// byte offset of the pointer slot inside it, slab the .rdata label of the
+	// string constant.
+	globalStrInits []struct {
+		glab, slab string
+		off        int
+	}
 	// Static locals: a "static int x;" inside a function gets a unique .data
 	// label (collision-free even when two functions name their static "x") and
 	// persists across calls. c.staticVars maps the source name to that label
@@ -53,12 +59,12 @@ type CG struct {
 	staticVars map[string]string
 	staticList []staticEmit
 	staticSeq  int
-	usedRegs    []string           // callee-save registers actually used as local homes
-	tmpDepth    int                // live expression-temporary slots
-	funcs       map[string]bool    // user-defined functions (by name)
-	funcDefs    map[string]*FuncDecl
-	calls       map[string]bool   // functions called that are not defined here
-	need        map[string]bool   // goclib functions this program actually uses
+	usedRegs   []string        // callee-save registers actually used as local homes
+	tmpDepth   int             // live expression-temporary slots
+	funcs      map[string]bool // user-defined functions (by name)
+	funcDefs   map[string]*FuncDecl
+	calls      map[string]bool // functions called that are not defined here
+	need       map[string]bool // goclib functions this program actually uses
 	// Built-in C library (clibCStore): needed C functions are emitted through
 	// genFunc (which marks more needs, so Gen iterates to a fixpoint), and the
 	// library's file-scope variables join the .data pool -- but only those the
@@ -68,29 +74,29 @@ type CG struct {
 	libGlobUsed  map[string]bool
 	libGlobals   []*DeclStmt
 	linux        bool              // true -> SysV ABI + ELF output
-	curRet      *Type             // return type of the function being generated
-	curParam    []*Type           // parameter types of the current function
-	resTyp      CType             // type of the value left by the last genExprT
-	resSigned   bool              // signedness of the last genExprT result (int-class only)
-	resW        int               // semantic width of the last genExprT result: 1/2/4 (int-class), 8 (long/pointer/double)
-	lvBitWidth  int               // bit width of the bit-field lvalue addressed by the last genLValue (0 = not a bit-field)
-	lvBitOff    int               // bit offset of that bit-field within its storage unit
-	lvBitUnit   int               // storage-unit size in bytes (1/2/4/8) of that bit-field's base type
-	lvBitSigned bool              // signedness of that bit-field's base type (for sign extension)
-	tmpSgn      []bool            // signedness of each expression-temporary slot
-	loops       []loopLabels      // active loop targets for break/continue
-	breaks      []string          // active break targets: innermost loop or switch, last
-	swDepth     int               // how many switch statements enclose the code being emitted
-	swSlots     int               // switch value slots reserved in this frame (max nesting)
-	curFn       string            // name of the function being generated (label mangling)
-	labels      map[string]string // C label name -> assembly label, per function
-	saveBaseOff int               // rbp offset of the variadic save area (0 if none)
-	nFixed      int               // number of named params before "..." in the current fn
-	sretSlot    int               // rbp offset of this function's hidden sret-pointer slot (0 = returns a scalar)
-	resStruct   bool              // the last call returned a struct; its value is in a tmp result buffer
-	resStructSz int               // size in bytes of that struct
-	resStructK  int               // tmpSlot index of the first result-buffer slot
-	resStructSl int               // number of tmp slots occupied by the result buffer
+	curRet       *Type             // return type of the function being generated
+	curParam     []*Type           // parameter types of the current function
+	resTyp       CType             // type of the value left by the last genExprT
+	resSigned    bool              // signedness of the last genExprT result (int-class only)
+	resW         int               // semantic width of the last genExprT result: 1/2/4 (int-class), 8 (long/pointer/double)
+	lvBitWidth   int               // bit width of the bit-field lvalue addressed by the last genLValue (0 = not a bit-field)
+	lvBitOff     int               // bit offset of that bit-field within its storage unit
+	lvBitUnit    int               // storage-unit size in bytes (1/2/4/8) of that bit-field's base type
+	lvBitSigned  bool              // signedness of that bit-field's base type (for sign extension)
+	tmpSgn       []bool            // signedness of each expression-temporary slot
+	loops        []loopLabels      // active loop targets for break/continue
+	breaks       []string          // active break targets: innermost loop or switch, last
+	swDepth      int               // how many switch statements enclose the code being emitted
+	swSlots      int               // switch value slots reserved in this frame (max nesting)
+	curFn        string            // name of the function being generated (label mangling)
+	labels       map[string]string // C label name -> assembly label, per function
+	saveBaseOff  int               // rbp offset of the variadic save area (0 if none)
+	nFixed       int               // number of named params before "..." in the current fn
+	sretSlot     int               // rbp offset of this function's hidden sret-pointer slot (0 = returns a scalar)
+	resStruct    bool              // the last call returned a struct; its value is in a tmp result buffer
+	resStructSz  int               // size in bytes of that struct
+	resStructK   int               // tmpSlot index of the first result-buffer slot
+	resStructSl  int               // number of tmp slots occupied by the result buffer
 }
 
 // loopLabels records the break/continue targets of the innermost loop.
@@ -433,7 +439,7 @@ func (c *CG) extendInt(width int, signed bool) {
 			c.emit("shl rax, 32")
 			c.emit("sar rax, 32")
 		}
-	// case 8 for long/pointer is no-op, fall through
+		// case 8 for long/pointer is no-op, fall through
 	}
 }
 
@@ -866,8 +872,8 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		} else {
 			// The conditional expression's type is the C common type of the
 			// two arms (integer promotions applied).
-		c.resTyp = TInt
-		c.resW, c.resSigned = promotedArith(wThen, sThen, wElse, sElse)
+			c.resTyp = TInt
+			c.resW, c.resSigned = promotedArith(wThen, sThen, wElse, sElse)
 		}
 		return c.resTyp, nil
 	case *CommaExpr:
@@ -1026,21 +1032,21 @@ func Gen(prog *Program, linux bool) (string, error) {
 		return "", goclibErr
 	}
 	c := &CG{
-		strLab:    map[*StrLit]string{},
-		doubleLab: map[float64]string{},
-		vars:      map[string]varInfo{},
-		funcs:     map[string]bool{},
-		funcDefs:  map[string]*FuncDecl{},
-		calls:     map[string]bool{},
-		need:      map[string]bool{},
-		globals:   map[string]bool{},
-		globalLab: map[string]string{},
-		globalTyp: map[string]*Type{},
-		staticVars: map[string]string{},
+		strLab:       map[*StrLit]string{},
+		doubleLab:    map[float64]string{},
+		vars:         map[string]varInfo{},
+		funcs:        map[string]bool{},
+		funcDefs:     map[string]*FuncDecl{},
+		calls:        map[string]bool{},
+		need:         map[string]bool{},
+		globals:      map[string]bool{},
+		globalLab:    map[string]string{},
+		globalTyp:    map[string]*Type{},
+		staticVars:   map[string]string{},
 		libEmitted:   map[string]bool{},
 		libGlobNames: map[string]bool{},
 		libGlobUsed:  map[string]bool{},
-		linux:     linux,
+		linux:        linux,
 	}
 	for _, g := range prog.Globals {
 		c.globals[g.Name] = true
@@ -1166,25 +1172,24 @@ func Gen(prog *Program, linux bool) (string, error) {
 		out.WriteString(e)
 	}
 	out.WriteString("\n")
-	// Bind any global pointer initialised by a string literal before main runs
-	// (goa has no data relocations, so we write the address at startup).
+	// Bind every pointer slot initialised by a string literal before main runs.
+	// goa has no data relocations, so a pointer value cannot live in .data; the
+	// entry stub instead computes each string's address with lea and writes it
+	// into the (zero-filled) pointer slot. This covers top-level globals, static
+	// locals, and char* members nested anywhere inside a braced initialiser.
 	var strInit strings.Builder
 	for _, g := range prog.Globals {
-		if g.Typ != nil && g.Typ.Kind == KPtr {
-			if sl, ok := g.Init.(*StrLit); ok {
-				lab, ok := c.strLab[sl]
-				if !ok {
-					lab = fmt.Sprintf("LC%d", len(c.strs))
-					c.strs = append(c.strs, *sl)
-					c.strLab[sl] = lab
-				}
-				c.globalStrInits = append(c.globalStrInits,
-					struct{ glab, slab string }{c.globalLab[g.Name], lab})
-			}
-		}
+		c.walkGlobalInit(g.Typ, g.Init, c.globalLab[g.Name], 0)
+	}
+	for _, se := range c.staticList {
+		c.walkGlobalInit(se.d.Typ, se.d.Init, se.lab, 0)
 	}
 	for _, si := range c.globalStrInits {
-		fmt.Fprintf(&strInit, "\tlea rax, [rip+%s]\n\tmov [%s], rax\n", si.slab, si.glab)
+		// lea rax,[rip+glab] -- address of the pointer slot
+		// lea rdx,[rip+slab] -- address of the string constant
+		// mov [rax+off],rdx -- store the string pointer into the slot
+		fmt.Fprintf(&strInit, "\tlea rax, [rip+%s]\n\tlea rdx, [rip+%s]\n\tmov [rax+%d], rdx\n",
+			si.glab, si.slab, si.off)
 	}
 
 	// Entry stub: align the stack, run main, and hand its return value to the
@@ -1594,6 +1599,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// and which stay on the stack.
 	var decls []localDecl
 	maxSwDepth := 0
+	hasAsm := false // an inline-assembly block in this function?
 	var gather func(Stmt, int)
 	gather = func(s Stmt, swDepth int) {
 		if swDepth > maxSwDepth {
@@ -1648,6 +1654,8 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			gather(n.Body, swDepth+1)
 		case *LabelStmt:
 			gather(n.Stmt, swDepth)
+		case *AsmStmt:
+			hasAsm = true
 		}
 	}
 	for _, st := range f.Body.Stmts {
@@ -1661,6 +1669,16 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// small int is a candidate for a callee-save register home.
 	addrTaken := c.findAddressTaken(f)
 	regPool := []string{"rbx", "r12", "r13", "r14"}
+	// A function that contains an inline-assembly block must keep every
+	// local on the stack: the asm text binds C variable names to their
+	// frame slots ([rbp+off]) or, worse, to a callee-save register home
+	// that the hand-written asm neither knows about nor preserves. Forcing
+	// the whole pool empty (regPool = nil below makes "ri < len(regPool)"
+	// always false) gives the asm a stable, addressable memory home for
+	// every variable it names.
+	if hasAsm {
+		regPool = nil
+	}
 	c.usedRegs = nil
 	regOf := map[string]string{}
 	ri := 0
@@ -2280,6 +2298,17 @@ func (c *CG) genStmt(s Stmt) error {
 		if n.Stmt != nil {
 			return c.genStmt(n.Stmt)
 		}
+	case *AsmStmt:
+		// Inline assembly: the raw block text goes to goa almost verbatim.
+		// Each line first passes through the binder (bindAsmLine), which
+		// rewrites every bare C variable name -- local, parameter, global
+		// or static local -- into the memory operand that addresses it, so
+		// hand-written asm can read and write C variables directly. goa
+		// trims each line and skips blanks, so empty lines from the block
+		// (after '{' / before '}') are harmless.
+		for _, ln := range strings.Split(n.Text, "\n") {
+			c.sb.WriteString(c.bindAsmLine(ln) + "\n")
+		}
 	case *BreakStmt:
 		// break binds to the innermost enclosing loop *or* switch; the
 		// separate stack keeps a switch from stealing a loop's continue.
@@ -2298,6 +2327,223 @@ func (c *CG) genStmt(s Stmt) error {
 		return fmt.Errorf("line %d: default label outside a switch", n.Line)
 	}
 	return nil
+}
+
+// asmReserved is every word the inline-asm binder must never rewrite into a
+// C variable's memory operand: goa's register names (GP 8/16/32/64-bit, XMM,
+// plus the rip pseudo-register), the NASM-style size keywords goa strips
+// before parsing an operand, and the instruction/data mnemonics goa's encode
+// table accepts. A C variable that collides with one of these cannot be
+// named directly inside an asm block. The list mirrors src/goa/asm.go
+// (register tables around line 149, encode table around line 924); keep the
+// two in sync.
+var asmReserved = func() map[string]bool {
+	m := map[string]bool{
+		// 64-bit GP registers
+		"rax": true, "rcx": true, "rdx": true, "rbx": true, "rsp": true,
+		"rbp": true, "rsi": true, "rdi": true,
+		"r8": true, "r9": true, "r10": true, "r11": true,
+		"r12": true, "r13": true, "r14": true, "r15": true,
+		// 32-bit GP registers
+		"eax": true, "ecx": true, "edx": true, "ebx": true, "esp": true,
+		"ebp": true, "esi": true, "edi": true,
+		"r8d": true, "r9d": true, "r10d": true, "r11d": true,
+		"r12d": true, "r13d": true, "r14d": true, "r15d": true,
+		// 16-bit GP registers
+		"ax": true, "cx": true, "dx": true, "bx": true, "sp": true,
+		"bp": true, "si": true, "di": true,
+		"r8w": true, "r9w": true, "r10w": true, "r11w": true,
+		"r12w": true, "r13w": true, "r14w": true, "r15w": true,
+		// 8-bit GP registers
+		"al": true, "cl": true, "dl": true, "bl": true, "spl": true,
+		"bpl": true, "sil": true, "dil": true,
+		"r8b": true, "r9b": true, "r10b": true, "r11b": true,
+		"r12b": true, "r13b": true, "r14b": true, "r15b": true,
+		// XMM registers
+		"xmm0": true, "xmm1": true, "xmm2": true, "xmm3": true,
+		"xmm4": true, "xmm5": true, "xmm6": true, "xmm7": true,
+		"xmm8": true, "xmm9": true, "xmm10": true, "xmm11": true,
+		"xmm12": true, "xmm13": true, "xmm14": true, "xmm15": true,
+		// pseudo-register and operand size keywords
+		"rip": true, "ptr": true, "byte": true, "word": true,
+		"dword": true, "qword": true,
+		// data directives
+		"db": true, "dq": true, "du": true,
+		// control flow
+		"ret": true, "retq": true, "retn": true, "leave": true,
+		"nop": true, "int3": true, "push": true, "pop": true,
+		"call": true, "jmp": true, "jrcxz": true, "jecxz": true,
+		// data movement / arithmetic / logic
+		"lea": true, "mov": true, "add": true, "sub": true, "and": true,
+		"or": true, "xor": true, "cmp": true, "test": true,
+		"adc": true, "sbb": true, // carry/borrow forms for multi-word math
+		"not": true, "mul": true,
+		"xchg": true, "bswap": true,
+		"bt": true, "bts": true, "btr": true, "btc": true, // bit test family
+		"movzx": true, "movsx": true, "movsxd": true, "movslq": true,
+		"movzbl": true, "movzbw": true, "movzbq": true,
+		"movzwl": true, "movzwq": true,
+		"movsbl": true, "movsbw": true, "movsbq": true,
+		"movswl": true, "movswq": true,
+		"inc": true, "dec": true, "neg": true,
+		"idiv": true, "div": true, "imul": true,
+		"shl": true, "sal": true, "shr": true, "sar": true,
+		"rol": true, "ror": true, "rcl": true, "rcr": true, // rotations
+		"cqo": true, "cqto": true, "cdq": true, "cltd": true,
+		"cdqe": true, "cltq": true, "cwde": true, "cwtl": true,
+		"syscall": true,
+		// processor control / serialisation
+		"pause": true, "hlt": true, "ud2": true,
+		"cpuid": true, "rdtsc": true,
+		"mfence": true, "lfence": true, "sfence": true,
+		// SSE
+		"movsd": true, "movss": true, "addsd": true, "subsd": true,
+		"mulsd": true, "divsd": true, "sqtsd": true, "xorpd": true,
+		"ucomisd": true, "cvtsi2sd": true, "cvttsd2si": true,
+		"cvtss2sd": true, "cvtsd2ss": true, "movq": true,
+	}
+	// The j<cc> / set<cc> / cmov<cc> families are generated from ONE spelling
+	// list rather than written out three times, so adding a condition code
+	// cannot leave one of the families unprotected. Keep this list identical
+	// to ccTable + ccAlias in src/goa/asm.go.
+	ccSpellings := []string{
+		// canonical codes
+		"o", "no", "b", "ae", "e", "ne", "be", "a",
+		"s", "ns", "p", "np", "l", "ge", "le", "g",
+		// classic synonyms
+		"z", "nz", "c", "nae", "nb", "nc", "na", "nbe",
+		"pe", "po", "nge", "nl", "ng", "nle",
+	}
+	for _, prefix := range []string{"j", "set", "cmov"} {
+		for _, cc := range ccSpellings {
+			m[prefix+cc] = true
+		}
+	}
+	return m
+}()
+
+func isAsmIdentStart(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func isAsmIdentByte(b byte) bool {
+	return isAsmIdentStart(b) || (b >= '0' && b <= '9')
+}
+
+// bindAsmLine rewrites one line of inline-assembly text so that every bare C
+// variable name becomes the memory operand that addresses it:
+//
+//	locals and parameters (c.vars)  -> [rbp+off]
+//	globals and static locals       -> [rip+G_x]   (label via c.globalLab)
+//
+// Registers, mnemonics, numeric literals (0x10, 123), .L local labels and
+// anything inside a string literal or comment are left untouched. The scan
+// mirrors goa's stripComment: ';' and "//" end the line (quote-aware), and a
+// backslash inside a string escapes the next character. A variable already
+// sitting inside square brackets is rewritten to its bare form (G_x or
+// rbp+off) so "[x]" does not double-wrap into "[ [rip+G_x] ]"; a word
+// followed by ':' (a label definition) or '[' (an array-style reference
+// like "x[0]") is never rewritten.
+func (c *CG) bindAsmLine(ln string) string {
+	t := strings.TrimLeft(ln, " \t")
+	if strings.HasPrefix(t, "#") {
+		return ln // goa treats a leading '#' as a comment too
+	}
+	var out strings.Builder
+	inBracket := false
+	for i := 0; i < len(ln); {
+		ch := ln[i]
+		if ch == '"' || ch == '\'' {
+			// Copy the whole string literal verbatim (backslash escapes the
+			// next character), exactly like goa's stripComment.
+			j := i + 1
+			for j < len(ln) {
+				if ln[j] == '\\' && j+1 < len(ln) {
+					j += 2
+					continue
+				}
+				if ln[j] == ch {
+					j++
+					break
+				}
+				j++
+			}
+			out.WriteString(ln[i:j])
+			i = j
+			continue
+		}
+		if ch == ';' || (ch == '/' && i+1 < len(ln) && ln[i+1] == '/') {
+			out.WriteString(ln[i:]) // comment runs to end of line
+			break
+		}
+		if ch == '[' {
+			inBracket = true
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if ch == ']' {
+			inBracket = false
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if isAsmIdentStart(ch) || (ch >= '0' && ch <= '9') {
+			j := i + 1
+			for j < len(ln) && isAsmIdentByte(ln[j]) {
+				j++
+			}
+			word := ln[i:j]
+			if ch >= '0' && ch <= '9' {
+				out.WriteString(word) // numeric literal (0x10, 123, ...)
+				i = j
+				continue
+			}
+			// A label definition ("foo:") or array-style reference
+			// ("x[0]") is not a plain variable operand.
+			if j < len(ln) && (ln[j] == ':' || ln[j] == '[') {
+				out.WriteString(word)
+				i = j
+				continue
+			}
+			out.WriteString(c.asmBindWord(word, inBracket))
+			i = j
+			continue
+		}
+		out.WriteByte(ch)
+		i++
+	}
+	return out.String()
+}
+
+// asmBindWord maps one candidate word to the memory operand that addresses
+// it, or returns the word unchanged when it is not a C variable (or is a
+// reserved asm word). inBracket selects the inside-of-[...] form (bare
+// symbol G_x / register base rbp+off) versus the full memory operand
+// ([rip+G_x] / [rbp+off]).
+func (c *CG) asmBindWord(w string, inBracket bool) string {
+	if asmReserved[w] {
+		return w
+	}
+	if vi, ok := c.vars[w]; ok {
+		// vi.off is always set in a function that contains an asm block
+		// (hasAsm forces every local onto the stack); the register-home
+		// branch is a defensive no-op.
+		if vi.reg != "" {
+			return w
+		}
+		if inBracket {
+			return fmt.Sprintf("rbp%+d", vi.off)
+		}
+		return fmt.Sprintf("[rbp%+d]", vi.off)
+	}
+	if lab, ok := c.globalLab[w]; ok {
+		if inBracket {
+			return lab
+		}
+		return "[rip+" + lab + "]"
+	}
+	return w
 }
 
 // labelSym returns the assembly label for a C label, creating one on first
@@ -2677,6 +2923,22 @@ func (c *CG) elemClassOf(e Expr) CType {
 	case *Ident:
 		vi, ok := c.vars[n.Name]
 		if !ok {
+			// A static local shadows a same-named global; its type lives
+			// under its .data label, not the source name.
+			if lab, ok2 := c.staticVars[n.Name]; ok2 {
+				if gt := c.globalTyp[lab]; gt != nil {
+					if gt.Kind == KDouble {
+						return TDouble
+					}
+					if gt.IsPtr() && gt.Elem != nil {
+						return gt.Elem.Class()
+					}
+					if gt.IsArray() && gt.Elem != nil {
+						return gt.Elem.Class()
+					}
+				}
+				return TInt
+			}
 			if gt := c.globalTyp[n.Name]; gt != nil {
 				if gt.Kind == KDouble {
 					return TDouble
@@ -2800,6 +3062,11 @@ func (c *CG) exprType(e Expr) *Type {
 		if vi, ok := c.vars[n.Name]; ok {
 			return vi.typ
 		}
+		// A static local's type is registered under its .data label, not its
+		// source name (which may even collide with a file-scope global).
+		if lab, ok := c.staticVars[n.Name]; ok {
+			return c.globalTyp[lab]
+		}
 		// A function designator decays to a pointer to that function.
 		if fd, ok := c.funcDefs[n.Name]; ok {
 			ft := FuncType(fd.Ret, fd.ParamTypes)
@@ -2858,6 +3125,18 @@ func (c *CG) elemWidthOf(e Expr) int {
 	case *Ident:
 		vi, ok := c.vars[n.Name]
 		if !ok {
+			// A static local shadows a same-named global; its type lives
+			// under its .data label, not the source name.
+			if lab, ok2 := c.staticVars[n.Name]; ok2 {
+				gt := c.globalTyp[lab]
+				if gt == nil {
+					return 8
+				}
+				if (gt.IsPtr() || gt.IsArray()) && gt.Elem != nil {
+					return c.typeWidth(gt.Elem)
+				}
+				return c.typeWidth(gt)
+			}
 			gt := c.globalTyp[n.Name]
 			if gt == nil {
 				return 8
@@ -3263,6 +3542,89 @@ func (c *CG) braceElemLocal(t *Type, e Expr, off int) error {
 	return nil
 }
 
+// walkGlobalInit scans a global/static-local initialiser for every pointer
+// slot initialised by a string literal and records the (label, byte offset,
+// string label) triple in c.globalStrInits so the entry stub can bind it at
+// startup. It mirrors the layout walk of fillBraceImage: arrays by element
+// stride, structs by member offset, unions by first member. A string filling a
+// char array needs no binding (its bytes live directly in .data).
+func (c *CG) walkGlobalInit(t *Type, init Expr, glab string, off int) {
+	if t == nil {
+		return
+	}
+	bi, ok := init.(*BraceInit)
+	if !ok {
+		if sl, ok := init.(*StrLit); ok && t.Kind == KPtr {
+			lab, ok := c.strLab[sl]
+			if !ok {
+				lab = fmt.Sprintf("LC%d", len(c.strs))
+				c.strs = append(c.strs, *sl)
+				c.strLab[sl] = lab
+			}
+			c.globalStrInits = append(c.globalStrInits,
+				struct {
+					glab, slab string
+					off        int
+				}{glab, lab, off})
+		}
+		return
+	}
+	if t.IsArray() {
+		ew := c.typeWidth(t.Elem)
+		for i, el := range bi.Elems {
+			if i >= t.Len {
+				break
+			}
+			c.walkGlobalInit(t.Elem, el.E, glab, off+i*ew)
+		}
+		return
+	}
+	if t.IsStruct() {
+		allDesig := len(bi.Elems) > 0
+		for _, el := range bi.Elems {
+			if el.Desig == "" {
+				allDesig = false
+				break
+			}
+		}
+		if allDesig {
+			for _, el := range bi.Elems {
+				if mi := memberIndex(t, el.Desig); mi >= 0 {
+					m := t.Members[mi]
+					c.walkGlobalInit(m.Type, el.E, glab, off+m.Offset)
+				}
+			}
+			return
+		}
+		for i, el := range bi.Elems {
+			if i >= len(t.Members) {
+				break
+			}
+			m := t.Members[i]
+			c.walkGlobalInit(m.Type, el.E, glab, off+m.Offset)
+		}
+		return
+	}
+	if t.IsUnion() {
+		if len(bi.Elems) == 0 {
+			return
+		}
+		el := bi.Elems[0]
+		m := t.Members[0]
+		if el.Desig != "" {
+			if mi := memberIndex(t, el.Desig); mi >= 0 {
+				m = t.Members[mi]
+			}
+		}
+		c.walkGlobalInit(m.Type, el.E, glab, off+m.Offset)
+		return
+	}
+	if len(bi.Elems) != 1 {
+		return
+	}
+	c.walkGlobalInit(t, bi.Elems[0].E, glab, off)
+}
+
 // emitGlobalVar lays out one program-level variable (true global or static
 // local) in .data under the given label. The emission mirrors the rules the
 // .data loop used for globals: a braced initialiser is rendered as a byte
@@ -3333,8 +3695,9 @@ func (c *CG) emitGlobalVar(out *strings.Builder, g *DeclStmt, lab string) error 
 
 // emitGlobalBrace lays out a global aggregate from a braced initialiser as a
 // byte image and emits it as db bytes. Bytes not explicitly initialised stay
-// zero. Pointer elements cannot take a string literal: goa has no data
-// relocations, so the pointer value could not be resolved.
+// zero. A char* member initialised by a string literal also stays zero here:
+// walkGlobalInit registered the (object, offset, string) triple and the entry
+// stub writes the string's address at startup (goa has no data relocations).
 func (c *CG) emitGlobalBrace(out *strings.Builder, t *Type, bi *BraceInit, lab string) error {
 	size := c.typeWidth(t)
 	if size < 1 {
@@ -3442,9 +3805,10 @@ func (c *CG) fillBraceElem(t *Type, e Expr, img []byte, off int) error {
 			copy(img[off:], b)
 			return nil
 		}
-		if t.Kind == KPtr {
-			return fmt.Errorf("global pointer initialiser from a string literal is not supported (goa has no data relocations)")
-		}
+		// A pointer slot initialised by a string leaves 8 zero bytes here:
+		// walkGlobalInit has already registered the (object, offset, string)
+		// triple, and the entry stub writes the string's address at startup.
+		// goa has no data relocations, so the value cannot be stored in .data.
 	}
 	switch t.Kind {
 	case KFloat:
@@ -3549,6 +3913,22 @@ func (c *CG) lvalueWidth(e Expr) int {
 			}
 			return 8
 		}
+		// A static local shadows a same-named global; its type lives under
+		// its .data label, not the source name.
+		if lab, ok2 := c.staticVars[id.Name]; ok2 {
+			if gt := c.globalTyp[lab]; gt != nil {
+				if gt.IsPtr() {
+					return 8
+				}
+				if gt.Kind == KFloat {
+					return 4
+				}
+				if gt.Kind == KStruct || gt.Kind == KUnion {
+					return gt.Size
+				}
+			}
+			return 8
+		}
 		if c.globals[id.Name] {
 			// A float global occupies 4 bytes in .data (emitted as four db
 			// values); everything else is a quad.
@@ -3573,6 +3953,14 @@ func (c *CG) lvalueClass(e Expr) CType {
 	if id, ok := e.(*Ident); ok {
 		if vi, ok2 := c.vars[id.Name]; ok2 {
 			return vi.typ.Class()
+		}
+		// A static local shadows a same-named global; its type lives under
+		// its .data label, not the source name.
+		if lab, ok2 := c.staticVars[id.Name]; ok2 {
+			if gt := c.globalTyp[lab]; gt != nil {
+				return gt.Class()
+			}
+			return TInt
 		}
 		if c.globals[id.Name] {
 			if gt := c.globalTyp[id.Name]; gt != nil {

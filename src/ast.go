@@ -59,7 +59,7 @@ type DeclStmt struct {
 	// single-translation-unit compiler, so register/auto are accepted as no-ops
 	// and extern/static only matter for the static-local lifetime rule.
 	Storage string
-	Line int
+	Line    int
 }
 
 type AssignStmt struct {
@@ -161,6 +161,15 @@ type GotoStmt struct {
 type LabelStmt struct {
 	Name string
 	Stmt Stmt
+	Line int
+}
+
+// AsmStmt is an inline-assembly block "__asm { ... }". Text is the raw source
+// between the braces, exactly as written (whitespace and comments included);
+// the code generator binds C variable names in it to their frame slots or
+// registers and hands it to goa verbatim.
+type AsmStmt struct {
+	Text string
 	Line int
 }
 

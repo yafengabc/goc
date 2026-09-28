@@ -1083,6 +1083,18 @@ func (p *Parser) parseStmt() (Stmt, error) {
 			return nil, err
 		}
 		return &GotoStmt{Label: lab.Text, Line: t.Line}, nil
+	case t.Kind == TKeyword && (t.Text == "__asm" || t.Text == "_asm"):
+		// Inline assembly. The lexer has already captured the raw block text
+		// as a single TAsm token (its body is assembler, not C), so there is
+		// nothing to parse here beyond the token itself.
+		p.next()
+		if p.cur().Kind != TAsm {
+			return nil, fmt.Errorf("line %d: expected a '{' block after %s", t.Line, t.Text)
+		}
+		block := p.cur().Text
+		line := p.cur().Line
+		p.next()
+		return &AsmStmt{Text: block, Line: line}, nil
 	case t.Kind == TKeyword && (t.Text == "break" || t.Text == "continue"):
 		p.next()
 		if err := p.expect(";"); err != nil {
@@ -1649,14 +1661,14 @@ func (p *Parser) parsePostfix() (Expr, error) {
 				e = &VaArgExpr{Ap: ap, Typ: dt.typ}
 				continue
 			}
-				var args []Expr
-				if !p.atPunct(")") {
-					for {
-						// C89 argument expressions are assignment-expressions,
-						// not comma-expressions: the top-level commas separate
-						// arguments. Parenthesised sub-expressions still parse
-						// the full comma-expression via parseExpr inside.
-						a, err := p.parseAssign()
+			var args []Expr
+			if !p.atPunct(")") {
+				for {
+					// C89 argument expressions are assignment-expressions,
+					// not comma-expressions: the top-level commas separate
+					// arguments. Parenthesised sub-expressions still parse
+					// the full comma-expression via parseExpr inside.
+					a, err := p.parseAssign()
 					if err != nil {
 						return nil, err
 					}

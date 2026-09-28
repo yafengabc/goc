@@ -223,6 +223,14 @@ func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 	case *GotoStmt:
 		// The target is validated once the whole function body is known
 		// (see checkLabels), because goto may jump forward.
+	case *AsmStmt:
+		// Inline assembly: the body is raw assembler text, not C, so there
+		// is nothing to type-check here. Variable names it refers to are
+		// bound to frame slots by the code generator (unknown identifiers
+		// are left alone and reported by goa as undefined symbols). The
+		// block cannot jump out of the function on its own, and any
+		// control-flow labels it defines are assembler-local, so no scope
+		// bookkeeping is needed either.
 	case *LabelStmt:
 		if n.Stmt != nil {
 			c.checkStmt(n.Stmt, fn)

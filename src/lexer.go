@@ -15,6 +15,12 @@ const (
 	TStr
 	TPunct
 	TKeyword
+	// TAsm carries the raw source text of a "__asm { ... }" block (the bytes
+	// between the braces, exactly as written). The block is handed through to
+	// the assembler verbatim, so the lexer captures the original spelling
+	// rather than a token stream -- whitespace, indentation and comment
+	// characters are all significant to goa.
+	TAsm
 )
 
 var keywords = map[string]bool{
@@ -171,6 +177,28 @@ func Lex(src string) ([]Token, error) {
 				i++
 			}
 			text := src[start:i]
+			// Inline assembly: "__asm { ... }" (and the MSVC alias "_asm")
+			// begins a block whose body is raw assembler text, not C. The
+			// block is only entered when the keyword is directly followed by
+			// '{' -- a bare "__asm" used as an ordinary identifier (or a GNU
+			// asm("...") call) lexes normally.
+			if (text == "__asm" || text == "_asm") && asmBraceFollows(src, i) {
+				// The switch-case body is its own scope in Go, so a := here
+				// would shadow the outer i/line and both fail to compile
+				// ("declared and not used: i") and, worse, discard the line
+				// counter the asm block advanced past -- making every later
+				// token carry the wrong line number. Assign to the outer
+				// variables explicitly instead.
+				var asmText string
+				var asmErr error
+				asmText, i, line, asmErr = lexAsmBlock(src, i, line)
+				if asmErr != nil {
+					return nil, asmErr
+				}
+				push(Token{Kind: TKeyword, Text: text, Line: line})
+				push(Token{Kind: TAsm, Text: asmText, Line: line})
+				continue
+			}
 			if keywords[text] {
 				push(Token{Kind: TKeyword, Text: text, Line: line})
 			} else {
@@ -276,4 +304,100 @@ func Lex(src string) ([]Token, error) {
 	}
 	push(Token{Kind: TEOF, Line: line})
 	return toks, nil
+}
+
+// asmBraceFollows reports whether the source at src[i:] (after whitespace)
+// opens a '{' -- i.e. an "__asm" token is followed by an inline-assembly
+// block rather than being an ordinary identifier.
+func asmBraceFollows(src string, i int) bool {
+	for i < len(src) {
+		switch src[i] {
+		case ' ', '\t', '\r', '\n':
+			i++
+		default:
+			return src[i] == '{'
+		}
+	}
+	return false
+}
+
+// lexAsmBlock consumes the body of a "__asm { ... }" block whose opening '{'
+// sits at src[i] and returns the raw text between the braces, the source
+// offset just past the matching '}', and the updated line counter.
+//
+// The body is assembler text, so its own quoting rules apply: a ';' or "//"
+// starts a line comment that runs to end of line, and string/char literals
+// are copied verbatim. '{' and '}' are only significant outside strings and
+// comments, and nesting depth is tracked so that stray braces (or a '}' in a
+// comment) never end the block early.
+func lexAsmBlock(src string, i, line int) (string, int, int, error) {
+	n := len(src)
+	// The caller passes the position just past the "__asm" keyword, which may
+	// be followed by whitespace before the opening '{'. Skip it (counting
+	// newlines so the line counter stays correct) and only then treat '{' as
+	// the depth-1 brace -- otherwise the '{' is counted as a nested brace and
+	// the first '}' drops depth to 1 instead of 0, swallowing everything up
+	// to the enclosing block's '}'.
+	for i < n && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n') {
+		if src[i] == '\n' {
+			line++
+		}
+		i++
+	}
+	if i < n && src[i] == '{' {
+		i++
+	}
+	var buf []byte
+	depth := 1
+	var inStr byte
+	for i < n {
+		c := src[i]
+		if inStr != 0 {
+			buf = append(buf, c)
+			if c == '\\' && i+1 < n {
+				i++
+				buf = append(buf, src[i])
+				i++
+				continue
+			}
+			if c == inStr {
+				inStr = 0
+			}
+			i++
+			continue
+		}
+		switch {
+		case c == '"' || c == '\'':
+			inStr = c
+			buf = append(buf, c)
+			i++
+		case c == ';' || (c == '/' && i+1 < n && src[i+1] == '/'):
+			// Line comment: copy to end of line verbatim, so a '}' inside
+			// a comment is ignored by the brace matcher.
+			for i < n && src[i] != '\n' {
+				buf = append(buf, src[i])
+				i++
+			}
+		case c == '\n':
+			line++
+			buf = append(buf, c)
+			i++
+		case c == '{':
+			depth++
+			buf = append(buf, c)
+			i++
+		case c == '}':
+			depth--
+			if depth == 0 {
+				i++
+				return string(buf), i, line, nil
+			}
+			buf = append(buf, c)
+			i++
+		default:
+			buf = append(buf, c)
+			i++
+		}
+	}
+	return "", 0, line, fmt.Errorf("line %d: unterminated __asm block (missing '}')", line)
 }

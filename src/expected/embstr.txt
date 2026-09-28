@@ -1,0 +1,10 @@
+hello 42
+one two
+x0 x1 tail
+9 designated
+union-str
+hi bufptr
+bigptr
+aa bb cc
+static-str static-s 5
+sa sb

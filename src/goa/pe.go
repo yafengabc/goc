@@ -204,21 +204,17 @@ func (a *Assembler) BuildPE(outPath string) error {
 		symRVA[k] = idataBase + v
 	}
 
-	// Apply fixups: patch the 4-byte displacement at each recorded site.
+	// Apply fixups: patch each recorded displacement (rel32 normally, rel8 for
+	// short jumps) at the site the instruction left for it.
 	for _, f := range a.fixups {
 		t, ok := symRVA[f.sym]
 		if !ok {
 			return fmt.Errorf("undefined symbol referenced: %s", f.sym)
 		}
 		s := a.sections[f.sect]
-		disp := int32(t - (symBase[s.Name] + f.off + 4 + f.ripAdj))
-		if f.off+4 > len(s.Data) {
-			return fmt.Errorf("fixup out of range for %s", f.sym)
+		if err := applyFixup(s, f, t, symBase[s.Name]); err != nil {
+			return err
 		}
-		s.Data[f.off] = byte(disp)
-		s.Data[f.off+1] = byte(disp >> 8)
-		s.Data[f.off+2] = byte(disp >> 16)
-		s.Data[f.off+3] = byte(disp >> 24)
 	}
 
 	entryRVA, ok := symRVA[a.entry]

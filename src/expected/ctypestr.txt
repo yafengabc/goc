@@ -1,0 +1,40 @@
+== ctype predicates ==
+char 65 alnum=1 alpha=1 cntrl=0 digit=0 graph=1 lower=0 print=1 punct=0 space=0 upper=1 xdigit=1
+char 122 alnum=1 alpha=1 cntrl=0 digit=0 graph=1 lower=1 print=1 punct=0 space=0 upper=0 xdigit=0
+char 55 alnum=1 alpha=0 cntrl=0 digit=1 graph=1 lower=0 print=1 punct=0 space=0 upper=0 xdigit=1
+char 32 alnum=0 alpha=0 cntrl=0 digit=0 graph=0 lower=0 print=1 punct=0 space=1 upper=0 xdigit=0
+char 33 alnum=0 alpha=0 cntrl=0 digit=0 graph=1 lower=0 print=1 punct=1 space=0 upper=0 xdigit=0
+char 44 alnum=0 alpha=0 cntrl=0 digit=0 graph=1 lower=0 print=1 punct=1 space=0 upper=0 xdigit=0
+char 0 alnum=0 alpha=0 cntrl=1 digit=0 graph=0 lower=0 print=0 punct=0 space=0 upper=0 xdigit=0
+char 127 alnum=0 alpha=0 cntrl=1 digit=0 graph=0 lower=0 print=0 punct=0 space=0 upper=0 xdigit=0
+== case transforms ==
+tolower('Q')=q tolower('5')=5
+toupper('q')=Q toupper('!')=!
+== strncat ==
+short=foobar
+long=foobarbaz
+== strrchr ==
+last-o=o
+last-l=lo
+missing=1
+== strstr ==
+find=world
+mid=lo world
+missing=1
+== strspn ==
+all-in=6
+none=0
+== strcspn ==
+stop-at=5
+no-hit=6
+== strpbrk ==
+hit=, world
+missing=1
+== strtok ==
+[the]
+[quick]
+[brown]
+[fox]
+== strtok padding ==
+[a]
+[b]
