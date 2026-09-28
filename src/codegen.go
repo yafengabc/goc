@@ -38,6 +38,12 @@ type CG struct {
 	globals     map[string]bool    // names of program-level (global/static) variables
 	globalLab   map[string]string  // name -> .data label for a global variable
 	globalTyp   map[string]*Type   // name -> declared type of a global variable
+	// globalStrInits records globals of pointer type initialised by a string
+	// literal ("char *p = "str""). The pointer cannot live in .data as a
+	// relocation (goa has none), so the entry stub writes it at startup with
+	// `lea rax,[rip+<str>]; mov [<global>],rax` -- glab is the .data label,
+	// slab the .rdata label of the string constant.
+	globalStrInits []struct{ glab, slab string }
 	// Static locals: a "static int x;" inside a function gets a unique .data
 	// label (collision-free even when two functions name their static "x") and
 	// persists across calls. c.staticVars maps the source name to that label
@@ -1160,17 +1166,40 @@ func Gen(prog *Program, linux bool) (string, error) {
 		out.WriteString(e)
 	}
 	out.WriteString("\n")
+	// Bind any global pointer initialised by a string literal before main runs
+	// (goa has no data relocations, so we write the address at startup).
+	var strInit strings.Builder
+	for _, g := range prog.Globals {
+		if g.Typ != nil && g.Typ.Kind == KPtr {
+			if sl, ok := g.Init.(*StrLit); ok {
+				lab, ok := c.strLab[sl]
+				if !ok {
+					lab = fmt.Sprintf("LC%d", len(c.strs))
+					c.strs = append(c.strs, *sl)
+					c.strLab[sl] = lab
+				}
+				c.globalStrInits = append(c.globalStrInits,
+					struct{ glab, slab string }{c.globalLab[g.Name], lab})
+			}
+		}
+	}
+	for _, si := range c.globalStrInits {
+		fmt.Fprintf(&strInit, "\tlea rax, [rip+%s]\n\tmov [%s], rax\n", si.slab, si.glab)
+	}
+
 	// Entry stub: align the stack, run main, and hand its return value to the
 	// platform's exit routine. Linux needs no shadow space and exits through
 	// the `exit` syscall stub; Windows uses ExitProcess.
 	out.WriteString("_start:\n")
 	out.WriteString("\tand rsp, -16\n")
 	if c.linux {
+		out.WriteString(strInit.String())
 		out.WriteString("\tcall main\n")
 		out.WriteString("\tmov rdi, rax\n")
 		out.WriteString("\tcall exit\n\n")
 	} else {
 		out.WriteString("\tsub rsp, 48\n")
+		out.WriteString(strInit.String())
 		out.WriteString("\tcall main\n")
 		out.WriteString("\tmov rcx, rax\n")
 		out.WriteString("\tcall ExitProcess\n\n")

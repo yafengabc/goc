@@ -1,4 +1,4 @@
-hello world count=42 char=A big=123456789 uns=255 hex=ff pi=3.141592
+hello world count=42 char=A big=123456789 uns=255 hex=ff pi=3.141593
 strlen(hello)=5
 strcpy -> copied! (p==heap:1)
 strcmp(abc,abc)=0 strcmp(abc,abd)=-1

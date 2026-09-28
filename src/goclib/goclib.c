@@ -361,40 +361,75 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                 n++;
             }
         } else if (spec == 'f') {
-            /* %f: 6 fractional digits, no exponent. */
+            /* %f: <prec> fractional digits, rounded half to even, no exponent. */
             double x = va_arg(ap, double);
-            if (x < 0) {
-                if (limit < 0 || n < limit) out[n] = '-';
-                n++;
-                x = -x;
-            }
-            double ip;
+            int neg = 0;
+            if (x < 0) { neg = 1; x = -x; }
+            if (prec > 17) prec = 17;          /* past double's precision */
             long whole = (long)x;
             double frac = x - (double)whole;
-            /* integer part */
-            char tmp[32];
-            int t = 0;
-            if (whole == 0) tmp[t++] = '0';
-            long w = whole;
-            while (w > 0) {
-                tmp[t++] = (char)('0' + (w % 10));
-                w /= 10;
+            char dig[20];                      /* prec+1 digits to round on */
+            int k;
+            for (k = 0; k <= prec; k++) {
+                frac *= 10.0;
+                int d = (int)frac;
+                dig[k] = (char)d;
+                frac -= (double)d;
             }
-            while (t-- > 0) {
-                if (limit < 0 || n < limit) out[n] = tmp[t];
+            /* round half to even on the prec-th digit */
+            {
+                int tail = (int)(frac * 10.0 + 0.5); /* nonzero past prec+1? */
+                if (prec == 0) {
+                    int d0 = dig[0];
+                    if (d0 > 5 || (d0 == 5 && (tail != 0 || (whole & 1) != 0)))
+                        whole++;
+                } else {
+                    int dp = dig[prec];
+                    if (dp > 5 || (dp == 5 && (tail != 0 || (dig[prec-1] & 1) != 0))) {
+                        int j = prec - 1;
+                        dig[j]++;
+                        while (j > 0 && dig[j] > 9) { dig[j] = 0; dig[--j]++; }
+                        if (dig[0] > 9) { dig[0] = 0; whole++; }
+                    }
+                }
+            }
+            if (neg) {
+                if (limit < 0 || n < limit) out[n] = '-';
                 n++;
             }
-            /* decimal point + prec fractional digits (prec 0: no point) */
+            {
+                char tmp[32];
+                int t = 0;
+                if (whole == 0) tmp[t++] = '0';
+                long w = whole;
+                while (w > 0) { tmp[t++] = (char)('0' + (w % 10)); w /= 10; }
+                while (t-- > 0) {
+                    if (limit < 0 || n < limit) out[n] = tmp[t];
+                    n++;
+                }
+            }
             if (prec > 0) {
                 if (limit < 0 || n < limit) out[n] = '.';
                 n++;
+                int k2;
+                for (k2 = 0; k2 < prec; k2++) {
+                    if (limit < 0 || n < limit) out[n] = (char)('0' + dig[k2]);
+                    n++;
+                }
             }
-            int k;
-            for (k = 0; k < prec; k++) {
-                frac *= 10.0;
-                int d = (int)frac;
-                frac -= (double)d;
-                if (limit < 0 || n < limit) out[n] = (char)('0' + d);
+        } else if (spec == 'p') {
+            /* %p: "0x" followed by 16 hex digits (full 64-bit address). */
+            void *pv = va_arg(ap, void *);
+            unsigned long v = (unsigned long)pv;
+            if (limit < 0 || n < limit) out[n] = '0';
+            n++;
+            if (limit < 0 || n < limit) out[n] = 'x';
+            n++;
+            int shift;
+            for (shift = 60; shift >= 0; shift -= 4) {
+                int d = (int)((v >> shift) & 0xf);
+                char ch = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+                if (limit < 0 || n < limit) out[n] = ch;
                 n++;
             }
         } else {

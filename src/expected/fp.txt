@@ -7,7 +7,7 @@ a=1.500000 b=2.250000
 sum=3.750000
 diff=-0.750000
 prod=3.375000
-div=0.666666
+div=0.666667
 neg=-1.500000
 == mixed ==
 c=4.000000
@@ -25,7 +25,7 @@ a<=b
 == while ==
 doubled 5 times, now 16.000000
 == function ==
-circle(2)=12.566359
+circle(2)=12.566360
 circle(1.5)=7.068577
 == chained ==
 x=3.000000
