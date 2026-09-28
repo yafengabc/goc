@@ -11,8 +11,7 @@
 ;   <FunctionName>              an exported function of the current group
 ;
 ; Keep the per-group lists alphabetised. Function names must also exist in
-; the windows.h family of headers (prototypes) and, when used inside
-; goclib.asm, in that block's "; @extern" line -- the def only answers
+; the windows.h family of headers (prototypes) -- the def only answers
 ; "which DLL".
 
 # kernel32

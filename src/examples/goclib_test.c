@@ -2,10 +2,8 @@
  * (goclib/goclib.c) and that it runs correctly on both backends.
  *
  * We #include the canonical goclib/goclib.c verbatim; everything below is just a
- * driver that exercises it. The five __goclib_* OS primitives come from the
- * hand-written assembly backend (goclib/goclib.asm), which goc pulls in on demand;
- * every public function (strlen, strcpy, printf, malloc, ...) is the C version
- * from goclib.c, which suppresses the assembly twin.
+ * driver that exercises it. Every function (strlen, strcpy, printf, malloc, ...)
+ * plus the five __goclib_* OS primitives is the C version from goclib.c.
  */
 #include "../goclib/goclib.c"
 

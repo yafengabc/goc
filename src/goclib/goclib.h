@@ -8,13 +8,13 @@
  * string.h) under goclib/ and injects them on `#include <name.h>`; user code
  * includes those, never this header. goclib/goclib.c includes goclib.h to pull
  * in the standard declarations it implements, plus the __goclib_* platform
- * primitives below, which are the only pieces that must stay in assembly
- * (goclib/goclib.asm) because they touch the OS (I/O, heap, process exit).
+ * primitives below, which are the only pieces that touch the OS directly
+ * (I/O, heap, process exit).
  *
- * goclib.c is DORMANT today: the assembly backend under goclib.asm is what goc
- * embeds and links, under the same public C names. Once goc compiles goclib.c
- * end to end, delete the public functions from the asm and keep only the
- * __goclib_* primitives; goclib.c calls those.
+ * goc compiles goclib.c at start-up for the selected target and emits the
+ * functions a program actually calls through its regular code generator; the
+ * __goclib_* primitives reach the OS via extern imports (kernel32 on Windows,
+ * goa syscall stubs on Linux).
  * ========================================================================== */
 
 #include <stddef.h>
@@ -23,7 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- platform primitives (supplied by goclib/goclib.asm) ------------------- */
+/* ---- platform primitives (implemented in goclib.c, OS glue) ---------------- */
 /* Write `len` bytes from `buf` to standard output. Returns bytes written. */
 long __goclib_write(const char *buf, long len);
 /* Terminate the process with `code` (does not return). */

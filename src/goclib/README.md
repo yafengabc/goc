@@ -1,80 +1,50 @@
 # goclib —— goc 自带的 C 库
 
 goc 不链接任何系统 libc（无 msvcrt / glibc，无 gcc）。它需要的 `printf`、`malloc`、
-`strlen` 等都由这里提供。目录里有两个互补的部分：
+`strlen` 等都由这里提供——**全部是纯 C 实现**（goclib.c），由 goc 在启动时按目标平台
+自行编译，函数体经常规代码生成器（genFunc）按需发射：程序真正调用到什么才链接什么，
+hello world 不为 malloc 买单。
 
 ```
 goclib/
-├── goclib.asm    汇编后端（当前真正在跑的），一份源、双平台条件编译
-├── goclib.h     跨平台 C 声明（goc 暂不能编译，stage5 启用）
-├── goclib.c     跨平台 C 实现（同上）
-└── README.md   本文件
+├── goclib.h     伞头：拉入标准头声明 + 五个 __goclib_* 平台原语原型
+├── goclib.c     唯一实现：平台原语（#if 分平台）+ 全部跨平台算法
+├── stddef.h / stdarg.h / stdio.h / stdlib.h / string.h   内置标准头
+├── win32.def    Windows extern → DLL 归属表（PE import 的唯一事实源）
+└── README.md    本文件
 ```
 
-## 1. `goclib.asm` —— 当前后端（汇编）
+## 1. 工作机制（codegen.go 的 buildClibC / genClibFuncs）
 
-整库写在一个文件里，用条件编译把 Windows 和 Linux 两套实现合并：
+- `init()` 里对两个目标各跑一次 `buildClibC(linux bool)`：伞头 goclib.h 作为独立 TU
+  先行编译（头内如有实现也会被收集），随后 `goclib/*.c` 按名序编译，同名定义**后者
+  胜出**（.c 定义覆盖头定义），重复不会到达链接器。
+- 平台选择用 `PreprocessTarget` 注入的宏：`_WIN32/_WIN64` 或 `__linux__/__linux`，
+  goclib.c 顶部 `#if defined(_WIN32) / #elif defined(__linux__)` 只留对应分支。
+- Gen 按 `c.need` 闭包发射 C 库函数（genClibFuncs 不动点：发射一个函数会标记它内部
+  调用的更多函数），库全局变量（如 `rand_state`）只在被引用时发射。
 
-```asm
-#if defined(_WIN64)
-  ; ---- Windows 分支：kernel32 WriteFile / GetProcessHeap / ExitProcess ----
-  ; printf sprintf puts putchar getchar strlen strcpy strcmp strcat strchr
-  ; memset memcpy memmove memcmp strncmp malloc free calloc atoi abs strtol
-  ; rand srand exit  + 内部 __goclib_write __goclib_vfmt __goclib_exit
-  ;                 __goclib_heap_alloc __goclib_heap_free __goclib_read
-#else
-  ; ---- Linux 分支：write / brk / exit / read syscall，SysV 调用约定 ----
-  ; 同名同语义
-#endif
-```
+## 2. 五个 `__goclib_*` 平台原语（碰 OS 的唯一层面）
 
-goc 在加载 goclib 时调用 `selectPlatform()`（`codegen.go`），按目标平台挑出对应分支、
-丢掉另一分支，**两份原文件的内容会被原样保留**（所以双平台行为和拆成两个目录时
-逐字节一致）。`go:embed goclib/*.asm` 把这一份文件嵌进 goc 二进制。
-
-加函数 / 加平台相关代码：往对应分支里丢一个 `; @func` 块；双平台都有的算法也要
-在两条分支里各写一份（这正是普通编译器用 `#ifdef` 包内联汇编的做法）。
-
-### 真正无法跨平台、只能留在汇编里的东西
-
-只有「碰 OS」的五个 `__goclib_*` 原语必须分平台写：
-
-| 原语 | Windows | Linux |
+| 原语 | Windows（kernel32 extern 直调） | Linux（goa syscall 桩） |
 |---|---|---|
-| `__goclib_write(buf,len)` | `GetStdHandle`+`WriteFile` | `write`(fd=1) syscall |
-| `__goclib_exit(code)` | `ExitProcess` | `exit` syscall |
-| `__goclib_heap_alloc(size)` | `GetProcessHeap`+`HeapAlloc` | `brk` bump 分配 |
+| `__goclib_write(buf,len)` | `GetStdHandle`+`WriteFile` | `write`(fd=1) |
+| `__goclib_exit(code)` | `ExitProcess` | `exit_group`(231) |
+| `__goclib_heap_alloc(size)` | `GetProcessHeap`+`HeapAlloc` | `brk` bump 分配器（16B 对齐） |
 | `__goclib_heap_free(p)` | `HeapFree` | 空操作（进程退出一起还） |
-| `__goclib_read(buf,len)` | `ReadFile` | `read`(fd=0) syscall |
+| `__goclib_read(buf,len)` | `GetStdHandle`+`ReadFile` | `read`(fd=0) |
 
-**除此之外的一切算法**（格式化、字符串/内存操作、strtol、rand、atoi…）本来也是
-汇编，但理论上都能用 C 写——只是 goc 现在的 C 子集还编不了（见第 2 节）。
+## 3. 符号约定
 
-## 2. `goclib.h` / `goclib.c` —— 跨平台 C 版（休眠中）
+- C 库函数 label 即函数名（`printf:`、`exit:`）。Linux 上库自带 `exit`（转调
+  `__goclib_exit`），入口桩 `call exit` 走 need 闭包拉 C 版函数体，**不再** import
+  同名 extern 桩——避免了 C 函数与 goa syscall 桩的符号冲突。
+- Win 侧原语调 kernel32：函数名必须同时出现在 win32.def（归属）与 windows.h 家族
+  头文件（原型）。改 win32.def 后必须重建 goc（embed 进二进制）。
 
-这是同一批函数的**纯 C 实现**，只写一遍、两个平台共用，算法全部用标准 C 表达，
-平台差异只在 `#include` 进来的五个 `__goclib_*` 原语上。
+## 4. 历史注记
 
-它**现在不参与编译**——goc 的 C 子集（stage 4 及之前）还缺：
-
-- `char` / 真正的指针类型（只能把指针塞进 `int`）；
-- 字节级元素访问（`Index` 硬编码 8 字节步长 + quad load）；
-- 全局 / `static` 变量（顶层非函数声明被丢弃）；
-- `for` / `break` / `continue`；
-- 变参函数（`printf` 的 `...`）。
-
-所以字符串/内存类函数、带状态的 `rand`/`srand`、以及变参 `printf` 暂时只能靠汇编。
-
-## 3. 迁移到 C 版（stage 5）
-
-等 goc 补齐上面那些特性后，把后端从 `goclib.asm` 换成 `goclib.c` 的步骤：
-
-1. goc 编译 `goclib/goclib.c`，把它和用户程序编进同一个翻译单元（让 `printf` 等成为
-   本地函数）。
-2. 把五个 `__goclib_*` 原语从 `goclib.asm` 里抽出来，在双平台分支上各自保留并暴露
-   （`goclib.asm` 其余的公开函数全部删掉）。
-3. 删除 `goclib.asm` 里除 `__goclib_*` 以外的所有函数——它们现在由 `goclib.c` 提供。
-4. `goclib.c` 里对 `__goclib_*` 的调用会像现在一样通过 `c.need` 解析并拉进对应原语。
-
-迁移后汇编层只剩五个平台原语，`goclib.asm` 退化为「OS 胶水」，跨平台算法统一由
-C 维护。
+阶段 4-13 期间后端是条件编译的手写汇编 `goclib.asm`（`; @func`/`; @deps`/`; @extern`
+块 + `selectPlatform` 选分支）。阶段 14 goc 的 C 子集补齐后，goclib.c 转正、goclib.asm
+整体退役（#117 五原语 C 化 + #118 移除 asm 机器）；曾需要的 `goclibAliasLinux`（exit →
+`__goclib_exit`）随 importSet 条件注入一并删除。

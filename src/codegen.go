@@ -150,10 +150,10 @@ const scratchSlots = 32
 // source edit, no recompile. Anything not listed there is a hard error rather
 // than a silent guess.
 //
-// The C library itself (printf, strlen, malloc, ...) is implemented on top of
-// kernel32 (Windows) or syscalls (Linux); see goclib/goclib.asm. The portable
-// C version goclib/goclib.c is the intended replacement once goc can compile
-// it. There is no msvcrt anywhere in the pipeline.
+// The C library itself (printf, strlen, malloc, ...) is implemented in
+// portable C (goclib/goclib.c) on top of kernel32 (Windows) or syscalls
+// (Linux), and goc compiles it into every program at start-up. There is no
+// msvcrt anywhere in the pipeline.
 var externDLL = loadWin32Def()
 
 // loadWin32Def parses the embedded goclib/win32.def table. A "# <dll>" line
@@ -201,30 +201,10 @@ var externLinux = map[string]bool{
 // goclib: the C library
 // ---------------------------------------------------------------------------
 //
-// The .asm file goclib/goclib.asm is embedded into goc at build time. It is ONE
-// source that carries BOTH platforms, selected per target by conditional
-// compilation: the Windows body lives under "#if defined(_WIN64)" and the
-// Linux body under the matching "#else" (see selectPlatform). This is the same
-// trick a normal compiler uses for inline asm — write the portable parts once,
-// isolate the OS-specific bits behind #ifdef.
-//
-// Inside the selected branch each function sits in a
-// block marked with "; @func <name>" and can declare what it needs:
-//
-//	; @deps __goclib_write strlen   other goclib functions to pull in
-//	; @extern WriteFile           imports to declare
-//
-// A block marked "; @data" holds that file's static data. goc emits only the
-// functions a program actually calls (plus their transitive deps), so a
-// hello-world does not pay for malloc.
-//
-// The genuinely cross-platform algorithms (strlen, strcpy, printf formatting,
-// strtol, rand, ...) are also written in portable C in goclib/goclib.c, ready to
-// REPLACE this assembly once goc supports char/pointer/globals/for (stage 5).
-// Until then the assembly below is the backend that actually runs.
-
-//go:embed goclib/*.asm
-var goclibFS embed.FS
+// The library is plain C (goclib/goclib.c plus the headers it includes) that
+// goc compiles at start-up exactly like a user program, once per target.
+// Functions land in the output only when a program actually calls them (plus
+// their transitive callees), so a hello-world does not pay for malloc.
 
 //go:embed goclib/*.def
 var goclibDefFS embed.FS
@@ -232,95 +212,14 @@ var goclibDefFS embed.FS
 //go:embed goclib/*.c
 var goclibCFS embed.FS
 
-type goclibFunc struct {
-	name string
-	deps []string // other goclib functions required
-	exts []string // imported symbols required
-	body string
-	file string
-}
-
-// goclibDataBlock is a chunk of static data emitted only when at least one of
-// the functions named in `needs` made it into the program. That keeps
-// printf's 512-byte output buffer out of a program that only calls putchar.
-type goclibDataBlock struct {
-	file  string
-	needs []string
-	text  string
-}
-
-var (
-	goclibFuncsWin    = map[string]*goclibFunc{}
-	goclibOrderWin    []string // source order, for stable output
-	goclibBlocksWin   []goclibDataBlock
-	goclibFuncsLinux  = map[string]*goclibFunc{}
-	goclibOrderLinux  []string
-	goclibBlocksLinux []goclibDataBlock
-	goclibErr         error
-)
-
-// goclibStore picks the tables for a target.
-func goclibStore(linux bool) (map[string]*goclibFunc, *[]string, *[]goclibDataBlock) {
-	if linux {
-		return goclibFuncsLinux, &goclibOrderLinux, &goclibBlocksLinux
-	}
-	return goclibFuncsWin, &goclibOrderWin, &goclibBlocksWin
-}
-
 func init() {
-	// Compile the built-in C library first, for both targets: the assembly
-	// loader below needs the C function set to retire the assembly twins.
+	// Compile the built-in C library for both targets. A failure is reported
+	// through goclibErr when Gen runs.
 	clibCWin, clibCErr = buildClibC(false)
 	if clibCErr == nil {
 		clibCLinux, clibCErr = buildClibC(true)
 	}
-	if clibCErr != nil {
-		goclibErr = clibCErr
-		return
-	}
-	goclibErr = loadClib()
-}
-
-func loadClib() error {
-	// The same embedded file is loaded twice, once per target; selectPlatform
-	// strips the branch that does not apply before the @func blocks are parsed.
-	if err := loadClibDir(goclibFS, "goclib", false); err != nil {
-		return err
-	}
-	return loadClibDir(goclibFS, "goclib", true)
-}
-
-func loadClibDir(fs embed.FS, dir string, linux bool) error {
-	entries, err := fs.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	var files []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".asm") {
-			files = append(files, e.Name())
-		}
-	}
-	sort.Strings(files)
-	for _, f := range files {
-		b, err := fs.ReadFile(dir + "/" + f)
-		if err != nil {
-			return err
-		}
-		// Drop the platform branch that does not apply to this target so that
-		// one file carries both Windows and Linux bodies.
-		src := selectPlatform(string(b), linux)
-		if err := parseClib(f, src, linux); err != nil {
-			return fmt.Errorf("%s/%s: %v", dir, f, err)
-		}
-	}
-	return nil
-}
-
-// goclibAlias maps a C name to a different symbol on Linux. Needed where the C
-// name would collide with an goa syscall stub of the same name.
-var goclibAliasLinux = map[string]string{
-	"exit": "__goclib_exit",
+	goclibErr = clibCErr
 }
 
 // ---------------------------------------------------------------------------
@@ -328,12 +227,10 @@ var goclibAliasLinux = map[string]string{
 // ---------------------------------------------------------------------------
 //
 // goclib.c (plus the headers it includes) is a plain C translation unit that
-// goc compiles at start-up exactly like a user program. The resulting function
-// bodies REPLACE the assembly versions of the same name: a function defined in
-// the C library is emitted through the regular code generator (genFunc) when a
-// program needs it, and the assembly tables are only consulted for functions
-// the C library does not define -- currently the five __goclib_* platform
-// primitives, which touch the OS directly.
+// goc compiles at start-up exactly like a user program. Every function the
+// library defines is emitted through the regular code generator (genFunc) when
+// a program needs it, so the C source is the single implementation of the
+// built-in library.
 //
 // Function implementations may live either in a declaration header or in a .c
 // file: the umbrella goclib.h is processed as its own translation unit first
@@ -353,6 +250,7 @@ var (
 	clibCWin   *clibCProgram
 	clibCLinux *clibCProgram
 	clibCErr   error
+	goclibErr  error
 )
 
 // clibCStore picks the compiled C library for a target.
@@ -428,360 +326,10 @@ func buildClibC(linux bool) (*clibCProgram, error) {
 	return lib, nil
 }
 
-// selectPlatform evaluates a small subset of C conditional compilation over the
-// goclib assembly source and returns only the lines that apply to the current
-// target. goa assembly has no '#' lines of its own, so the directives are
-// unambiguous. Supported:
-//
-//	#if defined(_WIN64)      #elif defined(__linux__)
-//	#else                    #endif
-//	#if 0  #if 1
-//
-// and the boolean operators ! && || ( ) inside the expressions. This is what
-// lets one goclib.asm carry both platforms, selected at load time — the same
-// trick a normal compiler uses for inline assembly.
-// goclibFrame tracks one #if/#else chain level during platform selection.
-type goclibFrame struct{ active, taken bool }
-
-func selectPlatform(src string, linux bool) string {
-	def := map[string]bool{"_WIN64": !linux, "__linux__": linux, "__x86_64__": true}
-	lines := strings.Split(src, "\n")
-	stack := []goclibFrame{{active: true}}
-	out := make([]string, 0, len(lines))
-	eval := func(expr string) bool {
-		toks := ceLex(expr)
-		v, _ := ceParse(toks, 0, def)
-		return v
-	}
-	for _, ln := range lines {
-		t := strings.TrimSpace(ln)
-		switch {
-		case strings.HasPrefix(t, "#if "):
-			c := eval(strings.TrimSpace(t[3:]))
-			stack = append(stack, goclibFrame{active: topActive(stack) && c, taken: c})
-			continue
-		case strings.HasPrefix(t, "#elif "):
-			f := &stack[len(stack)-1]
-			if !f.taken {
-				c := eval(strings.TrimSpace(t[5:]))
-				f.taken = c
-				f.active = topActive(stack[:len(stack)-1]) && c
-			} else {
-				f.active = false
-			}
-			continue
-		case t == "#else":
-			f := &stack[len(stack)-1]
-			f.active = topActive(stack[:len(stack)-1]) && !f.taken
-			f.taken = true
-			continue
-		case t == "#endif":
-			if len(stack) > 1 {
-				stack = stack[:len(stack)-1]
-			}
-			continue
-		}
-		if topActive(stack) {
-			out = append(out, ln)
-		}
-	}
-	return strings.Join(out, "\n")
-}
-
-func topActive(s []goclibFrame) bool {
-	if len(s) == 0 {
-		return true
-	}
-	return s[len(s)-1].active
-}
-
-// ceLex tokenises a #if/#elif boolean expression into a flat token slice.
-func ceLex(s string) []string {
-	var toks []string
-	i, n := 0, len(s)
-	for i < n {
-		c := s[i]
-		if c == ' ' || c == '\t' {
-			i++
-			continue
-		}
-		switch c {
-		case '(', ')', '!':
-			toks = append(toks, string(c))
-			i++
-		case '&':
-			toks = append(toks, "&&")
-			i += 2
-		case '|':
-			toks = append(toks, "||")
-			i += 2
-		default:
-			if isIdentStart(c) {
-				j := i
-				for j < n && isIdentChar(s[j]) {
-					j++
-				}
-				toks = append(toks, s[i:j])
-				i = j
-			} else if c >= '0' && c <= '9' {
-				j := i
-				for j < n && s[j] >= '0' && s[j] <= '9' {
-					j++
-				}
-				toks = append(toks, s[i:j])
-				i = j
-			} else {
-				i++ // ignore any other character
-			}
-		}
-	}
-	return toks
-}
-
-// ceParse evaluates a token slice as a boolean expression.
-//
-//	or   := and ('||' and)*
-//	and  := not ('&&' not)*
-//	not  := '!' not | primary
-//	prim := '(' or ')' | 'defined' ('(' ident ')' | ident) | '1' | '0'
-func ceParse(toks []string, i int, def map[string]bool) (bool, int) {
-	return ceOr(toks, i, def)
-}
-func ceOr(toks []string, i int, def map[string]bool) (bool, int) {
-	left, i := ceAnd(toks, i, def)
-	for i < len(toks) && toks[i] == "||" {
-		i++
-		right, ni := ceAnd(toks, i, def)
-		i = ni
-		left = left || right
-	}
-	return left, i
-}
-func ceAnd(toks []string, i int, def map[string]bool) (bool, int) {
-	left, i := ceNot(toks, i, def)
-	for i < len(toks) && toks[i] == "&&" {
-		i++
-		right, ni := ceNot(toks, i, def)
-		i = ni
-		left = left && right
-	}
-	return left, i
-}
-func ceNot(toks []string, i int, def map[string]bool) (bool, int) {
-	if i < len(toks) && toks[i] == "!" {
-		v, ni := ceNot(toks, i+1, def)
-		return !v, ni
-	}
-	return cePrimary(toks, i, def)
-}
-func cePrimary(toks []string, i int, def map[string]bool) (bool, int) {
-	if i >= len(toks) {
-		return false, i
-	}
-	t := toks[i]
-	switch {
-	case t == "(":
-		v, ni := ceOr(toks, i+1, def)
-		if ni < len(toks) && toks[ni] == ")" {
-			ni++
-		}
-		return v, ni
-	case t == "defined":
-		i++
-		name := ""
-		if i < len(toks) && toks[i] == "(" {
-			i++
-			if i < len(toks) {
-				name = toks[i]
-				i++
-			}
-			if i < len(toks) && toks[i] == ")" {
-				i++
-			}
-		} else if i < len(toks) {
-			name = toks[i]
-			i++
-		}
-		return def[name], i
-	case t == "1":
-		return true, i + 1
-	case t == "0":
-		return false, i + 1
-	default:
-		return false, i + 1
-	}
-}
-
-func isIdentStart(c byte) bool { return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
-func isIdentChar(c byte) bool  { return isIdentStart(c) || (c >= '0' && c <= '9') }
-
-func parseClib(file, src string, linux bool) error {
-	funcs, order, blocks := goclibStore(linux)
-	var cur *goclibFunc
-	var data []string
-	var dataNeeds []string
-	inData := false
-	skipping := false // inside a @func block retired by the C library
-	flush := func() error {
-		if inData {
-			*blocks = append(*blocks, goclibDataBlock{
-				file:  file,
-				needs: dataNeeds,
-				text:  strings.Join(data, "\n"),
-			})
-			data, dataNeeds, inData = nil, nil, false
-			return nil
-		}
-		if cur != nil {
-			if _, dup := funcs[cur.name]; dup {
-				return fmt.Errorf("duplicate function %q", cur.name)
-			}
-			funcs[cur.name] = cur
-			*order = append(*order, cur.name)
-			cur = nil
-		}
-		return nil
-	}
-	for _, raw := range strings.Split(src, "\n") {
-		t := strings.TrimSpace(raw)
-		// Inside a retired (C-superseded) function block: drop everything
-		// up to and including the matching "; @end" -- its @deps/@extern
-		// directives and body lines belong to a function that will never
-		// be linked from assembly.
-		if skipping {
-			if t == "; @end" {
-				skipping = false
-			}
-			continue
-		}
-		switch {
-		case t == "; @end":
-			if err := flush(); err != nil {
-				return err
-			}
-		case t == "; @data" || strings.HasPrefix(t, "; @data "):
-			if err := flush(); err != nil {
-				return err
-			}
-			// "; @data printf,sprintf" -- emit this block only if one of
-			// those functions is linked in.
-			for _, n := range strings.Split(strings.TrimSpace(strings.TrimPrefix(t, "; @data")), ",") {
-				if n = strings.TrimSpace(n); n != "" {
-					dataNeeds = append(dataNeeds, n)
-				}
-			}
-			inData = true
-		case strings.HasPrefix(t, "; @func"):
-			if err := flush(); err != nil {
-				return err
-			}
-			name := strings.TrimSpace(strings.TrimPrefix(t, "; @func"))
-			if name == "" {
-				return fmt.Errorf("@func without a name")
-			}
-			cur = &goclibFunc{name: name, file: file}
-			// A function the built-in C library defines is generated from C
-			// code; the assembly body is retired rather than linked, so the
-			// two implementations can never both reach an output binary.
-			if lib := clibCStore(linux); lib != nil {
-				if _, isC := lib.funcs[name]; isC {
-					cur = nil
-					skipping = true
-				}
-			}
-		case strings.HasPrefix(t, "; @deps"):
-			if cur == nil {
-				return fmt.Errorf("@deps outside a function")
-			}
-			cur.deps = append(cur.deps, strings.Fields(strings.TrimPrefix(t, "; @deps"))...)
-		case strings.HasPrefix(t, "; @extern"):
-			if cur == nil {
-				return fmt.Errorf("@extern outside a function")
-			}
-			cur.exts = append(cur.exts, strings.Fields(strings.TrimPrefix(t, "; @extern"))...)
-		default:
-			if inData {
-				data = append(data, raw)
-			} else if cur != nil {
-				cur.body += raw + "\n"
-			}
-		}
-	}
-	return flush()
-}
-
-// goclibUsed expands the set of needed goclib functions into their transitive
-// closure, and reports the imports and static data that go with them.
-func goclibUsed(need map[string]bool, linux bool) (order []string, exts []string, data string, err error) {
-	funcs, _, blocks := goclibStore(linux)
-	seen := map[string]bool{}
-	queue := make([]string, 0, len(need))
-	for n := range need {
-		queue = append(queue, n)
-	}
-	sort.Strings(queue)
-	for len(queue) > 0 {
-		n := queue[0]
-		queue = queue[1:]
-		if seen[n] {
-			continue
-		}
-		f, ok := funcs[n]
-		if !ok {
-			return nil, nil, "", fmt.Errorf("goclib: function %q is not defined for this target", n)
-		}
-		seen[n] = true
-		order = append(order, n)
-		queue = append(queue, f.deps...)
-	}
-	extSet := map[string]bool{}
-	for _, n := range order {
-		for _, e := range funcs[n].exts {
-			extSet[e] = true
-		}
-	}
-	// Static data comes along only if one of the functions that needs it did.
-	var db strings.Builder
-	for _, b := range *blocks {
-		if strings.TrimSpace(b.text) == "" {
-			continue
-		}
-		used := len(b.needs) == 0 // untagged block: always emitted
-		for _, n := range b.needs {
-			if seen[n] {
-				used = true
-				break
-			}
-		}
-		if used {
-			db.WriteString(b.text)
-			db.WriteString("\n")
-		}
-	}
-	for e := range extSet {
-		exts = append(exts, e)
-	}
-	sort.Strings(exts)
-	return order, exts, db.String(), nil
-}
-
-// goclibNames lists the public (non-internal) goclib functions, for error messages.
+// goclibNames lists the public (non-internal) built-in library functions, for
+// error messages.
 func goclibNames(linux bool) []string {
-	funcs, order, _ := goclibStore(linux)
-	_ = funcs
 	var out []string
-	for _, n := range *order {
-		if strings.HasPrefix(n, "__") {
-			// Internal name that a C-facing alias points at: report the C name.
-			for cName, sym := range goclibAliasLinux {
-				if sym == n {
-					out = append(out, cName)
-				}
-			}
-			continue
-		}
-		out = append(out, n)
-	}
 	if lib := clibCStore(linux); lib != nil {
 		for _, n := range lib.order {
 			if strings.HasPrefix(n, "__") {
@@ -1563,22 +1111,6 @@ func Gen(prog *Program, linux bool) (string, error) {
 		return "", fmt.Errorf("program has no main()")
 	}
 
-	// Pull in exactly the assembly goclib functions this program still needs
-	// (the platform primitives, plus whatever they depend on). Functions the
-	// C library defined were already emitted above and stay out of the
-	// assembly tables.
-	lib := clibCStore(c.linux)
-	asmNeed := map[string]bool{}
-	for name := range c.need {
-		if _, isC := lib.funcs[name]; !isC {
-			asmNeed[name] = true
-		}
-	}
-	order, goclibExts, dataBlock, err := goclibUsed(asmNeed, c.linux)
-	if err != nil {
-		return "", err
-	}
-
 	// Every import the program needs: the exit routine for the entry stub,
 	// whatever the C code calls directly, and whatever goclib pulled in.
 	importSet := map[string]bool{}
@@ -1597,9 +1129,6 @@ func Gen(prog *Program, linux bool) (string, error) {
 	}
 	for name := range c.calls {
 		importSet[name] = true
-	}
-	for _, e := range goclibExts {
-		importSet[e] = true
 	}
 	imports := make([]string, 0, len(importSet))
 	for name := range importSet {
@@ -1646,18 +1175,6 @@ func Gen(prog *Program, linux bool) (string, error) {
 		out.WriteString("\tcall ExitProcess\n\n")
 	}
 	out.WriteString(body.String())
-
-	if len(order) > 0 {
-		out.WriteString("\n; --- goclib: only what this program uses ---\n")
-		if dataBlock != "" {
-			out.WriteString(dataBlock)
-			out.WriteString("section .text\n")
-		}
-		funcs, _, _ := goclibStore(c.linux)
-		for _, n := range order {
-			out.WriteString(funcs[n].body)
-		}
-	}
 
 	// Program-level (global / static) variables live in a writable .data
 	// section, referenced via rip. Only constant integer initialisers are
@@ -4619,9 +4136,9 @@ type argSlot struct {
 
 // variadicFn reports whether a goclib function takes printf-style varargs.
 // For those, goc passes every argument in an 8-byte "general-purpose slot"
-// (doubles are moved bitwise into rax first), so the __goclib_va array lines
-// up positionally with the format string: the %d/%f/%s consumers all walk
-// the same 8-byte cursor, exactly like the goclib prologue expects.
+// (doubles are moved bitwise into rax first), so the slots line up
+// positionally with the format string: the %d/%f/%s consumers all walk
+// the same 8-byte va_list cursor.
 func variadicFn(name string) bool {
 	return name == "printf" || name == "sprintf"
 }
@@ -4632,24 +4149,13 @@ func variadicFn(name string) bool {
 // as a use, so a goclib helper referenced this way is pulled in exactly as if
 // it had been called.
 func (c *CG) funcAddrSym(name string) (string, bool) {
-	sym := name
-	if c.linux {
-		if a, ok := goclibAliasLinux[name]; ok {
-			sym = a
-		}
-	}
 	if c.funcs[name] {
-		return sym, true
-	}
-	funcs, _, _ := goclibStore(c.linux)
-	if _, ok := funcs[sym]; ok {
-		c.need[sym] = true
-		return sym, true
+		return name, true
 	}
 	if lib := clibCStore(c.linux); lib != nil {
-		if _, ok := lib.funcs[sym]; ok {
-			c.need[sym] = true
-			return sym, true
+		if _, ok := lib.funcs[name]; ok {
+			c.need[name] = true
+			return name, true
 		}
 	}
 	return "", false
@@ -4662,7 +4168,8 @@ func (c *CG) funcAddrSym(name string) (string, bool) {
 //     its position and type -- doubles to xmm0-3 (Win) / xmm0-7 (SysV),
 //     everything else to rcx/rdx/r8/r9 (Win) / rdi/rsi/... (SysV).
 //   - Varargs (printf/sprintf): every argument rides in an 8-byte GP slot,
-//     double bit patterns included, so __goclib_va needs no XMM handling.
+//     double bit patterns included, so the va_list cursor needs no XMM
+//     handling.
 //
 // Each argument is evaluated and spilled to a frame temporary slot, and only
 // loaded into the argument registers right before the call. This is required
@@ -4808,23 +4315,14 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 		extra += 8
 	}
 
-	// Resolve the callee. A goclib function may live under a different symbol
-	// than its C name (see goclibAliasLinux). Direct calls only: an indirect
-	// target is a run-time value, not a symbol we can book here.
+	// Resolve the callee. Direct calls only: an indirect target is a run-time
+	// value, not a symbol we can book here.
 	target := name
 	if !indirect {
-		if c.linux {
-			if a, ok := goclibAliasLinux[name]; ok {
-				target = a
-			}
-		}
 		if !c.funcs[name] && name != "main" {
-			funcs, _, _ := goclibStore(c.linux)
-			if _, ok := funcs[target]; ok {
-				c.need[target] = true
-			} else if lib := clibCStore(c.linux); lib != nil {
-				if _, ok := lib.funcs[target]; ok {
-					c.need[target] = true // built-in C library function
+			if lib := clibCStore(c.linux); lib != nil {
+				if _, ok := lib.funcs[name]; ok {
+					c.need[name] = true // built-in C library function
 				} else {
 					c.calls[name] = true
 				}
