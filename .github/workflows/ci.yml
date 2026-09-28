@@ -29,7 +29,12 @@ jobs:
           mkdir -p bin
           (cd src && go build -o ../bin/goc .)
           (cd src/goa && go build -o ../../bin/goa .)
-          (cd tools && go build ./elfcheck ./msgboxcheck)
+          (cd tools && go build ./elfcheck)
+          # msgboxcheck drives a real Windows dialog box, so it only exists as
+          # a Windows program: building it here without GOOS fails with "build
+          # constraints exclude all Go files" -- which silently took the whole
+          # Linux job down once. Cross-compile instead of skipping it.
+          (cd tools && GOOS=windows go build ./msgboxcheck)
       - name: native Linux e2e (real kernel, real SSE2)
         run: bash run_tests_linux.sh
 

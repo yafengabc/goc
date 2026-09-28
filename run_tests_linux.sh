@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Native Linux end-to-end test for the goc -> goa pipeline.
 #
-# Same idea as run_tests.sh (which runs on Windows and interprets the Linux
-# ELF outputs with elfcheck), but this script runs on a real Linux box and
-# EXECUTES the ELF binaries directly on the real kernel. That is the only way
-# to prove the SSE2 double codegen and the ELF structure are correct on actual
-# hardware, not just inside the interpreter.
+# Same idea as run_tests.sh (which runs on Windows and executes the Linux ELF
+# outputs under Unicorn, QEMU's CPU core), but this script runs on a real Linux
+# box and EXECUTES the ELF binaries directly on the real kernel. That is the
+# only check that proves the SSE2 double codegen, the SysV prologues and the
+# ELF structure against the actual loader rather than a model of it.
 #
 # Usage:  bash run_tests_linux.sh     (on Linux)
 # Exit:   0 if every example matches its golden file, 1 otherwise.
@@ -39,7 +39,7 @@ fail=0
 # Windows-only examples import Win32 DLLs; on a Linux box they have nothing to
 # link against, so skip them here. (On Windows, run_tests.sh still compiles the
 # no-golden ones, e.g. winbox, as a compile-only check.)
-win_only=" wintest winbox "
+win_only=" wintest winbox winreg "
 is_win_only() { case "$win_only" in *" $1 "*) return 0;; esac; return 1; }
 
 echo "== goc: linux targets, run on the real kernel =="
