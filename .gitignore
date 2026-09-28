@@ -30,3 +30,7 @@ scratch/
 
 # Go build cache written next to the project when GOCACHE points here.
 .gocache/
+
+# Test/debug scratch dirs produced by goc runs (goa work areas).
+tmp/
+buildtmp/

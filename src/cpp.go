@@ -75,7 +75,7 @@ func Preprocess(src, filename string) ([]Token, error) {
 // Windows x64 backend, __linux__ (and __linux) for the ELF backend -- so
 // library sources and user programs can write portable
 // "#if defined(_WIN32) ... #else ... #endif" branches.
-func PreprocessTarget(src, filename string, linux bool) ([]Token, error) {
+func PreprocessTarget(src, filename string, linux bool, incDirs ...string) ([]Token, error) {
 	src = spliceContinuations(src)
 	p := &Preprocessor{
 		macros:     map[string]*Macro{},
@@ -92,8 +92,99 @@ func PreprocessTarget(src, filename string, linux bool) ([]Token, error) {
 		p.macros["_WIN64"] = &Macro{Name: "_WIN64", Body: []Token{tokNum(1, 0)}}
 	}
 	p.baseDir = filepath.Dir(filename)
+	// User -I directories take priority over the base dir and the cwd.
+	p.searchDirs = append(p.searchDirs, incDirs...)
 	p.searchDirs = append(p.searchDirs, p.baseDir, ".")
 	return p.process(src, filename)
+}
+
+// SerializeTokens turns a preprocessed token stream back into C source text.
+// This is the backend for the "-E" (preprocess-only) mode: the stream already
+// has directives stripped and macros expanded/includes resolved, so what comes
+// out is a single self-contained translation unit, much like `gcc -E`.
+//
+// Exact whitespace is not reconstructed (only the Space flag, which records
+// whether a token was preceded by whitespace); line markers ("# 1 \"file\"")
+// are intentionally omitted. That is enough for shell-level compatibility and
+// for feeding the output back to goc, not for byte-exact gcc reproduction.
+func SerializeTokens(toks []Token) string {
+	var b strings.Builder
+	for _, t := range toks {
+		s := tokenText(t)
+		if b.Len() > 0 && t.Space {
+			b.WriteByte(' ')
+		}
+		b.WriteString(s)
+	}
+	return b.String()
+}
+
+// tokenText renders one token as the C text it represents.
+func tokenText(t Token) string {
+	switch t.Kind {
+	case TStr:
+		return cEscape(t.Str)
+	case TNum:
+		if t.IsChar {
+			return charLiteral(t.Num)
+		}
+		return t.Text // original numeric/character text is preserved verbatim
+	default:
+		return t.Text // TIdent, TKeyword, TPunct all carry their source text
+	}
+}
+
+// charLiteral rebuilds a 'x' literal from its integer value, re-escaping the
+// few control characters C source would spell out.
+func charLiteral(v int64) string {
+	switch v {
+	case '\n':
+		return "'\\n'"
+	case '\t':
+		return "'\\t'"
+	case '\r':
+		return "'\\r'"
+	case 0:
+		return "'\\0'"
+	case '\'':
+		return "'\\''"
+	case '\\':
+		return "'\\\\'"
+	default:
+		return fmt.Sprintf("'%c'", rune(v))
+	}
+}
+
+// cEscape renders raw bytes as a C double-quoted string literal, re-spelling
+// the control characters the way C source does (NUL -> \0, not \x00) so the
+// -E output is itself valid C.
+func cEscape(b []byte) string {
+	var s strings.Builder
+	s.WriteByte('"')
+	for _, c := range b {
+		switch c {
+		case '\n':
+			s.WriteString("\\n")
+		case '\t':
+			s.WriteString("\\t")
+		case '\r':
+			s.WriteString("\\r")
+		case 0:
+			s.WriteString("\\0")
+		case '"':
+			s.WriteString("\\\"")
+		case '\\':
+			s.WriteString("\\\\")
+		default:
+			if c < 0x20 || c >= 0x7f {
+				fmt.Fprintf(&s, "\\x%02x", c)
+			} else {
+				s.WriteByte(c)
+			}
+		}
+	}
+	s.WriteByte('"')
+	return s.String()
 }
 
 // spliceContinuations removes backslash-newline pairs (C translation phase 2),

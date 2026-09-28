@@ -35,4 +35,9 @@ echo "== tools =="
 (cd tools && go build -o "../bin/elfcheck$EXE"    ./elfcheck)
 (cd tools && go build -o "../bin/msgboxcheck$EXE" ./msgboxcheck)
 
-echo "done: bin/goc$EXE, bin/goa$EXE, bin/elfcheck$EXE, bin/msgboxcheck$EXE"
+# cc.exe: a gcc/clang-compatible alias of goc. Build scripts can invoke it as a
+# drop-in C compiler; it honours the gcc flag conventions accepted in main.go
+# and, when named cc, behaves like gcc (compile to an executable, no auto-run).
+cp -f "bin/goc$EXE" "bin/cc$EXE"
+
+echo "done: bin/goc$EXE, bin/cc$EXE, bin/goa$EXE, bin/elfcheck$EXE, bin/msgboxcheck$EXE"

@@ -34,6 +34,7 @@ echo "== building elfcheck =="
 
 # Fresh output dir: goc -o bin/goc-out writes every .asm/.exe/ELF here.
 rm -rf bin/goc-out
+mkdir -p bin/goc-out
 
 pass=0
 fail=0
