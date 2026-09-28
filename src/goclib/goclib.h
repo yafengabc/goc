@@ -4,19 +4,21 @@
 /* =============================================================================
  * goclib.h -- internal umbrella header for the goclib C library.
  *
- * goc ships real standard headers (stddef.h / stdarg.h / stdio.h / stdlib.h /
- * string.h) under goclib/ and injects them on `#include <name.h>`; user code
- * includes those, never this header. goclib/goclib.c includes goclib.h to pull
- * in the standard declarations it implements, plus the __goclib_* platform
- * primitives below, which are the only pieces that touch the OS directly
- * (I/O, heap, process exit).
+ * goc ships real standard headers (ctype.h / stddef.h / stdarg.h / stdio.h /
+ * stdlib.h / string.h) under goclib/ and injects them on `#include <name.h>`;
+ * user code includes those, never this header. Each goclib/*.c implementation
+ * file (os.c / stdio.c / stdlib.c / string.c / ctype.c) includes goclib.h to
+ * pull in the standard declarations it implements, plus the __goclib_*
+ * platform primitives declared below -- the only pieces that touch the OS
+ * directly (I/O, heap, process exit).
  *
- * goc compiles goclib.c at start-up for the selected target and emits the
- * functions a program actually calls through its regular code generator; the
- * __goclib_* primitives reach the OS via extern imports (kernel32 on Windows,
- * goa syscall stubs on Linux).
+ * goc compiles the goclib .c files at start-up for the selected target and
+ * emits the functions a program actually calls through its regular code
+ * generator; the __goclib_* primitives reach the OS via extern imports
+ * (kernel32 on Windows, goa syscall stubs on Linux).
  * ========================================================================== */
 
+#include <ctype.h>
 #include <stddef.h>
 #include <stdarg.h>
 #include <stdio.h>

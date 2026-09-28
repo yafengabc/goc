@@ -1,11 +1,17 @@
 /* goclib_test.c -- end-to-end proof that goc compiles the REAL C-version goclib
- * (goclib/goclib.c) and that it runs correctly on both backends.
+ * (the split goclib/*.c files) and that it runs correctly on both backends.
  *
- * We #include the canonical goclib/goclib.c verbatim; everything below is just a
- * driver that exercises it. Every function (strlen, strcpy, printf, malloc, ...)
- * plus the five __goclib_* OS primitives is the C version from goclib.c.
+ * We #include the canonical goclib umbrella header plus each implementation
+ * file verbatim; everything below is just a driver that exercises it. Every
+ * function (strlen, strcpy, printf, malloc, ...) plus the five __goclib_* OS
+ * primitives is the C version from goclib/*.c.
  */
-#include "../goclib/goclib.c"
+#include "../goclib/goclib.h"
+#include "../goclib/os.c"
+#include "../goclib/ctype.c"
+#include "../goclib/string.c"
+#include "../goclib/stdlib.c"
+#include "../goclib/stdio.c"
 
 int main() {
     /* --- variadic printf: %s %c %d %ld %u %x %f --- */

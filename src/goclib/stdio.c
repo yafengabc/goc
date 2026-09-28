@@ -1,0 +1,207 @@
+#include "goclib.h"
+#include <stdarg.h>
+
+/* ----------------------------- <stdio.h> --------------------------------- */
+/*
+ * Shared formatter. Writes the expansion of `fmt` (with `ap`) into `out`,
+ * stopping after `limit` characters (limit < 0 means "no limit", used by
+ * sprintf). Returns the number of characters written.
+ */
+static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
+    long n = 0;
+    const char *p = fmt;
+    while (*p) {
+        if (*p != '%') {
+            if (limit < 0 || n < limit) out[n] = *p;
+            n++;
+            p++;
+            continue;
+        }
+        p++;
+        if (*p == '%') {
+            if (limit < 0 || n < limit) out[n] = '%';
+            n++;
+            p++;
+            continue;
+        }
+        /* optional field width: parsed and ignored, exactly like the asm
+         * vfmt ("%10.2f" prints "1.23", unpadded) */
+        while (*p >= '0' && *p <= '9') p++;
+        /* optional precision: ".NN" digits, or a bare "." for zero.
+         * Only %f consumes it (fractional digit count); default 6. */
+        int prec = 6;
+        if (*p == '.') {
+            p++;
+            prec = 0;
+            while (*p >= '0' && *p <= '9') { prec = prec * 10 + (*p - '0'); p++; }
+        }
+        /* length modifiers select long/short forms; every va slot is 8
+         * bytes, so skipping the whole run is enough (same as the asm). */
+        while (*p == 'l' || *p == 'h' || *p == 'L' ||
+               *p == 'z' || *p == 'j' || *p == 't') p++;
+        char spec = *p++;
+        if (spec == 's') {
+            const char *s = va_arg(ap, const char *);
+            if (!s) s = "(null)";
+            while (*s) {
+                if (limit < 0 || n < limit) out[n] = *s;
+                n++;
+                s++;
+            }
+        } else if (spec == 'c') {
+            int c = va_arg(ap, int);
+            if (limit < 0 || n < limit) out[n] = (char)c;
+            n++;
+        } else if (spec == 'd' || spec == 'i' || spec == 'u' ||
+                   spec == 'o' || spec == 'x' || spec == 'X') {
+            /* integers (long on the varargs side) */
+            unsigned long v;
+            if (spec == 'd' || spec == 'i') {
+                long sv = va_arg(ap, long);
+                if (sv < 0 && spec != 'u') {
+                    if (limit < 0 || n < limit) out[n] = '-';
+                    n++;
+                    v = (unsigned long)(-sv);
+                } else {
+                    v = (unsigned long)sv;
+                }
+                if (spec == 'u') v = (unsigned long)sv; /* unsigned %u */
+            } else {
+                v = va_arg(ap, unsigned long);
+            }
+            /* convert in the chosen base */
+            int base = 10;
+            if (spec == 'o') base = 8;
+            else if (spec == 'x' || spec == 'X') base = 16;
+            char tmp[32];
+            int t = 0;
+            if (v == 0) { tmp[t++] = '0'; }
+            while (v > 0) {
+                int d = (int)(v % base);
+                v /= base;
+                if (d < 10) tmp[t++] = (char)('0' + d);
+                else tmp[t++] = (char)((spec == 'X' ? 'A' : 'a') + (d - 10));
+            }
+            while (t-- > 0) {
+                if (limit < 0 || n < limit) out[n] = tmp[t];
+                n++;
+            }
+        } else if (spec == 'f') {
+            /* %f: <prec> fractional digits, rounded half to even, no exponent. */
+            double x = va_arg(ap, double);
+            int neg = 0;
+            if (x < 0) { neg = 1; x = -x; }
+            if (prec > 17) prec = 17;          /* past double's precision */
+            long whole = (long)x;
+            double frac = x - (double)whole;
+            char dig[20];                      /* prec+1 digits to round on */
+            int k;
+            for (k = 0; k <= prec; k++) {
+                frac *= 10.0;
+                int d = (int)frac;
+                dig[k] = (char)d;
+                frac -= (double)d;
+            }
+            /* round half to even on the prec-th digit */
+            {
+                int tail = (int)(frac * 10.0 + 0.5); /* nonzero past prec+1? */
+                if (prec == 0) {
+                    int d0 = dig[0];
+                    if (d0 > 5 || (d0 == 5 && (tail != 0 || (whole & 1) != 0)))
+                        whole++;
+                } else {
+                    int dp = dig[prec];
+                    if (dp > 5 || (dp == 5 && (tail != 0 || (dig[prec-1] & 1) != 0))) {
+                        int j = prec - 1;
+                        dig[j]++;
+                        while (j > 0 && dig[j] > 9) { dig[j] = 0; dig[--j]++; }
+                        if (dig[0] > 9) { dig[0] = 0; whole++; }
+                    }
+                }
+            }
+            if (neg) {
+                if (limit < 0 || n < limit) out[n] = '-';
+                n++;
+            }
+            {
+                char tmp[32];
+                int t = 0;
+                if (whole == 0) tmp[t++] = '0';
+                long w = whole;
+                while (w > 0) { tmp[t++] = (char)('0' + (w % 10)); w /= 10; }
+                while (t-- > 0) {
+                    if (limit < 0 || n < limit) out[n] = tmp[t];
+                    n++;
+                }
+            }
+            if (prec > 0) {
+                if (limit < 0 || n < limit) out[n] = '.';
+                n++;
+                int k2;
+                for (k2 = 0; k2 < prec; k2++) {
+                    if (limit < 0 || n < limit) out[n] = (char)('0' + dig[k2]);
+                    n++;
+                }
+            }
+        } else if (spec == 'p') {
+            /* %p: "0x" followed by 16 hex digits (full 64-bit address). */
+            void *pv = va_arg(ap, void *);
+            unsigned long v = (unsigned long)pv;
+            if (limit < 0 || n < limit) out[n] = '0';
+            n++;
+            if (limit < 0 || n < limit) out[n] = 'x';
+            n++;
+            int shift;
+            for (shift = 60; shift >= 0; shift -= 4) {
+                int d = (int)((v >> shift) & 0xf);
+                char ch = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+                if (limit < 0 || n < limit) out[n] = ch;
+                n++;
+            }
+        } else {
+            /* unknown specifier: emit it verbatim */
+            if (limit < 0 || n < limit) out[n] = spec;
+            n++;
+        }
+    }
+    return n;
+}
+
+int sprintf(char *buf, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vfmt(buf, -1, fmt, ap);
+    buf[n] = 0;
+    va_end(ap);
+    return n;
+}
+
+int printf(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vfmt(buf, 512, fmt, ap);
+    va_end(ap);
+    __goclib_write(buf, n);
+    return n;
+}
+
+int puts(const char *s) {
+    long n = (long)strlen(s);
+    __goclib_write(s, n);
+    __goclib_write("\n", 1);
+    return 0;
+}
+
+int putchar(int c) {
+    char b = (char)c;
+    __goclib_write(&b, 1);
+    return c;
+}
+
+int getchar(void) {
+    char b;
+    long n = __goclib_read(&b, 1);
+    if (n <= 0) return -1;
+    return (unsigned char)b;
+}
