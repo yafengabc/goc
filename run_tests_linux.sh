@@ -74,7 +74,12 @@ for src in src/examples/*.c; do
     ./"$bin" >"/tmp/gocl_$name.out" 2>"/tmp/gocl_$name.err"
     rc=$?
 
-    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/gocl_$name.out" >"/tmp/gocl_$name.diff"; then
+    # Diff unconditionally: `rc != 0 || !diff` short-circuits before diff
+    # runs, so the crash case -- the one you most want the output for --
+    # left no file behind and printed "can't read .../diff" instead.
+    diff -u "$exp" "/tmp/gocl_$name.out" >"/tmp/gocl_$name.diff"
+    diffrc=$?
+    if [ "$rc" -ne 0 ] || [ "$diffrc" -ne 0 ]; then
         echo "FAIL  $name  (exit=$rc)"
         sed -n '1,12p' "/tmp/gocl_$name.diff"
         echo "--- actual output (od -c) ---"
@@ -111,7 +116,9 @@ for asm in src/goa/examples/linux/*.asm; do
     ./"$bin" >"/tmp/goal_$name.out" 2>"/tmp/goal_$name.err"
     rc=$?
 
-    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/goal_$name.out" >"/tmp/goal_$name.diff"; then
+    diff -u "$exp" "/tmp/goal_$name.out" >"/tmp/goal_$name.diff"
+    diffrc=$?
+    if [ "$rc" -ne 0 ] || [ "$diffrc" -ne 0 ]; then
         echo "FAIL  linux/$name  (exit=$rc)"
         sed -n '1,12p' "/tmp/goal_$name.diff"
         echo "--- actual output (od -c) ---"

@@ -41,3 +41,6 @@ scratch/
 # Test/debug scratch dirs produced by goc runs (goa work areas).
 tmp/
 buildtmp/
+
+# Python bytecode caches from the QEMU/Unicorn runners.
+__pycache__/

@@ -95,15 +95,29 @@ for src in src/examples/*.c; do
         continue
     fi
 
-    ./bin/goc-out/"$name".exe 2>&1 | tr -d '\r' > "/tmp/goc_$name.out"
+    # Capture the exit code separately from stdout. Comparing output alone
+    # hides a program that prints the right thing and then dies -- verified:
+    # a program whose printf matches the golden and which then faults on a
+    # null store exits 139 and was being reported as ok. goa's own suite hit
+    # this once already ("4" then crash) and was fixed there; this leg was
+    # still doing it wrong.
+    ./bin/goc-out/"$name".exe > "/tmp/goc_$name.raw" 2>&1
+    rc=$?
+    # Strip CR: the Windows console layer emits CRLF.
+    tr -d '\r' < "/tmp/goc_$name.raw" > "/tmp/goc_$name.out"
 
-    if diff -u "$exp" "/tmp/goc_$name.out" > "/tmp/goc_$name.diff"; then
+    # Always diff, so the diagnostic file exists even when the run crashed.
+    diff -u "$exp" "/tmp/goc_$name.out" > "/tmp/goc_$name.diff"
+    diffrc=$?
+    if [ "$rc" -ne 0 ] || [ "$diffrc" -ne 0 ]; then
+        echo "FAIL  $name (exit=$rc)"
+        sed -n '1,12p' "/tmp/goc_$name.diff"
+        echo "  raw bytes:"
+        od -c "/tmp/goc_$name.raw" | head -8
+        fail=$((fail + 1))
+    else
         printf "ok    %-10s %6d bytes\n" "$name" "$(stat -c%s bin/goc-out/"$name".exe)"
         pass=$((pass + 1))
-    else
-        echo "FAIL  $name"
-        sed -n '1,12p' "/tmp/goc_$name.diff"
-        fail=$((fail + 1))
     fi
 done
 
@@ -148,7 +162,12 @@ for src in src/examples/*.c; do
     "$UCPY" tools/ucrun.py "bin/goc-out/$name" 2>"/tmp/gocl_$name.err" | tr -d '\r' >"/tmp/gocl_$name.out"
     rc=${PIPESTATUS[0]}
 
-    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/gocl_$name.out" >"/tmp/gocl_$name.diff"; then
+    # Diff unconditionally: `rc != 0 || !diff` short-circuits before diff
+    # runs, so a crash -- the case you most want the output for -- left no
+    # file for the sed below and printed "can't read .../diff" instead.
+    diff -u "$exp" "/tmp/gocl_$name.out" >"/tmp/gocl_$name.diff"
+    diffrc=$?
+    if [ "$rc" -ne 0 ] || [ "$diffrc" -ne 0 ]; then
         echo "FAIL  linux/$name  (exit=$rc)"
         sed -n '1,12p' "/tmp/gocl_$name.diff"
         head -3 "/tmp/gocl_$name.err"

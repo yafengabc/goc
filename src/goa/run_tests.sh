@@ -125,7 +125,11 @@ for asm in examples/linux/*.asm; do
     "$UCPY" ../../tools/ucrun.py "examples/linux/$name" 2>"/tmp/goa_$name.err" \
         | tr -d '\r' >"/tmp/goa_$name.out"
     rc=${PIPESTATUS[0]}
-    if [ "$rc" -ne 0 ] || ! diff -u "$exp" "/tmp/goa_$name.out" >"/tmp/goa_$name.diff"; then
+    # Unconditional diff, same reason as the Windows leg above: the `rc!=0`
+    # short-circuit used to skip it, so a crash produced no diagnostic.
+    diff -u "$exp" "/tmp/goa_$name.out" >"/tmp/goa_$name.diff"
+    diffrc=$?
+    if [ "$rc" -ne 0 ] || [ "$diffrc" -ne 0 ]; then
         echo "FAIL  linux/$name  (exit=$rc)"
         sed -n '1,12p' "/tmp/goa_$name.diff"
         cat "/tmp/goa_$name.err"
