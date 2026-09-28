@@ -12,6 +12,21 @@ checked locally against its golden.
 Usage:
     python peun.py <windows-pe>
 Exit code: the program's exit code (or 1 on a trap).
+
+Scope, deliberately: this is a *diagnoser*, not a regression runner. The
+Windows leg of run_tests.sh execs the real .exe on the real OS, which is
+strictly stronger than anything modelled here -- so nothing runs this in
+CI. What it adds over exec'ing is the fault detail: a real access
+violation gives you 0xC0000005 and nothing else, while this reports the
+faulting address, the size and the rip that asked for it (that is how the
+phase1 null-dereference was pinned down on the Linux side).
+
+Only three imports are modelled: GetStdHandle, WriteFile, ExitProcess.
+That covers goa's own examples and nothing that allocates -- goclib's
+Windows side calls GetProcessHeap/HeapAlloc/HeapFree, so any goc example
+using malloc stops here with a named message. Emulating a heap would be
+modelling our own model of kernel32, which is exactly the trap this
+project already fell into with its hand-written ELF interpreter.
 """
 
 import struct
@@ -125,11 +140,23 @@ class UcPE:
 
         self.iat = pe.imports()
         self.entry = pe.entry
+        self.image_base = pe.image_base
         self.mu.hook_add(UC_HOOK_CODE, self.hook_code)
         self.mu.hook_add(UC_HOOK_MEM_INVALID, self.hook_invalid)
 
     def hook_invalid(self, mu, access, address, size, value, ud):
+        # Say where and from where. A bare "invalid memory" is the whole
+        # reason this tool exists over just exec'ing the exe: a real fault
+        # gives you 0xC0000005 and nothing else, while here you get the
+        # faulting address, the size and the rip that asked for it.
         rip = mu.reg_read(UC_X86_REG_RIP)
+        print(
+            "peun: unmapped %s at 0x%x (size %d) rip=0x%x\n"
+            "      image_base=0x%x, stack [0x%x,0x%x)"
+            % ("read" if access in (16, 17, 18) else "access", address, size, rip,
+               self.image_base, STACK_TOP - STACK_SIZE, STACK_TOP),
+            file=sys.stderr,
+        )
         raise Trap(1)
 
     def hook_code(self, mu, address, size, ud):
@@ -142,7 +169,15 @@ class UcPE:
         target = address + 6 + disp
         fname = self.iat.get(target)
         if fname is None:
-            raise Trap(1)  # call into something we don't model
+            # Not an import we recognised. Saying the address, rather than
+            # exiting 1 silently, is the difference between "the program is
+            # broken" and "this tool does not model that call".
+            print(
+                "peun: indirect call to 0x%x (rip=0x%x) is not in the IAT"
+                % (target, address),
+                file=sys.stderr,
+            )
+            raise Trap(1)
         # Simulate the call: push the return address, then emulate the body.
         rsp = mu.reg_read(UC_X86_REG_RSP) - 8
         mu.mem_write(rsp, struct.pack("<Q", address + 6))
@@ -161,6 +196,13 @@ class UcPE:
         elif fname == "ExitProcess":
             raise Trap(mu.reg_read(UC_X86_REG_RCX))
         else:
+            # An import we parsed but do not emulate -- e.g. HeapAlloc, which
+            # goclib's Windows side needs. Name it: exit 1 on its own looks
+            # like the program failed.
+            print(
+                "peun: no emulation for imported %s() (rip=0x%x)" % (fname, address),
+                file=sys.stderr,
+            )
             raise Trap(1)
         mu.reg_write(UC_X86_REG_RIP, address + 6)
 
