@@ -1170,11 +1170,13 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 	if err := c.genClibFuncs(); err != nil {
 		return "", err
 	}
-	// -O1 and above: structured peephole over the body stream. It sees real
-	// instructions only; inline __asm is off limits (its flag effects are
-	// the author's business). -O0 keeps the legacy textual pass so its
-	// output stays byte-identical.
+	// -O1 and above: structured passes over the body stream, constant
+	// forwarding first (it materialises the immediates the peephole then
+	// turns into xor). Both see real instructions only; inline __asm is off
+	// limits (its flag effects are the author's business). -O0 keeps the
+	// legacy textual pass so its output stays byte-identical.
 	if c.opt >= 1 {
+		c.insts = constProp(c.insts)
 		c.insts = peepholeIR(c.insts)
 	}
 	body.WriteString(printASM(c.insts))
@@ -1429,6 +1431,204 @@ func peepholeIR(insts []Inst) []Inst {
 		last = len(out) - 1
 	}
 	return out
+}
+
+// gp64Regs is the set of full 64-bit register spellings; gpRegs adds the
+// 32-bit names, because a partial-register destination still defines the
+// register (mov eax, [m] zero-extends into all of rax) and must therefore
+// invalidate any known value, even though it never forwards one.
+var gp64Regs = map[string]bool{
+	"rax": true, "rbx": true, "rcx": true, "rdx": true,
+	"rsi": true, "rdi": true, "rbp": true, "rsp": true,
+	"r8": true, "r9": true, "r10": true, "r11": true,
+	"r12": true, "r13": true, "r14": true, "r15": true,
+}
+
+var gpRegs = func() map[string]bool {
+	m := map[string]bool{}
+	for r := range gp64Regs {
+		m[r] = true
+	}
+	for _, r := range []string{"eax", "ebx", "ecx", "edx", "esi", "edi"} {
+		m[r] = true
+	}
+	for i := 8; i < 16; i++ {
+		m[fmt.Sprintf("r%dd", i)] = true
+	}
+	return m
+}()
+
+// isSlotOperand reports whether s is a direct, unsized variable access as goc
+// emits it for every stack slot and global: "[rbp-N]" / "[rbp+N]" /
+// "[rip+G_x]". These are exactly the operands whose addresses are distinct
+// from each other, so a store to one slot never perturbs another tracked one.
+// Anything else -- "[r10]", "[rax+8]", "byte [rbp-3]" -- could alias any of
+// them and is treated as clobbering all knowledge.
+func isSlotOperand(s string) bool {
+	return strings.HasPrefix(s, "[rbp") || strings.HasPrefix(s, "[rip+")
+}
+
+// constProp forward-propagates known constants through variable slots:
+// `mov rax, 7; mov [x], rax` records that [x] holds 7, and a later
+// `mov rcx, [x]` -- an argument load, a re-read, anything -- is rewritten to
+// `mov rcx, 7`. It runs at -O1, before peepholeIR (whose xor rewrite then
+// eats the zero constants this pass materialises).
+//
+// The analysis is deliberately narrow, because guessing x86 semantics is how
+// this project ended up retiring a hand-written interpreter: knowledge
+// survives ONLY across the few instruction shapes the compiler itself emits
+// around variable access, and is dropped wholesale at everything else.
+//
+//   - `mov r64, imm` defines rax's value (other destinations are ignored).
+//   - `mov [slot], rax` with rax known records the slot; from an unknown or
+//     32-bit source it invalidates that slot.
+//   - `mov r64, [slot]` forwards the constant when one is known; the load
+//     disappears entirely if the destination register already holds it.
+//   - `lea` writes addresses (kills rax on write) and touches no memory.
+//   - calls and jumps invalidate everything: calls may write any slot
+//     through a pointer, and control transfers make the following code
+//     reachable from paths the linear scan has not seen.
+//   - one-operand instructions and anything carrying a memory operand
+//     invalidate everything (idiv defines rdx:rax implicitly, neg writes its
+//     operand, `add [x],1` writes a slot, xchg touches memory unmodelled).
+//   - a pure two-operand register/immediate ALU instruction keeps slot
+//     knowledge (it writes no memory) but clears rax when its destination
+//     overlaps rax; cmp keeps everything but only ever loses an opportunity.
+//   - every label or inline-asm line invalidates everything. Labels because
+//     knowledge must hold on all incoming paths.
+//
+// Loads and stores of 8 bytes are the only widths involved: knowledge is
+// recorded exclusively from a 64-bit register store and forwarded only into
+// 64-bit register loads, so a `mov dword [x], eax` between them invalidates
+// rather than misleads. Flags are never read by any rewritten shape, so the
+// rewrites cannot move a condition-code boundary.
+func constProp(insts []Inst) []Inst {
+	type state struct {
+		imms     map[string]int64 // slot operand -> known value
+		raxVal   int64
+		raxKnown bool
+	}
+	s := state{imms: map[string]int64{}}
+	reset := func() { s.imms = map[string]int64{}; s.raxKnown = false }
+
+	out := make([]Inst, 0, len(insts))
+	for _, in := range insts {
+		if in.Kind != instInstr {
+			out = append(out, in)
+			reset()
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			out = append(out, in)
+			reset()
+			continue
+		}
+		switch {
+		case pl.op == "mov" && len(pl.operands) == 2 && gpRegs[pl.operands[0]]:
+			dst, src := pl.operands[0], pl.operands[1]
+			switch {
+			case !isMemOperand(src):
+				if v, err := strconv.ParseInt(src, 10, 64); err == nil {
+					if dst == "rax" {
+						s.raxKnown, s.raxVal = true, v
+					}
+				} else if dst == "rax" && src != "rax" {
+					// register-to-register copy from an untracked source
+					s.raxKnown = false
+				}
+				out = append(out, in)
+			case isSlotOperand(src):
+				// a 64-bit register load; forward a known slot value
+				if v, known := s.imms[src]; known {
+					if dst == "rax" && s.raxKnown && s.raxVal == v {
+						continue // the register already holds it: drop the load
+					}
+					in = Inst{Kind: instInstr, Text: "\tmov " + dst + ", " + strconv.FormatInt(v, 10)}
+					if dst == "rax" {
+						s.raxKnown, s.raxVal = true, v
+					}
+				} else if dst == "rax" {
+					s.raxKnown = false
+				}
+				out = append(out, in)
+			default:
+				// load from an indirect address: no forward, may read anything
+				if dst == "rax" {
+					s.raxKnown = false
+				}
+				out = append(out, in)
+			}
+		case pl.op == "mov" && len(pl.operands) == 2 && isMemOperand(pl.operands[0]):
+			dst, src := pl.operands[0], pl.operands[1]
+			if isSlotOperand(dst) {
+				// 8-byte store from rax: the slot becomes known. Any other
+				// source (unknown value, 32-bit register) invalidates it.
+				if src == "rax" && s.raxKnown {
+					s.imms[dst] = s.raxVal
+				} else {
+					delete(s.imms, dst)
+				}
+			} else {
+				// indirect or sized store: may alias any slot
+				s.imms = map[string]int64{}
+			}
+			out = append(out, in)
+		case pl.op == "lea" && len(pl.operands) == 2:
+			if pl.operands[0] == "rax" {
+				s.raxKnown = false
+			}
+			out = append(out, in)
+		case pl.op == "call" || strings.HasPrefix(pl.op, "j"):
+			// calls may store through pointers to any slot; a jump makes the
+			// following instructions reachable from elsewhere, and the label
+			// rule below is what keeps merge points safe -- be consistent
+			// and treat every control transfer as a boundary.
+			reset()
+			out = append(out, in)
+		default:
+			// ALU ops, cmp, SSE, sized stores, anything else parsed.
+			switch {
+			case len(pl.operands) == 1 || containsMemoryOperand(pl.operands):
+				// One-operand instructions write their operand and often
+				// implicit registers (idiv defines rdx:rax, neg the operand
+				// itself, push/pop move the stack); any memory operand may
+				// be written (add [x],1) or touched unmodelled (xchg). Drop
+				// everything.
+				reset()
+			case gpRegs[pl.operands[0]]:
+				// A pure register/immediate instruction writes no memory, so
+				// slot knowledge survives; a destination overlapping rax
+				// redefines it. (cmp only writes flags, but clearing rax here
+				// is merely a lost opportunity, never a wrong forward.)
+				if redefinesRax[pl.operands[0]] {
+					s.raxKnown = false
+				}
+			default:
+				reset() // exotic shape: play safe
+			}
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
+// redefinesRax holds the register spellings whose destination writes overlap
+// rax in whole or in part: a partial write (al/ah/ax/eax) leaves the rest of
+// rax intact, so a previously known value can no longer be trusted.
+var redefinesRax = map[string]bool{
+	"rax": true, "eax": true, "ax": true, "al": true, "ah": true,
+}
+
+// containsMemoryOperand reports whether any operand addresses memory in any
+// form: "[rbp-8]", "[r10]", "byte [rbp-3]" -- anything with a bracket in it.
+func containsMemoryOperand(ops []string) bool {
+	for _, o := range ops {
+		if strings.Contains(o, "[") {
+			return true
+		}
+	}
+	return false
 }
 
 // peepholeASM applies a few safe, textual optimisations to the generated

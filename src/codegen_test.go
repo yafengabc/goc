@@ -292,6 +292,145 @@ func TestOpt1StillCompiles(t *testing.T) {
 	}
 }
 
+// TestConstPropForward locks the forwarding behaviour: constants stored into
+// slots reach later loads into ANY destination register, chains propagate,
+// and a load whose destination already holds the value disappears entirely.
+func TestConstPropForward(t *testing.T) {
+	got := lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov [rbp-8], rax"),  // [rbp-8] = 7
+		peepIns("mov rax, 5"),        // rax overwritten
+		peepIns("mov [rbp-16], rax"), // [rbp-16] = 5
+		peepIns("mov rcx, [rbp-8]"),  // -> mov rcx, 7 (arg-load shape)
+		peepIns("mov rdx, [rbp-16]"), // -> mov rdx, 5
+		peepIns("mov rax, [rbp-8]"),  // rax holds 5, slot 7 -> mov rax, 7
+	}))
+	want := []string{
+		"\tmov rax, 7",
+		"\tmov [rbp-8], rax",
+		"\tmov rax, 5",
+		"\tmov [rbp-16], rax",
+		"\tmov rcx, 7",
+		"\tmov rdx, 5",
+		"\tmov rax, 7",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// The load disappears when the destination already holds the constant --
+	// the adjacent store->load shape peepholeIR also handles, subsumed here.
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov [rbp-8], rax"),
+		peepIns("mov rax, [rbp-8]"),
+	}))
+	if len(got) != 2 {
+		t.Fatalf("redundant load: got %d lines, want 2: %q", len(got), got)
+	}
+	if got[1] != "\tmov [rbp-8], rax" {
+		t.Errorf("surviving line = %q", got[1])
+	}
+
+	// Negative immediates propagate; a chain through a second slot works.
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, -3"),
+		peepIns("mov [rbp-8], rax"),
+		peepIns("mov rdx, [rbp-8]"),  // -> mov rdx, -3
+		peepIns("mov [rbp-16], rdx"), // rdx not tracked -> slot invalidated
+		peepIns("mov rcx, [rbp-16]"), // must NOT forward
+	}))
+	if got[2] != "\tmov rdx, -3" {
+		t.Errorf("negative constant not forwarded: %q", got[2])
+	}
+	if got[4] != "\tmov rcx, [rbp-16]" {
+		t.Errorf("forwarded through an untracked register: %q", got[4])
+	}
+}
+
+// TestConstPropKills locks the invalidation rules: labels, calls, ALU ops,
+// indirect or sized stores, and inline asm all wipe the knowledge; a lea or
+// a register copy does not (they write no memory).
+func TestConstPropKills(t *testing.T) {
+	// label: knowledge must hold on all incoming paths -> gone
+	got := lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov [rbp-8], rax"),
+		lLine("L1:"),
+		peepIns("mov rcx, [rbp-8]"),
+	}))
+	if got[3] != "\tmov rcx, [rbp-8]" {
+		t.Errorf("knowledge survived a label: %q", got[3])
+	}
+	// call: callee may store through pointers to any slot
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov [rbp-8], rax"),
+		peepIns("call printf"),
+		peepIns("mov rcx, [rbp-8]"),
+	}))
+	if got[3] != "\tmov rcx, [rbp-8]" {
+		t.Errorf("knowledge survived a call: %q", got[3])
+	}
+	// indirect store through a register: may alias any slot. The rax value
+	// itself survives (the store does not write rax).
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov [rbp-8], rax"),
+		peepIns("mov [r10], rax"),
+		peepIns("mov rcx, [rbp-8]"),
+	}))
+	if got[3] != "\tmov rcx, [rbp-8]" {
+		t.Errorf("knowledge survived an indirect store: %q", got[3])
+	}
+	// sized store: writes only part of a slot -> invalidate, never mislead
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov [rbp-8], rax"),
+		peepIns("mov byte [rbp-3], al"),
+		peepIns("mov rcx, [rbp-8]"),
+	}))
+	if got[3] != "\tmov rcx, [rbp-8]" {
+		t.Errorf("knowledge survived a sized store: %q", got[3])
+	}
+	// ALU op on rax: the register no longer holds the constant, so a later
+	// load of the still-known slot must materialise it again (not be dropped)
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov [rbp-8], rax"),
+		peepIns("add rax, 1"),
+		peepIns("mov rax, [rbp-8]"),
+	}))
+	if len(got) != 4 || got[3] != "\tmov rax, 7" {
+		t.Errorf("want the load rewritten after an intervening add, got %q", got)
+	}
+	// inline asm: closes everything, its own lines untouched
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov [rbp-8], rax"),
+		rawLine("mov rax, 9"),
+		peepIns("mov rcx, [rbp-8]"),
+	}))
+	if got[3] != "\tmov rcx, [rbp-8]" {
+		t.Errorf("knowledge survived inline asm: %q", got[3])
+	}
+	// lea does not write memory: slot knowledge survives across it
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov [rbp-8], rax"),
+		peepIns("lea r10, [rip+G_g]"),
+		peepIns("mov rcx, [rbp-8]"),
+	}))
+	if got[3] != "\tmov rcx, 7" {
+		t.Errorf("knowledge did not survive a lea: %q", got[3])
+	}
+}
+
 // TestAsmStmtEmission runs the full pipeline on a function with an inline
 // asm block and checks the binder produced real memory operands: the local x
 // must be forced onto the stack (hasAsm disables register allocation) and the
