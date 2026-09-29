@@ -196,3 +196,63 @@ int main() {
 	}
 	t.Fatalf("print(struct Point[]) without a printer must ask for Point_array_print, got: %v", errs)
 }
+
+// &a[0] is a pointer expression, not a bare array identifier: it carries no
+// compile-time length and stays on the %p / printf path.
+func TestPrintArrayAddrOfElemStillPointer(t *testing.T) {
+	src := `int main() {
+    int a[3] = {1, 2, 3};
+    print(&a[0]);
+    return 0;
+}`
+	asm := genAsmOpt(t, src, 0)
+	if got := strings.Count(asm, "call printf"); got != 1 {
+		t.Fatalf("print(&a[0]) must keep the printf (%%p) lowering, got %d:\n%s", got, asm)
+	}
+	if strings.Contains(asm, "call int_array_print") {
+		t.Fatalf("print(&a[0]) must not dispatch to the array printer:\n%s", asm)
+	}
+}
+
+// Array content printing is a single-argument specialisation: in a
+// multi-argument print the array is just another pointer expression (the
+// %p caveat), so print("a is", a) stays on the printf path.
+func TestPrintArrayMultiArgStillPointer(t *testing.T) {
+	src := `int main() {
+    int a[3] = {1, 2, 3};
+    print("a is", a);
+    print(a, 10);
+    return 0;
+}`
+	asm := genAsmOpt(t, src, 0)
+	if got := strings.Count(asm, "call printf"); got != 2 {
+		t.Fatalf("multi-arg print must keep the printf lowering, got %d:\n%s", got, asm)
+	}
+	if strings.Contains(asm, "call int_array_print") {
+		t.Fatalf("multi-arg print must not dispatch to the array printer:\n%s", asm)
+	}
+}
+
+// The user's T_array_print printer and the T_array_* UFCS methods coexist on
+// the same struct array: print(pts) reaches the printer, pts.sum() the
+// method, and neither steals the other's call site.
+func TestPrintStructArrayPrinterAndMethodCoexist(t *testing.T) {
+	src := `struct Point { int x; int y; };
+int Point_array_print(struct Point *a, long n) { return 0; }
+long Point_array_sum(struct Point *a, long n) { return 0; }
+int main() {
+    struct Point pts[2] = {{1, 2}, {3, 4}};
+    print(pts);
+    return pts.sum();
+}`
+	asm := genAsmOpt(t, src, 0)
+	if got := strings.Count(asm, "call Point_array_print"); got != 1 {
+		t.Fatalf("print(pts) must lower to one Point_array_print call, got %d:\n%s", got, asm)
+	}
+	if got := strings.Count(asm, "call Point_array_sum"); got != 1 {
+		t.Fatalf("pts.sum() must lower to one Point_array_sum call, got %d:\n%s", got, asm)
+	}
+	if strings.Contains(asm, "call printf") {
+		t.Fatalf("neither the printer nor the method may drag in printf/vfmt:\n%s", asm)
+	}
+}
