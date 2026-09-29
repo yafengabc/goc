@@ -3874,6 +3874,15 @@ func (c *CG) elemClassOf(e Expr) CType {
 		return TInt
 	case *IncDecExpr:
 		return c.elemClassOf(n.E)
+	case *CastExpr:
+		// A cast re-types what a subsequent dereference/subscript reads:
+		// *(double *)p is a double element, *(int *)p an int one. Without
+		// this, both were reported as TInt and the double load used the
+		// integer path (mov instead of movsd).
+		if n.Typ != nil && (n.Typ.IsPtr() || n.Typ.IsArray()) && n.Typ.Elem != nil {
+			return n.Typ.Elem.Class()
+		}
+		return TInt
 	}
 	return TInt
 }
@@ -4091,6 +4100,14 @@ func (c *CG) elemWidthOf(e Expr) int {
 	case *IncDecExpr:
 		return c.elemWidthOf(n.E)
 	case *CastExpr:
+		// A cast to a pointer/array type changes what a subsequent
+		// dereference or subscript reads: *(int *)p loads 4 bytes at the
+		// pointed-to address, NOT the 8-byte pointer slot, and
+		// ((int *)p)[i] strides 4 bytes. Only a cast to a scalar (which
+		// dereferencing cannot apply to) falls back to its own width.
+		if n.Typ != nil && (n.Typ.IsPtr() || n.Typ.IsArray()) && n.Typ.Elem != nil {
+			return c.typeWidth(n.Typ.Elem)
+		}
 		return c.typeWidth(n.Typ)
 	}
 	return 8

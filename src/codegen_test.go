@@ -744,3 +744,64 @@ func TestDeadStores(t *testing.T) {
 		t.Errorf("sized store treated as covering: %q", got)
 	}
 }
+
+// TestCastDerefWidth locks the cast-dereference load width: *(int *)p must
+// load 4 bytes (mov eax, [..]) even though the cast expression's OWN type is
+// the 8-byte pointer. Regression for the shared array-print skeleton, where
+// __goclib_conv_int read 8 bytes and printed 51539607563 for {11,12,13}.
+func TestCastDerefWidth(t *testing.T) {
+	// int deref: 4-byte load with sign extension
+	asm := genAsm(t, `int a[1] = {7};
+int main(){
+  int v;
+  v = *(int *)&a[0];
+  return v;
+}`)
+	if !strings.Contains(asm, "mov eax, [rax]") {
+		t.Errorf("*(int *)p did not emit a 4-byte load: %q", asm)
+	}
+	if strings.Contains(asm, "mov rax, [rax]") {
+		t.Errorf("*(int *)p emitted an 8-byte load: %q", asm)
+	}
+	// short deref: 2-byte load
+	asm = genAsm(t, `short a[1] = {7};
+int main(){
+  int v;
+  v = *(short *)&a[0];
+  return v;
+}`)
+	if !strings.Contains(asm, "mov ax, [rax]") {
+		t.Errorf("*(short *)p did not emit a 2-byte load: %q", asm)
+	}
+	// char deref: 1-byte load
+	asm = genAsm(t, `char a[1] = {7};
+int main(){
+  int v;
+  v = *(char *)&a[0];
+  return v;
+}`)
+	if !strings.Contains(asm, "mov al, [rax]") {
+		t.Errorf("*(char *)p did not emit a 1-byte load: %q", asm)
+	}
+	// double deref through a cast: must take the double path (movsd) even
+	// though elemClassOf used to report TInt for cast expressions.
+	asm = genAsm(t, `double a[1] = {1.5};
+int main(){
+  double v;
+  v = *(double *)&a[0];
+  return (int)v;
+}`)
+	if !strings.Contains(asm, "movsd xmm0, [rax]") {
+		t.Errorf("*(double *)p did not emit a double load: %q", asm)
+	}
+	// long deref keeps the 8-byte load -- a long* cast really is 8 bytes
+	asm = genAsm(t, `long a[1] = {7};
+int main(){
+  long v;
+  v = *(long *)&a[0];
+  return (int)v;
+}`)
+	if !strings.Contains(asm, "mov rax, [rax]") {
+		t.Errorf("*(long *)p did not emit an 8-byte load: %q", asm)
+	}
+}
