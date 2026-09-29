@@ -309,49 +309,86 @@ int int_print(int v) {
 
 /* Python-style array printing: "[1, 2, 3]" plus newline. The print builtin
  * passes the element count as a compile-time constant -- a C array carries
- * no length at runtime. Elements reuse the shared digit converters
- * (__goclib_long_to_buf for integers, __goclib_double_g for floats); the
- * bracket / separator / newline skeleton is written once as a macro over
- * the element type and its converter. Every instance is a real function
- * the builtin can call, and on-demand emission links only the ones that are
- * referenced. Each returns the number of characters written.
+ * no length at runtime. One shared skeleton walks the array as raw bytes
+ * and hands each element to a per-type converter; each public printer is a
+ * thin wrapper picking the converter for its element type. Elements reuse
+ * the shared digit converters (__goclib_long_to_buf for integers,
+ * __goclib_double_g for floats). Adding a new element type is one converter
+ * plus one wrapper; specialising a type (radix, width, ...) touches only
+ * its own converter. On-demand emission links only the referenced printers
+ * (and their converters, pulled in by the function-pointer reference).
+ * Every function returns the number of characters written.
  *
  * The unsigned* arrays reuse the signed printers: int_array_print reads
  * ints at their true width and the int->long conversion sign-extends, so an
  * unsigned int value above INT_MAX prints negative -- the same caveat
  * printf %d has (likewise an unsigned long above LONG_MAX). Values within
  * the signed range print correctly. */
-#define DEFINE_ARRAY_PRINTER(NAME, ELEM_T, DIGITS)                  \
-int NAME(ELEM_T *a, long n) {                                       \
-    char buf[40];                                                   \
-    long i;                                                         \
-    int total = 1; /* "[" */                                        \
-    __goclib_write("[", 1);                                         \
-    for (i = 0; i < n; i++) {                                       \
-        int k;                                                      \
-        if (i > 0) {                                                \
-            __goclib_write(", ", 2);                                \
-            total += 2;                                             \
-        }                                                           \
-        k = DIGITS(buf, a[i]);                                      \
-        __goclib_write(buf, k);                                     \
-        total += k;                                                 \
-    }                                                               \
-    __goclib_write("]\n", 2);                                       \
-    return total + 2;                                               \
+
+typedef int (*__goclib_array_conv)(char *buf, void *p);
+
+/* shared skeleton: "[e1, e2, ...]" plus newline, returning chars written */
+int __goclib_array_print(void *a, long n, long elem_size,
+                         __goclib_array_conv conv) {
+    char buf[40];
+    char *p = (char *)a;
+    long i;
+    int total = 1; /* "[" */
+    __goclib_write("[", 1);
+    for (i = 0; i < n; i++) {
+        int k;
+        if (i > 0) {
+            __goclib_write(", ", 2);
+            total += 2;
+        }
+        k = conv(buf, p);
+        __goclib_write(buf, k);
+        total += k;
+        p += elem_size;
+    }
+    __goclib_write("]\n", 2);
+    return total + 2;
 }
 
+/* per-type converters: render the element at p into buf, return its length */
+static int __goclib_conv_short(char *buf, void *p) {
+    return __goclib_long_to_buf(buf, *(short *)p);
+}
+static int __goclib_conv_int(char *buf, void *p) {
+    return __goclib_long_to_buf(buf, *(int *)p);
+}
+static int __goclib_conv_long(char *buf, void *p) {
+    return __goclib_long_to_buf(buf, *(long *)p);
+}
+static int __goclib_conv_bool(char *buf, void *p) {
+    return __goclib_long_to_buf(buf, *(_Bool *)p);
+}
 /* float widens to double so the %g converter serves it too. */
-int __goclib_float_to_g(char *buf, float x) {
-    return __goclib_double_g(buf, (double)x);
+static int __goclib_conv_float(char *buf, void *p) {
+    return __goclib_double_g(buf, (double)*(float *)p);
+}
+static int __goclib_conv_double(char *buf, void *p) {
+    return __goclib_double_g(buf, *(double *)p);
 }
 
-DEFINE_ARRAY_PRINTER(short_array_print, short, __goclib_long_to_buf)
-DEFINE_ARRAY_PRINTER(int_array_print, int, __goclib_long_to_buf)
-DEFINE_ARRAY_PRINTER(long_array_print, long, __goclib_long_to_buf)
-DEFINE_ARRAY_PRINTER(bool_array_print, _Bool, __goclib_long_to_buf)
-DEFINE_ARRAY_PRINTER(float_array_print, float, __goclib_float_to_g)
-DEFINE_ARRAY_PRINTER(double_array_print, double, __goclib_double_g)
+int short_array_print(short *a, long n) {
+    return __goclib_array_print(a, n, sizeof(short), __goclib_conv_short);
+}
+int int_array_print(int *a, long n) {
+    return __goclib_array_print(a, n, sizeof(int), __goclib_conv_int);
+}
+int long_array_print(long *a, long n) {
+    return __goclib_array_print(a, n, sizeof(long), __goclib_conv_long);
+}
+int bool_array_print(_Bool *a, long n) {
+    return __goclib_array_print(a, n, sizeof(_Bool), __goclib_conv_bool);
+}
+int float_array_print(float *a, long n) {
+    return __goclib_array_print(a, n, sizeof(float), __goclib_conv_float);
+}
+int double_array_print(double *a, long n) {
+    return __goclib_array_print(a, n, sizeof(double), __goclib_conv_double);
+}
 
 /* Thin target for the print(...) builtin (see stdio.h): the "%s\n" case,
  * with vfmt's "(null)" guard kept. The integer case lowers straight to
