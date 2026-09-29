@@ -119,7 +119,15 @@ func Lex(src string) ([]Token, error) {
 					i++
 				}
 				text := src[start:i]
-				v, _ := strconv.ParseInt(text[2:], 16, 64)
+				// Parse as an unsigned bit pattern so that 0x8000000000000000
+				// (2^63) survives as the int64 minimum: -0x8000000000000000 is
+				// the standard spelling of LONG_MIN. ParseInt would overflow
+				// on it and leave v == 0.
+				u, err := strconv.ParseUint(text[2:], 16, 64)
+				var v int64
+				if err == nil {
+					v = int64(u)
+				}
 				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
 					i++
 				}
@@ -164,8 +172,15 @@ func Lex(src string) ([]Token, error) {
 				f, _ := strconv.ParseFloat(text, 64)
 				push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, Line: line})
 			} else {
+				// Parse as an unsigned bit pattern: 9223372036854775808 (2^63)
+				// maps to the int64 minimum, so -9223372036854775808L works.
+				// Sscanf's %d overflows on it and leaves v == 0, which turns
+				// LONG_MIN into -0 == 0. Values beyond 2^64-1 stay 0.
+				u, err := strconv.ParseUint(text, 10, 64)
 				var v int64
-				fmt.Sscanf(text, "%d", &v)
+				if err == nil {
+					v = int64(u)
+				}
 				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
 					i++
 				}
