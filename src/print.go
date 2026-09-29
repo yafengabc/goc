@@ -11,10 +11,10 @@ package main
 // Single-argument calls on common shapes are dispatched to thin goclib
 // primitives instead, so the weight of the vfmt interpreter is not linked
 // in when only print("str") / print(int) / print(long) / print() are used:
-//   - no arguments            -> print_str("")   (just the newline)
-//   - char*                   -> print_str(s)
-//   - int / char / _Bool      -> print_int_line(v)
-//   - long                    -> print_long_line(v)
+//   - no arguments            -> str_print("")   (just the newline)
+//   - char*                   -> str_print(s)
+//   - int / char / _Bool      -> int_print(v)
+//   - long                    -> long_print(v)
 //   - anything else (floats, other pointers, structs) -> printf, below
 //
 // Argument conversion, deliberately honest about C semantics:
@@ -37,8 +37,8 @@ import "fmt"
 // argument reports exactly once.
 func (c *checker) rewritePrint(n *Call, fn *FuncDecl) *Type {
 	// Static dispatch: a single argument whose static type is a printable
-	// scalar or string lowers to the thin print_str / print_int_line /
-	// print_long_line primitives -- no format interpreter linked. Anything
+	// scalar or string lowers to the thin str_print / int_print / long_print
+	// primitives -- no format interpreter linked. Anything
 	// else (multiple arguments, floats, non-string pointers, structs, an
 	// already-errored argument) falls through to the printf lowering.
 	typed := make([]*Type, len(n.Args))
@@ -50,17 +50,17 @@ func (c *checker) rewritePrint(n *Call, fn *FuncDecl) *Type {
 		}
 		switch {
 		case len(n.Args) == 0:
-			// print() is just the newline: print_str("") writes "\n".
-			return c.rewritePrintThin(n, "print_str", []Expr{&StrLit{Bytes: []byte{}}}, fn)
+			// print() is just the newline: str_print("") writes "\n".
+			return c.rewritePrintThin(n, "str_print", []Expr{&StrLit{Bytes: []byte{}}}, fn)
 		case t == nil:
 			// errored argument: keep going through the printf path so the
 			// %d stand-in reports exactly once.
 		case t.Kind == KBool || (t.Kind == KInt && t.Width <= 4):
-			return c.rewritePrintThin(n, "print_int_line", n.Args, fn)
+			return c.rewritePrintThin(n, "int_print", n.Args, fn)
 		case t.Kind == KInt && t.Width == 8:
-			return c.rewritePrintThin(n, "print_long_line", n.Args, fn)
+			return c.rewritePrintThin(n, "long_print", n.Args, fn)
 		case t.Kind == KPtr && t.Elem != nil && t.Elem.Kind == KInt && t.Elem.Width == 1:
-			return c.rewritePrintThin(n, "print_str", n.Args, fn)
+			return c.rewritePrintThin(n, "str_print", n.Args, fn)
 		}
 	}
 	fs := make([]byte, 0, 8*len(n.Args)+2)

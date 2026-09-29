@@ -212,11 +212,15 @@ int putchar(int c) {
 
 /* ------------------- thin integer printing ------------------------------- */
 /*
- * int_print / long_print are the weightless counterparts of printf("%d"):
- * a digits-to-buffer conversion and a single __goclib_write, no vfmt. A
- * program that prints only integers links neither the format interpreter
- * nor the floating-point converter. Returns the number of characters
- * written.
+ * int_print / long_print are the weightless counterparts of printf("%d\n"):
+ * a digits-to-buffer conversion, one write for the digits and one for the
+ * newline, no vfmt. A program that prints only integers links neither the
+ * format interpreter nor the floating-point converter. Returns the number
+ * of characters written, newline included.
+ *
+ * Both the UFCS scalar method x.print() and the print(...) builtin lower
+ * here: int_print / long_print are the single source for integer output,
+ * and their newline matches the print() builtin's "print a line" semantic.
  *
  * The sign is handled in unsigned arithmetic, so the most negative value
  * prints correctly: negating LONG_MIN overflows long but is exact modulo
@@ -253,34 +257,27 @@ int long_print(long v) {
         }
     }
     __goclib_write(buf, n);
-    return n;
+    __goclib_write("\n", 1);
+    return n + 1;
 }
 
 int int_print(int v) {
     return long_print((long)v);
 }
 
-/* Thin targets for the print(...) builtin (see stdio.h). print_str is the
- * "%s\n" case with vfmt's "(null)" guard kept; the int/long line printers
- * reuse long_print and append the newline. All return the total character
- * count so the builtin keeps its printf-lowering return semantics. */
-int print_str(const char *s) {
+/* Thin target for the print(...) builtin (see stdio.h): the "%s\n" case,
+ * with vfmt's "(null)" guard kept. The integer case lowers straight to
+ * int_print / long_print (which now carry their own newline). Everything
+ * returns the total character count so the builtin keeps its
+ * printf-lowering return semantics. Its name keeps the UFCS spelling
+ * (T_print): str_print. */
+int str_print(const char *s) {
     if (!s) s = "(null)";
     long n = 0;
     while (s[n]) n++;
     __goclib_write(s, n);
     __goclib_write("\n", 1);
     return (int)(n + 1);
-}
-
-int print_long_line(long v) {
-    int n = long_print(v);
-    __goclib_write("\n", 1);
-    return n + 1;
-}
-
-int print_int_line(int v) {
-    return print_long_line((long)v);
 }
 
 int getchar(void) {

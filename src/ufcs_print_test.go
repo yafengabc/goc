@@ -117,15 +117,15 @@ func TestPrintBuildsFormatString(t *testing.T) {
 }
 
 // print() with no arguments is just the newline: it lowers to
-// print_str(""), never touching the format interpreter.
+// str_print(""), never touching the format interpreter.
 func TestPrintEmpty(t *testing.T) {
 	src := `int main() {
     print();
     return 0;
 }`
 	asm := genAsmOpt(t, src, 0)
-	if got := strings.Count(asm, "call print_str"); got != 1 {
-		t.Fatalf("print() must lower to one print_str(\"\") call, got %d:\n%s", got, asm)
+	if got := strings.Count(asm, "call str_print"); got != 1 {
+		t.Fatalf("print() must lower to one str_print(\"\") call, got %d:\n%s", got, asm)
 	}
 	if strings.Contains(asm, "call printf") {
 		t.Fatalf("print() must not drag in printf/vfmt:\n%s", asm)
@@ -134,7 +134,7 @@ func TestPrintEmpty(t *testing.T) {
 
 // --- print thin dispatch: single-argument lowerings stay off vfmt --------
 
-// print("str") and print(char*) both lower to print_str, which appends the
+// print("str") and print(char*) both lower to str_print, which appends the
 // newline itself; printf/vfmt is not linked.
 func TestPrintStringThin(t *testing.T) {
 	src := `int main() {
@@ -144,15 +144,15 @@ func TestPrintStringThin(t *testing.T) {
     return 0;
 }`
 	asm := genAsmOpt(t, src, 0)
-	if got := strings.Count(asm, "call print_str"); got != 2 {
-		t.Fatalf("string prints must lower to print_str twice, got %d:\n%s", got, asm)
+	if got := strings.Count(asm, "call str_print"); got != 2 {
+		t.Fatalf("string prints must lower to str_print twice, got %d:\n%s", got, asm)
 	}
 	if strings.Contains(asm, "call printf") {
 		t.Fatalf("string prints must not drag in printf/vfmt:\n%s", asm)
 	}
 }
 
-// print(int) -> print_int_line; char and _Bool widen to int the same way
+// print(int) -> int_print; char and _Bool widen to int the same way
 // the %d conversion would.
 func TestPrintIntThin(t *testing.T) {
 	src := `int main() {
@@ -163,15 +163,15 @@ func TestPrintIntThin(t *testing.T) {
     return 0;
 }`
 	asm := genAsmOpt(t, src, 0)
-	if got := strings.Count(asm, "call print_int_line"); got != 3 {
-		t.Fatalf("int/char/_Bool prints must lower to print_int_line thrice, got %d:\n%s", got, asm)
+	if got := strings.Count(asm, "call int_print"); got != 3 {
+		t.Fatalf("int/char/_Bool prints must lower to int_print thrice, got %d:\n%s", got, asm)
 	}
 	if strings.Contains(asm, "call printf") {
 		t.Fatalf("int prints must not drag in printf/vfmt:\n%s", asm)
 	}
 }
 
-// print(long) -> print_long_line.
+// print(long) -> long_print.
 func TestPrintLongThin(t *testing.T) {
 	src := `int main() {
     long L = 1234567890123;
@@ -179,8 +179,8 @@ func TestPrintLongThin(t *testing.T) {
     return 0;
 }`
 	asm := genAsmOpt(t, src, 0)
-	if got := strings.Count(asm, "call print_long_line"); got != 1 {
-		t.Fatalf("long prints must lower to print_long_line, got %d:\n%s", got, asm)
+	if got := strings.Count(asm, "call long_print"); got != 1 {
+		t.Fatalf("long prints must lower to long_print, got %d:\n%s", got, asm)
 	}
 	if strings.Contains(asm, "call printf") {
 		t.Fatalf("long prints must not drag in printf/vfmt:\n%s", asm)
@@ -197,7 +197,7 @@ func TestPrintDoubleStillPrintf(t *testing.T) {
 	if got := strings.Count(asm, "call printf"); got != 1 {
 		t.Fatalf("print(double) must keep the printf lowering, got %d:\n%s", got, asm)
 	}
-	if strings.Contains(asm, "call print_str") || strings.Contains(asm, "call print_int_line") || strings.Contains(asm, "call print_long_line") {
+	if strings.Contains(asm, "call str_print") || strings.Contains(asm, "call int_print") || strings.Contains(asm, "call long_print") {
 		t.Fatalf("print(double) must not hit a thin path:\n%s", asm)
 	}
 }
@@ -214,7 +214,7 @@ func TestPrintPointerStillPrintf(t *testing.T) {
 	if got := strings.Count(asm, "call printf"); got != 1 {
 		t.Fatalf("print(int*) must keep the printf lowering, got %d:\n%s", got, asm)
 	}
-	if strings.Contains(asm, "call print_str") || strings.Contains(asm, "call print_int_line") || strings.Contains(asm, "call print_long_line") {
+	if strings.Contains(asm, "call str_print") || strings.Contains(asm, "call int_print") || strings.Contains(asm, "call long_print") {
 		t.Fatalf("print(int*) must not hit a thin path:\n%s", asm)
 	}
 }

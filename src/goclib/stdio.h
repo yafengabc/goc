@@ -17,22 +17,17 @@ int puts(const char *s);
 int putchar(int c);
 int getchar(void);
 
-/* Thin integer printing: digits-to-buffer conversion plus one write, with
- * no format interpreter involved. A program that prints only integers links
- * neither vfmt nor the floating-point converter (measured: 2.5KB exe vs
- * 13.8KB for a printf("%d") program). The names are the UFCS spellings, so
- * x.print() on an int/long rewrites to int_print(x) / long_print(x).
- * Returns characters written. */
+/* Thin printing: no format interpreter involved. A program that prints
+ * only strings/integers links neither vfmt nor the floating-point
+ * converter (measured: 2.0KB exe vs 13.3KB for a printf program). All
+ * three names are UFCS spellings (T_print), so the scalar method syntax
+ * x.print() on an int/long rewrites to int_print(x) / long_print(x), and
+ * the print(...) builtin lowers single-argument calls to int_print /
+ * long_print / str_print. Each prints one line -- conversion plus a
+ * newline -- and returns the character count, exactly like the printf
+ * lowering would. */
 int int_print(int v);
 int long_print(long v);
-
-/* print(...) builtin thin targets. The compiler lowers a single-argument
- * print call to one of these instead of printf, so the common print("str")
- * / print(int) / print(long) / print() cases stay off the format
- * interpreter. Each appends the newline print() implies and returns the
- * character count, exactly like the printf lowering would. */
-int print_str(const char *s);
-int print_int_line(int v);
-int print_long_line(long v);
+int str_print(const char *s);
 
 #endif /* GOC_STDIO_H */

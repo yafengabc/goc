@@ -1,5 +1,5 @@
 /* Thin print dispatch: single-argument print(...) calls lower to
- * print_str / print_int_line / print_long_line, so this program links none
+ * str_print / int_print / long_print, so this program links none
  * of the vfmt format interpreter. Multi-argument and float prints stay on
  * printf (covered by ufcs_print.c); the point here is that every call in
  * this file takes the thin path and the binary still works end to end.
