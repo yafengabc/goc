@@ -221,30 +221,30 @@ bash run_tests_linux.sh             # 在真 Linux 上直接 exec ELF（CI 的 U
 cd src/goa && bash run_tests.sh     # 只跑汇编器自己的用例
 ```
 
-`bash run_tests.sh` 一次做六件事，最后一律汇总 `pass=N fail=M`，非零 fail 退出码非 0：
+`bash run_tests.sh` 一次做八件事，最后一律汇总 `pass=N fail=M`，非零 fail 退出码非 0：
 
 1. 构建 goc / goa / elfcheck
 2. 找一个能 `import unicorn` 的 Python（`GOC_PYTHON` 可覆盖；找不到就**大声跳过**
    Linux 腿而不是假装通过）
-3. **Windows 腿 ×2**（-O0 与 -O1 各 42 项）—— 40 个例子 vs golden 逐字节比对，另有
+3. **Windows 腿 ×3**（-O0/-O1/-Os 各 42 项）—— 40 个例子 vs golden 逐字节比对，另有
    `winbox`（MessageBox）和 `winreg`（注册窗口类 + `GetMessage` 消息循环 + WM_PAINT）
-   两个 GUI demo 刻意没有 golden，只验证 user32 那些导入能编译链接。-O1 腿是优化
+   两个 GUI demo 刻意没有 golden，只验证 user32 那些导入能编译链接。-O1/-Os 腿是优化
    轨道的行为护栏：**与 -O0 比对同一份 golden**，任何 pass 改变可观察输出都在这里炸
-4. **Linux 腿 ×2**（-O0 与 -O1 各 39 项）—— 同一批例子出 ELF，先用
+4. **Linux 腿 ×3**（-O0/-O1/-Os 各 39 项）—— 同一批例子出 ELF，先用
    `elfcheck --structure-only` 校验结构，再由 `tools/ucrun.py` 在 Unicorn（QEMU TCG）
    里执行，与**同一份** golden 比对。依赖 Win32 DLL 的 3 个例子跳过。没有 unicorn
    时这一对腿整段跳过（见下）
 5. **委托 `src/goa/run_tests.sh`**：11 个 Windows 例子 + 3 个 Linux 例子 + 1 个 GUI
    （`msgboxcheck` 真的去点对话框的「是」）
-6. **三个 Go module 各自跑单测**：src 54 项、src/goa 33 项
+6. **三个 Go module 各自跑单测**：src 77 项、src/goa 33 项
 
-本机（Windows 11 + MSYS2 的 Python 带 unicorn 2.1.4）现状 **`pass=166 fail=0`**。
+本机（Windows 11 + MSYS2 的 Python 带 unicorn 2.1.4）现状 **`pass=247 fail=0`**。
 
 CI 里两个 job 是分工关系，不是重复：
 
 | | Windows runner | Ubuntu runner |
 | --- | --- | --- |
-| 执行内容 | 84 项 Windows 目标（-O0/-O1 各 42）+ 委托的 goa 套件 + 三个模块单测 | `run_tests_linux.sh`：ELF 直接跑在**真实内核**上 |
+| 执行内容 | 126 项 Windows 目标（-O0/-O1/-Os 各 42）+ 委托的 goa 套件 + 三个模块单测 | `run_tests_linux.sh`：ELF 直接跑在**真实内核**上 |
 | Linux 目标 | 需要 Python + unicorn，runner 没装，于是**明确跳过**（脚本会打 WARNING，不会静默算通过） | **39 个 goc 例子 + 3 个 goa 例子全跑**，逐字节比对同一份 golden |
 | GUI 用例 | `GOC_SKIP_MSGBOX=1` 跳过（需要交互式桌面） | —— |
 
@@ -274,13 +274,13 @@ CI 跑来验证过。修好后第一次跑就是 42/42 全绿，而且产物字�
 
 ## 优化
 
-`-O` 系列被真正解析（拼法照 gcc 语义映射：`-O`/`-Og`→1、`-O0..3`→数字、`-Os`/`-Oz`→2、
-`-Ofast`→3，认识不了的照旧忽略）。护栏是硬性的：**`-O0`（默认）输出与历史管线逐字节
-相同**，所以上面 85 项 golden 永远成立；`-O1` 起才在指令流上跑优化 pass（内联 →
-常量传播/折叠 → 窥孔 → 死存储消除），
-`run_tests.sh` 的 -O1 腿拿**同一份** golden 裁定行为。
+`-O` 系列被真正解析（拼法照 gcc 语义映射：`-O`/`-Og`→1、`-O1`→1、`-O2`/`-O3`→3（gcc 的
+-O2 本就内联）、`-Os`/`-Oz`→2、`-Ofast`→3，认识不了的照旧忽略）。护栏是硬性的：
+**`-O0`（默认）输出与历史管线逐字节相同**，所以同一批 golden 永远成立；`-O1` 起才在指令
+流上跑优化 pass（内联 → 常量传播/折叠 → 窥孔 → 死存储消除 → 跨块死存储消除），
+`run_tests.sh` 的 -O1/-Os 腿拿**同一份** golden 裁定行为。
 
-`-O1` 现在做四件事，全部跑在全程序指令流（`[]Inst`，标签/内联 asm 边界显式）上：
+`-O1` 现在做五件事，全部跑在全程序指令流（`[]Inst`，标签/内联 asm 边界显式）上：
 
 1. **小函数内联**：无调用（叶子）、无内联 asm、不写 callee-save 寄存器、无栈参数/
    变参的函数成为模板。调用点展开时剥掉 prologue/epilogue（`ret` 序列换成跳到续点的
@@ -297,6 +297,10 @@ CI 跑来验证过。修好后第一次跑就是 42/42 全绿，而且产物字�
    和任何间接/带尺寸访存都按「可能读」保守处理，标签/调用/跳转截断窗口。
 4. **IR 级窥孔**：`mov <reg>, 0` → `xor <reg32>, <reg32>`（2 字节清零整个寄存器）；
    消除紧邻的冗余访存（存后立即读回同一寄存器的 load、相邻重复 load）。
+5. **跨块死存储消除**（CFG + 反向 liveness）：按函数切段、建基本块与边、反向不动点求
+   存活集，删掉任何路径都读不到的 store——线性窗口外的跨块覆盖链、call 之后的死
+   spill（被调方写不到调用方未逃逸的栈槽）、`ret` 前无读者的 store。间接访存/内联
+   asm/形状不明的指令让整段退出；`lea` 取址的槽永久存活；窄访问毒化槽位。
 
 内联 `__asm{}` 一律不碰 —— 其中指令的 flags 语义只有作者知道（-O0 的文本窥孔会改写
 用户 asm 里的 `mov eax, 0`，-O1 不会）。pass 只做局部改写、绝不跨标签移动代码；一切
@@ -304,8 +308,10 @@ CI 跑来验证过。修好后第一次跑就是 42/42 全绿，而且产物字�
 内联是时间换空间：互相调用多的小函数（ctype/struct 系列）-O1 会变大一些，运行输出
 仍由同一份 golden 裁定。
 
-更高档位当前与 `-O1` 等价。路线上的下一层是 CFG + 精确 liveness（内联 spill 的彻底
-清除、寄存器级分配）。
+`-Os`/`-Oz` 是体积优先档：关掉唯一会变大代码的 pass（内联，例集实测 +17KB），其余清理
+pass 照跑——全例集 -Os 比 -O0 还小约 23KB、比 -O1 小约 61KB。`-O2`/`-O3`/`-Ofast` 落在
+最激进档（pass 集与 -O1 相同）。路线上的下一层是跨块 copy-prop（liveness 基建直接
+复用）、寄存器级分配。
 
 ## 体积对比
 

@@ -1173,12 +1173,19 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 	// -O1 and above: structured passes over the whole-program body stream.
 	// Inlining first (its argument spills then feed constants to the
 	// tracker), constant forwarding second (it materialises the immediates
-	// the peephole then turns into xor). All three see real instructions
+	// the peephole then turns into xor). All passes see real instructions
 	// only; inline __asm is off limits (its flag effects are the author's
 	// business). -O0 keeps the legacy textual pass so its output stays
 	// byte-identical.
+	//
+	// opt 2 (-Os/-Oz) is the size-first level: inlining is the only pass
+	// here that grows the program (measured +17KB across the examples), so
+	// it stays off; every other pass only deletes instructions and runs
+	// exactly as at -O1.
 	if c.opt >= 1 {
-		c.insts = inlineCalls(c.insts)
+		if c.opt != 2 {
+			c.insts = inlineCalls(c.insts)
+		}
 		c.insts = constProp(c.insts)
 		c.insts = peepholeIR(c.insts)
 		c.insts = deadStores(c.insts)

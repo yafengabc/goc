@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # End-to-end test for the goc -> goa pipeline: compile every example with goc,
 # run it, and byte-compare the output against src/expected/<name>.txt -- at
-# -O0 and, with the same goldens, at -O1 (the optimisation track's behavioural
-# guardrail: a pass that changes observable output fails here, not in prod).
+# -O0 and, with the same goldens, at -O1 and -Os (the optimisation track's
+# behavioural guardrail: a pass that changes observable output fails here,
+# not in prod). -Os is the size-first level: no inlining, every cleanup pass.
 #
-# Outputs go to bin/goc-out/ (-O0) and bin/goc-out-o1/ (-O1), never next to
-# the sources, so src/examples/ stays pristine -- only the .c files live there.
+# Outputs go to bin/goc-out/ (-O0), bin/goc-out-o1/ (-O1) and bin/goc-out-os/
+# (-Os), never next to the sources, so src/examples/ stays pristine -- only
+# the .c files live there.
 #
 # Usage:  bash run_tests.sh
 # Exit:   0 if every example matches, 1 otherwise.
@@ -59,9 +61,9 @@ else
     echo "==          leg will be SKIPPED. Set GOC_PYTHON=/path/to/python to enable it. =="
 fi
 
-# Fresh output dirs: goc -o <dir> writes every .exe/ELF there. The -o1 dirs
-# hold the -O1 legs' products; both are rebuilt from scratch every run.
-rm -rf bin/goc-out bin/goc-out-o1
+# Fresh output dirs: goc -o <dir> writes every .exe/ELF there. The -o1/-os
+# dirs hold the optimised legs' products; all are rebuilt from scratch.
+rm -rf bin/goc-out bin/goc-out-o1 bin/goc-out-os
 mkdir -p bin/goc-out
 
 pass=0
@@ -209,6 +211,12 @@ run_linux_leg "" ""
 
 echo "== linux target -O1 =="
 run_linux_leg "-o1" "O1/" -O1
+
+echo "== windows target -Os (size first: no inlining, cleanup passes on) =="
+run_win_leg "-os" "Os/" -Os
+
+echo "== linux target -Os =="
+run_linux_leg "-os" "Os/" -Os
 
 # goa's own assembler examples have their own suite (src/goa/run_tests.sh),
 # covering the Windows examples natively, the GUI one through msgboxcheck, and

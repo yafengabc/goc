@@ -80,7 +80,7 @@ func TestParseArgsOptLevels(t *testing.T) {
 		flag string
 		want int
 	}{
-		{"-O0", 0}, {"-O1", 1}, {"-O2", 2}, {"-O3", 3},
+		{"-O0", 0}, {"-O1", 1}, {"-O2", 3}, {"-O3", 3},
 		{"-O", 1}, {"-Og", 1}, {"-Os", 2}, {"-Oz", 2}, {"-Ofast", 3},
 	}
 	for _, tc := range cases {

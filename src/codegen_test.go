@@ -270,6 +270,28 @@ func TestOpt1LeavesInlineAsmAlone(t *testing.T) {
 	}
 }
 
+// -Os is the size-first level: inlining is the only pass that grows the
+// program (measured +17KB across the example set), so it is the one pass
+// -Os skips. Every other cleanup pass still runs, which the -Os legs in
+// run_tests.sh pin behaviourally; this test pins the level split itself.
+func TestOsKeepsCalls(t *testing.T) {
+	src := `int add3(int a){ return a + 3; }
+int main(){
+    int buf[2];
+    buf[0] = add3(4);
+    buf[0] = add3(5);
+    return buf[0];
+}`
+	asm1 := genAsmOpt(t, src, 1)
+	asmS := genAsmOpt(t, src, 2)
+	if strings.Contains(asm1, "call add3") {
+		t.Errorf("-O1 must inline add3:\n%s", asm1)
+	}
+	if got := strings.Count(asmS, "call add3"); got != 2 {
+		t.Errorf("-Os must keep both call sites, got %d:\n%s", got, asmS)
+	}
+}
+
 // TestOpt1StillMatchesO0Behaviour runs a real program through both levels and
 // requires the peephole not to break anything the compiler relies on: both
 // levels must produce output (the golden comparison over every example lives
