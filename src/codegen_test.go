@@ -337,19 +337,20 @@ func TestConstPropForward(t *testing.T) {
 		t.Errorf("surviving line = %q", got[1])
 	}
 
-	// Negative immediates propagate; a chain through a second slot works.
+	// Negative immediates propagate; a chain through a second slot works
+	// because registers are tracked too (rdx keeps its -3 across the store).
 	got = lineTexts(constProp([]Inst{
 		peepIns("mov rax, -3"),
 		peepIns("mov [rbp-8], rax"),
 		peepIns("mov rdx, [rbp-8]"),  // -> mov rdx, -3
-		peepIns("mov [rbp-16], rdx"), // rdx not tracked -> slot invalidated
-		peepIns("mov rcx, [rbp-16]"), // must NOT forward
+		peepIns("mov [rbp-16], rdx"), // [rbp-16] = -3 via tracked rdx
+		peepIns("mov rcx, [rbp-16]"), // -> mov rcx, -3
 	}))
 	if got[2] != "\tmov rdx, -3" {
 		t.Errorf("negative constant not forwarded: %q", got[2])
 	}
-	if got[4] != "\tmov rcx, [rbp-16]" {
-		t.Errorf("forwarded through an untracked register: %q", got[4])
+	if got[4] != "\tmov rcx, -3" {
+		t.Errorf("chain through a tracked register broken: %q", got[4])
 	}
 }
 
@@ -492,5 +493,232 @@ func TestAsmBlockCapture(t *testing.T) {
 	// The next token after TAsm must be the 'return' keyword on a later line.
 	if asm+1 >= len(toks) || toks[asm+1].Text != "return" {
 		t.Errorf("token after TAsm = %+v, want the return keyword", toks[asm+1])
+	}
+}
+
+// TestInlineExpands drives inlineCalls end to end on a miniature program:
+// the leaf `add` gets a template, main's call site is replaced by the
+// remapped body followed by the continuation label, and the prologue's
+// `sub rsp` grows by the inlined frame need.
+func TestInlineExpands(t *testing.T) {
+	insts := []Inst{
+		lLine("_start:"),
+		peepIns("and rsp, -16"),
+		peepIns("sub rsp, 48"),
+		peepIns("call main"),
+		peepIns("mov rcx, rax"),
+		peepIns("call ExitProcess"),
+		lLine("add:"),
+		peepIns("push rbp"),
+		peepIns("mov rbp, rsp"),
+		peepIns("sub rsp, 304"),
+		peepIns("mov [rbp-8], rcx"),
+		peepIns("mov rax, [rbp-8]"),
+		peepIns("shl rax, 32"),
+		peepIns("mov rsp, rbp"),
+		peepIns("pop rbp"),
+		peepIns("ret"),
+		lLine("main:"),
+		peepIns("push rbp"),
+		peepIns("mov rbp, rsp"),
+		peepIns("sub rsp, 288"),
+		peepIns("mov rcx, 3"),
+		peepIns("call add"),
+		peepIns("mov [rbp-16], rax"),
+		peepIns("xor eax, eax"),
+		peepIns("mov rsp, rbp"),
+		peepIns("pop rbp"),
+		peepIns("ret"),
+	}
+	got := lineTexts(inlineCalls(insts))
+	joined := strings.Join(got, "\n")
+	if strings.Contains(joined, "call add") {
+		t.Fatalf("call add was not expanded:/n%s", joined)
+	}
+	// main's frame grows by add's need (maxSlot 8 -> 16 aligned): 288+304.
+	if !strings.Contains(joined, "\tsub rsp, 304") {
+		t.Errorf("main prologue frame did not grow")
+	}
+	// add's body lands inside main with slots remapped: main's deepest slot
+	// is [rbp-16], so the inline area starts at base = 16+8 = 24 and add's
+	// [rbp-8] becomes [rbp-24]; its epilogue became the continuation jump.
+	want := []string{
+		"\tmov rcx, 3",
+		"\tmov [rbp-24], rcx",
+		"\tmov rax, [rbp-24]",
+		"\tshl rax, 32",
+		"\tjmp .L__inl0",
+		".L__inl0:",
+		"\tmov [rbp-16], rax",
+	}
+	pos := 0
+	for _, w := range want {
+		found := -1
+		for i := pos; i < len(got); i++ {
+			if got[i] == w {
+				found = i
+				break
+			}
+		}
+		if found < 0 {
+			t.Fatalf("expected %q after line %d, got:/n%s", w, pos, joined)
+		}
+		pos = found + 1
+	}
+}
+
+// TestInlineRejects pins the safety screen: a body containing a call, an
+// inline-asm line, a callee-save write, a stack-argument offset or a push
+// must not become a template.
+func TestInlineRejects(t *testing.T) {
+	base := func(extra ...Inst) []Inst {
+		insts := []Inst{
+			lLine("add:"),
+			peepIns("push rbp"),
+			peepIns("mov rbp, rsp"),
+			peepIns("sub rsp, 32"),
+			peepIns("mov [rbp-8], rcx"),
+			peepIns("mov rax, [rbp-8]"),
+			peepIns("mov rsp, rbp"),
+			peepIns("pop rbp"),
+			peepIns("ret"),
+			lLine("main:"),
+			peepIns("push rbp"),
+			peepIns("mov rbp, rsp"),
+			peepIns("sub rsp, 64"),
+			peepIns("call add"),
+			peepIns("mov rsp, rbp"),
+			peepIns("pop rbp"),
+			peepIns("ret"),
+		}
+		// insert the suspicious instruction before add's epilogue
+		return append(insts[:8], append(extra, insts[8:]...)...)
+	}
+	for _, tc := range []struct {
+		name  string
+		extra []Inst
+	}{
+		{"call", []Inst{peepIns("call printf")}},
+		{"raw", []Inst{rawLine("\tmov eax, 5")}},
+		{"callee-save", []Inst{peepIns("mov rbx, rax")}},
+		{"stack-arg", []Inst{peepIns("mov rax, [rbp+16]")}},
+		{"push", []Inst{peepIns("push rax")}},
+		{"ret", []Inst{peepIns("ret")}},
+	} {
+		got := lineTexts(inlineCalls(base(tc.extra...)))
+		if !contains(got, "\tcall add") {
+			t.Errorf("%s: call add was expanded, want rejected", tc.name)
+		}
+	}
+}
+
+func contains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestConstPropFold locks the ALU evaluation: known operands fold the
+// destination value (the instruction still emits -- flags stay put), a
+// partially-unknown operand kills the destination, and the shl/sar int
+// normalisation pair composes with the fold.
+func TestConstPropFold(t *testing.T) {
+	got := lineTexts(constProp([]Inst{
+		peepIns("mov rax, 3"),
+		peepIns("mov r10, 4"),
+		peepIns("add rax, r10"),     // rax = 7, instruction kept
+		peepIns("mov rcx, [rbp-8]"), // slot unknown: no forward
+	}))
+	want := []string{
+		"\tmov rax, 3",
+		"\tmov r10, 4",
+		"\tadd rax, r10", // still emitted for its flag effects
+		"\tmov rcx, [rbp-8]",
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("line %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// The folded value feeds later loads of the slot it was stored to.
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 3"),
+		peepIns("mov r10, 4"),
+		peepIns("add rax, r10"),
+		peepIns("shl rax, 32"), // 7<<32 known
+		peepIns("sar rax, 32"), // back to 7: int normalisation composes
+		peepIns("mov [rbp-8], rax"),
+		peepIns("mov rdx, [rbp-8]"), // -> mov rdx, 7
+	}))
+	if got[6] != "\tmov rdx, 7" {
+		t.Errorf("folded value did not reach the later load: %q", got[6])
+	}
+	// An unknown second operand invalidates only the destination; cmp/test
+	// write flags only and disturb nothing.
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 3"),
+		peepIns("add rax, rcx"), // rcx unknown: rax dies
+		peepIns("mov r10, 5"),
+		peepIns("cmp rax, 5"),
+		peepIns("mov [rbp-8], r10"),
+		peepIns("mov rdx, [rbp-8]"), // -> mov rdx, 5
+	}))
+	if got[5] != "\tmov rdx, 5" {
+		t.Errorf("cmp disturbed register knowledge: %q", got[5])
+	}
+}
+
+// TestDeadStores locks the coverage rule: a store covered by a later
+// full-width store to the same slot disappears once nothing reads it in
+// between; a read (even via lea) saves it; labels, calls, jumps, inline asm
+// and any indirect/sized memory operand block the elimination entirely.
+func TestDeadStores(t *testing.T) {
+	// covered: the first store is unread when the second lands
+	got := lineTexts(deadStores([]Inst{
+		peepIns("mov [rbp-8], rax"),  // dead
+		peepIns("mov rcx, 5"),        // unrelated register work
+		peepIns("mov [rbp-8], rcx"),  // covers it
+		peepIns("mov rdx, [rbp-16]"), // reads another slot, no interference
+	}))
+	if len(got) != 3 || got[0] != "\tmov rcx, 5" {
+		t.Errorf("covered store survived: %q", got)
+	}
+	// a read in between saves the store
+	got = lineTexts(deadStores([]Inst{
+		peepIns("mov [rbp-8], rax"),
+		peepIns("mov rdx, [rbp-8]"), // reads it
+		peepIns("mov [rbp-8], rcx"),
+	}))
+	if len(got) != 3 {
+		t.Errorf("read-backed store was dropped: %q", got)
+	}
+	// lea takes the address: the callee may write through it
+	got = lineTexts(deadStores([]Inst{
+		peepIns("mov [rbp-8], rax"),
+		peepIns("lea rcx, [rbp-8]"),
+		peepIns("mov [rbp-8], rcx"),
+	}))
+	if len(got) != 3 {
+		t.Errorf("address-taken store was dropped: %q", got)
+	}
+	// a label before the covering store: other paths may read the slot
+	got = lineTexts(deadStores([]Inst{
+		peepIns("mov [rbp-8], rax"),
+		lLine(".L1:"),
+		peepIns("mov [rbp-8], rcx"),
+	}))
+	if len(got) != 3 {
+		t.Errorf("store crossed by a label was dropped: %q", got)
+	}
+	// a sized store is no covering store (it rewrites only part of the slot)
+	got = lineTexts(deadStores([]Inst{
+		peepIns("mov [rbp-8], rax"),
+		peepIns("mov byte [rbp-8], cl"),
+	}))
+	if len(got) != 2 {
+		t.Errorf("sized store treated as covering: %q", got)
 	}
 }

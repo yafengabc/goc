@@ -1170,14 +1170,18 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 	if err := c.genClibFuncs(); err != nil {
 		return "", err
 	}
-	// -O1 and above: structured passes over the body stream, constant
-	// forwarding first (it materialises the immediates the peephole then
-	// turns into xor). Both see real instructions only; inline __asm is off
-	// limits (its flag effects are the author's business). -O0 keeps the
-	// legacy textual pass so its output stays byte-identical.
+	// -O1 and above: structured passes over the whole-program body stream.
+	// Inlining first (its argument spills then feed constants to the
+	// tracker), constant forwarding second (it materialises the immediates
+	// the peephole then turns into xor). All three see real instructions
+	// only; inline __asm is off limits (its flag effects are the author's
+	// business). -O0 keeps the legacy textual pass so its output stays
+	// byte-identical.
 	if c.opt >= 1 {
+		c.insts = inlineCalls(c.insts)
 		c.insts = constProp(c.insts)
 		c.insts = peepholeIR(c.insts)
+		c.insts = deadStores(c.insts)
 	}
 	body.WriteString(printASM(c.insts))
 
@@ -1468,32 +1472,440 @@ func isSlotOperand(s string) bool {
 	return strings.HasPrefix(s, "[rbp") || strings.HasPrefix(s, "[rip+")
 }
 
-// constProp forward-propagates known constants through variable slots:
-// `mov rax, 7; mov [x], rax` records that [x] holds 7, and a later
+// ---------- -O1: small-function inlining over the whole-program IR ----------
+
+// inlineCand is an extracted, inlining-ready body of a leaf function: the
+// prologue is stripped, every `mov rsp, rbp; pop rbp; ret` epilogue is
+// replaced by a placeholder, and the remaining instructions passed the
+// safety screen (no calls, no inline asm, no callee-save writes, no stack
+// arguments).
+type inlineCand struct {
+	body    []Inst          // prologue/epilogue-stripped template
+	labels  map[string]bool // internal label names, for per-site renaming
+	maxSlot int             // deepest [rbp-N] the template touches
+	need    int             // frame bytes the remapped body occupies (16-aligned)
+}
+
+// inlineRetPlaceholder marks where a stripped epilogue used to be; each
+// instantiation rewrites it into a jump to its call-site continuation label.
+const inlineRetPlaceholder = "@@goc_inline_ret@@"
+
+// internalLabelRe matches the compiler-generated local labels. Every one of
+// them starts with a dot (.L1:, .Lcmp3:, .Lcase7:, .Lswend6:); top-level
+// symbols (_start:, add:, main:) never do, so the dot is the whole story.
+var internalLabelRe = regexp.MustCompile(`^\.`)
+
+var rbpSlotRe = regexp.MustCompile(`\[rbp-(\d+)\]`)
+
+// calleeSaveWrites lists every spelling of a register whose clobbering would
+// corrupt the caller's state across an inlined body: the callee-save integer
+// registers plus rsp/rbp. goc homes locals in rbx/r12-r14, so a template
+// writing any of these could silently overwrite a caller local.
+var calleeSaveWrites = func() map[string]bool {
+	m := map[string]bool{"rbp": true, "rsp": true}
+	fams := []struct {
+		r64, r32, r16, r8, r8h string
+	}{
+		{"rbx", "ebx", "bx", "bl", "bh"},
+		{"r12", "r12d", "r12w", "r12b", ""},
+		{"r13", "r13d", "r13w", "r13b", ""},
+		{"r14", "r14d", "r14w", "r14b", ""},
+		{"r15", "r15d", "r15w", "r15b", ""},
+	}
+	for _, f := range fams {
+		for _, r := range []string{f.r64, f.r32, f.r16, f.r8, f.r8h} {
+			if r != "" {
+				m[r] = true
+			}
+		}
+	}
+	return m
+}()
+
+// parseEq reports whether text parses as exactly the given mnemonic and
+// operands.
+func parseEq(text, op string, ops ...string) bool {
+	pl, ok := parseBodyLine(text)
+	if !ok || pl.op != op || len(pl.operands) != len(ops) {
+		return false
+	}
+	for i := range ops {
+		if pl.operands[i] != ops[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// extractInlineCand prepares the block [lo, hi) (lo points at the function
+// label) for inlining, or returns nil when any safety rule rejects it.
+func extractInlineCand(insts []Inst, lo, hi int) *inlineCand {
+	body := insts[lo+1 : hi]
+	// Canonical prologue: push rbp / mov rbp, rsp / sub rsp, N. The entry
+	// stub (_start:) and anything else irregular is excluded, which also
+	// guarantees a caller-side rbp frame exists when this body is a caller.
+	if len(body) < 4 {
+		return nil
+	}
+	if !parseEq(body[0].Text, "push", "rbp") || !parseEq(body[1].Text, "mov", "rbp", "rsp") {
+		return nil
+	}
+	if fr, ok := parseBodyLine(body[2].Text); !ok || fr.op != "sub" ||
+		len(fr.operands) != 2 || fr.operands[0] != "rsp" {
+		return nil
+	}
+	// Every ret must close a mov rsp,rbp / pop rbp / ret triple: those are
+	// the only epilogues goc emits (goa has no `leave`), and anything else
+	// means a shape we do not model. `ret` carries no operands, so
+	// parseBodyLine rejects it -- compare the trimmed text instead.
+	isRet := func(in Inst) bool { return strings.TrimSpace(in.Text) == "ret" }
+	isMvr := func(in Inst) bool { return parseEq(in.Text, "mov", "rsp", "rbp") }
+	isPop := func(in Inst) bool { return parseEq(in.Text, "pop", "rbp") }
+	for i := 2; i < len(body); i++ {
+		if isRet(body[i]) && !(isMvr(body[i-2]) && isPop(body[i-1])) {
+			return nil
+		}
+	}
+	// Build the template: skip the prologue, replace each epilogue triple
+	// with the placeholder.
+	tmpl := make([]Inst, 0, len(body))
+	for i := 3; i < len(body); {
+		if i+2 < len(body) && isMvr(body[i]) && isPop(body[i+1]) && isRet(body[i+2]) {
+			tmpl = append(tmpl, Inst{Kind: instInstr, Text: inlineRetPlaceholder})
+			i += 3
+			continue
+		}
+		tmpl = append(tmpl, body[i])
+		i++
+	}
+	// Safety screen over the template.
+	cand := &inlineCand{body: tmpl, labels: map[string]bool{}}
+	for _, in := range tmpl {
+		switch in.Kind {
+		case instRaw:
+			return nil
+		case instLabel:
+			cand.labels[strings.TrimSuffix(in.Text, ":")] = true
+		case instInstr:
+			if in.Text == "\t"+inlineRetPlaceholder || in.Text == inlineRetPlaceholder {
+				continue
+			}
+			pl, ok := parseBodyLine(in.Text)
+			if !ok {
+				return nil // unparseable: play safe
+			}
+			switch {
+			case pl.op == "call":
+				return nil // leaf functions only
+			case pl.op == "push" || pl.op == "pop":
+				return nil // stack effects we do not track
+			}
+			for _, o := range pl.operands {
+				// [rsp...] and any positive [rbp+...] offset belong to stack
+				// arguments / shadow space / variadic saves -- not modelled.
+				// ([rip+G_x] global references are fine and stay untouched.)
+				if strings.Contains(o, "[rsp") || strings.Contains(o, "[rbp+") {
+					return nil
+				}
+			}
+			if len(pl.operands) > 0 && calleeSaveWrites[pl.operands[0]] {
+				return nil // would corrupt the caller's register-homed locals
+			}
+		}
+	}
+	// Frame need: the template's deepest remapped slot, 16-aligned so the
+	// caller's sub rsp stays a multiple of 16.
+	for _, in := range tmpl {
+		if in.Kind != instInstr {
+			continue
+		}
+		for _, sm := range rbpSlotRe.FindAllStringSubmatch(in.Text, -1) {
+			if n, err := strconv.Atoi(sm[1]); err == nil && n > cand.maxSlot {
+				cand.maxSlot = n
+			}
+		}
+	}
+	cand.need = (cand.maxSlot + 15) / 16 * 16
+	return cand
+}
+
+// expandInline instantiates the template for one call site: slots shift by
+// base-8, internal labels gain the site suffix, the placeholder becomes a
+// jump to cont, and cont's label lands right after the body.
+func expandInline(tmpl *inlineCand, base int, suffix, cont string) []Inst {
+	out := make([]Inst, 0, len(tmpl.body)+1)
+	for _, in := range tmpl.body {
+		switch in.Kind {
+		case instLabel:
+			out = append(out, Inst{Kind: instLabel,
+				Text: strings.TrimSuffix(in.Text, ":") + suffix + ":"})
+		case instInstr:
+			if in.Text == "\t"+inlineRetPlaceholder || in.Text == inlineRetPlaceholder {
+				out = append(out, Inst{Kind: instInstr, Text: "\tjmp " + cont})
+				continue
+			}
+			if pl, ok := parseBodyLine(in.Text); ok &&
+				strings.HasPrefix(pl.op, "j") && len(pl.operands) == 1 &&
+				tmpl.labels[pl.operands[0]] {
+				out = append(out, Inst{Kind: instInstr,
+					Text: "\t" + pl.op + " " + pl.operands[0] + suffix})
+				continue
+			}
+			txt := rbpSlotRe.ReplaceAllStringFunc(in.Text, func(m string) string {
+				n, _ := strconv.Atoi(rbpSlotRe.FindStringSubmatch(m)[1])
+				return fmt.Sprintf("[rbp-%d]", n-8+base)
+			})
+			out = append(out, Inst{Kind: instInstr, Text: txt})
+		default:
+			out = append(out, in)
+		}
+	}
+	out = append(out, Inst{Kind: instLabel, Text: cont + ":"})
+	return out
+}
+
+// maxRBPSlot returns the deepest [rbp-N] offset used by the instructions.
+func maxRBPSlot(insts []Inst) int {
+	m := 0
+	for _, in := range insts {
+		if in.Kind != instInstr {
+			continue
+		}
+		for _, sm := range rbpSlotRe.FindAllStringSubmatch(in.Text, -1) {
+			if n, err := strconv.Atoi(sm[1]); err == nil && n > m {
+				m = n
+			}
+		}
+	}
+	return m
+}
+
+// inlineCalls expands calls to small leaf functions across the whole-program
+// instruction stream at -O1 and above. A block qualifies as a call site's
+// target when its template was extracted (leaf, regular prologue, no shape
+// we do not model); a block qualifies as a caller when it has the canonical
+// prologue (so a real rbp frame exists for the remapped slots).
+//
+// Per caller: call sites are collected in order, each gets a disjoint slot
+// area below every slot the caller itself uses (base_k = callerMax + 8 +
+// sum of previous needs), the prologue's `sub rsp, N` grows by the total,
+// and the sites are then expanded back-to-front so indices stay valid. The
+// Windows shadow-space sandwich (`sub rsp, 32` ... `call` ... `add rsp, 32`)
+// is dropped along with the call: an inlined body makes no calls, so it
+// needs no shadow space. SysV call sites have no such sandwich and are
+// unaffected.
+func inlineCalls(insts []Inst) []Inst {
+	type block struct {
+		start, end int // [start] = top-level label line; end exclusive
+		regular    bool
+	}
+	var blocks []block
+	for i, in := range insts {
+		if in.Kind != instLabel {
+			continue
+		}
+		name := strings.TrimSuffix(in.Text, ":")
+		if name == in.Text || internalLabelRe.MatchString(name) {
+			continue // internal label, stays inside its function block
+		}
+		if len(blocks) > 0 {
+			blocks[len(blocks)-1].end = i
+		}
+		blocks = append(blocks, block{start: i})
+	}
+	if len(blocks) > 0 {
+		blocks[len(blocks)-1].end = len(insts)
+	}
+	for bi := range blocks {
+		b := &blocks[bi]
+		// Canonical prologue: push rbp / mov rbp, rsp / sub rsp, N. Blocks
+		// without it (the _start entry stub) are neither candidates nor
+		// callers -- expanding into them would reference an uninitialised
+		// rbp.
+		b.regular = b.start+3 < b.end &&
+			parseEq(insts[b.start+1].Text, "push", "rbp") &&
+			parseEq(insts[b.start+2].Text, "mov", "rbp", "rsp") &&
+			func() bool {
+				fr, ok := parseBodyLine(insts[b.start+3].Text)
+				return ok && fr.op == "sub" && len(fr.operands) == 2 && fr.operands[0] == "rsp"
+			}()
+	}
+	// Templates first (from the untouched stream), then expansion.
+	cands := map[string]*inlineCand{}
+	for _, b := range blocks {
+		if !b.regular {
+			continue
+		}
+		if cd := extractInlineCand(insts, b.start, b.end); cd != nil {
+			cands[strings.TrimSuffix(insts[b.start].Text, ":")] = cd
+		}
+	}
+	if len(cands) == 0 {
+		return insts
+	}
+	siteSeq := 0
+	var out []Inst
+	for _, b := range blocks {
+		seg := insts[b.start:b.end]
+		if !b.regular {
+			out = append(out, seg...)
+			continue
+		}
+		// Call sites in order, with disjoint slot bases.
+		type site struct {
+			idx  int // index within seg of the call line
+			base int
+			cd   *inlineCand
+		}
+		callerMax := maxRBPSlot(seg)
+		base := callerMax + 8
+		var sites []site
+		for i, in := range seg {
+			if in.Kind != instInstr {
+				continue
+			}
+			pl, ok := parseBodyLine(in.Text)
+			if !ok || pl.op != "call" || len(pl.operands) != 1 {
+				continue
+			}
+			if cd := cands[pl.operands[0]]; cd != nil {
+				sites = append(sites, site{idx: i, base: base, cd: cd})
+				base += cd.need
+			}
+		}
+		if len(sites) == 0 {
+			out = append(out, seg...)
+			continue
+		}
+		// Grow the prologue frame by the total inlined need.
+		total := base - (callerMax + 8)
+		if fr, ok := parseBodyLine(seg[3].Text); ok && fr.op == "sub" && len(fr.operands) == 2 {
+			if n, err := strconv.Atoi(fr.operands[1]); err == nil {
+				seg[3] = Inst{Kind: instInstr, Text: fmt.Sprintf("\tsub rsp, %d", n+total)}
+			}
+		}
+		// Expand back-to-front; earlier site indices stay valid.
+		for si := len(sites) - 1; si >= 0; si-- {
+			s := sites[si]
+			cont := fmt.Sprintf(".L__inl%d", siteSeq)
+			suffix := fmt.Sprintf("_inl%d", siteSeq)
+			siteSeq++
+			loDel, hiDel := s.idx, s.idx+1
+			if s.idx-1 > 0 && parseEq(seg[s.idx-1].Text, "sub", "rsp", "32") &&
+				s.idx+1 < len(seg) && parseEq(seg[s.idx+1].Text, "add", "rsp", "32") {
+				loDel, hiDel = s.idx-1, s.idx+2 // drop the shadow-space sandwich
+			}
+			rep := expandInline(s.cd, s.base, suffix, cont)
+			newSeg := make([]Inst, 0, len(seg)-(hiDel-loDel)+len(rep))
+			newSeg = append(newSeg, seg[:loDel]...)
+			newSeg = append(newSeg, rep...)
+			newSeg = append(newSeg, seg[hiDel:]...)
+			seg = newSeg
+		}
+		out = append(out, seg...)
+	}
+	return out
+}
+
+// deadStores drops a store to a slot that a later full-width store to the
+// same slot covers before anything reads the value back. This is the DCE
+// half that pairs with constProp's load elimination: inlining an argument
+// spills the incoming register into the callee frame, constProp forwards the
+// value and deletes the load -- and without this pass the now-unread spill
+// stayed behind (its bytes are pure bloat, one per inlined call site).
+//
+// The scan is linear with a conservative window, mirroring constProp's
+// rules: a pending store survives until the slot is read exactly (lea
+// counts -- taking the address lets the callee write it), is covered by a
+// full-width re-store (unsized `mov [slot], reg`), or the scan hits a
+// boundary -- labels, calls, jumps, inline asm, or any other memory operand
+// (an indirect or sized store may alias the slot; a byte store only rewrites
+// part of it, so neither counts as a covering store).
+func deadStores(insts []Inst) []Inst {
+	dead := map[int]bool{}
+	pending := map[string]int{} // slot operand -> index of the pending store
+	clearAll := func() { pending = map[string]int{} }
+	for i, in := range insts {
+		if in.Kind != instInstr {
+			clearAll() // label or inline asm: other paths may read anything
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			clearAll()
+			continue
+		}
+		if pl.op == "call" || strings.HasPrefix(pl.op, "j") {
+			clearAll()
+			continue
+		}
+		covered := pl.op == "mov" && len(pl.operands) == 2 &&
+			isMemOperand(pl.operands[0]) && isSlotOperand(pl.operands[0])
+		if covered {
+			slot := pl.operands[0]
+			if j, isPend := pending[slot]; isPend {
+				dead[j] = true // nobody read it: the earlier store is covered
+			}
+			pending[slot] = i
+		}
+		for _, o := range pl.operands {
+			if !strings.Contains(o, "[") {
+				continue
+			}
+			if covered && o == pl.operands[0] {
+				continue // the store's own destination is a write, not a read
+			}
+			if _, isPend := pending[o]; isPend {
+				delete(pending, o) // the value is read: its store must stay
+				continue
+			}
+			clearAll() // indirect/sized/foreign memory: may alias any slot
+			break
+		}
+	}
+	out := make([]Inst, 0, len(insts))
+	for i, in := range insts {
+		if !dead[i] {
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
+// constProp forward-propagates known values through registers and variable
+// slots: `mov rax, 7; mov [x], rax` records that [x] holds 7, and a later
 // `mov rcx, [x]` -- an argument load, a re-read, anything -- is rewritten to
-// `mov rcx, 7`. It runs at -O1, before peepholeIR (whose xor rewrite then
-// eats the zero constants this pass materialises).
+// `mov rcx, 7`. Two-operand integer ALU ops over known values are evaluated
+// (the instruction still emits -- only the tracker learns the result), so a
+// fully-constant expression collapses into `mov rax, <imm>` chains. It runs
+// at -O1, after inlining (inlined argument spills then feed it constants)
+// and before peepholeIR (whose xor rewrite then eats the zero constants this
+// pass materialises).
 //
 // The analysis is deliberately narrow, because guessing x86 semantics is how
 // this project ended up retiring a hand-written interpreter: knowledge
 // survives ONLY across the few instruction shapes the compiler itself emits
 // around variable access, and is dropped wholesale at everything else.
 //
-//   - `mov r64, imm` defines rax's value (other destinations are ignored).
-//   - `mov [slot], rax` with rax known records the slot; from an unknown or
-//     32-bit source it invalidates that slot.
+//   - `mov r64, imm` defines the destination's value; register-to-register
+//     copies propagate it; a 32-bit destination or an indirect source drops
+//     the wide value (partial write / unknown source).
+//   - `mov [slot], r64` with a known source records the slot; from an
+//     unknown or 32-bit source it invalidates that slot.
 //   - `mov r64, [slot]` forwards the constant when one is known; the load
 //     disappears entirely if the destination register already holds it.
-//   - `lea` writes addresses (kills rax on write) and touches no memory.
+//   - `lea` writes an address (a value we do not track) and touches no
+//     memory.
 //   - calls and jumps invalidate everything: calls may write any slot
 //     through a pointer, and control transfers make the following code
 //     reachable from paths the linear scan has not seen.
 //   - one-operand instructions and anything carrying a memory operand
 //     invalidate everything (idiv defines rdx:rax implicitly, neg writes its
 //     operand, `add [x],1` writes a slot, xchg touches memory unmodelled).
+//   - cmp/test write flags only and invalidate nothing.
 //   - a pure two-operand register/immediate ALU instruction keeps slot
-//     knowledge (it writes no memory) but clears rax when its destination
-//     overlaps rax; cmp keeps everything but only ever loses an opportunity.
+//     knowledge (it writes no memory); its destination value is folded when
+//     both operands are known, else dropped.
 //   - every label or inline-asm line invalidates everything. Labels because
 //     knowledge must hold on all incoming paths.
 //
@@ -1502,14 +1914,93 @@ func isSlotOperand(s string) bool {
 // 64-bit register loads, so a `mov dword [x], eax` between them invalidates
 // rather than misleads. Flags are never read by any rewritten shape, so the
 // rewrites cannot move a condition-code boundary.
+// reg64Name maps any integer register spelling to its 64-bit name; unknown
+// spellings pass through unchanged. A 32-bit destination partially redefines
+// the 64-bit register, so knowledge of the wide value must drop.
+func reg64Name(r string) string {
+	if gp64Regs[r] {
+		return r
+	}
+	switch r {
+	case "eax":
+		return "rax"
+	case "ebx":
+		return "rbx"
+	case "ecx":
+		return "rcx"
+	case "edx":
+		return "rdx"
+	case "esi":
+		return "rsi"
+	case "edi":
+		return "rdi"
+	}
+	if len(r) == 4 && r[0] == 'r' && r[3] == 'd' { // r8d..r15d
+		return r[:3]
+	}
+	return r
+}
+
+// foldALU evaluates a two-operand integer instruction over known values with
+// 64-bit wrap-around semantics, matching x86. Shift counts outside [0,63]
+// refuse to fold: x86 masks the count (shl rax,64 == shl rax,0) while Go's
+// shift would saturate. Division never folds (single operand, plus a
+// divide-by-zero fault the constant folder must not swallow).
+//
+// Folding only *records* the result in the value tracker; the instruction
+// itself still emits, so its flag effects stay exactly where they were.
+func foldALU(op string, a, b int64) (int64, bool) {
+	switch op {
+	case "add":
+		return a + b, true
+	case "sub":
+		return a - b, true
+	case "and":
+		return a & b, true
+	case "or":
+		return a | b, true
+	case "xor":
+		return a ^ b, true
+	case "imul":
+		return a * b, true
+	case "shl":
+		if b < 0 || b > 63 {
+			return 0, false
+		}
+		return a << uint(b), true
+	case "sar":
+		if b < 0 || b > 63 {
+			return 0, false
+		}
+		return a >> uint(b), true
+	case "shr":
+		if b < 0 || b > 63 {
+			return 0, false
+		}
+		return int64(uint64(a) >> uint(b)), true
+	}
+	return 0, false
+}
+
 func constProp(insts []Inst) []Inst {
 	type state struct {
-		imms     map[string]int64 // slot operand -> known value
-		raxVal   int64
-		raxKnown bool
+		regs map[string]int64 // 64-bit register spelling -> known value
+		imms map[string]int64 // slot operand -> known value
 	}
-	s := state{imms: map[string]int64{}}
-	reset := func() { s.imms = map[string]int64{}; s.raxKnown = false }
+	s := state{regs: map[string]int64{}, imms: map[string]int64{}}
+	reset := func() { s.regs = map[string]int64{}; s.imms = map[string]int64{} }
+	// killReg drops knowledge of the 64-bit register a destination overlaps.
+	killReg := func(dst string) { delete(s.regs, reg64Name(dst)) }
+	knownOperand := func(o string) (int64, bool) {
+		if v, err := strconv.ParseInt(o, 10, 64); err == nil {
+			return v, true
+		}
+		if gp64Regs[o] {
+			v, ok := s.regs[o]
+			return v, ok
+		}
+		return 0, false
+	}
 
 	out := make([]Inst, 0, len(insts))
 	for _, in := range insts {
@@ -1528,56 +2019,59 @@ func constProp(insts []Inst) []Inst {
 		case pl.op == "mov" && len(pl.operands) == 2 && gpRegs[pl.operands[0]]:
 			dst, src := pl.operands[0], pl.operands[1]
 			switch {
-			case !isMemOperand(src):
+			case gp64Regs[dst] && !isMemOperand(src):
 				if v, err := strconv.ParseInt(src, 10, 64); err == nil {
-					if dst == "rax" {
-						s.raxKnown, s.raxVal = true, v
+					s.regs[dst] = v
+				} else if gp64Regs[src] {
+					// register-to-register copy: the value follows the source
+					if sv, ok := s.regs[src]; ok {
+						s.regs[dst] = sv
+					} else {
+						delete(s.regs, dst)
 					}
-				} else if dst == "rax" && src != "rax" {
-					// register-to-register copy from an untracked source
-					s.raxKnown = false
+				} else {
+					delete(s.regs, dst)
 				}
-				out = append(out, in)
-			case isSlotOperand(src):
+			case gp64Regs[dst] && isSlotOperand(src):
 				// a 64-bit register load; forward a known slot value
 				if v, known := s.imms[src]; known {
-					if dst == "rax" && s.raxKnown && s.raxVal == v {
+					if dv, held := s.regs[dst]; held && dv == v {
 						continue // the register already holds it: drop the load
 					}
 					in = Inst{Kind: instInstr, Text: "\tmov " + dst + ", " + strconv.FormatInt(v, 10)}
-					if dst == "rax" {
-						s.raxKnown, s.raxVal = true, v
-					}
-				} else if dst == "rax" {
-					s.raxKnown = false
+					s.regs[dst] = v
+				} else {
+					delete(s.regs, dst)
 				}
-				out = append(out, in)
 			default:
-				// load from an indirect address: no forward, may read anything
-				if dst == "rax" {
-					s.raxKnown = false
-				}
-				out = append(out, in)
+				// 32-bit destination or an indirect address: a partial write
+				// or an unknown source -- the wide value cannot be trusted.
+				killReg(dst)
 			}
+			out = append(out, in)
 		case pl.op == "mov" && len(pl.operands) == 2 && isMemOperand(pl.operands[0]):
 			dst, src := pl.operands[0], pl.operands[1]
 			if isSlotOperand(dst) {
-				// 8-byte store from rax: the slot becomes known. Any other
-				// source (unknown value, 32-bit register) invalidates it.
-				if src == "rax" && s.raxKnown {
-					s.imms[dst] = s.raxVal
+				// 8-byte store from a known 64-bit register: the slot becomes
+				// known. Any other source (unknown value, 32-bit register)
+				// invalidates it.
+				if gp64Regs[src] {
+					if v, ok := s.regs[src]; ok {
+						s.imms[dst] = v
+					} else {
+						delete(s.imms, dst)
+					}
 				} else {
 					delete(s.imms, dst)
 				}
 			} else {
-				// indirect or sized store: may alias any slot
+				// indirect or sized store: may alias any slot. Registers are
+				// untouched (the store does not write one).
 				s.imms = map[string]int64{}
 			}
 			out = append(out, in)
 		case pl.op == "lea" && len(pl.operands) == 2:
-			if pl.operands[0] == "rax" {
-				s.raxKnown = false
-			}
+			killReg(pl.operands[0]) // addresses are values we do not track
 			out = append(out, in)
 		case pl.op == "call" || strings.HasPrefix(pl.op, "j"):
 			// calls may store through pointers to any slot; a jump makes the
@@ -1589,6 +2083,9 @@ func constProp(insts []Inst) []Inst {
 		default:
 			// ALU ops, cmp, SSE, sized stores, anything else parsed.
 			switch {
+			case (pl.op == "cmp" || pl.op == "test") && len(pl.operands) == 2:
+				// writes flags only: reads nothing we track, writes nothing
+				// we track -- keep every bit of knowledge
 			case len(pl.operands) == 1 || containsMemoryOperand(pl.operands):
 				// One-operand instructions write their operand and often
 				// implicit registers (idiv defines rdx:rax, neg the operand
@@ -1596,14 +2093,27 @@ func constProp(insts []Inst) []Inst {
 				// be written (add [x],1) or touched unmodelled (xchg). Drop
 				// everything.
 				reset()
-			case gpRegs[pl.operands[0]]:
-				// A pure register/immediate instruction writes no memory, so
-				// slot knowledge survives; a destination overlapping rax
-				// redefines it. (cmp only writes flags, but clearing rax here
-				// is merely a lost opportunity, never a wrong forward.)
-				if redefinesRax[pl.operands[0]] {
-					s.raxKnown = false
+			case gp64Regs[pl.operands[0]]:
+				// A pure register/immediate two-operand instruction writes no
+				// memory, so slot knowledge survives. Fold when both operands
+				// are known; otherwise the destination value dies.
+				dst := pl.operands[0]
+				folded := false
+				if av, aok := s.regs[dst]; aok && len(pl.operands) == 2 {
+					if bv, bok := knownOperand(pl.operands[1]); bok {
+						if r, ok := foldALU(pl.op, av, bv); ok {
+							s.regs[dst] = r
+							folded = true
+						}
+					}
 				}
+				if !folded {
+					delete(s.regs, dst)
+				}
+			case gpRegs[pl.operands[0]]:
+				// 32-bit destination: the zero-extension semantics and flag
+				// effects are not worth modelling -- drop the wide value.
+				killReg(pl.operands[0])
 			default:
 				reset() // exotic shape: play safe
 			}
@@ -1611,13 +2121,6 @@ func constProp(insts []Inst) []Inst {
 		}
 	}
 	return out
-}
-
-// redefinesRax holds the register spellings whose destination writes overlap
-// rax in whole or in part: a partial write (al/ah/ax/eax) leaves the rest of
-// rax intact, so a previously known value can no longer be trusted.
-var redefinesRax = map[string]bool{
-	"rax": true, "eax": true, "ax": true, "al": true, "ah": true,
 }
 
 // containsMemoryOperand reports whether any operand addresses memory in any
