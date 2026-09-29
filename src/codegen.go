@@ -1182,6 +1182,7 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 		c.insts = constProp(c.insts)
 		c.insts = peepholeIR(c.insts)
 		c.insts = deadStores(c.insts)
+		c.insts = livenessDSE(c.insts)
 	}
 	body.WriteString(printASM(c.insts))
 
