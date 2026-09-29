@@ -255,7 +255,7 @@ func parseArgs(args []string) (buildCfg, bool) {
 			body := strings.TrimPrefix(arg, "--")
 			switch {
 			case body == "version":
-				fmt.Println("goc (Go-of-C) 0.1")
+				fmt.Println("goc (Go-of-C)", versionInfo())
 				os.Exit(0)
 			case body == "help":
 				printHelp()

@@ -23,10 +23,23 @@ export GOTMPDIR="$TMP"
 
 EXE="$(go env GOEXE)"   # ".exe" on Windows, "" elsewhere
 
+# Version stamp for goc --version: git describe on a tag (v0.0.1), a suffix
+# past it (v0.0.1-3-ga1b2c3d), or a bare hash with no tags yet. Empty when
+# git is unavailable; goc then reports "dev".
+#
+# The stamp target is `main.version`, NOT the module path: `go build .` in the
+# package directory builds the main package under the synthetic path
+# command-line-arguments, where -X silently does nothing on newer toolchains.
+# `main.version` is the canonical, version-independent spelling.
+VERSION=""
+if command -v git >/dev/null 2>&1; then
+	VERSION="$(git describe --tags --always 2>/dev/null || true)"
+fi
+
 mkdir -p bin
 
 echo "== goc =="
-(cd src && go build -trimpath -ldflags="-s -w" -o "../bin/goc$EXE" .)
+(cd src && go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "../bin/goc$EXE" .)
 
 echo "== goa =="
 (cd src/goa && go build -trimpath -ldflags="-s -w" -o "../../bin/goa$EXE" .)
