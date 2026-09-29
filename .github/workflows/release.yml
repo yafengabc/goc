@@ -1,0 +1,59 @@
+name: Release
+
+# Tag-triggered release build. Pushing a v* tag (e.g. v0.0.1) builds the
+# Windows toolchain binaries, cross-compiles the Linux ones, checksums them
+# and creates a GitHub Release with release notes from
+# .github/release-notes/<tag>.md (committed BEFORE the tag is pushed).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # required to create the Release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash   # runner default on Windows is pwsh; build.sh needs bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # git describe needs tags -> full history
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: build (Windows toolchain)
+        run: bash build.sh
+
+      - name: cross-compile Linux toolchain
+        run: |
+          V="$(git describe --tags --always)"
+          (cd src && GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=$V" -o ../bin/goc-linux .)
+          (cd src/goa && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../../bin/goa-linux .)
+          ls -l bin/
+
+      - name: package + checksums
+        run: |
+          V="$(git describe --tags --always)"
+          mkdir -p release
+          cp bin/goc.exe   "release/goc-${V}-windows-x86_64.exe"
+          cp bin/cc.exe    "release/goc-${V}-windows-x86_64-cc.exe"
+          cp bin/goa.exe   "release/goa-${V}-windows-x86_64.exe"
+          cp bin/goc-linux "release/goc-${V}-linux-x86_64"
+          cp bin/goa-linux "release/goa-${V}-linux-x86_64"
+          cp README.md release/README.md
+          cp LICENSE release/LICENSE
+          (cd release && sha256sum * > SHA256SUMS.txt)
+          cat release/SHA256SUMS.txt
+
+      - name: create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release/* \
+            --notes-file ".github/release-notes/${GITHUB_REF_NAME}.md"
+          gh release view "$GITHUB_REF_NAME" --json name,tagName,assets --jq '{name, tagName, assets: [.assets[].name]}'
