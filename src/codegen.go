@@ -4937,6 +4937,14 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 	// register-allocated because they can be address-taken).
 	if id, ok := n.E.(*Ident); ok {
 		if vi, ok2 := c.vars[id.Name]; ok2 && vi.reg != "" {
+			// -- must step down, not up. Pick the right mnemonic once so all
+			// four fast-path sites below emit inc/dec and add/sub correctly.
+			opInc := "inc"
+			opAdd := "add"
+			if n.Op == "--" {
+				opInc = "dec"
+				opAdd = "sub"
+			}
 			if et != nil && et.Kind == KBool {
 				// _Bool keeps exactly 0/1: normalise the register after the
 				// increment/decrement. Prefix returns the new (normalised)
@@ -4944,9 +4952,9 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 				c.emit("mov rax, %s", vi.reg) // old value
 				if n.Prefix {
 					if step == 1 {
-						c.emit("inc %s", vi.reg)
+						c.emit("%s %s", opInc, vi.reg)
 					} else {
-						c.emit("add %s, %d", vi.reg, step)
+						c.emit("%s %s, %d", opAdd, vi.reg, step)
 					}
 					c.emit("mov rax, %s", vi.reg)
 					c.normalizeBool()
@@ -4954,9 +4962,9 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 				} else {
 					c.emit("mov rdx, rax") // save old value
 					if step == 1 {
-						c.emit("inc %s", vi.reg)
+						c.emit("%s %s", opInc, vi.reg)
 					} else {
-						c.emit("add %s, %d", vi.reg, step)
+						c.emit("%s %s, %d", opAdd, vi.reg, step)
 					}
 					c.emit("mov rax, %s", vi.reg)
 					c.normalizeBool()
@@ -4970,9 +4978,9 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 			}
 			if n.Prefix {
 				if step == 1 {
-					c.emit("inc %s", vi.reg)
+					c.emit("%s %s", opInc, vi.reg)
 				} else {
-					c.emit("add %s, %d", vi.reg, step)
+					c.emit("%s %s, %d", opAdd, vi.reg, step)
 				}
 				c.emit("mov rax, %s", vi.reg)
 				if resW == 4 {
@@ -4985,9 +4993,9 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 			} else {
 				c.emit("mov rax, %s", vi.reg) // old value (already canonical)
 				if step == 1 {
-					c.emit("inc %s", vi.reg)
+					c.emit("%s %s", opInc, vi.reg)
 				} else {
-					c.emit("add %s, %d", vi.reg, step)
+					c.emit("%s %s, %d", opAdd, vi.reg, step)
 				}
 				if resW == 4 {
 					// Canonicalise the register's new value through a scratch

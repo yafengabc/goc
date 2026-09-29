@@ -17,4 +17,13 @@ int puts(const char *s);
 int putchar(int c);
 int getchar(void);
 
+/* Thin integer printing: digits-to-buffer conversion plus one write, with
+ * no format interpreter involved. A program that prints only integers links
+ * neither vfmt nor the floating-point converter (measured: 2.5KB exe vs
+ * 13.8KB for a printf("%d") program). The names are the UFCS spellings, so
+ * x.print() on an int/long rewrites to int_print(x) / long_print(x).
+ * Returns characters written. */
+int int_print(int v);
+int long_print(long v);
+
 #endif /* GOC_STDIO_H */

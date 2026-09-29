@@ -210,6 +210,56 @@ int putchar(int c) {
     return c;
 }
 
+/* ------------------- thin integer printing ------------------------------- */
+/*
+ * int_print / long_print are the weightless counterparts of printf("%d"):
+ * a digits-to-buffer conversion and a single __goclib_write, no vfmt. A
+ * program that prints only integers links neither the format interpreter
+ * nor the floating-point converter. Returns the number of characters
+ * written.
+ *
+ * The sign is handled in unsigned arithmetic, so the most negative value
+ * prints correctly: negating LONG_MIN overflows long but is exact modulo
+ * 2^64, and C's unsigned arithmetic is defined modulo 2^64.
+ */
+int long_print(long v) {
+    char buf[21]; /* sign + 20 digits (LONG_MIN's full width) */
+    int n = 0;
+    unsigned long u = (unsigned long)v;
+    if (v < 0) {
+        u = (unsigned long)0 - u;
+        buf[n] = '-';
+        n++;
+    }
+    /* digits come out least-significant first */
+    do {
+        buf[n] = (char)('0' + (int)(u % 10));
+        u /= 10;
+        n++;
+    } while (u > 0);
+    /* reverse the digit run (past the sign, if any) */
+    {
+        int lo = 0;
+        int hi = n - 1;
+        if (buf[0] == '-') {
+            lo = 1;
+        }
+        while (lo < hi) {
+            char t = buf[lo];
+            buf[lo] = buf[hi];
+            buf[hi] = t;
+            lo++;
+            hi--;
+        }
+    }
+    __goclib_write(buf, n);
+    return n;
+}
+
+int int_print(int v) {
+    return long_print((long)v);
+}
+
 int getchar(void) {
     char b;
     long n = __goclib_read(&b, 1);
