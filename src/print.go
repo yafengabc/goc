@@ -12,9 +12,22 @@ package main
 // primitives instead, so the weight of the vfmt interpreter is not linked
 // in when only print("str") / print(int) / print(long) / print() are used:
 //   - no arguments            -> str_print("")   (just the newline)
-//   - char*                   -> str_print(s)
+//   - char*                   -> str_print(s)    (char arrays decay here)
 //   - int / char / _Bool      -> int_print(v)
 //   - long                    -> long_print(v)
+//   - short[N]/int[N]/long[N] ident -> the matching *_array_print printer
+//                               (bool/float/double have their own printers
+//                               too); Python-style "[1, 2, 3]". The checker
+//                               knows KArr.Len so the count is a compile-time
+//                               constant -- a C array carries no length at
+//                               runtime. char arrays are NOT included: string
+//                               semantics win, they lower via the char* decay
+//                               above. A struct/union array with a tag T
+//                               dispatches to a user-defined T_array_print --
+//                               the same T_f convention as UFCS methods --
+//                               so any element type the user can name has a
+//                               printable array form. Non-identifier
+//                               expressions fall to the %p path.
 //   - anything else (floats, other pointers, structs) -> printf, below
 //
 // Argument conversion, deliberately honest about C semantics:
@@ -42,6 +55,22 @@ func (c *checker) rewritePrint(n *Call, fn *FuncDecl) *Type {
 	// else (multiple arguments, floats, non-string pointers, structs, an
 	// already-errored argument) falls through to the printf lowering.
 	typed := make([]*Type, len(n.Args))
+	// A bare array identifier is recognised by its declared (KArr) type --
+	// checkExpr would already have decayed it to a pointer. char arrays are
+	// excluded here so they keep the string path above. A struct/union array
+	// without a user printer leaves a hint behind (arrHint) so the caller can
+	// point at the T_array_print function to define instead of silently
+	// printing the array's address.
+	var arrName string
+	var arrArgs []Expr
+	var arrHint string
+	if len(n.Args) == 1 {
+		var arrOK bool
+		arrName, arrArgs, arrOK, arrHint = c.arrayPrintDispatch(n.Args[0])
+		if !arrOK {
+			arrName = ""
+		}
+	}
 	if len(n.Args) <= 1 {
 		var t *Type
 		if len(n.Args) == 1 {
@@ -61,7 +90,15 @@ func (c *checker) rewritePrint(n *Call, fn *FuncDecl) *Type {
 			return c.rewritePrintThin(n, "long_print", n.Args, fn)
 		case t.Kind == KPtr && t.Elem != nil && t.Elem.Kind == KInt && t.Elem.Width == 1:
 			return c.rewritePrintThin(n, "str_print", n.Args, fn)
+		case arrName != "":
+			return c.rewritePrintThin(n, arrName, arrArgs, fn)
 		}
+	}
+	// A struct/union array whose T_array_print the user never defined: report
+	// the printer to write, then fall through -- the array decays to a
+	// pointer and the %p stand-in keeps the program compilable.
+	if arrHint != "" {
+		c.errf(0, "%s", arrHint)
 	}
 	fs := make([]byte, 0, 8*len(n.Args)+2)
 	for i, a := range n.Args {
@@ -97,14 +134,81 @@ func (c *checker) rewritePrint(n *Call, fn *FuncDecl) *Type {
 
 // rewritePrintThin renames a print call in place to one of the thin
 // single-argument primitives and type-checks it against the goclib
-// prototype.
+// prototype (or, for a user-defined struct-array printer, the user's own
+// function).
 func (c *checker) rewritePrintThin(n *Call, name string, args []Expr, fn *FuncDecl) *Type {
 	n.Name = name
 	n.Args = args
-	if pd, ok := c.protos[name]; ok {
-		return c.checkArgs("print", pd.ParamTypes, pd.Variadic, args, fn, pd.Ret)
+	if fd, ok := c.funcs[name]; ok {
+		return c.checkArgs(name, fd.ParamTypes, fd.Variadic, args, fn, fd.Ret)
 	}
-	return IntType() // unreachable: goclib.h always feeds the prototype table
+	if pd, ok := c.protos[name]; ok {
+		return c.checkArgs(name, pd.ParamTypes, pd.Variadic, args, fn, pd.Ret)
+	}
+	return IntType() // unreachable: goclib.h feeds the prototype table, and
+	// user printers were resolved by arrayPrintDispatch against c.funcs/c.protos
+}
+
+// arrayPrintDispatch recognises a bare array identifier passed to print()
+// (e.g. print(a) for "int a[5]") and returns the thin goclib array printer
+// plus the rewritten argument list: the identifier itself and its length as
+// a compile-time constant. A C array carries no runtime length, but the
+// checker sees the declared KArr type, whose Len is exactly what the printer
+// needs. The element type picks the printer -- short/int/long dispatch on
+// width (KInt), bool/float/double on their own kinds; the unsigned variants
+// reuse the same-width signed printer, which reads at the true element width
+// (values above the signed max print negative, the printf %d caveat). char
+// arrays are deliberately excluded (they are strings and lower via the char*
+// case above). A struct/union array with a tag T dispatches to a
+// user-defined T_array_print -- the same T_f convention as UFCS methods --
+// when one exists; without one, ok=false comes back with a hint (4th slot)
+// naming the function to write, so the caller points at it instead of
+// silently printing the address. Other element types and non-identifier
+// expressions (a+1, &a, a function that returns a pointer, ...) cannot carry
+// a length and stay on the %p / printf path.
+func (c *checker) arrayPrintDispatch(a Expr) (string, []Expr, bool, string) {
+	id, ok := a.(*Ident)
+	if !ok {
+		return "", nil, false, ""
+	}
+	at := c.lookup(id.Name)
+	if at == nil || at.Kind != KArr || at.Len <= 0 || at.Elem == nil {
+		return "", nil, false, ""
+	}
+	name := ""
+	switch at.Elem.Kind {
+	case KInt:
+		switch at.Elem.Width { // char(1) stays a string, never an element list
+		case 2:
+			name = "short_array_print"
+		case 4:
+			name = "int_array_print"
+		case 8:
+			name = "long_array_print"
+		default:
+			return "", nil, false, ""
+		}
+	case KBool:
+		name = "bool_array_print"
+	case KFloat:
+		name = "float_array_print"
+	case KDouble:
+		name = "double_array_print"
+	case KStruct, KUnion:
+		if at.Elem.Tag == "" {
+			return "", nil, false, "" // anonymous: nothing to name
+		}
+		name = at.Elem.Tag + "_array_print"
+		if c.funcs[name] == nil && c.protos[name] == nil {
+			return "", nil, false, fmt.Sprintf(
+				"print: no printer for a %s array (define int %s(%s *a, long n) to print its contents)",
+				at.Elem, name, at.Elem)
+		}
+	default:
+		return "", nil, false, ""
+	}
+	length := &NumLit{Val: int64(at.Len), Kind: TInt}
+	return name, []Expr{a, length}, true, ""
 }
 
 // printSpec picks the printf conversion for a print() argument of static

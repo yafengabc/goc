@@ -30,4 +30,20 @@ int int_print(int v);
 int long_print(long v);
 int str_print(const char *s);
 
+/* Array content printing, Python style: "[1, 2, 3]" plus newline. The
+ * print(...) builtin lowers print(arr) here when the argument is an array
+ * identifier -- the length is a compile-time constant the builtin passes
+ * in (a C array carries no runtime length). One printer per element type,
+ * generated from a shared skeleton in stdio.c; the unsigned* arrays reuse
+ * the same-width signed printer (an unsigned int above INT_MAX prints
+ * negative, the printf %d caveat). char arrays are deliberately not here:
+ * they are strings and stay on str_print. Each returns the number of
+ * characters written. */
+int short_array_print(short *a, long n);
+int int_array_print(int *a, long n);
+int long_array_print(long *a, long n);
+int bool_array_print(_Bool *a, long n);
+int float_array_print(float *a, long n);
+int double_array_print(double *a, long n);
+
 #endif /* GOC_STDIO_H */

@@ -87,72 +87,19 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                 n++;
             }
         } else if (spec == 'f' || spec == 'g') {
-            /* %f: <prec> fractional digits, rounded half to even, no exponent.
-             * %g: the same conversion, then trailing zeros are stripped. */
+            /* %f: <prec> fractional digits, rounded half to even, no
+             * exponent. %g: the same conversion, then trailing fractional
+             * zeros are stripped. Both share __goclib_double_to_buf with
+             * the array printers, so the floating-point conversion lives
+             * in exactly one place (see below). */
             double x = va_arg(ap, double);
-            int neg = 0;
-            if (x < 0) { neg = 1; x = -x; }
-            if (prec > 17) prec = 17;          /* past double's precision */
-            long whole = (long)x;
-            double frac = x - (double)whole;
-            char dig[20];                      /* prec+1 digits to round on */
-            int k;
-            for (k = 0; k <= prec; k++) {
-                frac *= 10.0;
-                int d = (int)frac;
-                dig[k] = (char)d;
-                frac -= (double)d;
-            }
-            /* round half to even on the prec-th digit */
-            {
-                int tail = (int)(frac * 10.0 + 0.5); /* nonzero past prec+1? */
-                if (prec == 0) {
-                    int d0 = dig[0];
-                    if (d0 > 5 || (d0 == 5 && (tail != 0 || (whole & 1) != 0)))
-                        whole++;
-                } else {
-                    int dp = dig[prec];
-                    if (dp > 5 || (dp == 5 && (tail != 0 || (dig[prec-1] & 1) != 0))) {
-                        int j = prec - 1;
-                        dig[j]++;
-                        while (j > 0 && dig[j] > 9) { dig[j] = 0; dig[--j]++; }
-                        if (dig[0] > 9) { dig[0] = 0; whole++; }
-                    }
-                }
-            }
-            /* %g strips trailing fractional zeros and a dangling decimal
-             * point ("2.500000" -> "2.5", "1.000000" -> "1"). A simplified
-             * %g: precision counts fractional digits like %f (C's %g counts
-             * significant digits) and there is no exponent form. Rounding
-             * runs first, so "0.999999" becomes "1". */
-            if (spec == 'g' && prec > 0) {
-                int last = prec - 1;
-                while (last >= 0 && dig[last] == 0) last--;
-                prec = last + 1; /* 0 -> no fractional part at all */
-            }
-            if (neg) {
-                if (limit < 0 || n < limit) out[n] = '-';
+            char tmp[40];
+            int t = __goclib_double_to_buf(tmp, x, prec);
+            if (spec == 'g') t = __goclib_double_strip_g(tmp, t);
+            int k2;
+            for (k2 = 0; k2 < t; k2++) {
+                if (limit < 0 || n < limit) out[n] = tmp[k2];
                 n++;
-            }
-            {
-                char tmp[32];
-                int t = 0;
-                if (whole == 0) tmp[t++] = '0';
-                long w = whole;
-                while (w > 0) { tmp[t++] = (char)('0' + (w % 10)); w /= 10; }
-                while (t-- > 0) {
-                    if (limit < 0 || n < limit) out[n] = tmp[t];
-                    n++;
-                }
-            }
-            if (prec > 0) {
-                if (limit < 0 || n < limit) out[n] = '.';
-                n++;
-                int k2;
-                for (k2 = 0; k2 < prec; k2++) {
-                    if (limit < 0 || n < limit) out[n] = (char)('0' + dig[k2]);
-                    n++;
-                }
             }
         } else if (spec == 'p') {
             /* %p: "0x" followed by 16 hex digits (full 64-bit address). */
@@ -176,6 +123,92 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
         }
     }
     return n;
+}
+
+/* ----------------- shared floating-point conversion -----------------------
+ * The %f/%g machinery of vfmt, extracted so the array printers can reuse it:
+ * a floating-point array is printed element by element with the very same
+ * digits printf("%g") would emit. __goclib_double_to_buf is the %f form
+ * (<prec> fractional digits, rounded half to even, no exponent);
+ * __goclib_double_strip_g drops trailing fractional zeros (the %g form);
+ * __goclib_double_g is the default-%g shorthand the array printers use.
+ * Rounding runs first, so "0.999999" becomes "1". */
+int __goclib_double_to_buf(char *buf, double x, int prec) {
+    int n = 0;
+    int neg = 0;
+    if (x < 0) { neg = 1; x = -x; }
+    if (prec > 17) prec = 17;          /* past double's precision */
+    long whole = (long)x;
+    double frac = x - (double)whole;
+    char dig[20];                      /* prec+1 digits to round on */
+    int k;
+    for (k = 0; k <= prec; k++) {
+        frac *= 10.0;
+        int d = (int)frac;
+        dig[k] = (char)d;
+        frac -= (double)d;
+    }
+    /* round half to even on the prec-th digit */
+    {
+        int tail = (int)(frac * 10.0 + 0.5); /* nonzero past prec+1? */
+        if (prec == 0) {
+            int d0 = dig[0];
+            if (d0 > 5 || (d0 == 5 && (tail != 0 || (whole & 1) != 0)))
+                whole++;
+        } else {
+            int dp = dig[prec];
+            if (dp > 5 || (dp == 5 && (tail != 0 || (dig[prec-1] & 1) != 0))) {
+                int j = prec - 1;
+                dig[j]++;
+                while (j > 0 && dig[j] > 9) { dig[j] = 0; dig[--j]++; }
+                if (dig[0] > 9) { dig[0] = 0; whole++; }
+            }
+        }
+    }
+    if (neg) {
+        buf[n] = '-';
+        n++;
+    }
+    {
+        char tmp[32];
+        int t = 0;
+        if (whole == 0) tmp[t++] = '0';
+        long w = whole;
+        while (w > 0) { tmp[t++] = (char)('0' + (w % 10)); w /= 10; }
+        while (t-- > 0) { buf[n] = tmp[t]; n++; }
+    }
+    if (prec > 0) {
+        buf[n] = '.';
+        n++;
+        int k2;
+        for (k2 = 0; k2 < prec; k2++) {
+            buf[n] = (char)('0' + dig[k2]);
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Strips trailing fractional zeros after the '.' in buf[0..n): the "%g"
+ * shape. Integer tails survive ("10.000000" -> "10") and a lone point goes
+ * too ("1.000000" -> "1"). */
+int __goclib_double_strip_g(char *buf, int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        if (buf[i] == '.') {
+            int last = n - 1;
+            while (last > i && buf[last] == '0') last--;
+            if (last == i) last--; /* nothing but zeros after the point */
+            return last + 1;
+        }
+    }
+    return n; /* no '.', nothing to strip */
+}
+
+/* __goclib_double_g: the %g conversion with the default six fractional
+ * digits -- exactly what printf("%g") prints for a double. */
+int __goclib_double_g(char *buf, double x) {
+    return __goclib_double_strip_g(buf, __goclib_double_to_buf(buf, x, 6));
 }
 
 int sprintf(char *buf, const char *fmt, ...) {
@@ -226,8 +259,11 @@ int putchar(int c) {
  * prints correctly: negating LONG_MIN overflows long but is exact modulo
  * 2^64, and C's unsigned arithmetic is defined modulo 2^64.
  */
-int long_print(long v) {
-    char buf[21]; /* sign + 20 digits (LONG_MIN's full width) */
+
+/* __goclib_long_to_buf converts v to decimal digits in buf (sign first,
+ * digits big-endian) and returns the character count. Shared by long_print
+ * and the array printers, which supply the newline / brackets themselves. */
+int __goclib_long_to_buf(char *buf, long v) {
     int n = 0;
     unsigned long u = (unsigned long)v;
     if (v < 0) {
@@ -256,6 +292,12 @@ int long_print(long v) {
             hi--;
         }
     }
+    return n;
+}
+
+int long_print(long v) {
+    char buf[21]; /* sign + 20 digits (LONG_MIN's full width) */
+    int n = __goclib_long_to_buf(buf, v);
     __goclib_write(buf, n);
     __goclib_write("\n", 1);
     return n + 1;
@@ -264,6 +306,52 @@ int long_print(long v) {
 int int_print(int v) {
     return long_print((long)v);
 }
+
+/* Python-style array printing: "[1, 2, 3]" plus newline. The print builtin
+ * passes the element count as a compile-time constant -- a C array carries
+ * no length at runtime. Elements reuse the shared digit converters
+ * (__goclib_long_to_buf for integers, __goclib_double_g for floats); the
+ * bracket / separator / newline skeleton is written once as a macro over
+ * the element type and its converter. Every instance is a real function
+ * the builtin can call, and on-demand emission links only the ones that are
+ * referenced. Each returns the number of characters written.
+ *
+ * The unsigned* arrays reuse the signed printers: int_array_print reads
+ * ints at their true width and the int->long conversion sign-extends, so an
+ * unsigned int value above INT_MAX prints negative -- the same caveat
+ * printf %d has (likewise an unsigned long above LONG_MAX). Values within
+ * the signed range print correctly. */
+#define DEFINE_ARRAY_PRINTER(NAME, ELEM_T, DIGITS)                  \
+int NAME(ELEM_T *a, long n) {                                       \
+    char buf[40];                                                   \
+    long i;                                                         \
+    int total = 1; /* "[" */                                        \
+    __goclib_write("[", 1);                                         \
+    for (i = 0; i < n; i++) {                                       \
+        int k;                                                      \
+        if (i > 0) {                                                \
+            __goclib_write(", ", 2);                                \
+            total += 2;                                             \
+        }                                                           \
+        k = DIGITS(buf, a[i]);                                      \
+        __goclib_write(buf, k);                                     \
+        total += k;                                                 \
+    }                                                               \
+    __goclib_write("]\n", 2);                                       \
+    return total + 2;                                               \
+}
+
+/* float widens to double so the %g converter serves it too. */
+int __goclib_float_to_g(char *buf, float x) {
+    return __goclib_double_g(buf, (double)x);
+}
+
+DEFINE_ARRAY_PRINTER(short_array_print, short, __goclib_long_to_buf)
+DEFINE_ARRAY_PRINTER(int_array_print, int, __goclib_long_to_buf)
+DEFINE_ARRAY_PRINTER(long_array_print, long, __goclib_long_to_buf)
+DEFINE_ARRAY_PRINTER(bool_array_print, _Bool, __goclib_long_to_buf)
+DEFINE_ARRAY_PRINTER(float_array_print, float, __goclib_float_to_g)
+DEFINE_ARRAY_PRINTER(double_array_print, double, __goclib_double_g)
 
 /* Thin target for the print(...) builtin (see stdio.h): the "%s\n" case,
  * with vfmt's "(null)" guard kept. The integer case lowers straight to
