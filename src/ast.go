@@ -233,9 +233,15 @@ type Call struct {
 // function. A call written directly against an identifier is still a Call --
 // even when that identifier turns out to be a function-pointer variable, which
 // the type checker and code generator resolve later.
+//
+// A member call "x.f(args)" whose member f does not exist can still be valid:
+// when the checker resolves it as a method on x's struct type (Go/Nim style
+// UFCS, spelled T_f), it records the rewritten direct call here. Codegen then
+// emits T_f with the receiver prepended to the arguments and ignores Fn.
 type IndirectCall struct {
 	Fn   Expr
 	Args []Expr
+	UFCS *Call
 }
 
 // Index is the subscript operator: arr[i] or ptr[i]. The base may be an array

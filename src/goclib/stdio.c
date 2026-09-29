@@ -86,8 +86,9 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                 if (limit < 0 || n < limit) out[n] = tmp[t];
                 n++;
             }
-        } else if (spec == 'f') {
-            /* %f: <prec> fractional digits, rounded half to even, no exponent. */
+        } else if (spec == 'f' || spec == 'g') {
+            /* %f: <prec> fractional digits, rounded half to even, no exponent.
+             * %g: the same conversion, then trailing zeros are stripped. */
             double x = va_arg(ap, double);
             int neg = 0;
             if (x < 0) { neg = 1; x = -x; }
@@ -118,6 +119,16 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                         if (dig[0] > 9) { dig[0] = 0; whole++; }
                     }
                 }
+            }
+            /* %g strips trailing fractional zeros and a dangling decimal
+             * point ("2.500000" -> "2.5", "1.000000" -> "1"). A simplified
+             * %g: precision counts fractional digits like %f (C's %g counts
+             * significant digits) and there is no exponent form. Rounding
+             * runs first, so "0.999999" becomes "1". */
+            if (spec == 'g' && prec > 0) {
+                int last = prec - 1;
+                while (last >= 0 && dig[last] == 0) last--;
+                prec = last + 1; /* 0 -> no fractional part at all */
             }
             if (neg) {
                 if (limit < 0 || n < limit) out[n] = '-';

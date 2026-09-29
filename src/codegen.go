@@ -3995,6 +3995,13 @@ func (c *CG) exprType(e Expr) *Type {
 		}
 		return nil
 	case *IndirectCall:
+		// A UFCS method call types like the direct call it was rewritten to.
+		if n.UFCS != nil {
+			if fd, ok := c.funcDefs[n.UFCS.Name]; ok {
+				return fd.Ret
+			}
+			return nil
+		}
 		if ft := funcTypeOf(c.exprType(n.Fn)); ft != nil {
 			return ft.Ret
 		}
@@ -5622,6 +5629,11 @@ func (c *CG) fnPtrVar(name string) (Expr, *Type, bool) {
 // tab[i](x), s.cb(x). The callee expression is evaluated once, before the
 // arguments, so that evaluating an argument cannot clobber it.
 func (c *CG) genIndirectCall(n *IndirectCall) (CType, error) {
+	// A checker-resolved method call (UFCS) is a plain direct call to the
+	// named function with the receiver already prepended to the arguments.
+	if n.UFCS != nil {
+		return c.genCallExpr(n.UFCS)
+	}
 	return c.genCall("", n.Fn, funcTypeOf(c.exprType(n.Fn)), n.Args)
 }
 

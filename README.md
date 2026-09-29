@@ -131,13 +131,16 @@ goc 在启动时把整个库当普通 C 程序编译**两次**（每个目标一
 
 printf 的已知边界：
 
-- 支持 `%d %i %u %o %x %X %s %c %f %p %%`；长度修饰符 `l h L z j t` 被解析（所有变参
+- 支持 `%d %i %u %o %x %X %s %c %f %g %p %%`；长度修饰符 `l h L z j t` 被解析（所有变参
   槽位都是 8 字节，所以解析掉即等价）。
 - **宽度一概忽略**：`%5d` 打 `42`、`%02x` 打 `7`，不会补空格或前导零 —— 这是与标准 C
   明确的差异（代码里有意为之，见 `stdio.c` 里 vfmt 的注释）。
-- 精度只有 `%f` 认：`%.6f` 默认 6 位，`%.0f` 到 `%.17f` 都行。
+- 精度只有 `%f` 与 `%g` 认：`%.6f` 默认 6 位，`%.0f` 到 `%.17f` 都行；`%g` 用同一套
+  定点转换后去掉小数部分的尾零（`2.500000`→`2.5`、`1.000000`→`1`）。注意这是
+  **简化版 `%g`**：C 的 `%g` 按有效数字计数并会切换科学计数法，这里按小数位计数
+  且没有指数形式。
 - 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界检查（缓冲区归调用方管）。
-- 没有 `%e %g %a %n`。
+- 没有 `%e %a %n`。
 - 库里没有 `scanf`、没有文件 I/O、没有 `math.h`、没有 `time.h`。
 
 ## 支持的语言子集
@@ -148,6 +151,15 @@ printf 的已知边界：
   `enum`、多维数组、指针、函数指针、`typedef`
 - **位域**：MSVC 布局规则（跨存储单元分配、`:0` 强制开新单元、无名位域做填充），
   读写走读-改-写
+- **方法（UFCS）**：`x.f(args)` / `p->f(args)` 在成员 `f` 不存在时按方法解析——定义
+  普通函数 `T_f`（首参为 `struct T` 值或 `struct T*` 指针，T 是 x 的 struct 标签）
+  即可写成 `x.f(args)`；指针接收者收到 `&x`（`p->f` 直接收 `p`），值接收者收到 `x`
+  （`p->f` 收 `*p`）。成员查找永远优先（函数指针成员不受影响）。纯编译期重写，
+  无 vtable、无运行时元数据
+- **print 内建**：`print(expr, ...)` 按实参静态类型拼一个格式串降到 `printf`——
+  整数（含 `_Bool`；`char` 打数字值）`%d`、浮点 `%g`、`char*`/字符串字面量/char 数组
+  `%s`、其他指针 `%p`、struct/union 拒绝（提示定义 `T_print` 方法后用 `x.print()`）。
+  实参空格分隔、行尾换行，`print()` 只换行；用户声明的 `print` 函数优先于内建
 - **初始化**：`{}` 初始化列表（嵌套、指定初始化器 `.field =`、数组长度推断）、
   字符数组用字符串字面量初始化、`char *p = "str"`（含全局）
 - **存储类与限定符**：`static`（局部持久化，且只初始化一次）、`extern`、`typedef`；
@@ -226,19 +238,19 @@ cd src/goa && bash run_tests.sh     # 只跑汇编器自己的用例
 1. 构建 goc / goa / elfcheck
 2. 找一个能 `import unicorn` 的 Python（`GOC_PYTHON` 可覆盖；找不到就**大声跳过**
    Linux 腿而不是假装通过）
-3. **Windows 腿 ×3**（-O0/-O1/-Os 各 42 项）—— 40 个例子 vs golden 逐字节比对，另有
+3. **Windows 腿 ×3**（-O0/-O1/-Os 各 43 项）—— 41 个例子 vs golden 逐字节比对，另有
    `winbox`（MessageBox）和 `winreg`（注册窗口类 + `GetMessage` 消息循环 + WM_PAINT）
    两个 GUI demo 刻意没有 golden，只验证 user32 那些导入能编译链接。-O1/-Os 腿是优化
    轨道的行为护栏：**与 -O0 比对同一份 golden**，任何 pass 改变可观察输出都在这里炸
-4. **Linux 腿 ×3**（-O0/-O1/-Os 各 39 项）—— 同一批例子出 ELF，先用
+4. **Linux 腿 ×3**（-O0/-O1/-Os 各 40 项）—— 同一批例子出 ELF，先用
    `elfcheck --structure-only` 校验结构，再由 `tools/ucrun.py` 在 Unicorn（QEMU TCG）
    里执行，与**同一份** golden 比对。依赖 Win32 DLL 的 3 个例子跳过。没有 unicorn
    时这一对腿整段跳过（见下）
 5. **委托 `src/goa/run_tests.sh`**：11 个 Windows 例子 + 3 个 Linux 例子 + 1 个 GUI
    （`msgboxcheck` 真的去点对话框的「是」）
-6. **三个 Go module 各自跑单测**：src 77 项、src/goa 33 项
+6. **三个 Go module 各自跑单测**：src 87 项、src/goa 33 项
 
-本机（Windows 11 + MSYS2 的 Python 带 unicorn 2.1.4）现状 **`pass=247 fail=0`**。
+本机（Windows 11 + MSYS2 的 Python 带 unicorn 2.1.4）现状 **`pass=253 fail=0`**。
 
 CI 里两个 job 是分工关系，不是重复：
 

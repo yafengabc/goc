@@ -709,6 +709,14 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 }
 
 func (c *checker) checkCall(n *Call, fn *FuncDecl) *Type {
+	// print(...) is a compiler builtin: the checker sees every argument's
+	// static type, so it builds the format string and lowers the call to
+	// printf. A user-declared print function keeps precedence.
+	if n.Name == "print" {
+		if _, user := c.funcs["print"]; !user {
+			return c.rewritePrint(n, fn)
+		}
+	}
 	if fd, ok := c.funcs[n.Name]; ok {
 		return c.checkArgs(n.Name, fd.ParamTypes, fd.Variadic, n.Args, fn, fd.Ret)
 	}
@@ -796,6 +804,12 @@ func (c *checker) funcTypeByName(name string) *Type {
 
 // checkIndirectCall validates a call through a computed function address.
 func (c *checker) checkIndirectCall(n *IndirectCall, fn *FuncDecl) *Type {
+	// A member call x.f(args) may be a method on x's struct type (UFCS).
+	// Resolved calls carry the rewritten direct form in n.UFCS; everything
+	// else falls through to the ordinary indirect-call rules.
+	if t, ok := c.tryUFCS(n, fn); ok {
+		return t
+	}
 	ft := funcTypeOf(c.checkExpr(n.Fn, fn))
 	if ft == nil {
 		c.errf(0, "called expression (%T) is not a function pointer", n.Fn)
