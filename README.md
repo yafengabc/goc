@@ -24,11 +24,13 @@ syscall（`write` / `read` / `brk` / `exit_group`）。两头都没有 msvcrt / 
 
 ## 下载与发布
 
-GitHub Release 由 `v*` tag 触发，产出一套**开箱即用**的资产：把对应平台的两个
-二进制放进同一个目录就能用 —— `goc.exe` 会去找自己**旁边**的 `goa.exe`（Linux
-同理，找旁边的 `goa`），所以文件名刻意不带版本号（版本在 Release 的 tag 上）。
-Windows 资产 `goc.exe` / `cc.exe` / `goa.exe`，Linux 资产 `goc` / `goa`，另附
-`SHA256SUMS.txt` 校验和。
+GitHub Release 由 `v*` tag 触发，产出版本化 zip（如
+`goc-v0.0.1-windows-x86_64.zip` 与 `goc-v0.0.1-linux-x86_64.zip`）。zip 里是
+**开箱即用**的工具链目录：解压后 `goc.exe` 会去找自己**旁边**的 `goa.exe`
+（Linux 同理，找旁边的 `goa`），所以 zip 内的文件名不带版本号——版本在
+zip 文件名和 Release 的 tag 上。Windows zip 含 `goc.exe` / `cc.exe` /
+`goa.exe`，Linux zip 含 `goc` / `goa`，均附 `README.md` / `LICENSE`，另有一份
+`SHA256SUMS.txt` 校验所有资产。
 
 ## 目录结构
 

@@ -36,20 +36,39 @@ jobs:
           ls -l bin/
 
       - name: package + checksums
-        # Plain filenames on purpose: goc's findGoa looks for "goa.exe"/"goa"
-        # NEXT TO the goc executable, so a versioned asset name would make a
-        # freshly-downloaded toolchain fail with "cannot find goa". Version
-        # lives in the Release tag, not in the filenames.
+        # Versioned zips, plain names INSIDE. goc's findGoa looks for
+        # "goa.exe"/"goa" NEXT TO the goc executable, so inside a zip the
+        # files are bare (goc.exe/cc.exe/goa.exe or goc/goa) and the version
+        # lives in the zip filename — a downloaded+unzipped toolchain just
+        # works. Python zipfile is used on purpose: Git Bash `tar -a` and
+        # plain `cp` of extension-less files into a dir that already holds
+        # e.g. goc.exe have known path-mangling bugs (MSYS EXEPATH).
         run: |
-          mkdir -p release
-          cp bin/goc.exe   release/goc.exe          # Windows toolchain: drop-in folder
-          cp bin/cc.exe    release/cc.exe
-          cp bin/goa.exe   release/goa.exe
-          cp bin/goc-linux release/goc              # Linux toolchain: findGoa wants bare "goa"
-          cp bin/goa-linux release/goa
-          cp README.md release/README.md
-          cp LICENSE release/LICENSE
-          (cd release && sha256sum * > SHA256SUMS.txt)
+          V="$(git describe --tags --always)"
+          mkdir -p build/win build/linux release
+          cp bin/goc.exe   build/win/goc.exe
+          cp bin/cc.exe    build/win/cc.exe
+          cp bin/goa.exe   build/win/goa.exe
+          cp bin/goc-linux build/linux/goc
+          cp bin/goa-linux build/linux/goa
+          cp README.md build/win/README.md
+          cp README.md build/linux/README.md
+          cp LICENSE build/win/LICENSE
+          cp LICENSE build/linux/LICENSE
+          python - "$V" <<'PY'
+          import os, sys, zipfile
+          V = sys.argv[1]
+          def z(d, out):
+              with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
+                  for f in sorted(os.listdir(d)):
+                      p = os.path.join(d, f)
+                      if os.path.isfile(p):
+                          zf.write(p, arcname=f)
+              print('->', out, zipfile.ZipFile(out).namelist())
+          z('build/win',   'release/goc-%s-windows-x86_64.zip' % V)
+          z('build/linux', 'release/goc-%s-linux-x86_64.zip' % V)
+          PY
+          (cd release && sha256sum *.zip > SHA256SUMS.txt)
           cat release/SHA256SUMS.txt
 
       - name: create Release
