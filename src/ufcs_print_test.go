@@ -183,3 +183,64 @@ int main() {
 		t.Fatal("print must keep rejecting structs even with a _print method defined")
 	}
 }
+
+// --- scalar methods: a.print() finds int_print(a) ---------------------------
+
+// A scalar base resolves to the fixed-spelling method tag: int_print for an
+// int receiver, value receiver only. Rvalue receivers work too -- a scalar
+// method call needs no address.
+func TestUFCSScalarMethod(t *testing.T) {
+	src := `int int_print(int v) { printf("%d", v); return v; }
+int main() {
+    int a;
+    a = 41;
+    return (a + 1).print();
+}`
+	asm := genAsmOpt(t, src, 0)
+	if !strings.Contains(asm, "call int_print") {
+		t.Fatalf("(a+1).print() must lower to a direct call of int_print:\n%s", asm)
+	}
+}
+
+// The receiver spelling must match exactly: int_print takes an int, so a
+// char base does not find it (char_print exists as its own spelling).
+func TestUFCSScalarExactSpelling(t *testing.T) {
+	src := `int int_print(int v) { return v; }
+int main() {
+    char c;
+    return c.print();
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("char.print() must not resolve to int_print")
+	}
+}
+
+// Scalar methods have no arrow form: p->print() on an int* is a plain
+// member-lookup error.
+func TestUFCSScalarNoArrow(t *testing.T) {
+	src := `int int_print(int v) { return v; }
+int main() {
+    int a;
+    int *q = &a;
+    return q->print();
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("q->print() on an int* must not resolve to a scalar method")
+	}
+}
+
+// A scalar receiver with the wrong parameter type falls through to the
+// normal error: the method exists but its signature doesn't fit.
+func TestUFCSScalarWrongReceiver(t *testing.T) {
+	src := `int int_print(long v) { return v; }
+int main() {
+    int a;
+    return a.print();
+}`
+	errs := checkSrc(t, src)
+	if len(errs) == 0 {
+		t.Fatal("int_print(long) must not accept an int receiver")
+	}
+}
