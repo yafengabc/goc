@@ -26,4 +26,13 @@ int getchar(void);
 int int_print(int v);
 int long_print(long v);
 
+/* print(...) builtin thin targets. The compiler lowers a single-argument
+ * print call to one of these instead of printf, so the common print("str")
+ * / print(int) / print(long) / print() cases stay off the format
+ * interpreter. Each appends the newline print() implies and returns the
+ * character count, exactly like the printf lowering would. */
+int print_str(const char *s);
+int print_int_line(int v);
+int print_long_line(long v);
+
 #endif /* GOC_STDIO_H */

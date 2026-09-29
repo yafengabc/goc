@@ -260,6 +260,29 @@ int int_print(int v) {
     return long_print((long)v);
 }
 
+/* Thin targets for the print(...) builtin (see stdio.h). print_str is the
+ * "%s\n" case with vfmt's "(null)" guard kept; the int/long line printers
+ * reuse long_print and append the newline. All return the total character
+ * count so the builtin keeps its printf-lowering return semantics. */
+int print_str(const char *s) {
+    if (!s) s = "(null)";
+    long n = 0;
+    while (s[n]) n++;
+    __goclib_write(s, n);
+    __goclib_write("\n", 1);
+    return (int)(n + 1);
+}
+
+int print_long_line(long v) {
+    int n = long_print(v);
+    __goclib_write("\n", 1);
+    return n + 1;
+}
+
+int print_int_line(int v) {
+    return print_long_line((long)v);
+}
+
 int getchar(void) {
     char b;
     long n = __goclib_read(&b, 1);
