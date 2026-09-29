@@ -22,6 +22,14 @@ Windows 产物只导入 **Windows 系统 DLL**（`win32.def` 列出的 kernel32/
 syscall（`write` / `read` / `brk` / `exit_group`）。两头都没有 msvcrt / glibc，
 也没有 gcc。
 
+## 下载与发布
+
+GitHub Release 由 `v*` tag 触发，产出一套**开箱即用**的资产：把对应平台的两个
+二进制放进同一个目录就能用 —— `goc.exe` 会去找自己**旁边**的 `goa.exe`（Linux
+同理，找旁边的 `goa`），所以文件名刻意不带版本号（版本在 Release 的 tag 上）。
+Windows 资产 `goc.exe` / `cc.exe` / `goa.exe`，Linux 资产 `goc` / `goa`，另附
+`SHA256SUMS.txt` 校验和。
+
 ## 目录结构
 
 ```
@@ -156,10 +164,11 @@ printf 的已知边界：
   即可写成 `x.f(args)`；指针接收者收到 `&x`（`p->f` 直接收 `p`），值接收者收到 `x`
   （`p->f` 收 `*p`）。成员查找永远优先（函数指针成员不受影响）。纯编译期重写，
   无 vtable、无运行时元数据
-- **print 内建**：`print(expr, ...)` 按实参静态类型拼一个格式串降到 `printf`——
-  整数（含 `_Bool`；`char` 打数字值）`%d`、浮点 `%g`、`char*`/字符串字面量/char 数组
-  `%s`、其他指针 `%p`、struct/union 拒绝（提示定义 `T_print` 方法后用 `x.print()`）。
-  实参空格分隔、行尾换行，`print()` 只换行；用户声明的 `print` 函数优先于内建
+- **print 内建**：`print(expr, ...)` 按实参**静态类型**分派到最薄的发射路径——
+  `print()` 只换行，单参 `char*`/字符串字面量走 `str_print`、单参 `int`/`char`/`_Bool`
+  走 `int_print`、单参 `long` 走 `long_print`，其余才回退 `printf` 拼格式串；带换行、
+  返回输出字符数，用户声明的 `print` 函数优先。数组打印 `print(a)` → `[1, 2, 3]`
+  与自定义 `T_print` / `T_array_print` 方法见下面「print 内建」一节
 - **初始化**：`{}` 初始化列表（嵌套、指定初始化器 `.field =`、数组长度推断）、
   字符数组用字符串字面量初始化、`char *p = "str"`（含全局）
 - **存储类与限定符**：`static`（局部持久化，且只初始化一次）、`extern`、`typedef`；
@@ -186,6 +195,49 @@ printf 的已知边界：
 - 没有 `long long`、VLA、复合字面量、`_Generic` 等 C99+ 特性
 - 没有数组指定初始化器 `[i] = v`
 - 库只有上面那 45 个函数
+
+## print 内建：为体积优化的输出
+
+`print` 不是 `printf` 的别名，而是编译器在 `src/print.go` 里做的**编译期静态分派**
+内建。它在编译时看每个实参的静态类型，直接选择最薄的发射路径：
+
+- `print()` —— 只换行
+- `print("hello")` / 单参 `char*` —— `str_print`：一个 `write` 调用 + 换行
+- `print(42)` / 单参 `int` / `char` / `_Bool` —— `int_print`：整数转文本 + `write`
+- `print(42L)` / 单参 `long` —— `long_print`
+- 其余（多参、浮点、指针、混搭）—— 回退 `printf` 按格式串发射
+
+三条薄函数（`int_print` / `long_print` / `str_print`）由 goclib 提供，都带换行、
+返回输出字符数，语义与 `printf` 的对应格式一致。`print` 是编译期重写，用户自己
+声明的 `print` 函数永远优先。
+
+### 数组打印
+
+`print(a)`（裸数组标识符）会把数组打印成 `[1, 2, 3]` 这样的文本：
+
+```c
+int a[3] = {11, 12, 13};
+long l[2] = {1000000000L, 2000000000L};
+double d[3] = {1.5, 2.5, 3.25};
+char s[] = "abc";
+
+print(a);   // [11, 12, 13]
+print(l);   // [1000000000, 2000000000]
+print(d);   // [1.5, 2.5, 3.25]
+print(s);   // abc   （char 数组按字符串打印）
+```
+
+实现上 goclib 只有一份共享骨架 `__goclib_array_print(a, n, elem_size, conv)`：
+按元素字节步进，经函数指针回调把每个元素转成文本；`short/int/long/bool/float/
+double` 六个公开函数是薄包装，各自只带一个类型转换器。**新增一种数组类型 =
+一个转换器 + 一个包装**。struct/union 数组没有内建格式，编译器会分派用户定义的
+`T_array_print(T *a, long n)`（同样带换行）。
+
+### 数组方法
+
+数组也能挂方法：`arr.f(args)` 在成员 `f` 不存在时重写为 `T_array_f(arr, len, args)`，
+`len` 是编译期已知的数组长度。比如定义了 `uint_array_add` 后就能写 `uint_arr.add(1)`，
+元素拼写是精确的（`uint_array_add` ≠ `int_array_add`）。
 
 ## double 支持
 
@@ -330,14 +382,26 @@ pass 照跑——全例集 -Os 比 -O0 还小约 23KB、比 -O1 小约 61KB。`-
 同一份 Windows PE32+ 源码，gcc 16.2.0（MSYS2 ucrt64，`-O2`，加不加 `-static` 结果
 一样）与 goc+goa：
 
-| | gcc -O2 | goc + goa |
-| --- | --- | --- |
-| `hello`（printf 一行） | 38989 字节 | **12800 字节** |
-| `src/examples/stress.c` | 40784 字节 | **14848 字节** |
+| | gcc -O2 | goc + goa | 差 |
+| --- | --- | --- | --- |
+| `print("Hello, world!")`（goc 内建） | gcc 没有此内建 | **2048 字节**（-O0 起即是） | — |
+| `printf("Hello, world!\n")` | 38989 字节 | 13312 字节（-O1/-Os） | goc 小 65.9% |
+| 数组打印（`print(a)` 等四个数组） | 40477 字节¹ | **8192 字节** | goc 小 79.8% |
+| `src/examples/stress.c` | 40784 字节 | 15360 字节（-O1） | goc 小 62.3% |
 
-差 2.7~3 倍 —— 大头是 CRT 启动代码和整个 printf 家族。goc 侧按需发射，用到什么
-发什么：`phase1.c` 的 ELF 只有 4030 字节。汇编器自己的产物更小，`src/goa/examples/
-hello.exe` 是 **1536 字节**（做法见 `src/goa/README.md` 的「输出体积」一节）。
+¹ gcc 没有 `print` 内建，用等价的 `printf` 手写实现（同一份数据、同一份输出，
+  输出文本与 goc 版逐字一致）。
+
+同一个「Hello, world!」：goc 的产物是 **2048 字节**，gcc 写同样一句话要
+**38989 字节** —— 小 **94.7%**（约 1/19），而且 `-O0` 就是这个体积。即使两边都写
+`printf`，goc 也只要 13312 字节。数组打印用 `print` 是 8192 字节，gcc 手写等价的
+printf 版本要 40477 字节。
+
+差的大头是 CRT 启动代码和整个 printf 家族。goc 侧**按需发射**：程序实际调用到的
+函数（及其传递闭包）才进产物，只用 `print` 的程序不会背上 printf 的 512 字节输出
+缓冲；`phase1.c` 的 ELF 只有 4030 字节。汇编器自己的产物更小，
+`src/goa/examples/hello.exe` 是 **1536 字节**（做法见 `src/goa/README.md` 的「输出
+体积」一节）。
 
 ## 许可
 

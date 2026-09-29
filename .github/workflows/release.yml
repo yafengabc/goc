@@ -36,14 +36,17 @@ jobs:
           ls -l bin/
 
       - name: package + checksums
+        # Plain filenames on purpose: goc's findGoa looks for "goa.exe"/"goa"
+        # NEXT TO the goc executable, so a versioned asset name would make a
+        # freshly-downloaded toolchain fail with "cannot find goa". Version
+        # lives in the Release tag, not in the filenames.
         run: |
-          V="$(git describe --tags --always)"
           mkdir -p release
-          cp bin/goc.exe   "release/goc-${V}-windows-x86_64.exe"
-          cp bin/cc.exe    "release/goc-${V}-windows-x86_64-cc.exe"
-          cp bin/goa.exe   "release/goa-${V}-windows-x86_64.exe"
-          cp bin/goc-linux "release/goc-${V}-linux-x86_64"
-          cp bin/goa-linux "release/goa-${V}-linux-x86_64"
+          cp bin/goc.exe   release/goc.exe          # Windows toolchain: drop-in folder
+          cp bin/cc.exe    release/cc.exe
+          cp bin/goa.exe   release/goa.exe
+          cp bin/goc-linux release/goc              # Linux toolchain: findGoa wants bare "goa"
+          cp bin/goa-linux release/goa
           cp README.md release/README.md
           cp LICENSE release/LICENSE
           (cd release && sha256sum * > SHA256SUMS.txt)
