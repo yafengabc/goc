@@ -410,7 +410,7 @@ func (c *checker) checkMemberLValue(n *MemberExpr, fn *FuncDecl) (*Type, bool) {
 		st = bt
 	}
 	if st == nil || (st.Kind != KStruct && st.Kind != KUnion) {
-		c.errf(n.Line, "member access on non-struct/union type %s", st)
+		c.errf(n.Line, "member access on non-struct/union type %s%s", st, c.arrayMethodHint(n))
 		return IntType(), false
 	}
 	for _, m := range st.Members {

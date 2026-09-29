@@ -24,6 +24,19 @@ func (c *checker) tryUFCS(n *IndirectCall, fn *FuncDecl) (*Type, bool) {
 	if !ok {
 		return nil, false
 	}
+	// An array base carries methods spelled T_array_f: arr.f(args) is the
+	// direct call T_array_f(arr, len, args), the count a compile-time
+	// constant because a C array has no runtime length. Only a bare array
+	// identifier can be a receiver -- an expression like a+1 or a function
+	// returning a pointer carries no length the checker can see. Dot form
+	// only: arr->f would mean "member of *arr", never an array method.
+	if !me.Arrow {
+		if id, ok := me.Base.(*Ident); ok {
+			if at := c.lookup(id.Name); at != nil && at.Kind == KArr && at.Len > 0 && at.Elem != nil {
+				return c.tryArrayUFCS(n, me, id, at, fn)
+			}
+		}
+	}
 	bt := c.checkExpr(me.Base, fn)
 	st := bt
 	if me.Arrow {
@@ -109,6 +122,107 @@ func (c *checker) tryUFCS(n *IndirectCall, fn *FuncDecl) (*Type, bool) {
 	args = append(args, n.Args...)
 	n.UFCS = &Call{Name: meth, Args: args}
 	return c.checkArgs(meth, fd.ParamTypes, fd.Variadic, args, fn, fd.Ret), true
+}
+
+// tryArrayUFCS resolves a method call on an array base. arr.f(args) for an
+// array of T rewrites into the direct call T_array_f(arr, len, args) -- the
+// same T_array_ naming convention the array printers use (T_array_print),
+// for any T the user can name. The length is passed as a compile-time
+// constant, which is exactly why only a bare array identifier can be a
+// receiver. The method's first parameter must be a pointer to the element
+// type, as T_array_print(T *a, long n) demands; checkArgs then validates
+// the count against the second parameter and the user's arguments against
+// the rest. On any mismatch -- no such method, or a differently-shaped
+// T_array_f -- ok = false sends the call down the ordinary member-lookup
+// error path, exactly like a struct method that does not fit.
+func (c *checker) tryArrayUFCS(n *IndirectCall, me *MemberExpr, id *Ident, at *Type, fn *FuncDecl) (*Type, bool) {
+	tag := arrayTag(at.Elem)
+	if tag == "" {
+		return nil, false
+	}
+	meth := tag + "_array_" + me.Name
+	fd, ok := c.funcs[meth]
+	if !ok {
+		fd = c.protos[meth]
+	}
+	if fd == nil || len(fd.ParamTypes) == 0 {
+		return nil, false // no such array method: report the member error
+	}
+	p0 := fd.ParamTypes[0]
+	if !p0.IsPtr() || !sameElem(p0.Elem, at.Elem) {
+		return nil, false // wrong receiver shape: report the member error
+	}
+	length := &NumLit{Val: int64(at.Len), Kind: TInt}
+	args := make([]Expr, 0, len(n.Args)+2)
+	args = append(args, id, length)
+	args = append(args, n.Args...)
+	n.UFCS = &Call{Name: meth, Args: args}
+	return c.checkArgs(meth, fd.ParamTypes, fd.Variadic, args, fn, fd.Ret), true
+}
+
+// arrayMethodHint returns a "define a T_array_f method" hint when the
+// member's base is a bare array identifier, or "" for every other base.
+// It is the array twin of the struct method escape hatch: arr.f() with no
+// T_array_f defined reports the plain member error but points at the
+// function to write instead of leaving the user to guess.
+func (c *checker) arrayMethodHint(n *MemberExpr) string {
+	if n.Arrow {
+		return ""
+	}
+	id, ok := n.Base.(*Ident)
+	if !ok {
+		return ""
+	}
+	at := c.lookup(id.Name)
+	if at == nil || at.Kind != KArr || at.Len <= 0 || at.Elem == nil {
+		return ""
+	}
+	tag := arrayTag(at.Elem)
+	if tag == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (a method on this array can be defined as a function %s_array_%s and called as %s.%s())",
+		tag, n.Name, id.Name, n.Name)
+}
+
+// arrayTag returns the method-name prefix of an array element type: the
+// scalarTag spelling for arithmetic elements (int_array_add, uint_array_add,
+// double_array_avg, ...), the struct/union tag for named aggregates
+// (Point_array_sum). "" for element types with no nameable spelling --
+// pointers, nested arrays, anonymous structs. Note unsigned elements keep
+// their u spelling here: an array method reads and writes its elements, so
+// uint_array_add is genuinely different from int_array_add (print's shared
+// same-width printer has no such requirement).
+func arrayTag(elem *Type) string {
+	if elem == nil {
+		return ""
+	}
+	if elem.Kind == KStruct || elem.Kind == KUnion {
+		if elem.Tag == "" {
+			return ""
+		}
+		return elem.Tag
+	}
+	return scalarTag(elem)
+}
+
+// sameElem reports whether t spells exactly like the array's element type:
+// the same kind, and for ints the same width and signedness, for structs
+// and unions the same tag. Array methods are found by exact element
+// spelling -- int_array_add takes an int*, never a long* -- so a
+// differently-shaped T_array_f is not a method and the call reports the
+// ordinary member error.
+func sameElem(t, elem *Type) bool {
+	if t == nil || elem == nil || t.Kind != elem.Kind {
+		return false
+	}
+	switch t.Kind {
+	case KInt:
+		return t.Width == elem.Width && t.Signed == elem.Signed
+	case KStruct, KUnion:
+		return t.Tag != "" && t.Tag == elem.Tag
+	}
+	return true
 }
 
 // ufcsHint builds the "define a T_f method" hint used in error messages when
