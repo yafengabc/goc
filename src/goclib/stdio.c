@@ -573,12 +573,11 @@ int sscanf(const char *s, const char *fmt, ...) {
             if (endp == sp) break;
             sp = endp;
             if (!suppress) {
+                void *out = va_arg(ap, void *);
                 if (lmod == 0) {
-                    float *f32 = (float *)va_arg(ap, float *);
-                    *f32 = (float)dv;
+                    *(float *)out = (float)dv;
                 } else {
-                    double *f64 = (double *)va_arg(ap, double *);
-                    *f64 = dv;
+                    *(double *)out = dv;
                 }
                 assigned++;
             }
@@ -609,15 +608,16 @@ int sscanf(const char *s, const char *fmt, ...) {
          * collide and store through the wrong width. See README/known bugs.
          */
         if (!suppress) {
+            /* A single target pointer; goc now scopes block-local declarations
+             * correctly, so the old i16/i32/i64/f32/f64 name-mangling workaround
+             * is no longer needed. */
+            void *out = va_arg(ap, void *);
             if (lmod == 'h') {
-                short *i16 = (short *)va_arg(ap, short *);
-                *i16 = (short)(neg ? -(long)uv : (long)uv);
+                *(short *)out = (short)(neg ? -(long)uv : (long)uv);
             } else if (lmod == 0) {
-                int *i32 = (int *)va_arg(ap, int *);
-                *i32 = (int)(neg ? -(long)uv : (long)uv);
+                *(int *)out = (int)(neg ? -(long)uv : (long)uv);
             } else {
-                long *i64 = (long *)va_arg(ap, long *);
-                *i64 = neg ? -(long)uv : (long)uv;
+                *(long *)out = neg ? -(long)uv : (long)uv;
             }
             assigned++;
         }
