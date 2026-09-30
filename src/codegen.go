@@ -26,27 +26,27 @@ type varInfo struct {
 }
 
 type CG struct {
-	insts      []Inst // the function-body instruction stream (see Inst)
-	opt        int    // optimisation level from -O; 0 keeps the legacy output
-	strs       []StrLit
-	strLab     map[*StrLit]string
-	doubles    []float64
-	doubleLab  map[float64]string
-	label      int
+	insts     []Inst // the function-body instruction stream (see Inst)
+	opt       int    // optimisation level from -O; 0 keeps the legacy output
+	strs      []StrLit
+	strLab    map[*StrLit]string
+	doubles   []float64
+	doubleLab map[float64]string
+	label     int
 	// Block-scoped locals and parameters. Every declaration gets a unique
 	// uid; its home (off/reg/typ) lives in varEnts[uid]. Name resolution
 	// walks scopes (innermost last), so a declaration correctly shadows an
 	// outer one with the same name, and sibling blocks may reuse a name
 	// without their homes colliding.
-	varEnts map[int]varInfo  // uid -> home
-	scopes  []map[string]int // name -> uid; innermost scope is last
-	varUID  int              // next uid to assign
-	declUID map[*DeclStmt]int // declaration node -> uid (filled during gather)
-	localBytes int                // bytes consumed by stack-resident locals (incl. array padding)
-	regArea    int                // bytes reserved just below rbp for saved callee-save regs
-	globals    map[string]bool    // names of program-level (global/static) variables
-	globalLab  map[string]string  // name -> .data label for a global variable
-	globalTyp  map[string]*Type   // name -> declared type of a global variable
+	varEnts    map[int]varInfo   // uid -> home
+	scopes     []map[string]int  // name -> uid; innermost scope is last
+	varUID     int               // next uid to assign
+	declUID    map[*DeclStmt]int // declaration node -> uid (filled during gather)
+	localBytes int               // bytes consumed by stack-resident locals (incl. array padding)
+	regArea    int               // bytes reserved just below rbp for saved callee-save regs
+	globals    map[string]bool   // names of program-level (global/static) variables
+	globalLab  map[string]string // name -> .data label for a global variable
+	globalTyp  map[string]*Type  // name -> declared type of a global variable
 	// globalStrInits records every pointer slot initialised by a string literal
 	// -- top-level "char *p = "str"", a static local, or a char* member nested
 	// anywhere inside a braced initialiser. The pointer value cannot live in
@@ -2632,7 +2632,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	c.scopes = nil
 	c.varUID = 0
 	c.declUID = map[*DeclStmt]int{}
-	c.pushScope() // function / parameter scope (scope 0)
+	c.pushScope()                      // function / parameter scope (scope 0)
 	c.staticVars = map[string]string{} // fresh per function: static-local names do not leak across functions
 	c.curRet = f.Ret
 	c.curParam = f.ParamTypes

@@ -321,15 +321,15 @@ func Lex(src string) ([]Token, error) {
 				continue
 			}
 			switch two {
-		case "==", "!=", "<=", ">=", "&&", "||", "##", "<<", ">>", "++", "--",
-			"+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "->":
+			case "==", "!=", "<=", ">=", "&&", "||", "##", "<<", ">>", "++", "--",
+				"+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "->":
 				push(Token{Kind: TPunct, Text: two, Line: line})
 				i += 2
 				continue
 			}
 			// '^' (xor) and '~' (bitwise not) complete the bitwise family the
-		// language already had (& | << >>).
-		if strings.IndexByte("+-*/%=<>!(){};,.[]&?:|^~", c) >= 0 {
+			// language already had (& | << >>).
+			if strings.IndexByte("+-*/%=<>!(){};,.[]&?:|^~", c) >= 0 {
 				push(Token{Kind: TPunct, Text: string(c), Line: line})
 				i++
 				continue

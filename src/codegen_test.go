@@ -30,7 +30,7 @@ func fnAsm(asm, name string) string {
 		if ln == "" {
 			continue
 		}
-		if (ln[0] == '\t' || ln[0] == ' ') {
+		if ln[0] == '\t' || ln[0] == ' ' {
 			continue
 		}
 		if strings.HasSuffix(ln, ":") {

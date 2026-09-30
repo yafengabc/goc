@@ -195,7 +195,7 @@ func opReadsDst(op string) bool {
 // or shape the analysis does not model).
 func scanFX(seg []Inst) ([]fxEffects, map[string]bool, map[string]bool) {
 	fxs := make([]fxEffects, len(seg))
-	esc := map[string]bool{}  // slots whose address exists (lea) or are poisoned
+	esc := map[string]bool{}   // slots whose address exists (lea) or are poisoned
 	known := map[string]bool{} // every direct slot seen
 	for i, in := range seg {
 		switch in.Kind {
@@ -310,7 +310,7 @@ func scanFX(seg []Inst) ([]fxEffects, map[string]bool, map[string]bool) {
 
 // lvBlock is one basic block of a function segment under analysis.
 type lvBlock struct {
-	start, end int    // [start, end) instruction indices into the segment
+	start, end int // [start, end) instruction indices into the segment
 	succ       []*lvBlock
 	use, def   map[string]bool // upward-exposed uses / first kills
 	liveIn     map[string]bool
