@@ -195,6 +195,40 @@ int main() {
 	}
 }
 
+// A block-scope declaration hides a file-scope name, function names included
+// (C 6.2.1p7). The local must win for value uses AND for "fp(x)" call
+// spelling; otherwise goclib helpers whose locals collide with user function
+// names resolve to the wrong symbol (crash / silent corruption).
+func TestLocalShadowsFunction(t *testing.T) {
+	src := `
+int h(int a) { return a; }
+int main() {
+    int h = 5;          /* local int shadows function h */
+    int (*g)(int) = 0;
+    return h + (g == 0);
+}`
+	if errs := checkSrc(t, src); len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+}
+
+func TestLocalFuncPtrShadowsFunctionCall(t *testing.T) {
+	src := `
+int h(int a) { return a + 100; }
+int g(int a) { return a; }
+int main() {
+    int (*h)(int) = g;  /* local func-ptr shadows function h */
+    int r = h(5);       /* must call through the LOCAL pointer: r == 5 */
+    if (r != 5) {
+        return 1;       /* would be 105 if the function had won */
+    }
+    return 0;
+}`
+	if errs := checkSrc(t, src); len(errs) != 0 {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+}
+
 func TestCheckControlFlow(t *testing.T) {
 	src := `
 enum Color { RED, GREEN, BLUE };

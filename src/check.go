@@ -725,18 +725,17 @@ func (c *checker) checkCall(n *Call, fn *FuncDecl) *Type {
 			return c.rewritePrint(n, fn)
 		}
 	}
+	// A local variable holding a function pointer shadows a same-named
+	// function (C block scoping hides file-scope names, function names
+	// included): "fp(x)" through such a variable is an indirect call.
+	if ft := funcTypeOf(c.lookup(n.Name)); ft != nil {
+		return c.checkArgs(n.Name, ft.Params, ft.Variadic, n.Args, fn, ft.Ret)
+	}
 	if fd, ok := c.funcs[n.Name]; ok {
 		return c.checkArgs(n.Name, fd.ParamTypes, fd.Variadic, n.Args, fn, fd.Ret)
 	}
 	if pd, ok := c.protos[n.Name]; ok {
 		return c.checkArgs(n.Name, pd.ParamTypes, pd.Variadic, n.Args, fn, pd.Ret)
-	}
-	// The name may designate a VARIABLE holding a function pointer: C allows
-	// "fp(x)" exactly like "(*fp)(x)", and goc parses both against identifier
-	// callees. Function names and variables are separate namespaces, so this
-	// is unambiguous once the function tables above have been consulted.
-	if ft := funcTypeOf(c.lookup(n.Name)); ft != nil {
-		return c.checkArgs(n.Name, ft.Params, ft.Variadic, n.Args, fn, ft.Ret)
 	}
 	// External / goclib call whose signature we do not model: accept it and
 	// assume an int result (true for every goclib function goc exposes).

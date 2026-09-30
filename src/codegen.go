@@ -227,6 +227,7 @@ var externLinux = map[string]bool{
 	"lseek": true, "mmap": true, "munmap": true, "brk": true, "ioctl": true,
 	"writev": true, "nanosleep": true, "getpid": true, "kill": true,
 	"exit": true, "exit_group": true, "gettimeofday": true, "clock_gettime": true,
+	"unlink": true, "__goclib_rename": true,
 }
 
 // ---------------------------------------------------------------------------
@@ -776,16 +777,11 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		c.resW = 8 // a string literal is a pointer
 		return TInt, nil
 	case *Ident:
-		// A function designator used as a value decays to a pointer to that
-		// function, exactly like an array: "fp = add;". Function names live in
-		// a separate namespace from variables, so this must be resolved first.
-		if sym, ok := c.funcAddrSym(n.Name); ok {
-			c.emit("lea rax, [rip+%s]", sym)
-			c.resTyp = TInt
-			c.resSigned = false
-			c.resW = 8 // a function address is a pointer
-			return TInt, nil
-		}
+		// Resolution order mirrors the checker: locals (incl. parameters and
+		// static locals) and globals shadow a same-named function -- C block
+		// scoping hides file-scope names, function names included. Only when
+		// no variable of that name exists may the identifier name a function,
+		// in which case it decays to a pointer to that function ("fp = add;").
 		vi, ok := c.lookupVar(n.Name)
 		if !ok {
 			if lab, ok2 := c.staticVars[n.Name]; ok2 {
@@ -800,7 +796,14 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 				// 0, mirroring local arrays).
 				return c.loadGlobal(c.globalLab[n.Name], c.globalTyp[n.Name])
 			}
-			if ev, ok := enumConsts[n.Name]; ok {
+			if sym, ok2 := c.funcAddrSym(n.Name); ok2 {
+				c.emit("lea rax, [rip+%s]", sym)
+				c.resTyp = TInt
+				c.resSigned = false
+				c.resW = 8 // a function address is a pointer
+				return TInt, nil
+			}
+			if ev, ok2 := enumConsts[n.Name]; ok2 {
 				// An enumerator is a compile-time integer constant.
 				c.emit("mov rax, %d", ev)
 				c.resTyp = TInt
@@ -1198,6 +1201,14 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 		// The Windows PE entry point receives no argc/argv, so _start calls
 		// this goclib helper to build them from GetCommandLineA before main.
 		c.need["__goclib_get_args"] = true
+		// The entry stub terminates through the C library's exit (not a bare
+		// ExitProcess) so atexit handlers registered by main run on both
+		// platforms; exit itself ends in __goclib_exit -> ExitProcess.
+		if lib := clibCStore(c.linux); lib != nil {
+			if _, isC := lib.funcs["exit"]; isC {
+				c.need["exit"] = true
+			}
+		}
 	}
 	if err := c.genClibFuncs(); err != nil {
 		return "", err
@@ -1243,7 +1254,13 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 			importSet["exit"] = true
 		}
 	} else {
-		importSet["ExitProcess"] = true
+		// The entry stub calls the C library's exit when available (pulled in
+		// via need["exit"] above); the ExitProcess import is then only needed
+		// by __goclib_exit, which the need closure tracks. Keep the import for
+		// the no-library fallback path.
+		if lib := clibCStore(c.linux); lib == nil {
+			importSet["ExitProcess"] = true
+		}
 	}
 	for name := range c.calls {
 		importSet[name] = true
@@ -1332,7 +1349,7 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 		out.WriteString("\tmov rdx, [rsp+32]\n")
 		out.WriteString("\tcall main\n")
 		out.WriteString("\tmov rcx, rax\n")
-		out.WriteString("\tcall ExitProcess\n\n")
+		out.WriteString("\tcall exit\n\n")
 	}
 	out.WriteString(body.String())
 
@@ -3883,12 +3900,10 @@ func (c *CG) genLValue(e Expr) error {
 	c.lvBitWidth, c.lvBitOff, c.lvBitUnit, c.lvBitSigned = 0, 0, 0, false
 	switch n := e.(type) {
 	case *Ident:
-		// Address of a function designator: "&add" is just another spelling of
-		// "add". Both yield the function's address.
-		if sym, ok := c.funcAddrSym(n.Name); ok {
-			c.emit("lea r10, [rip+%s]", sym)
-			return nil
-		}
+		// Locals and globals shadow a same-named function (C block scoping,
+		// same order as the value path and the checker). Only after no
+		// variable matches may this name a function: "&add" is just another
+		// spelling of "add"; both yield the function's address.
 		vi, ok := c.lookupVar(n.Name)
 		if !ok {
 			if lab, ok2 := c.staticVars[n.Name]; ok2 {
@@ -3900,6 +3915,10 @@ func (c *CG) genLValue(e Expr) error {
 				// Address of a global: rip-relative lea into .data.
 				c.useLibGlobal(n.Name)
 				c.emit("lea r10, [rip+%s]", c.globalLab[n.Name])
+				return nil
+			}
+			if sym, ok2 := c.funcAddrSym(n.Name); ok2 {
+				c.emit("lea r10, [rip+%s]", sym)
 				return nil
 			}
 			return fmt.Errorf("undefined variable %q", n.Name)
@@ -6038,11 +6057,11 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	}
 	// A call whose name designates a VARIABLE holding a function pointer is an
 	// indirect call: C spells it exactly like a direct call ("fp(x)"), but the
-	// address has to be loaded from the variable at run time.
-	if !c.funcs[n.Name] {
-		if e, ft, ok := c.fnPtrVar(n.Name); ok {
-			return c.genCall("", e, ft, n.Args)
-		}
+	// address has to be loaded from the variable at run time. A local (or
+	// global) of function-pointer type shadows a same-named function, so the
+	// variable is consulted before the direct-call table.
+	if e, ft, ok := c.fnPtrVar(n.Name); ok {
+		return c.genCall("", e, ft, n.Args)
 	}
 	return c.genCall(n.Name, nil, nil, n.Args)
 }
