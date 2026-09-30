@@ -1435,11 +1435,14 @@ func (p *Parser) parseComma() (Expr, error) {
 	return left, nil
 }
 
-// parseBraceInit parses a braced initialiser "{ a, .x = b, { c } }" found in
-// the initialiser position of a declaration. Elements are assignment
-// expressions, nested braces, or designated members (". name ="), separated by
-// commas with an optional trailing comma. Array designators ("[2] = ...") are
-// not supported and are rejected with a clear message.
+// parseBraceInit parses a braced initialiser "{ a, .x = b, [2] = c, { d } }"
+// found in the initialiser position of a declaration. Elements are assignment
+// expressions, nested braces, or designated members (". name =" for struct/
+// union members, "[ N ] =" for array index designators, where N is a
+// non-negative integer constant). Elements are separated by commas with an
+// optional trailing comma. Mixing positional and designated elements in the
+// same (sub-)initialiser is rejected by the checker, mirroring the rule goc
+// already applies to struct member designators.
 func (p *Parser) parseBraceInit() (Expr, error) {
 	line := p.cur().Line
 	p.next() // consume '{'
@@ -1449,7 +1452,7 @@ func (p *Parser) parseBraceInit() (Expr, error) {
 			p.next()
 			break
 		}
-		el := InitElem{}
+		el := InitElem{DesigIdx: -1}
 		if p.atPunct(".") {
 			p.next()
 			if p.cur().Kind != TIdent {
@@ -1460,7 +1463,22 @@ func (p *Parser) parseBraceInit() (Expr, error) {
 				return nil, err
 			}
 		} else if p.atPunct("[") {
-			return nil, fmt.Errorf("line %d: array designators ([i] = ...) are not supported in initialisers", p.cur().Line)
+			p.next() // consume '['
+			if p.cur().Kind != TNum {
+				return nil, fmt.Errorf("line %d: expected integer index after '[' in initialiser", p.cur().Line)
+			}
+			idx := p.cur().Num
+			if idx < 0 {
+				return nil, fmt.Errorf("line %d: array designator index must be non-negative", p.cur().Line)
+			}
+			el.DesigIdx = int(idx)
+			p.next() // consume the number
+			if err := p.expect("]"); err != nil {
+				return nil, err
+			}
+			if err := p.expect("="); err != nil {
+				return nil, err
+			}
 		}
 		if p.atPunct("{") {
 			e, err := p.parseBraceInit()

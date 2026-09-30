@@ -191,12 +191,15 @@ type StrLit struct {
 }
 
 // InitElem is one element of a brace initialiser. Desig holds the member
-// name for a designated initialiser (".x = 1") and is "" for positional
-// initialisation; E is the value, which may itself be a *BraceInit for a
-// nested aggregate.
+// name for a designated initialiser (".x = 1"); DesigIdx holds the array
+// index for an array designator ("[2] = 1"). Exactly one of them is set for a
+// designated element (Desig for struct/union members, DesigIdx for array
+// elements); both are empty/negative for positional initialisation. E is the
+// value, which may itself be a *BraceInit for a nested aggregate.
 type InitElem struct {
-	Desig string
-	E     Expr
+	Desig    string
+	DesigIdx int // array designator index ("[i] ="); -1 means "not a designator"
+	E        Expr
 }
 
 // BraceInit is a braced initialiser "{ ... }" for an array, struct, union or

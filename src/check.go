@@ -869,25 +869,54 @@ func assignable(dst, src *Type) bool {
 func (c *checker) checkBraceInit(t *Type, bi *BraceInit, fn *FuncDecl, line int) {
 	switch {
 	case t.IsArray():
+		hasDesig := false
+		for _, el := range bi.Elems {
+			if el.Desig != "" {
+				c.errf(line, "member designator %q is only valid in a struct/union initialiser", el.Desig)
+			}
+			if el.DesigIdx >= 0 {
+				hasDesig = true
+			}
+		}
 		if t.Len == 0 {
-			if len(bi.Elems) == 0 {
+			n := 0
+			if hasDesig {
+				for _, el := range bi.Elems {
+					if el.DesigIdx >= 0 && el.DesigIdx+1 > n {
+						n = el.DesigIdx + 1
+					}
+				}
+			} else {
+				n = len(bi.Elems)
+			}
+			if n == 0 {
 				c.errf(line, "empty initialiser for array of incomplete length")
 				return
 			}
-			t.Len = len(bi.Elems)
+			t.Len = n
 		}
-		if len(bi.Elems) > t.Len {
-			c.errf(line, "too many initialisers for array of %d element(s)", t.Len)
-		}
-		for i, el := range bi.Elems {
-			if el.Desig != "" {
-				c.errf(line, "member designator %q is only valid in a struct/union initialiser", el.Desig)
+		if hasDesig {
+			for _, el := range bi.Elems {
+			if el.DesigIdx < 0 {
+				c.errf(line, "cannot mix positional and designated (\"[i] =\") initialisers")
 				continue
 			}
-			if i >= t.Len {
-				break
+				if el.DesigIdx >= t.Len {
+					c.errf(line, "designator index %d out of range for array of %d element(s)", el.DesigIdx, t.Len)
+					continue
+				}
+				c.checkBraceElem(t.Elem, el.E, fn, line)
 			}
-			c.checkBraceElem(t.Elem, el.E, fn, line)
+		} else {
+			for i, el := range bi.Elems {
+				if el.Desig != "" {
+					continue
+				}
+				if i >= t.Len {
+					break
+				}
+				c.checkBraceElem(t.Elem, el.E, fn, line)
+			}
 		}
 	case t.IsStruct():
 		c.checkStructBrace(t, bi, fn, line)
@@ -900,6 +929,10 @@ func (c *checker) checkBraceInit(t *Type, bi *BraceInit, fn *FuncDecl, line int)
 		}
 		el := bi.Elems[0]
 		mi := 0
+		if el.DesigIdx >= 0 {
+			c.errf(line, "array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
+			return
+		}
 		if el.Desig != "" {
 			mi = memberIndex(t, el.Desig)
 			if mi < 0 {
@@ -920,6 +953,10 @@ func (c *checker) checkBraceInit(t *Type, bi *BraceInit, fn *FuncDecl, line int)
 			c.errf(line, "invalid initialiser for scalar type %s", t)
 			return
 		}
+		if bi.Elems[0].DesigIdx >= 0 {
+			c.errf(line, "array designator \"[%d] =\" is only valid in an array initialiser", bi.Elems[0].DesigIdx)
+			return
+		}
 		c.checkBraceElem(t, bi.Elems[0].E, fn, line)
 	}
 }
@@ -927,6 +964,12 @@ func (c *checker) checkBraceInit(t *Type, bi *BraceInit, fn *FuncDecl, line int)
 // checkStructBrace validates a struct initialiser, either all-positional or
 // all-designated (".x = ..."); mixing the two styles is rejected.
 func (c *checker) checkStructBrace(t *Type, bi *BraceInit, fn *FuncDecl, line int) {
+	for _, el := range bi.Elems {
+		if el.DesigIdx >= 0 {
+			c.errf(line, "array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
+			return
+		}
+	}
 	allDesig := true
 	for _, el := range bi.Elems {
 		if el.Desig == "" {

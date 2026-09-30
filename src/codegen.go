@@ -4702,11 +4702,22 @@ func (c *CG) genBraceInitLocal(t *Type, bi *BraceInit, off int) error {
 func (c *CG) braceWalkLocal(t *Type, bi *BraceInit, off int) error {
 	if t.IsArray() {
 		ew := c.typeWidth(t.Elem)
-		for i, el := range bi.Elems {
-			if i >= t.Len {
+		hasDesig := false
+		for _, el := range bi.Elems {
+			if el.DesigIdx >= 0 {
+				hasDesig = true
 				break
 			}
-			if err := c.braceElemLocal(t.Elem, el.E, off+i*ew); err != nil {
+		}
+		for i, el := range bi.Elems {
+			idx := el.DesigIdx
+			if !hasDesig {
+				idx = i
+			}
+			if idx < 0 || idx >= t.Len {
+				continue
+			}
+			if err := c.braceElemLocal(t.Elem, el.E, off+idx*ew); err != nil {
 				return err
 			}
 		}
@@ -4737,6 +4748,9 @@ func (c *CG) braceWalkLocal(t *Type, bi *BraceInit, off int) error {
 			if i >= len(t.Members) {
 				break
 			}
+			if el.DesigIdx >= 0 {
+				return fmt.Errorf("array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
+			}
 			if el.Desig != "" {
 				return fmt.Errorf("cannot mix positional and designated (\".%s =\") initialisers", el.Desig)
 			}
@@ -4753,6 +4767,9 @@ func (c *CG) braceWalkLocal(t *Type, bi *BraceInit, off int) error {
 		}
 		el := bi.Elems[0]
 		m := t.Members[0]
+		if el.DesigIdx >= 0 {
+			return fmt.Errorf("array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
+		}
 		if el.Desig != "" {
 			if mi := memberIndex(t, el.Desig); mi >= 0 {
 				m = t.Members[mi]
@@ -5013,11 +5030,22 @@ func (c *CG) emitGlobalBrace(out *strings.Builder, t *Type, bi *BraceInit, lab s
 func (c *CG) fillBraceImage(t *Type, bi *BraceInit, img []byte, off int) error {
 	if t.IsArray() {
 		ew := c.typeWidth(t.Elem)
-		for i, el := range bi.Elems {
-			if i >= t.Len {
+		hasDesig := false
+		for _, el := range bi.Elems {
+			if el.DesigIdx >= 0 {
+				hasDesig = true
 				break
 			}
-			if err := c.fillBraceElem(t.Elem, el.E, img, off+i*ew); err != nil {
+		}
+		for i, el := range bi.Elems {
+			idx := el.DesigIdx
+			if !hasDesig {
+				idx = i
+			}
+			if idx < 0 || idx >= t.Len {
+				continue
+			}
+			if err := c.fillBraceElem(t.Elem, el.E, img, off+idx*ew); err != nil {
 				return err
 			}
 		}
@@ -5048,6 +5076,9 @@ func (c *CG) fillBraceImage(t *Type, bi *BraceInit, img []byte, off int) error {
 			if i >= len(t.Members) {
 				break
 			}
+			if el.DesigIdx >= 0 {
+				return fmt.Errorf("array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
+			}
 			if el.Desig != "" {
 				return fmt.Errorf("cannot mix positional and designated (\".%s =\") initialisers", el.Desig)
 			}
@@ -5064,6 +5095,9 @@ func (c *CG) fillBraceImage(t *Type, bi *BraceInit, img []byte, off int) error {
 		}
 		el := bi.Elems[0]
 		m := t.Members[0]
+		if el.DesigIdx >= 0 {
+			return fmt.Errorf("array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
+		}
 		if el.Desig != "" {
 			if mi := memberIndex(t, el.Desig); mi >= 0 {
 				m = t.Members[mi]
