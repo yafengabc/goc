@@ -129,6 +129,14 @@ run_win_leg() {  # <dirSuffix> <label> [extra goc flags...]
         # still doing it wrong.
         "$out/$name.exe" > "$log.raw" 2>&1
         rc=$?
+        if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+            # A freshly written exe can be momentarily locked by the real-time
+            # antivirus scan; exec then fails with 126/127. Retry once before
+            # calling it a failure.
+            sleep 1
+            "$out/$name.exe" > "$log.raw" 2>&1
+            rc=$?
+        fi
         # Strip CR: the Windows console layer emits CRLF.
         tr -d '\r' < "$log.raw" > "$log.out"
 
