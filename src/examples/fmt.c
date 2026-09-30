@@ -14,7 +14,7 @@ int main() {
     printf("p15=%.15f\n", 0.1);
     printf("p0=%.0f\n", 2.5);
     printf("p0b=%.0f\n", 2.0);
-    printf("w2=%10.2f\n", 1.2345);   // field width is parsed and ignored
+    printf("w2=%10.2f\n", 1.2345);   // field-width 10 now honoured: "      1.23"
     printf("neg=%.2f\n", -3.14159);
     printf("zero=%.5f\n", 0.0);
     return 0;
