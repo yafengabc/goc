@@ -24,9 +24,18 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             p++;
             continue;
         }
-        /* optional field width: parsed and ignored, exactly like the asm
-         * vfmt ("%10.2f" prints "1.23", unpadded) */
-        while (*p >= '0' && *p <= '9') p++;
+        /* flags: '-' left-justify, '0' zero-pad (numbers only); the others
+         * are parsed and ignored for compatibility. */
+        int left = 0, zero = 0;
+        while (*p == '-' || *p == '0' || *p == '+' || *p == ' ' || *p == '#') {
+            if (*p == '-') left = 1;
+            else if (*p == '0') zero = 1;
+            p++;
+        }
+        /* field width: a run of digits, or '*' to read it from the args. */
+        int width = 0;
+        if (*p == '*') { width = va_arg(ap, int); p++; }
+        else { while (*p >= '0' && *p <= '9') { width = width * 10 + (*p - '0'); p++; } }
         /* optional precision: ".NN" digits, or a bare "." for zero.
          * Only %f consumes it (fractional digit count); default 6. */
         int prec = 6;
@@ -40,18 +49,17 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
         while (*p == 'l' || *p == 'h' || *p == 'L' ||
                *p == 'z' || *p == 'j' || *p == 't') p++;
         char spec = *p++;
+        /* The converted text lives in `field` (length `fl`); %s keeps its own
+         * pointer `s` because it may exceed the static buffer. */
+        char field[512];
+        int fl = 0;
+        const char *s = 0;
         if (spec == 's') {
-            const char *s = va_arg(ap, const char *);
+            s = va_arg(ap, const char *);
             if (!s) s = "(null)";
-            while (*s) {
-                if (limit < 0 || n < limit) out[n] = *s;
-                n++;
-                s++;
-            }
         } else if (spec == 'c') {
             int c = va_arg(ap, int);
-            if (limit < 0 || n < limit) out[n] = (char)c;
-            n++;
+            field[fl++] = (char)c;
         } else if (spec == 'd' || spec == 'i' || spec == 'u' ||
                    spec == 'o' || spec == 'x' || spec == 'X') {
             /* integers (long on the varargs side) */
@@ -59,8 +67,7 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             if (spec == 'd' || spec == 'i') {
                 long sv = va_arg(ap, long);
                 if (sv < 0 && spec != 'u') {
-                    if (limit < 0 || n < limit) out[n] = '-';
-                    n++;
+                    field[fl++] = '-';
                     v = (unsigned long)(-sv);
                 } else {
                     v = (unsigned long)sv;
@@ -69,57 +76,70 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             } else {
                 v = va_arg(ap, unsigned long);
             }
-            /* convert in the chosen base */
-            int base = 10;
-            if (spec == 'o') base = 8;
-            else if (spec == 'x' || spec == 'X') base = 16;
-            char tmp[32];
-            int t = 0;
-            if (v == 0) { tmp[t++] = '0'; }
-            while (v > 0) {
-                int d = (int)(v % base);
-                v /= base;
-                if (d < 10) tmp[t++] = (char)('0' + d);
-                else tmp[t++] = (char)((spec == 'X' ? 'A' : 'a') + (d - 10));
-            }
-            while (t-- > 0) {
-                if (limit < 0 || n < limit) out[n] = tmp[t];
-                n++;
-            }
-        } else if (spec == 'f' || spec == 'g') {
+        /* convert in the chosen base */
+        int base = 10;
+        if (spec == 'o') base = 8;
+        else if (spec == 'x' || spec == 'X') base = 16;
+        char tmp[32];
+        int t = 0;
+        if (v == 0) { tmp[t++] = '0'; }
+        while (v > 0) {
+            int d = (int)(v % base);
+            v /= base;
+            if (d < 10) tmp[t++] = (char)('0' + d);
+            else tmp[t++] = (char)((spec == 'X' ? 'A' : 'a') + (d - 10));
+        }
+        while (t-- > 0) field[fl++] = tmp[t];
+    } else if (spec == 'f' || spec == 'g') {
             /* %f: <prec> fractional digits, rounded half to even, no
              * exponent. %g: the same conversion, then trailing fractional
              * zeros are stripped. Both share __goclib_double_to_buf with
              * the array printers, so the floating-point conversion lives
              * in exactly one place (see below). */
             double x = va_arg(ap, double);
-            char tmp[40];
-            int t = __goclib_double_to_buf(tmp, x, prec);
-            if (spec == 'g') t = __goclib_double_strip_g(tmp, t);
-            int k2;
-            for (k2 = 0; k2 < t; k2++) {
-                if (limit < 0 || n < limit) out[n] = tmp[k2];
-                n++;
-            }
+            fl = __goclib_double_to_buf(field, x, prec);
+            if (spec == 'g') fl = __goclib_double_strip_g(field, fl);
         } else if (spec == 'p') {
             /* %p: "0x" followed by 16 hex digits (full 64-bit address). */
             void *pv = va_arg(ap, void *);
             unsigned long v = (unsigned long)pv;
-            if (limit < 0 || n < limit) out[n] = '0';
-            n++;
-            if (limit < 0 || n < limit) out[n] = 'x';
-            n++;
+            field[fl++] = '0';
+            field[fl++] = 'x';
             int shift;
             for (shift = 60; shift >= 0; shift -= 4) {
                 int d = (int)((v >> shift) & 0xf);
-                char ch = (char)(d < 10 ? '0' + d : 'a' + d - 10);
-                if (limit < 0 || n < limit) out[n] = ch;
-                n++;
+                field[fl++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
             }
         } else {
             /* unknown specifier: emit it verbatim */
-            if (limit < 0 || n < limit) out[n] = spec;
-            n++;
+            field[fl++] = spec;
+        }
+        /* ---- field-width padding ---- */
+        {
+            int numeric = (spec == 'd' || spec == 'i' || spec == 'u' ||
+                           spec == 'o' || spec == 'x' || spec == 'X' ||
+                           spec == 'f' || spec == 'g');
+            int clen = (spec == 's') ? (int)strlen(s) : fl;
+            if (clen >= width || width <= 0) {
+                if (spec == 's') { while (*s) { if (limit<0||n<limit) out[n]=*s; n++; s++; } }
+                else { int k; for (k=0;k<fl;k++) { if (limit<0||n<limit) out[n]=field[k]; n++; } }
+            } else {
+                int pad = width - clen;
+                if (left) {
+                    if (spec == 's') { while (*s) { if (limit<0||n<limit) out[n]=*s; n++; s++; } }
+                    else { int k; for (k=0;k<fl;k++) { if (limit<0||n<limit) out[n]=field[k]; n++; } }
+                    int k; for (k=0;k<pad;k++) { if (limit<0||n<limit) out[n]=' '; n++; }
+                } else if (zero && numeric && fl > 0 && field[0] == '-') {
+                    if (limit<0||n<limit) out[n]='-'; n++;
+                    int k; for (k=0;k<pad;k++) { if (limit<0||n<limit) out[n]='0'; n++; }
+                    for (k=1;k<fl;k++) { if (limit<0||n<limit) out[n]=field[k]; n++; }
+                } else {
+                    char pc = (zero && numeric) ? '0' : ' ';
+                    int k; for (k=0;k<pad;k++) { if (limit<0||n<limit) out[n]=pc; n++; }
+                    if (spec == 's') { while (*s) { if (limit<0||n<limit) out[n]=*s; n++; s++; } }
+                    else { int k; for (k=0;k<fl;k++) { if (limit<0||n<limit) out[n]=field[k]; n++; } }
+                }
+            }
         }
     }
     return n;
