@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,6 +31,7 @@ import (
 // Usage (goc convenience front-end):
 //
 //	goc file.c                 compile and run
+//	goc run file.c [args...]   compile to a temp dir, run with args (go run)
 //	goc -c file.c              compile only (produce file.exe / file)
 //	goc -S file.c              emit assembly only (produce file.asm)
 //	goc -o app file.c          write the executable to app(..exe)
@@ -45,121 +47,23 @@ import (
 // default action is "compile and emit an executable" without auto-running,
 // matching cc's contract.
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "run" {
+		runCmd(os.Args[2:])
+		return // runCmd always exits
+	}
+
 	cfg, isCC := parseArgs(os.Args[1:])
 
 	if len(cfg.inputs) == 0 {
 		fmt.Fprintln(os.Stderr, "goc: no input files")
 		os.Exit(1)
 	}
-	if len(cfg.inputs) > 1 {
-		fmt.Fprintln(os.Stderr, "goc: multiple input files given -- goc compiles one translation unit into a complete executable and cannot link separate objects; invoke it once per program")
-		os.Exit(1)
-	}
-	srcPath := cfg.inputs[0]
-	if strings.HasSuffix(srcPath, ".o") || strings.HasSuffix(srcPath, ".obj") ||
-		strings.HasSuffix(srcPath, ".a") || strings.HasSuffix(srcPath, ".lib") {
-		fmt.Fprintf(os.Stderr, "goc: %s -- goc cannot consume object/library files (no separate linking stage)\n", srcPath)
-		os.Exit(1)
-	}
-
-	src, err := os.ReadFile(srcPath)
+	outPath, err := buildProgram(cfg, isCC)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	src = []byte(injectDefines(string(src), cfg.defines))
-
-	toks, err := PreprocessTarget(string(src), srcPath, cfg.linux, cfg.incDirs...)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "preprocess error:", err)
-		os.Exit(1)
-	}
-
-	// -E: preprocess only, emit the (directives-stripped, macro-expanded)
-	// translation unit and stop.
-	if cfg.mode == "preprocess" {
-		out := SerializeTokens(toks)
-		if cfg.outFile != "" && !isDir(cfg.outFile) {
-			if err := os.WriteFile(cfg.outFile, []byte(out), 0644); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-		} else {
-			os.Stdout.WriteString(out)
-			if len(out) == 0 || out[len(out)-1] != '\n' {
-				os.Stdout.WriteString("\n")
-			}
-		}
-		return
-	}
-
-	prog, err := Parse(toks)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "parse error:", err)
-		os.Exit(1)
-	}
-	if errs := Check(prog); len(errs) > 0 {
-		fmt.Fprintln(os.Stderr, "type error(s):")
-		for _, e := range errs {
-			fmt.Fprintln(os.Stderr, "  "+e.Error())
-		}
-		os.Exit(1)
-	}
-	asm, err := Gen(prog, cfg.linux, cfg.opt)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "codegen error:", err)
-		os.Exit(1)
-	}
-
-	asmPath, outPath := outputPaths(srcPath, cfg.outFile, cfg.linux, cfg.mode == "asm")
-	if err := os.MkdirAll(filepath.Dir(asmPath), 0755); err != nil {
-		fmt.Fprintln(os.Stderr, "goc:", err)
-		os.Exit(1)
-	}
-	if err := os.WriteFile(asmPath, []byte(asm), 0644); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
-	if cfg.mode == "asm" {
-		if !isCC {
-			fmt.Printf("assembly written to %s\n", asmPath)
-		}
-		return
-	}
-
-	// Hand the assembly to goa, our own assembler. No gcc involved.
-	goa, err := findGoa()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "cannot find goa:", err)
-		fmt.Fprintln(os.Stderr, "build it with: cd src/goa && go build .")
-		fmt.Fprintln(os.Stderr, "or set GOA=<path to goa>")
-		os.Exit(1)
-	}
-
-	var cmd *exec.Cmd
-	if cfg.linux {
-		cmd = exec.Command(goa, "-f", "elf", asmPath, outPath)
-	} else {
-		cmd = exec.Command(goa, asmPath, outPath)
-	}
-	// goa prints "compiled X (N bytes)" on success; that is fine for the goc
-	// front-end but gcc is silent, so drop goa's stdout when acting as cc.
-	if isCC {
-		cmd.Stdout = nil
-	} else {
-		cmd.Stdout = os.Stdout
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "goa failed:", err)
-		os.Exit(1)
-	}
-	if !isCC {
-		fmt.Printf("compiled %s -> %s\n", srcPath, outPath)
-	}
-
-	if cfg.mode == "compile" {
+	if outPath == "" || cfg.mode != "run" {
 		return
 	}
 
@@ -186,6 +90,198 @@ func main() {
 			fmt.Fprintln(os.Stderr, "run failed:", err)
 		}
 	}
+}
+
+// buildProgram runs the preprocess -> parse -> check -> gen -> goa pipeline
+// for cfg's single input and returns the executable path. The -E and -S
+// modes write their own outputs and return "". Compile errors terminate the
+// process (exit 1), matching the historical behaviour.
+func buildProgram(cfg buildCfg, isCC bool) (string, error) {
+	srcPath := cfg.inputs[0]
+	if strings.HasSuffix(srcPath, ".o") || strings.HasSuffix(srcPath, ".obj") ||
+		strings.HasSuffix(srcPath, ".a") || strings.HasSuffix(srcPath, ".lib") {
+		return "", fmt.Errorf("goc: %s -- goc cannot consume object/library files (no separate linking stage)", srcPath)
+	}
+
+	src, err := os.ReadFile(srcPath)
+	if err != nil {
+		return "", err
+	}
+	src = []byte(injectDefines(string(src), cfg.defines))
+
+	toks, err := PreprocessTarget(string(src), srcPath, cfg.linux, cfg.incDirs...)
+	if err != nil {
+		return "", fmt.Errorf("preprocess error: %w", err)
+	}
+
+	// -E: preprocess only, emit the (directives-stripped, macro-expanded)
+	// translation unit and stop.
+	if cfg.mode == "preprocess" {
+		out := SerializeTokens(toks)
+		if cfg.outFile != "" && !isDir(cfg.outFile) {
+			if err := os.WriteFile(cfg.outFile, []byte(out), 0644); err != nil {
+				return "", err
+			}
+		} else {
+			os.Stdout.WriteString(out)
+			if len(out) == 0 || out[len(out)-1] != '\n' {
+				os.Stdout.WriteString("\n")
+			}
+		}
+		return "", nil
+	}
+
+	prog, err := Parse(toks)
+	if err != nil {
+		return "", fmt.Errorf("parse error: %w", err)
+	}
+	if errs := Check(prog); len(errs) > 0 {
+		var b strings.Builder
+		b.WriteString("type error(s):")
+		for _, e := range errs {
+			fmt.Fprintf(&b, "\n  %s", e.Error())
+		}
+		return "", errors.New(b.String())
+	}
+	asm, err := Gen(prog, cfg.linux, cfg.opt)
+	if err != nil {
+		return "", fmt.Errorf("codegen error: %w", err)
+	}
+	asmPath, outPath := outputPaths(srcPath, cfg.outFile, cfg.linux, cfg.mode == "asm")
+	if err := os.MkdirAll(filepath.Dir(asmPath), 0755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(asmPath, []byte(asm), 0644); err != nil {
+		return "", err
+	}
+
+	if cfg.mode == "asm" {
+		if !isCC {
+			fmt.Printf("assembly written to %s\n", asmPath)
+		}
+		return "", nil
+	}
+
+	// Hand the assembly to goa, our own assembler. No gcc involved.
+	goa, err := findGoa()
+	if err != nil {
+		return "", fmt.Errorf("cannot find goa: %w (build it with: cd src/goa && go build ., or set GOA=<path>)", err)
+	}
+
+	var cmd *exec.Cmd
+	if cfg.linux {
+		cmd = exec.Command(goa, "-f", "elf", asmPath, outPath)
+	} else {
+		cmd = exec.Command(goa, asmPath, outPath)
+	}
+	// goa prints "compiled X (N bytes)" on success; that is fine for the goc
+	// front-end but gcc is silent, so drop goa's stdout when acting as cc.
+	if isCC {
+		cmd.Stdout = nil
+	} else {
+		cmd.Stdout = os.Stdout
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("goa failed: %w", err)
+	}
+	if !isCC {
+		fmt.Printf("compiled %s -> %s\n", srcPath, outPath)
+	}
+	return outPath, nil
+}
+
+// splitRunArgs divides `goc run` arguments into build flags, the source file
+// and the program arguments: everything up to the first bare token is a build
+// flag (known separate-value flags swallow their value so it is not mistaken
+// for the source); the first bare token is the source; everything after it
+// goes to the compiled program verbatim -- the go run contract.
+func splitRunArgs(args []string) (buildArgs []string, src string, progArgs []string) {
+	takesValue := map[string]bool{
+		"-o": true, "-D": true, "-I": true, "-target": true,
+		"-MF": true, "-MT": true, "-MQ": true, "-include": true,
+	}
+	i := 0
+	for ; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			break
+		}
+		if takesValue[a] {
+			i++ // skip the flag's separate value
+		}
+		// Attached forms (-ofile, -O2, -Wall) carry no separate value.
+	}
+	if i < len(args) {
+		return args[:i], args[i], args[i+1:]
+	}
+	return args, "", nil
+}
+
+// runCmd implements `goc run [build-flags] file.c [program-args...]`:
+// compile into a temporary directory, execute with the given arguments and
+// inherited stdio, pass the program's exit code through, and clean up.
+// The program's own argc/argv come from the OS (Windows rebuilds them from
+// GetCommandLineA, Linux reads [rsp] at entry), so exec-ing with progArgs is
+// all the forwarding needed.
+func runCmd(args []string) {
+	buildArgs, src, progArgs := splitRunArgs(args)
+	if src == "" {
+		fmt.Fprintln(os.Stderr, "goc run: no input files")
+		fmt.Fprintln(os.Stderr, "usage: goc run [-O*] [-Dname[=val]] [-Idir] file.c [args...]")
+		os.Exit(1)
+	}
+
+	cfg, _ := parseArgs(buildArgs)
+	cfg.inputs = []string{src}
+	cfg.mode = "compile" // the run below is runCmd's job
+	if cfg.linux {
+		fmt.Fprintln(os.Stderr, "goc run: cannot execute a Linux ELF on this host (drop -target linux, or use -c and run it on Linux)")
+		os.Exit(1)
+	}
+
+	tmp, err := os.MkdirTemp("", "goc-run-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "goc run:", err)
+		os.Exit(1)
+	}
+	defer os.RemoveAll(tmp)
+	cfg.outFile = tmp
+
+	code := 0
+	func() {
+		// defer (not a bare os.Exit path) so the temp dir is removed on
+		// every exit from here, compile errors included.
+		defer os.RemoveAll(tmp)
+
+		outPath, err := buildProgram(cfg, false)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			code = 1
+			return
+		}
+		abs, err := filepath.Abs(outPath)
+		if err != nil {
+			abs = outPath
+		}
+		cmd := exec.Command(abs, progArgs...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				// Pass the program's exit status through, go-run style.
+				if c := ee.ExitCode(); c >= 0 {
+					code = c
+					return
+				}
+			} else {
+				fmt.Fprintln(os.Stderr, "goc run:", err)
+			}
+			code = 1
+		}
+	}()
+	os.Exit(code)
 }
 
 // buildCfg holds the result of parsing the command line.
@@ -421,8 +517,11 @@ func printHelp() {
 	fmt.Print(`goc - a tiny C compiler (gcc/clang-compatible front-end)
 
 Usage: goc [options] file.c
+       goc run [build-flags] file.c [program-args...]
 
 Options:
+  run             compile to a temp dir, run with the given arguments;
+                  the program's exit code is passed through
   -c              compile to an executable (no auto-run)
   -S              emit assembly only
   -E              preprocess only, write the translation unit to stdout/-o

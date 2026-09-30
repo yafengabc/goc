@@ -136,3 +136,30 @@ func TestOutputPaths(t *testing.T) {
 		t.Errorf("asm file: asm=%q out=%q", asm, out)
 	}
 }
+
+// TestSplitRunArgs checks the `goc run` argument splitter: build flags come
+// first (known separate-value flags swallow their value so it is not mistaken
+// for the source), the first bare token is the source file, and everything
+// after it is passed to the program verbatim.
+func TestSplitRunArgs(t *testing.T) {
+	ba, src, pa := splitRunArgs([]string{"-O1", "-DFOO=7", "-I", "inc", "-target", "win", "a.c", "x", "-y"})
+	if len(ba) != 6 || ba[0] != "-O1" || ba[2] != "-I" || ba[4] != "-target" {
+		t.Errorf("buildArgs = %v", ba)
+	}
+	if src != "a.c" {
+		t.Errorf("src = %q, want a.c", src)
+	}
+	if len(pa) != 2 || pa[0] != "x" || pa[1] != "-y" {
+		t.Errorf("progArgs = %v, want [x -y]", pa)
+	}
+	// A separate-value flag right before the source must not eat it.
+	ba, src, pa = splitRunArgs([]string{"-o", "out", "a.c"})
+	if len(ba) != 2 || src != "a.c" || len(pa) != 0 {
+		t.Errorf("ba=%v src=%q pa=%v", ba, src, pa)
+	}
+	// No source at all: src == "" signals the usage error.
+	ba, src, pa = splitRunArgs([]string{"-O1"})
+	if src != "" || len(pa) != 0 || len(ba) != 1 {
+		t.Errorf("ba=%v src=%q pa=%v", ba, src, pa)
+	}
+}
