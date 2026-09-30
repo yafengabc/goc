@@ -131,6 +131,12 @@ var linuxSyscalls = map[string]int64{
 	"exit_group":    231,
 	"gettimeofday":  96,
 	"clock_gettime": 228,
+	"unlink":        87,
+	"rename":        82,
+	// __goclib_rename: the alias goclib's rename() wrapper calls for the raw
+	// syscall. The wrapper cannot `extern rename` itself -- the name resolves
+	// to its own definition, an infinite recursion (see goclib/file.c).
+	"__goclib_rename": 82,
 }
 
 func NewAssembler() *Assembler {

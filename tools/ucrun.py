@@ -13,8 +13,10 @@ Exit code: the program's exit code (or 128+signal-ish for traps).
 """
 
 import os
+import shutil
 import struct
 import sys
+import tempfile
 
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC
 from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_INVALID
@@ -126,8 +128,29 @@ class UcLinux:
         self.mu.reg_write(UC_X86_REG_RSP, rsp)
         self.mu.reg_write(UC_X86_REG_RIP, ldr.entry)
         self.entry = ldr.entry
+
+        # File-syscall emulation (open/read/write/close/lseek/unlink/rename)
+        # runs against a per-run temporary directory so example programs that
+        # write/read disk files behave like on a real kernel without littering
+        # the source tree. Guest fd values (>= 3) map to host-open objects.
+        self.tmpdir = tempfile.mkdtemp(prefix="ucrun_")
+        os.chdir(self.tmpdir)
+        self.fds = {}        # guest_fd -> host open object (int fd on the host)
+        self.next_fd = 3
+
         self.mu.hook_add(UC_HOOK_CODE, self.hook_code)
         self.mu.hook_add(UC_HOOK_MEM_INVALID, self.hook_invalid)
+
+    def read_cstr(self, addr):
+        """Read a NUL-terminated C string from guest memory."""
+        out = bytearray()
+        while len(out) < 4096:
+            b = self.mu.mem_read(addr, 1)[0]
+            if b == 0:
+                break
+            out.append(b)
+            addr += 1
+        return out.decode("latin-1")
 
     def grow_heap(self, addr):
         # Kernel semantics: brk() moves the break pointer (may be unaligned),
@@ -165,12 +188,97 @@ class UcLinux:
         if n == 60 or n == 231:  # exit / exit_group
             raise Trap(mu.reg_read(UC_X86_REG_RDI))
         elif n == 1:  # write
+            fd = mu.reg_read(UC_X86_REG_RDI)
             buf = mu.reg_read(UC_X86_REG_RSI)
             cnt = mu.reg_read(UC_X86_REG_RDX)
-            if cnt:
-                self.out.write(mu.mem_read(buf, cnt))
-            self.out.flush()
-            mu.reg_write(UC_X86_REG_RAX, cnt)
+            data = bytes(mu.mem_read(buf, cnt)) if cnt else b""
+            if fd in (1, 2):       # stdout/stderr -> the harness console
+                self.out.write(data)
+                self.out.flush()
+                mu.reg_write(UC_X86_REG_RAX, cnt)
+            else:                  # a guest file fd -> the real host file
+                h = self.fds.get(fd)
+                if h is None:
+                    mu.reg_write(UC_X86_REG_RAX, -1)
+                else:
+                    try:
+                        os.write(h, data)
+                        mu.reg_write(UC_X86_REG_RAX, cnt)
+                    except OSError:
+                        mu.reg_write(UC_X86_REG_RAX, -1)
+        elif n == 0:  # read
+            fd = mu.reg_read(UC_X86_REG_RDI)
+            buf = mu.reg_read(UC_X86_REG_RSI)
+            cnt = mu.reg_read(UC_X86_REG_RDX)
+            if fd == 0:        # console input: the harness wires none up -> EOF
+                mu.reg_write(UC_X86_REG_RAX, 0)
+            else:
+                h = self.fds.get(fd)
+                if h is None:
+                    mu.reg_write(UC_X86_REG_RAX, -1)
+                else:
+                    try:
+                        data = os.read(h, cnt)
+                    except OSError:
+                        data = b""
+                    if data:
+                        self.mu.mem_write(buf, data)
+                    mu.reg_write(UC_X86_REG_RAX, len(data))
+        elif n == 2:  # open
+            path = self.read_cstr(mu.reg_read(UC_X86_REG_RDI))
+            flags = mu.reg_read(UC_X86_REG_RSI)
+            mode = mu.reg_read(UC_X86_REG_RDX)
+            oflags = os.O_RDONLY if (flags & 3) == 0 else (
+                os.O_WRONLY if (flags & 3) == 1 else os.O_RDWR)
+            if flags & 0x40: oflags |= os.O_CREAT   # LO_CREAT
+            if flags & 0x200: oflags |= os.O_TRUNC  # LO_TRUNC
+            if flags & 0x400: oflags |= os.O_APPEND # LO_APPEND
+            try:
+                h = os.open(path, oflags, mode)
+                gfd = self.next_fd
+                self.next_fd += 1
+                self.fds[gfd] = h
+                mu.reg_write(UC_X86_REG_RAX, gfd)
+            except OSError:
+                mu.reg_write(UC_X86_REG_RAX, -1)
+        elif n == 3:  # close
+            fd = mu.reg_read(UC_X86_REG_RDI)
+            h = self.fds.pop(fd, None)
+            if h is None:
+                mu.reg_write(UC_X86_REG_RAX, -1)
+            else:
+                try:
+                    os.close(h)
+                    mu.reg_write(UC_X86_REG_RAX, 0)
+                except OSError:
+                    mu.reg_write(UC_X86_REG_RAX, -1)
+        elif n == 8:  # lseek
+            fd = mu.reg_read(UC_X86_REG_RDI)
+            offset = mu.reg_read(UC_X86_REG_RSI)
+            whence = mu.reg_read(UC_X86_REG_RDX)
+            h = self.fds.get(fd)
+            if h is None:
+                mu.reg_write(UC_X86_REG_RAX, -1)
+            else:
+                try:
+                    mu.reg_write(UC_X86_REG_RAX, os.lseek(h, offset, whence))
+                except OSError:
+                    mu.reg_write(UC_X86_REG_RAX, -1)
+        elif n == 87:  # unlink
+            path = self.read_cstr(mu.reg_read(UC_X86_REG_RDI))
+            try:
+                os.unlink(path)
+                mu.reg_write(UC_X86_REG_RAX, 0)
+            except OSError:
+                mu.reg_write(UC_X86_REG_RAX, -1)
+        elif n == 82:  # rename
+            oldp = self.read_cstr(mu.reg_read(UC_X86_REG_RDI))
+            newp = self.read_cstr(mu.reg_read(UC_X86_REG_RSI))
+            try:
+                os.rename(oldp, newp)
+                mu.reg_write(UC_X86_REG_RAX, 0)
+            except OSError:
+                mu.reg_write(UC_X86_REG_RAX, -1)
         elif n == 12:  # brk
             mu.reg_write(UC_X86_REG_RAX, self.grow_heap(mu.reg_read(UC_X86_REG_RDI)))
         else:
@@ -186,13 +294,18 @@ def main():
         print("usage: ucrun.py <linux-elf> [args...]", file=sys.stderr)
         return 2
     elf = sys.argv[1]
+    runner = None
     try:
-        rc = UcLinux(elf, sys.argv[2:]).run()
+        runner = UcLinux(elf, sys.argv[2:])
+        rc = runner.run()
     except Trap as t:
         rc = t.code
     except Exception as e:
         print(f"ucrun: {e}", file=sys.stderr)
         rc = 1
+    finally:
+        if runner is not None and getattr(runner, "tmpdir", None):
+            shutil.rmtree(runner.tmpdir, ignore_errors=True)
     sys.exit(rc & 0xFF)
 
 

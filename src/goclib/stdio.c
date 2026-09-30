@@ -1,5 +1,6 @@
 #include "goclib.h"
 #include <stdarg.h>
+#include <errno.h>
 
 /* ----------------------------- <stdio.h> --------------------------------- */
 /*
@@ -240,27 +241,76 @@ int sprintf(char *buf, const char *fmt, ...) {
     return n;
 }
 
-int printf(const char *fmt, ...) {
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vfmt(buf, 512, fmt, ap);
-    va_end(ap);
-    __goclib_write(buf, n);
+/* vfprintf formats into a stack buffer and writes it to `stream`. A buffer
+ * cap of 4096 matches the file layer's block size; like printf, output longer
+ * than that is truncated, which is acceptable for this teaching lib. */
+int vfprintf(FILE *stream, const char *fmt, va_list ap) {
+    char buf[4096];
+    int n = vfmt(buf, 4096, fmt, ap);
+    if (n < 0) n = 0;
+    if (n > 4096) n = 4096;
+    fwrite(buf, 1, n, stream);
     return n;
 }
 
+int fprintf(FILE *stream, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vfprintf(stream, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int printf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vfprintf(__goclib_stdout(), fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int vprintf(const char *fmt, va_list ap) {
+    return vfprintf(__goclib_stdout(), fmt, ap);
+}
+
+/* snprintf/vsnprintf: vfmt already returns the untruncated length while
+ * writing at most `limit` bytes, which is exactly the C11 contract --
+ * "return the length the text would have had", buffer capped, NUL added. */
+int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
+    long cap = (long)n - 1;
+    if (cap < 0) cap = 0;
+    long m = vfmt(buf, cap, fmt, ap);
+    if (m < 0) m = 0;
+    buf[m < cap ? m : cap] = 0;
+    return (int)m;
+}
+
+int snprintf(char *buf, size_t n, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, n, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+void perror(const char *s) {
+    FILE *e = __goclib_stderr();
+    if (s && *s) {
+        fputs(s, e);
+        fputs(": ", e);
+    }
+    fputs(strerror(errno), e);
+    fputc('\n', e);
+}
+
 int puts(const char *s) {
-    long n = (long)strlen(s);
-    __goclib_write(s, n);
-    __goclib_write("\n", 1);
+    fwrite(s, 1, (long)strlen(s), __goclib_stdout());
+    fputc('\n', __goclib_stdout());
     return 0;
 }
 
 int putchar(int c) {
-    char b = (char)c;
-    __goclib_write(&b, 1);
-    return c;
+    return fputc(c, __goclib_stdout());
 }
 
 /* ------------------- thin integer printing ------------------------------- */
@@ -426,10 +476,7 @@ int str_print(const char *s) {
 }
 
 int getchar(void) {
-    char b;
-    long n = __goclib_read(&b, 1);
-    if (n <= 0) return -1;
-    return (unsigned char)b;
+    return fgetc(__goclib_stdin());
 }
 
 /* ------------------------------- sscanf ---------------------------------- */
@@ -648,5 +695,224 @@ int sscanf(const char *s, const char *fmt, ...) {
     /* Nothing assigned AND nothing consumed means the input ran out before
      * the first conversion could finish -- the C "EOF" answer. */
     if (assigned == 0 && sp == s) return -1;
+    return assigned;
+}
+
+/* =============================================================================
+ * fscanf -- formatted input from a FILE* (standard streams, disk files, ...).
+ *
+ * Mirrors sscanf's conversion logic but sources characters from `stream` via
+ * fgetc/ungetc instead of a string pointer. ungetc provides exactly one
+ * character of pushback, which is sufficient: every branch reads at most one
+ * look-ahead character and pushes it back when it does not match.
+ * ========================================================================== */
+typedef struct { FILE *f; int pushed; int got_any; } __fscan;
+
+static int __fs_get(__fscan *s) {
+    int c;
+    if (s->pushed >= 0) { c = s->pushed; s->pushed = -1; return c; }
+    c = fgetc(s->f);
+    if (c != -1) s->got_any = 1;
+    return c;
+}
+static void __fs_unget(__fscan *s, int c) { s->pushed = c; }
+
+static int __fs_ws(__fscan *s) {
+    int c;
+    for (;;) {
+        c = __fs_get(s);
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+            c == '\v' || c == '\f') continue;
+        break;
+    }
+    if (c != -1) __fs_unget(s, c);
+    return 0;
+}
+
+static int __fs_digit(int c, int base) {
+    int d;
+    if (c >= '0' && c <= '9') d = c - '0';
+    else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+    else return -1;
+    if (d < base) return d;
+    return -1;
+}
+
+int fscanf(FILE *stream, const char *fmt, ...) {
+    va_list ap;
+    __fscan sc;
+    const char *fp = fmt;
+    int assigned = 0, suppress, lmod, base, ok, neg, c, cnt;
+    unsigned long uv;
+    char *dst;
+    long width;
+
+    if (stream == 0) return -1;
+    sc.f = stream; sc.pushed = -1; sc.got_any = 0;
+    va_start(ap, fmt);
+    while (*fp != '\0') {
+        if (*fp == ' ' || *fp == '\t' || *fp == '\n') {
+            __fs_ws(&sc);
+            fp++;
+            continue;
+        }
+        if (*fp != '%') {
+            c = __fs_get(&sc);
+            if (c == -1) break;
+            if (c != *fp) { __fs_unget(&sc, c); break; }
+            fp++;
+            continue;
+        }
+        fp++;
+        if (*fp == '%') {
+            c = __fs_get(&sc);
+            if (c == -1) break;
+            if (c != '%') { __fs_unget(&sc, c); break; }
+            fp++;
+            continue;
+        }
+        suppress = 0;
+        if (*fp == '*') { suppress = 1; fp++; }
+        width = 0;
+        while (*fp >= '0' && *fp <= '9') { width = width * 10 + (*fp - '0'); fp++; }
+        lmod = 0;
+        if (*fp == 'h' || *fp == 'l' || *fp == 'L') {
+            lmod = *fp; fp++;
+            if ((lmod == 'l' && *fp == 'l') || (lmod == 'h' && *fp == 'h')) fp++;
+        }
+
+        if (*fp == 'c') {
+            long n = (width > 0) ? width : 1;
+            long i;
+            if (suppress) {
+                for (i = 0; i < n; i++) { c = __fs_get(&sc); if (c == -1) break; }
+            } else {
+                dst = (char *)va_arg(ap, char *);
+                for (i = 0; i < n; i++) {
+                    c = __fs_get(&sc);
+                    if (c == -1) break;
+                    dst[i] = (char)c;
+                }
+                assigned++;
+            }
+            fp++;
+            continue;
+        }
+        if (*fp == 's') {
+            long n = 0;
+            if (!suppress) dst = (char *)va_arg(ap, char *);
+            __fs_ws(&sc);
+            for (;;) {
+                c = __fs_get(&sc);
+                if (c == -1 || c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                    if (c != -1) __fs_unget(&sc, c);
+                    break;
+                }
+                if (!suppress) dst[n] = (char)c;
+                n++;
+                if (width > 0 && n >= width) break;
+            }
+            if (!suppress) { dst[n] = 0; assigned++; }
+            fp++;
+            continue;
+        }
+        if (*fp == 'f' || *fp == 'F' || *fp == 'e' || *fp == 'E' ||
+            *fp == 'g' || *fp == 'G' || *fp == 'a' || *fp == 'A') {
+            double dv;
+            char tb[256];
+            long ti = 0;
+            char *endp;
+            __fs_ws(&sc);
+            c = __fs_get(&sc);
+            if (c == -1) break;
+            tb[ti++] = (char)c;
+            for (;;) {
+                c = __fs_get(&sc);
+                if (c == -1) break;
+                if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' ||
+                    c == '+' || c == '-') {
+                    if (ti < 255) tb[ti++] = (char)c;
+                } else { __fs_unget(&sc, c); break; }
+            }
+            tb[ti] = 0;
+            if (ti == 0) break;
+            dv = strtod(tb, &endp);
+            if (endp == tb) break;   /* nothing parseable */
+            if (!suppress) {
+                void *out = va_arg(ap, void *);
+                if (lmod == 0) *(float *)out = (float)dv;
+                else *(double *)out = dv;
+                assigned++;
+            }
+            fp++;
+            continue;
+        }
+
+        base = -1;
+        if (*fp == 'd' || *fp == 'u') base = 10;
+        else if (*fp == 'i') base = 0;
+        else if (*fp == 'o') base = 8;
+        else if (*fp == 'x' || *fp == 'X') base = 16;
+        if (base < 0) break;         /* unknown conversion: stop */
+
+        __fs_ws(&sc);
+        c = __fs_get(&sc);
+        if (c == -1) break;
+        neg = 0;
+        if (c == '+') { c = __fs_get(&sc); }
+        else if (c == '-') { neg = 1; c = __fs_get(&sc); }
+        if (c == -1) break;
+
+        uv = 0; ok = 0; cnt = 0;
+        {
+            int hexpre = 0;
+            if (c == '0') {
+                int d2 = __fs_get(&sc);
+                if (d2 == 'x' || d2 == 'X') {
+                    if (base == 0 || base == 16) { hexpre = 1; base = 16; }
+                    else if (d2 != -1) __fs_unget(&sc, d2);
+                } else {
+                    if (d2 != -1) __fs_unget(&sc, d2);
+                    if (base == 0) base = 8;
+                }
+            }
+            if (hexpre) {
+                int d2 = __fs_get(&sc);
+                if (d2 != -1) {
+                    int d = __fs_digit(d2, 16);
+                    if (d >= 0) { uv = (unsigned long)d; ok = 1; cnt = 1; }
+                    else __fs_unget(&sc, d2);
+                }
+            } else {
+                int d = __fs_digit(c, base);
+                if (d >= 0) { uv = (unsigned long)d; ok = 1; cnt = 1; }
+                else __fs_unget(&sc, c);
+            }
+            while (ok) {
+                int d3 = __fs_get(&sc);
+                if (d3 == -1) break;
+                {
+                    int d = __fs_digit(d3, base);
+                    if (d < 0) { __fs_unget(&sc, d3); break; }
+                    if (width > 0 && cnt >= width) { __fs_unget(&sc, d3); break; }
+                    uv = uv * (unsigned long)base + (unsigned long)d;
+                    cnt++;
+                }
+            }
+        }
+        if (!ok) break;
+        if (!suppress) {
+            void *out = va_arg(ap, void *);
+            if (lmod == 'h') *(short *)out = (short)(neg ? -(long)uv : (long)uv);
+            else if (lmod == 0) *(int *)out = (int)(neg ? -(long)uv : (long)uv);
+            else *(long *)out = neg ? -(long)uv : (long)uv;
+            assigned++;
+        }
+        fp++;
+        continue;
+    }
+    va_end(ap);
+    if (assigned == 0 && !sc.got_any) return -1;
     return assigned;
 }

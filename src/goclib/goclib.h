@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <assert.h>
 
 /* ---- platform primitives (implemented in goclib.c, OS glue) ---------------- */
 /* Write `len` bytes from `buf` to standard output. Returns bytes written. */

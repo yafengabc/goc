@@ -3,30 +3,98 @@
 
 #include <stddef.h>
 
-/* goc stdio.h -- the printf family and the stdio primitives goc provides.
+/* goc stdio.h -- the printf/scanf families and the file-I/O primitives goc
+ * provides. printf / sprintf / fprintf / scanf are variadic; goc's checker
+ * accepts any number of trailing arguments against the `...` in the prototype.
+ * All implementations come from goclib and are linked in on demand -- this
+ * header only carries declarations, as in a real libc.
  *
- * printf / sprintf are variadic; goc's checker accepts any number of trailing
- * arguments against the `...` in the prototype. All implementations come from
- * goclib (the assembly backend today, the C one later) and are linked in on
- * demand -- this header only carries declarations, as in a real libc.
+ * FILE is an opaque struct (defined in file.c); user code manipulates it only
+ * through FILE *. The three standard streams are macros expanding to goclib
+ * accessors, so they work as expressions (e.g. inside fprintf(stdout, ...))
+ * while their OS handles are resolved at runtime.
  */
 
+typedef struct __goclib_FILE FILE;
+
+#define EOF (-1)
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#define BUFSIZ 4096
+#define FOPEN_MAX 20
+
+#define stdin  __goclib_stdin()
+#define stdout __goclib_stdout()
+#define stderr __goclib_stderr()
+
+/* formatted output */
 int printf(const char *fmt, ...);
+int fprintf(FILE *stream, const char *fmt, ...);
 int sprintf(char *buf, const char *fmt, ...);
-/* Supported conversions: d i u o x X (h/l/ll lengths), f e g a, c, s, and
- * "%%", with width and "*" suppression. No scansets, %p or %n. Returns the
- * number of items assigned, or -1 if the input ends before the first one
- * completes. */
+/* snprintf/vsnprintf write at most n-1 characters plus a NUL and return the
+ * length the fully-formatted text would have had (possibly > n-1). */
+int snprintf(char *buf, size_t n, const char *fmt, ...);
+int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
+int vfprintf(FILE *stream, const char *fmt, va_list ap);
+int vprintf(const char *fmt, va_list ap);
+
+/* getc/putc are the traditional macro spellings of fgetc/fputc. */
+#define getc(f)  fgetc(f)
+#define putc(c, f) fputc(c, f)
+
+/* Position pairs: goc stores the offset directly, so fpos_t is a long and
+ * these are expression macros on top of ftell/fseek. */
+typedef long fpos_t;
+#define fgetpos(f, p) (*(fpos_t *)(p) = ftell(f))
+#define fsetpos(f, p) fseek((f), *(fpos_t *)(p), SEEK_SET)
+
+/* formatted input */
 int sscanf(const char *s, const char *fmt, ...);
+int fscanf(FILE *stream, const char *fmt, ...);
+
 int puts(const char *s);
 int putchar(int c);
 int getchar(void);
+/* perror(s) prints "s: <strerror(errno)>" (or just the message when s is
+ * null or empty) to stderr, then leaves errno unchanged. */
+void perror(const char *s);
+
+/* file I/O */
+FILE *fopen(const char *path, const char *mode);
+/* Reopen `stream` on `path` with `mode`, closing its current association;
+ * the FILE * itself stays valid (the freopen(stdout, ...) idiom). */
+FILE *freopen(const char *path, const char *mode, FILE *stream);
+int fclose(FILE *stream);
+long fread(void *ptr, long size, long nmemb, FILE *stream);
+long fwrite(const void *ptr, long size, long nmemb, FILE *stream);
+int fgetc(FILE *stream);
+int fputc(int c, FILE *stream);
+char *fgets(char *s, long n, FILE *stream);
+int fputs(const char *s, FILE *stream);
+int fflush(FILE *stream);
+long ftell(FILE *stream);
+int fseek(FILE *stream, long offset, int whence);
+void rewind(FILE *stream);
+int feof(FILE *stream);
+int ferror(FILE *stream);
+void clearerr(FILE *stream);
+int ungetc(int c, FILE *stream);
+int remove(const char *path);
+int rename(const char *oldp, const char *newp);
+FILE *tmpfile(void);
+int setvbuf(FILE *stream, char *buf, int mode, long size);
+
+/* internal accessors backing the stdin/stdout/stderr macros */
+FILE *__goclib_stdin(void);
+FILE *__goclib_stdout(void);
+FILE *__goclib_stderr(void);
 
 /* Thin printing: no format interpreter involved. A program that prints
  * only strings/integers links neither vfmt nor the floating-point
  * converter (measured: 2.0KB exe vs 13.3KB for a printf program). All
  * three names are UFCS spellings (T_print), so the scalar method syntax
- * x.print() on an int/long rewrites to int_print(x) / long_print(x), and
+ * x.print() on an int/long rewrites to int_print / long_print(x), and
  * the print(...) builtin lowers single-argument calls to int_print /
  * long_print / str_print. Each prints one line -- conversion plus a
  * newline -- and returns the character count, exactly like the printf

@@ -1,0 +1,11 @@
+L1=[hello 42
+]L2=[world
+]read=5 bytes
+pos=20 eof=0
+first=h at6=4
+scan=1 v0=42
+before-stdout
+via-fprintf-stdout
+after-stdout
+remove=0
+rename=0

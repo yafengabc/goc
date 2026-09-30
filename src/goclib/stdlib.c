@@ -212,6 +212,222 @@ void srand(unsigned int seed) {
     rand_state = seed ? (unsigned long)seed : 1UL;
 }
 
+/* ----------------------------- atexit hooks ------------------------------- */
+
+#define ATEXIT_MAX 32
+void (*atexit_fns[ATEXIT_MAX])(void);
+int atexit_n = 0;
+
 void exit(int code) {
+    /* atexit handlers run last-registered-first; a handler may itself
+     * register more handlers, so re-check the counter after each call. */
+    while (atexit_n > 0) {
+        void (*fn)(void) = atexit_fns[atexit_n - 1];
+        atexit_n--;
+        fn();
+    }
+    /* C exit semantics: buffered std streams are flushed after the handlers
+     * (a handler's own printf must land too). A stream that was never
+     * fclose'd keeps buffering until here; streams opened with fopen and
+     * never closed may still lose their tail -- the teaching library does
+     * not track them for a global flush. */
+    fflush(stdout);
+    fflush(stderr);
     __goclib_exit((long)code);
+}
+
+/* --------------------------- conversions / misc --------------------------- */
+
+long atol(const char *s) {
+    return (long)strtol(s, 0, 10);
+}
+
+double atof(const char *s) {
+    return strtod(s, 0);
+}
+
+long labs(long x) {
+    return x < 0 ? -x : x;
+}
+
+div_t div(int numer, int denom) {
+    div_t r;
+    r.quot = numer / denom;
+    r.rem = numer % denom;
+    return r;
+}
+
+ldiv_t ldiv(long numer, long denom) {
+    ldiv_t r;
+    r.quot = numer / denom;
+    r.rem = numer % denom;
+    return r;
+}
+
+/* --------------------------------- atexit --------------------------------- */
+
+int atexit(void (*fn)(void)) {
+    if (atexit_n >= ATEXIT_MAX) return -1;
+    atexit_fns[atexit_n++] = fn;
+    return 0;
+}
+
+void abort(void) {
+#if defined(_WIN32)
+    __goclib_exit(3);
+#else
+    __goclib_exit(134);   /* conventional 128+SIGABRT shell convention */
+#endif
+}
+
+/* --------------------------------- qsort ---------------------------------- */
+/*
+ * In-place quicksort, median-of-three pivot, insertion sort for the final
+ * few elements (and as the small-partition cut-off). Elements are moved
+ * byte-wise so arbitrary element widths work. Recursion always descends
+ * into the SMALLER half; the larger half is looped on, bounding the stack
+ * depth by log2(n).
+ */
+
+static void qs_exch(char *a, char *b, long w) {
+    while (w-- > 0) {
+        char t = *a;
+        *a = *b;
+        *b = t;
+        a++;
+        b++;
+    }
+}
+
+static void qs_sort(char *base, long n, long w,
+                    int (*cmp)(const void *, const void *)) {
+    long i, j;
+    while (n > 8) {
+        char *mid = base + (n / 2) * w;
+        char *last = base + (n - 1) * w;
+        /* median-of-first/mid/last parked in `last`, a decent pivot */
+        if (cmp(base, mid) > 0) qs_exch(base, mid, w);
+        if (cmp(mid, last) > 0) {
+            qs_exch(mid, last, w);
+            if (cmp(base, mid) > 0) qs_exch(base, mid, w);
+        }
+        /* Lomuto partition around the last element */
+        i = -1;
+        for (j = 0; j < n - 1; j++) {
+            if (cmp(base + j * w, last) < 0) {
+                i++;
+                qs_exch(base + i * w, base + j * w, w);
+            }
+        }
+        i++;
+        qs_exch(base + i * w, last, w);
+        /* recurse smaller side, loop the larger */
+        if (i < n - i - 1) {
+            qs_sort(base, i, w, cmp);
+            base = base + (i + 1) * w;
+            n = n - i - 1;
+        } else {
+            qs_sort(base + (i + 1) * w, n - i - 1, w, cmp);
+            n = i;
+        }
+    }
+    for (i = 1; i < n; i++) {
+        for (j = i; j > 0 && cmp(base + (j - 1) * w, base + j * w) > 0; j--) {
+            qs_exch(base + (j - 1) * w, base + j * w, w);
+        }
+    }
+}
+
+void qsort(void *base, size_t nmemb, size_t size,
+           int (*cmp)(const void *, const void *)) {
+    if (base == 0 || nmemb < 2 || size == 0) return;
+    qs_sort((char *)base, (long)nmemb, (long)size, cmp);
+}
+
+void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+              int (*cmp)(const void *, const void *)) {
+    char *lo;
+    size_t n;
+    if (key == 0 || base == 0 || size == 0) return 0;
+    lo = (char *)base;
+    n = nmemb;
+    while (n > 0) {
+        size_t mid = n / 2;
+        char *p = lo + mid * (long)size;
+        int r = cmp(key, p);
+        if (r == 0) return p;
+        if (r < 0) {
+            n = mid;
+        } else {
+            lo = p + (long)size;
+            n = n - mid - 1;
+        }
+    }
+    return 0;
+}
+
+/* -------------------------------- getenv ---------------------------------- */
+/*
+ * Windows asks kernel32 directly. Linux has no getenv syscall and goc does
+ * not link libc (so there is no `environ` symbol to declare): the portable
+ * trick is reading /proc/self/environ, a NUL-separated KEY=VALUE list the
+ * kernel exposes for every process.
+ */
+
+#if defined(_WIN32)
+extern long GetEnvironmentVariableA(const char *name, char *buf, long size);
+#else
+extern long open(const char *path, long flags, long mode);
+extern long read(long fd, void *buf, long n);
+extern long close(long fd);
+#endif
+
+static char envbuf[1024];
+
+char *getenv(const char *name) {
+    long nl = 0;
+    if (name == 0) return 0;
+    while (name[nl]) nl++;
+    if (nl == 0) return 0;
+#if defined(_WIN32)
+    {
+        long n = GetEnvironmentVariableA(name, envbuf, 1024);
+        if (n <= 0 || n >= 1024) return 0;
+        return envbuf;
+    }
+#else
+    {
+        long fd = open("/proc/self/environ", 0 /* O_RDONLY */, 0);
+        char raw[8192];
+        long total = 0, got, i;
+        if (fd < 0) return 0;
+        while (total < 8192 &&
+               (got = read(fd, raw + total, 8192 - total)) > 0) {
+            total += got;
+        }
+        close(fd);
+        i = 0;
+        while (i < total) {
+            long j = i;
+            while (j < total && raw[j]) j++;
+            /* entry occupies raw[i..j): "NAME=VALUE" */
+            if (j - i > nl && raw[i + nl] == '=') {
+                long k = 0;
+                while (k < nl && raw[i + k] == name[k]) k++;
+                if (k == nl) {
+                    long vlen = j - i - nl - 1;
+                    long t;
+                    if (vlen >= 1024) vlen = 1023;
+                    for (t = 0; t < vlen; t++) {
+                        envbuf[t] = raw[i + nl + 1 + t];
+                    }
+                    envbuf[vlen] = 0;
+                    return envbuf;
+                }
+            }
+            i = j + 1;
+        }
+        return 0;
+    }
+#endif
 }
