@@ -9,6 +9,12 @@
 # (-Os), never next to the sources, so src/examples/ stays pristine -- only
 # the .c files live there.
 #
+# The six example legs, the goa suite and the three unit-test modules are
+# independent of each other (disjoint output dirs and /tmp log names), so by
+# default they run IN PARALLEL: each leg logs to /tmp/leg_<id>.log and the
+# driver waits for all of them, then prints every leg's report and the summed
+# pass/fail counts. GOC_PARALLEL=0 restores the old sequential behaviour.
+#
 # Usage:  bash run_tests.sh
 # Exit:   0 if every example matches, 1 otherwise.
 
@@ -66,9 +72,6 @@ fi
 rm -rf bin/goc-out bin/goc-out-o1 bin/goc-out-os
 mkdir -p bin/goc-out
 
-pass=0
-fail=0
-
 # Windows-only examples import Win32 DLLs (kernel32/user32/gdi32), so the
 # Linux (ELF64) leg must skip them: they cannot compile without those DLLs.
 win_only=" wintest winbox winreg "
@@ -82,10 +85,14 @@ is_win_only() { case "$win_only" in *" $1 "*) return 0;; esac; return 1; }
 #
 # dirSuffix separates output directories and tmp files so legs cannot clobber
 # each other's products; label prefixes the report ("O1/").
+#
+# Counting: each leg tracks its own counts and ends its log with a single
+# "LEGSTATS pass=N fail=M" line the driver aggregates after wait.
 
 run_win_leg() {  # <dirSuffix> <label> [extra goc flags...]
     local dir="$1" label="$2"; shift 2
     local out="bin/goc-out$dir"
+    local leg_pass=0 leg_fail=0
     mkdir -p "$out"
     for src in src/examples/*.c; do
         name="$(basename "$src" .c)"
@@ -97,10 +104,10 @@ run_win_leg() {  # <dirSuffix> <label> [extra goc flags...]
                 # GUI demo with no golden: prove the user32 imports compile+link.
                 if ! ./bin/goc.exe -c "$@" -o "$out" "$src" >/dev/null 2>"$log.err"; then
                     echo "FAIL  ${label}$name  (compile): $(cat "$log.err")"
-                    fail=$((fail + 1))
+                    leg_fail=$((leg_fail + 1))
                 else
                     printf "ok    ${label}%-10s compile-only\n" "$name"
-                    pass=$((pass + 1))
+                    leg_pass=$((leg_pass + 1))
                 fi
             else
                 echo "SKIP  ${label}$name  (no src/expected/$name.txt)"
@@ -110,7 +117,7 @@ run_win_leg() {  # <dirSuffix> <label> [extra goc flags...]
 
         if ! ./bin/goc.exe -c "$@" -o "$out" "$src" >/dev/null 2>"$log.err"; then
             echo "FAIL  ${label}$name  (compile): $(cat "$log.err")"
-            fail=$((fail + 1))
+            leg_fail=$((leg_fail + 1))
             continue
         fi
 
@@ -133,18 +140,20 @@ run_win_leg() {  # <dirSuffix> <label> [extra goc flags...]
             sed -n '1,12p' "$log.diff"
             echo "  raw bytes:"
             od -c "$log.raw" | head -8
-            fail=$((fail + 1))
+            leg_fail=$((leg_fail + 1))
         else
             printf "ok    ${label}%-10s %6d bytes\n" "$name" "$(stat -c%s "$out/$name.exe")"
-            pass=$((pass + 1))
+            leg_pass=$((leg_pass + 1))
         fi
     done
+    echo "LEGSTATS pass=$leg_pass fail=$leg_fail"
 }
 
 run_linux_leg() {  # <dirSuffix> <label> [extra goc flags...]
     local dir="$1" label="$2"; shift 2
     local out="bin/goc-out$dir"
     local skipped=0
+    local leg_pass=0 leg_fail=0
     mkdir -p "$out"
     for src in src/examples/*.c; do
         name="$(basename "$src" .c)"
@@ -167,7 +176,7 @@ run_linux_leg() {  # <dirSuffix> <label> [extra goc flags...]
 
         if ! ./bin/goc.exe -c "$@" -target linux -o "$out" "$src" >/dev/null 2>"/tmp/gocl${dir}_$name.err"; then
             echo "FAIL  ${label}linux/$name  (compile): $(cat "/tmp/gocl${dir}_$name.err")"
-            fail=$((fail + 1))
+            leg_fail=$((leg_fail + 1))
             continue
         fi
 
@@ -187,64 +196,115 @@ run_linux_leg() {  # <dirSuffix> <label> [extra goc flags...]
             echo "FAIL  ${label}linux/$name  (exit=$rc)"
             sed -n '1,12p' "/tmp/gocl${dir}_$name.diff"
             head -3 "/tmp/gocl${dir}_$name.err"
-            fail=$((fail + 1))
+            leg_fail=$((leg_fail + 1))
         else
             printf "ok    ${label}linux/%-10s %6d bytes\n" "$name" "$(stat -c%s "$out/$name")"
-            pass=$((pass + 1))
+            leg_pass=$((leg_pass + 1))
         fi
     done
     [ "$skipped" -gt 0 ] && echo "SKIP  ${label}linux/*  ($skipped examples need a Python with unicorn)"
+    echo "LEGSTATS pass=$leg_pass fail=$leg_fail"
     return 0
 }
 
-echo "== windows target (-O0) =="
-run_win_leg "" ""
-
-echo "-----------------------------"
-echo "pass=$pass fail=$fail"
-
-echo "== windows target -O1 (IR peephole on) =="
-run_win_leg "-o1" "O1/" -O1
-
-echo "== linux target -O0 (ELF64, executed under QEMU/Unicorn) =="
-run_linux_leg "" ""
-
-echo "== linux target -O1 =="
-run_linux_leg "-o1" "O1/" -O1
-
-echo "== windows target -Os (size first: no inlining, cleanup passes on) =="
-run_win_leg "-os" "Os/" -Os
-
-echo "== linux target -Os =="
-run_linux_leg "-os" "Os/" -Os
-
-# goa's own assembler examples have their own suite (src/goa/run_tests.sh),
-# covering the Windows examples natively, the GUI one through msgboxcheck, and
-# the Linux ones under QEMU. Run it rather than growing a second copy here --
-# it already reports exit codes separately from stdout, which catches a crash
-# that happens to print the right prefix.
-echo "== goa examples (via src/goa/run_tests.sh) =="
-if GOC_PYTHON="${UCPY:-}" bash src/goa/run_tests.sh; then
-    pass=$((pass + 1))
-else
-    echo "FAIL  goa examples suite"
-    fail=$((fail + 1))
-fi
-
-# Unit tests. Each of src/, src/goa/ and tools/ is its own Go module, so `go
-# test ./...` run from src alone silently skips the assembler's unit tests --
-# iterate all three explicitly.
-echo "== unit tests (all three modules) =="
-for mod in src src/goa tools; do
-    if (cd "$mod" && go test -count=1 ./... >"/tmp/unit.log" 2>&1); then
-        printf "ok    unit: %-10s (%s tests)\n" "$mod" "$(cd "$mod" && go test -count=1 ./... -v 2>/dev/null | grep -c '^--- PASS')"
-        pass=$((pass + 1))
+# run_unit <mod> <logfile>: unit tests for one Go module. -v once, counted
+# from the same log (the old harness ran the suite twice for the count).
+run_unit() {  # <mod> <logfile>
+    local mod="$1" logf="$2"
+    if (cd "$mod" && go test -count=1 -v ./... >"$logf" 2>&1); then
+        printf "ok    unit: %-10s (%s tests)\n" "$mod" "$(grep -c '^--- PASS' "$logf")"
+        echo "LEGSTATS pass=1 fail=0"
     else
         echo "FAIL  unit: $mod"
-        tail -15 "/tmp/unit.log"
-        fail=$((fail + 1))
+        tail -15 "$logf"
+        echo "LEGSTATS pass=0 fail=1"
     fi
-done
+}
+
+# run_goa: the goa assembler example suite (src/goa/run_tests.sh) covers the
+# Windows examples natively, the GUI one through msgboxcheck, and the Linux
+# ones under QEMU. Run it rather than growing a second copy here -- it already
+# reports exit codes separately from stdout, which catches a crash that
+# happens to print the right prefix.
+run_goa() {
+    if GOC_PYTHON="${UCPY:-}" bash src/goa/run_tests.sh; then
+        echo "ok    goa examples suite"
+        echo "LEGSTATS pass=1 fail=0"
+    else
+        echo "FAIL  goa examples suite"
+        echo "LEGSTATS pass=0 fail=1"
+    fi
+}
+
+pass=0
+fail=0
+aggregate() {  # <logfile>...: sum every leg's LEGSTATS line
+    local f p f2
+    for f in "$@"; do
+        p="$(sed -n 's/^LEGSTATS pass=\([0-9]*\) fail=[0-9]*$/\1/p' "$f" | awk '{s+=$1} END{print s+0}')"
+        f2="$(sed -n 's/^LEGSTATS pass=[0-9]* fail=\([0-9]*\)$/\1/p' "$f" | awk '{s+=$1} END{print s+0}')"
+        pass=$((pass + p))
+        fail=$((fail + f2))
+    done
+}
+
+if [ "${GOC_PARALLEL:-1}" = "1" ]; then
+    echo "== running 6 example legs + goa suite + 3 unit modules in parallel =="
+    run_win_leg  ""   ""           >/tmp/leg_win0.log   2>&1 & p0=$!
+    run_win_leg  "-o1" "O1/"  -O1  >/tmp/leg_wino1.log  2>&1 & p1=$!
+    run_win_leg  "-os" "Os/"  -Os  >/tmp/leg_winos.log  2>&1 & p2=$!
+    run_linux_leg ""   ""           >/tmp/leg_lin0.log   2>&1 & p3=$!
+    run_linux_leg "-o1" "O1/"  -O1 >/tmp/leg_lino1.log  2>&1 & p4=$!
+    run_linux_leg "-os" "Os/"  -Os >/tmp/leg_linos.log  2>&1 & p5=$!
+    run_goa                     >/tmp/leg_goa.log    2>&1 & p6=$!
+    run_unit src        /tmp/unit_src.log    >/tmp/leg_unit_src.log  2>&1 & p7=$!
+    run_unit src/goa    /tmp/unit_goa.log    >/tmp/leg_unit_goa.log  2>&1 & p8=$!
+    run_unit tools      /tmp/unit_tools.log  >/tmp/leg_unit_tools.log 2>&1 & p9=$!
+
+    rc=0
+    for pid in $p0 $p1 $p2 $p3 $p4 $p5 $p6 $p7 $p8 $p9; do
+        wait "$pid" || rc=1
+    done
+
+    echo "== windows target (-O0) ==";                    cat /tmp/leg_win0.log
+    echo "-----------------------------"
+    echo "== windows target -O1 (IR peephole on) ==";     cat /tmp/leg_wino1.log
+    echo "== windows target -Os (size first) ==";         cat /tmp/leg_winos.log
+    echo "== linux target -O0 (ELF64 under QEMU/Unicorn) =="; cat /tmp/leg_lin0.log
+    echo "== linux target -O1 ==";                        cat /tmp/leg_lino1.log
+    echo "== linux target -Os ==";                        cat /tmp/leg_linos.log
+    echo "== goa examples (via src/goa/run_tests.sh) =="; cat /tmp/leg_goa.log
+    echo "== unit tests (all three modules) ==";          cat /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log
+
+    aggregate /tmp/leg_win0.log /tmp/leg_wino1.log /tmp/leg_winos.log \
+              /tmp/leg_lin0.log /tmp/leg_lino1.log /tmp/leg_linos.log \
+              /tmp/leg_goa.log \
+              /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log
+    [ "$rc" -ne 0 ] && fail=$((fail + 1))
+else
+    echo "== windows target (-O0) =="
+    run_win_leg "" ""       | tee /tmp/leg_win0.log
+    echo "== windows target -O1 (IR peephole on) =="
+    run_win_leg "-o1" "O1/" -O1 | tee /tmp/leg_wino1.log
+    echo "== linux target -O0 (ELF64, executed under QEMU/Unicorn) =="
+    run_linux_leg "" ""     | tee /tmp/leg_lin0.log
+    echo "== linux target -O1 =="
+    run_linux_leg "-o1" "O1/" -O1 | tee /tmp/leg_lino1.log
+    echo "== windows target -Os (size first: no inlining, cleanup passes on) =="
+    run_win_leg "-os" "Os/" -Os | tee /tmp/leg_winos.log
+    echo "== linux target -Os =="
+    run_linux_leg "-os" "Os/" -Os | tee /tmp/leg_linos.log
+    echo "== goa examples (via src/goa/run_tests.sh) =="
+    run_goa | tee /tmp/leg_goa.log
+    echo "== unit tests (all three modules) =="
+    run_unit src     /tmp/unit_src.log   | tee /tmp/leg_unit_src.log
+    run_unit src/goa /tmp/unit_goa.log   | tee /tmp/leg_unit_goa.log
+    run_unit tools   /tmp/unit_tools.log | tee /tmp/leg_unit_tools.log
+    aggregate /tmp/leg_win0.log /tmp/leg_wino1.log /tmp/leg_winos.log \
+              /tmp/leg_lin0.log /tmp/leg_lino1.log /tmp/leg_linos.log \
+              /tmp/leg_goa.log \
+              /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log
+fi
 
 echo "-----------------------------"
 echo "pass=$pass fail=$fail"
