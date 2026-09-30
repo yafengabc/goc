@@ -43,6 +43,7 @@ GetTempPathA
 GetTickCount
 HeapAlloc
 HeapFree
+HeapReAlloc
 LoadLibraryA
 MoveFileA
 ReadFile

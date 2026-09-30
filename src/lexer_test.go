@@ -78,3 +78,58 @@ func TestLexIntegerPlain(t *testing.T) {
 		t.Fatalf("42 lexed as %d, want 42", v)
 	}
 }
+
+func TestLexCharEscapeControls(t *testing.T) {
+	// '\b' and '\f' used to fall through to "the character itself", so '\b'
+	// lexed as 'b' (98) and '\f' as 'f' (102). cJSON's print_string_ptr
+	// switches on exactly those two escapes when it counts how many
+	// characters a string needs escaped, so every key beginning with a 'b'
+	// or an 'f' was counted one too long and the printed JSON lost a byte
+	// of alignment ("bits" came out as "bitso").
+	cases := []struct {
+		src  string
+		want int64
+	}{
+		{"'\\b'", 8},
+		{"'\\f'", 12},
+		{"'\\a'", 7},
+		{"'\\v'", 11},
+		{"'\\n'", 10},
+		{"'\\r'", 13},
+		{"'\\t'", 9},
+		{"'\\\\'", 92},
+		{"'\\''", 39},
+		{"'\\\"'", 34},
+		{"'\\0'", 0},
+	}
+	for _, c := range cases {
+		if v, _ := numOf(t, c.src); v != c.want {
+			t.Errorf("%s lexed as %d, want %d", c.src, v, c.want)
+		}
+	}
+}
+
+func TestLexStringEscapeControls(t *testing.T) {
+	// The same escape table drives string literals, and a string body has to
+	// produce the identical bytes.
+	toks, err := Lex(`"\b\f\a\v\n\t\r\\\"\0"`)
+	if err != nil {
+		t.Fatalf("Lex error: %v", err)
+	}
+	want := []byte{8, 12, 7, 11, 10, 9, 13, '\\', '"', 0}
+	for _, tok := range toks {
+		if tok.Kind != TStr {
+			continue
+		}
+		if len(tok.Str) != len(want) {
+			t.Fatalf("string literal lexed as %v, want %v", tok.Str, want)
+		}
+		for i := range want {
+			if tok.Str[i] != want[i] {
+				t.Fatalf("string literal lexed as %v, want %v", tok.Str, want)
+			}
+		}
+		return
+	}
+	t.Fatal("no string literal token found")
+}

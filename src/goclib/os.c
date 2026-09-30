@@ -19,6 +19,9 @@ extern void  ExitProcess(long code);
 extern void *GetProcessHeap(void);
 extern void *HeapAlloc(void *heap, long flags, long bytes);
 extern long  HeapFree(void *heap, long flags, void *block);
+/* HeapReAlloc resizes in place when it can and copies when it cannot, so
+ * it is both smaller and faster than alloc+copy here. */
+extern void *HeapReAlloc(void *heap, long flags, void *block, long bytes);
 
 long __goclib_write(const char *buf, long len) {
     long written = 0;
@@ -53,6 +56,15 @@ void __goclib_heap_free(void *p) {
     if (p != 0) HeapFree(GetProcessHeap(), 0, p);
 }
 
+void *__goclib_heap_realloc(void *p, long size) {
+    if (p == 0) return __goclib_heap_alloc(size);
+    if (size <= 0) {
+        __goclib_heap_free(p);
+        return 0;
+    }
+    return HeapReAlloc(GetProcessHeap(), 0, p, size);
+}
+
 #elif defined(__linux__)
 
 /*
@@ -66,6 +78,13 @@ extern void *brk(void *addr);
 extern void exit_group(long code);
 
 static char *heap_cur;                      /* brk bump-allocator cursor */
+
+/* Every block carries this many bytes in front of the returned pointer,
+ * holding the requested size. The bump allocator cannot otherwise answer
+ * "how big was this block?", which realloc needs. 16 keeps the payload
+ * 16-byte aligned and leaves room to grow the header later.
+ */
+#define HEAP_HDR 16
 
 long __goclib_write(const char *buf, long len) {
     if (len <= 0) return 0;
@@ -84,9 +103,9 @@ void __goclib_exit(long code) {
 void *__goclib_heap_alloc(long size) {
     long need;
     char *next;
-    char *p;
+    char *raw;
     if (size <= 0) size = 1;
-    need = (size + 15) / 16 * 16;           /* 16-byte aligned */
+    need = ((size + HEAP_HDR) + 15) / 16 * 16;  /* header + 16-byte aligned */
     if (heap_cur == 0) {
         heap_cur = (char *)brk((void *)0);  /* query the current break */
     }
@@ -94,13 +113,31 @@ void *__goclib_heap_alloc(long size) {
     if ((char *)brk((void *)next) != next) {
         return 0;                           /* failed: brk returns the old break */
     }
-    p = heap_cur;
+    raw = heap_cur;
     heap_cur = next;
-    return p;
+    *((long *)raw) = size;                  /* realloc reads this back */
+    return raw + HEAP_HDR;
 }
 
 void __goclib_heap_free(void *p) {
     /* bump allocator: nothing to do until the process exits. */
+}
+
+void *__goclib_heap_realloc(void *p, long size) {
+    char *np;
+    long old;
+    long copy;
+    if (p == 0) return __goclib_heap_alloc(size);
+    if (size <= 0) return 0;
+    old = *((long *)((char *)p - HEAP_HDR));
+    np = (char *)__goclib_heap_alloc(size);
+    if (np == 0) return 0;
+    /* The old block is never reclaimed -- the bump allocator has no free --
+     * so this trades memory for a correct copy of min(old, new) bytes. */
+    copy = old;
+    if (size < copy) copy = size;
+    memcpy(np, p, copy);
+    return np;
 }
 
 #else

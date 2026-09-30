@@ -13,9 +13,15 @@
 void *malloc(size_t size);
 void  free(void *ptr);
 void *calloc(size_t n, size_t size);
+/* Resize a block from malloc/calloc/realloc, keeping the first min(old,new)
+ * bytes. A null `ptr` makes this malloc(size). */
+void *realloc(void *ptr, size_t size);
 int   atoi(const char *s);
 int   abs(int x);
 long  strtol(const char *s, char **endp, int base);
+/* Decimal floats, plus "inf"/"infinity"/"nan". Hexadecimal floats ("0x1p3")
+ * are not recognised. On failure *endp is set to s itself. */
+double strtod(const char *s, char **endp);
 int   rand(void);
 void  srand(unsigned int seed);
 void  exit(int code);

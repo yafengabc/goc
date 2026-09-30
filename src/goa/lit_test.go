@@ -121,3 +121,31 @@ func TestStripCommentInString(t *testing.T) {
 		}
 	}
 }
+
+// TestLiteralDBEscapedQuote guards splitTopLevel's escape handling. It used to
+// end a db operand's string at the first quote whether or not that quote was
+// backslash-escaped, so a literal holding JSON -- "a\\\\\"b,c" -- had its
+// quoting state desynchronised and the comma inside the string was split off
+// as a separate operand ("bad db operand").
+func TestLiteralDBEscapedQuote(t *testing.T) {
+	a := NewAssembler()
+	src := "section .rdata\n" +
+		"LC0 db \"a\\\\\\\"b,c\", 0\n" +
+		"LC1 db \"q\\\"b\\\\\\\\f\\nb\", 0\n"
+	if err := a.Assemble(src); err != nil {
+		t.Fatalf("assemble: %v", err)
+	}
+	var got string
+	for _, s := range a.sections {
+		if s.Name == ".rdata" || s.Name == ".data" {
+			got = string(s.Data)
+			break
+		}
+	}
+	// LC0: a, backslash, quote, b, comma, c -- the comma belongs to the string
+	// LC1: q, quote, b, backslash, backslash, f, backslash, n, b
+	want := "a\\\"b,c\x00q\"b\\\\f\nb\x00"
+	if got != want {
+		t.Errorf("rdata mismatch:/n got %q\nwant %q", got, want)
+	}
+}

@@ -13,6 +13,11 @@
 
 int printf(const char *fmt, ...);
 int sprintf(char *buf, const char *fmt, ...);
+/* Supported conversions: d i u o x X (h/l/ll lengths), f e g a, c, s, and
+ * "%%", with width and "*" suppression. No scansets, %p or %n. Returns the
+ * number of items assigned, or -1 if the input ends before the first one
+ * completes. */
+int sscanf(const char *s, const char *fmt, ...);
 int puts(const char *s);
 int putchar(int c);
 int getchar(void);

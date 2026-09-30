@@ -411,3 +411,222 @@ int getchar(void) {
     if (n <= 0) return -1;
     return (unsigned char)b;
 }
+
+/* ------------------------------- sscanf ---------------------------------- */
+/*
+ * The scanf conversions goc supports: d i u o x X (with h/l/ll lengths),
+ * f e g a and friends, c, s, and "%%". Widths and "*" suppression are
+ * honoured; scansets (%[...]), %p and %n are not. Floating point is parsed
+ * by strtod, so the two agree by construction.
+ *
+ * Returns the number of items ASSIGNED (suppressed conversions do not
+ * count), or -1 if the input ends before the first conversion completes.
+ * That distinction is the whole reason scanf returns "assigned" rather
+ * than "matched": callers test "!= 1" after asking for one item.
+ */
+static const char *scan_ws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f') p++;
+    return p;
+}
+
+/*
+ * Read an unsigned integer of the given base (0 = autodetect: 0x/0X means
+ * hex, a leading 0 means octal, otherwise decimal). Stops at the first
+ * character that is not a digit in that base. *ok reports whether at least
+ * one digit was consumed.
+ */
+static unsigned long scan_uint(const char **pp, int base, int width, int *ok) {
+    const char *p = *pp;
+    unsigned long v = 0;
+    int n = 0;
+    int d;
+    *ok = 0;
+    if (base == 0) {
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+            base = 16;
+            p = p + 2;
+        } else if (p[0] == '0') {
+            base = 8;
+        } else {
+            base = 10;
+        }
+    } else if (base == 16 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        /* An explicit "%x" still accepts the 0x prefix -- scanf's %x and %i
+         * agree here, and "0x1f" must not be read as the integer 0. */
+        p = p + 2;
+    }
+    while (*p != '\0' && (width <= 0 || n < width)) {
+        if (*p >= '0' && *p <= '9') {
+            d = *p - '0';
+        } else if (*p >= 'a' && *p <= 'z') {
+            d = *p - 'a' + 10;
+        } else if (*p >= 'A' && *p <= 'Z') {
+            d = *p - 'A' + 10;
+        } else {
+            break;
+        }
+        if (d >= base) break;
+        v = v * (unsigned long)base + (unsigned long)d;
+        p++;
+        n++;
+        *ok = 1;
+    }
+    *pp = p;
+    return v;
+}
+
+int sscanf(const char *s, const char *fmt, ...) {
+    va_list ap;
+    const char *sp = s;
+    const char *fp = fmt;
+    int assigned = 0;
+    int suppress;
+    int width;
+    int lmod;
+    int base;
+    int ok;
+    int neg;
+    unsigned long uv;
+    char *dst;
+
+    va_start(ap, fmt);
+    while (*fp != '\0') {
+        /* Whitespace in the format matches any run of whitespace in the
+         * input, including none -- it never causes a mismatch. */
+        if (*fp == ' ' || *fp == '\t' || *fp == '\n') {
+            sp = scan_ws(sp);
+            fp++;
+            continue;
+        }
+        if (*fp != '%') {
+            if (*sp != *fp) break;
+            sp++;
+            fp++;
+            continue;
+        }
+        fp++;
+        if (*fp == '%') {
+            if (*sp != '%') break;
+            sp++;
+            fp++;
+            continue;
+        }
+        suppress = 0;
+        if (*fp == '*') {
+            suppress = 1;
+            fp++;
+        }
+        width = 0;
+        while (*fp >= '0' && *fp <= '9') {
+            width = width * 10 + (*fp - '0');
+            fp++;
+        }
+        /* goc's long is already 64 bits, so "l", "ll" and "L" all name the
+         * same 8-byte target for an integer conversion. */
+        lmod = 0;
+        if (*fp == 'h' || *fp == 'l' || *fp == 'L') {
+            lmod = *fp;
+            fp++;
+            if ((lmod == 'l' && *fp == 'l') || (lmod == 'h' && *fp == 'h')) fp++;
+        }
+
+        if (*fp == 'c') {
+            int n = width > 0 ? width : 1;
+            int i;
+            if (suppress) {
+                sp = sp + n;
+            } else {
+                dst = (char *)va_arg(ap, char *);
+                for (i = 0; i < n && *sp != '\0'; i++) {
+                    dst[i] = *sp;
+                    sp++;
+                }
+                assigned++;
+            }
+            fp++;
+            continue;
+        }
+        if (*fp == 's') {
+            int n = 0;
+            if (!suppress) dst = (char *)va_arg(ap, char *);
+            sp = scan_ws(sp);
+            while (*sp != '\0' && *sp != ' ' && *sp != '\t' && *sp != '\n' && *sp != '\r' &&
+                   (width <= 0 || n < width)) {
+                if (!suppress) dst[n] = *sp;
+                sp++;
+                n++;
+            }
+            if (n == 0) break;
+            if (!suppress) {
+                dst[n] = '\0';
+                assigned++;
+            }
+            fp++;
+            continue;
+        }
+        if (*fp == 'f' || *fp == 'F' || *fp == 'e' || *fp == 'E' ||
+            *fp == 'g' || *fp == 'G' || *fp == 'a' || *fp == 'A') {
+            char *endp;
+            double dv;
+            sp = scan_ws(sp);
+            dv = strtod(sp, &endp);
+            if (endp == sp) break;
+            sp = endp;
+            if (!suppress) {
+                if (lmod == 0) {
+                    float *f32 = (float *)va_arg(ap, float *);
+                    *f32 = (float)dv;
+                } else {
+                    double *f64 = (double *)va_arg(ap, double *);
+                    *f64 = dv;
+                }
+                assigned++;
+            }
+            fp++;
+            continue;
+        }
+
+        base = -1;
+        if (*fp == 'd' || *fp == 'u') base = 10;
+        else if (*fp == 'i') base = 0;
+        else if (*fp == 'o') base = 8;
+        else if (*fp == 'x' || *fp == 'X') base = 16;
+        if (base < 0) break;                /* unknown conversion: stop */
+
+        sp = scan_ws(sp);
+        neg = 0;
+        if (*sp == '+') {
+            sp++;
+        } else if (*sp == '-') {
+            neg = 1;
+            sp++;
+        }
+        uv = scan_uint(&sp, base, width, &ok);
+        if (!ok) break;
+        /* The five pointer targets below deliberately carry distinct names
+         * (i16/i32/i64/f32/f64): goc resolves a local by name alone, so two
+         * sibling blocks declaring "out" with different pointee types would
+         * collide and store through the wrong width. See README/known bugs.
+         */
+        if (!suppress) {
+            if (lmod == 'h') {
+                short *i16 = (short *)va_arg(ap, short *);
+                *i16 = (short)(neg ? -(long)uv : (long)uv);
+            } else if (lmod == 0) {
+                int *i32 = (int *)va_arg(ap, int *);
+                *i32 = (int)(neg ? -(long)uv : (long)uv);
+            } else {
+                long *i64 = (long *)va_arg(ap, long *);
+                *i64 = neg ? -(long)uv : (long)uv;
+            }
+            assigned++;
+        }
+        fp++;
+        continue;
+    }
+    va_end(ap);
+    /* Nothing assigned AND nothing consumed means the input ran out before
+     * the first conversion could finish -- the C "EOF" answer. */
+    if (assigned == 0 && sp == s) return -1;
+    return assigned;
+}

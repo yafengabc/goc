@@ -535,7 +535,7 @@ func (p *Parser) parseEnumSpecifier() (*Type, error) {
 		name := p.next().Text
 		if p.atPunct("=") {
 			p.next()
-			v, err := p.constAdd()
+			v, err := p.constExpr()
 			if err != nil {
 				return nil, err
 			}
@@ -565,6 +565,15 @@ func (p *Parser) parseDeclarator(base *Type, allowFunc bool, abstract bool) (dec
 	for p.atPunct("*") {
 		base = PtrType(base)
 		p.next()
+		// C allows a qualifier-list after the '*' ("const char * const p",
+		// "int * volatile q"). Those qualifiers constrain the pointer ITSELF,
+		// and goc has nowhere to record that -- a pointer lives in a register
+		// or a stack slot, neither of which can be read-only -- so they are
+		// parsed and dropped. Dropping them is also what makes a library's
+		// const-correct signatures parse at all.
+		for isQualifier(p.cur()) {
+			p.next()
+		}
 	}
 	var d declResult
 	if p.atPunct("(") {
@@ -691,11 +700,175 @@ func (p *Parser) parseArrayLength() (int, error) {
 	if p.atPunct("]") {
 		return 0, nil
 	}
-	v, err := p.constAdd()
+	v, err := p.constExpr()
 	if err != nil {
 		return 0, err
 	}
 	return v, nil
+}
+
+// Constant expressions above '+': case labels, enum values and array lengths
+// routinely spell values like "(1 << 3)", "(A | B)" or "(N > 0)", so the
+// constant parser follows C's precedence all the way up instead of stopping
+// at additive. constExpr is the entry point -- each layer parses the next
+// tighter one as its operands, exactly as the C grammar does.
+func (p *Parser) constExpr() (int, error) {
+	v, err := p.constLAnd()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("||") {
+		p.next()
+		r, err := p.constLAnd()
+		if err != nil {
+			return 0, err
+		}
+		v = constBool(v != 0 || r != 0)
+	}
+	return v, nil
+}
+
+func (p *Parser) constLAnd() (int, error) {
+	v, err := p.constBOr()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("&&") {
+		p.next()
+		r, err := p.constBOr()
+		if err != nil {
+			return 0, err
+		}
+		v = constBool(v != 0 && r != 0)
+	}
+	return v, nil
+}
+
+func (p *Parser) constBOr() (int, error) {
+	v, err := p.constBXor()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("|") {
+		p.next()
+		r, err := p.constBXor()
+		if err != nil {
+			return 0, err
+		}
+		v |= r
+	}
+	return v, nil
+}
+
+func (p *Parser) constBXor() (int, error) {
+	v, err := p.constBAnd()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("^") {
+		p.next()
+		r, err := p.constBAnd()
+		if err != nil {
+			return 0, err
+		}
+		v ^= r
+	}
+	return v, nil
+}
+
+func (p *Parser) constBAnd() (int, error) {
+	v, err := p.constEq()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("&") {
+		p.next()
+		r, err := p.constEq()
+		if err != nil {
+			return 0, err
+		}
+		v &= r
+	}
+	return v, nil
+}
+
+func (p *Parser) constEq() (int, error) {
+	v, err := p.constRel()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("==") || p.atPunct("!=") {
+		op := p.next().Text
+		r, err := p.constRel()
+		if err != nil {
+			return 0, err
+		}
+		if op == "==" {
+			v = constBool(v == r)
+		} else {
+			v = constBool(v != r)
+		}
+	}
+	return v, nil
+}
+
+func (p *Parser) constRel() (int, error) {
+	v, err := p.constShift()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("<") || p.atPunct(">") || p.atPunct("<=") || p.atPunct(">=") {
+		op := p.next().Text
+		r, err := p.constShift()
+		if err != nil {
+			return 0, err
+		}
+		switch op {
+		case "<":
+			v = constBool(v < r)
+		case ">":
+			v = constBool(v > r)
+		case "<=":
+			v = constBool(v <= r)
+		default:
+			v = constBool(v >= r)
+		}
+	}
+	return v, nil
+}
+
+func (p *Parser) constShift() (int, error) {
+	v, err := p.constAdd()
+	if err != nil {
+		return 0, err
+	}
+	for p.atPunct("<<") || p.atPunct(">>") {
+		op := p.next().Text
+		r, err := p.constAdd()
+		if err != nil {
+			return 0, err
+		}
+		// Mirrors codegen's rule for a real shl/shr: x86 masks the count to
+		// 6 bits, so an out-of-range shift would fold to a value the emitted
+		// instruction disagrees with. Refuse instead.
+		if r < 0 || r > 63 {
+			return 0, fmt.Errorf("line %d: shift count %d out of range in constant expression", p.cur().Line, r)
+		}
+		if op == "<<" {
+			v <<= uint(r)
+		} else {
+			v >>= uint(r)
+		}
+	}
+	return v, nil
+}
+
+// constBool renders a comparison/logical result the way C does: 1 or 0.
+func constBool(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func (p *Parser) constAdd() (int, error) {
@@ -723,7 +896,7 @@ func (p *Parser) constMul() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	for p.atPunct("*") || p.atPunct("/") {
+	for p.atPunct("*") || p.atPunct("/") || p.atPunct("%") {
 		op := p.next().Text
 		r, err := p.constPrim()
 		if err != nil {
@@ -731,11 +904,16 @@ func (p *Parser) constMul() (int, error) {
 		}
 		if op == "*" {
 			v *= r
-		} else {
+		} else if op == "/" {
 			if r == 0 {
 				return 0, fmt.Errorf("line %d: division by zero in array size", p.cur().Line)
 			}
 			v /= r
+		} else {
+			if r == 0 {
+				return 0, fmt.Errorf("line %d: division by zero in array size", p.cur().Line)
+			}
+			v %= r
 		}
 	}
 	return v, nil
@@ -744,7 +922,7 @@ func (p *Parser) constMul() (int, error) {
 func (p *Parser) constPrim() (int, error) {
 	if p.atPunct("(") {
 		p.next()
-		v, err := p.constAdd()
+		v, err := p.constExpr()
 		if err != nil {
 			return 0, err
 		}
@@ -764,6 +942,23 @@ func (p *Parser) constPrim() (int, error) {
 	if p.atPunct("+") {
 		p.next()
 		return p.constPrim()
+	}
+	if p.atPunct("~") {
+		p.next()
+		v, err := p.constPrim()
+		if err != nil {
+			return 0, err
+		}
+		return ^v, nil
+	}
+	// '!' yields C's 1/0, so a case label like "case !FOO:" folds to 0/1.
+	if p.atPunct("!") {
+		p.next()
+		v, err := p.constPrim()
+		if err != nil {
+			return 0, err
+		}
+		return constBool(v == 0), nil
 	}
 	if p.cur().Kind == TNum && !p.cur().IsDbl {
 		v := int(p.next().Num)
@@ -1035,9 +1230,9 @@ func (p *Parser) parseStmt() (Stmt, error) {
 		return &SwitchStmt{Src: src, Body: body, Line: t.Line}, nil
 	case t.Kind == TKeyword && t.Text == "case":
 		p.next()
-		v, err := p.constAdd()
+		v, err := p.constExpr()
 		if err != nil {
-			return nil, fmt.Errorf("line %d: case label must be an integer constant", t.Line)
+			return nil, fmt.Errorf("line %d: case label must be an integer constant (%v)", t.Line, err)
 		}
 		if err := p.expect(":"); err != nil {
 			return nil, err
@@ -1339,6 +1534,8 @@ func (p *Parser) assignOp() string {
 		return "&"
 	case p.atPunct("|="):
 		return "|"
+	case p.atPunct("^="):
+		return "^"
 	case p.atPunct("<<="):
 		return "<<"
 	case p.atPunct(">>="):
@@ -1567,7 +1764,7 @@ func (p *Parser) parseUnary() (Expr, error) {
 		}
 		return &SizeofExpr{E: e}, nil
 	}
-	if p.atPunct("-") || p.atPunct("!") {
+	if p.atPunct("-") || p.atPunct("!") || p.atPunct("~") {
 		op := p.next().Text
 		e, err := p.parseUnary()
 		if err != nil {

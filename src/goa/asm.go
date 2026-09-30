@@ -2645,6 +2645,17 @@ func splitTopLevel(s string, sep byte) []string {
 		c := s[i]
 		if inStr != 0 {
 			cur.WriteByte(c)
+			if c == '\\' && i+1 < len(s) {
+				// A backslash escapes whatever follows it, so the quote in
+				// "\"" does not end the string. Skipping escapes here keeps
+				// the quoting state in step with the bytes: without it, a db
+				// operand holding something JSON-ish -- "a\\\\\"b,c" -- ended
+				// its string at the wrong place and the comma inside it was
+				// split off as a separate operand.
+				i++
+				cur.WriteByte(s[i])
+				continue
+			}
 			if c == inStr {
 				inStr = 0
 			}

@@ -502,6 +502,14 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 				c.errf(0, "operand of '!' must be scalar, got %s", t)
 			}
 			return IntType()
+		case "~":
+			// Bitwise complement: integer operands only, and the operand
+			// promotes to int exactly like the binary bitwise operators do.
+			t := c.checkExpr(n.E, fn)
+			if !t.IsIntClass() {
+				c.errf(0, "operand of '~' must be an integer, got %s", t)
+			}
+			return IntType()
 		case "&":
 			// Taking the address of a function designator is how a function
 			// pointer is initialised ("fp = &add"). The designator is not an

@@ -232,8 +232,18 @@ func Lex(src string) ([]Token, error) {
 						buf = append(buf, '\t')
 					case 'r':
 						buf = append(buf, '\r')
+					case 'b':
+						buf = append(buf, '\b')
+					case 'f':
+						buf = append(buf, '\f')
+					case 'a':
+						buf = append(buf, '\a')
+					case 'v':
+						buf = append(buf, '\v')
 					case '\\':
 						buf = append(buf, '\\')
+					case '\'':
+						buf = append(buf, '\'')
 					case '"':
 						buf = append(buf, '"')
 					case '0':
@@ -266,6 +276,14 @@ func Lex(src string) ([]Token, error) {
 					ch = '\t'
 				case 'r':
 					ch = '\r'
+				case 'b':
+					ch = '\b'
+				case 'f':
+					ch = '\f'
+				case 'a':
+					ch = '\a'
+				case 'v':
+					ch = '\v'
 				case '\\':
 					ch = '\\'
 				case '\'':
@@ -303,13 +321,15 @@ func Lex(src string) ([]Token, error) {
 				continue
 			}
 			switch two {
-			case "==", "!=", "<=", ">=", "&&", "||", "##", "<<", ">>", "++", "--",
-				"+=", "-=", "*=", "/=", "%=", "&=", "|=", "->":
+		case "==", "!=", "<=", ">=", "&&", "||", "##", "<<", ">>", "++", "--",
+			"+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "->":
 				push(Token{Kind: TPunct, Text: two, Line: line})
 				i += 2
 				continue
 			}
-			if strings.IndexByte("+-*/%=<>!(){};,.[]&?:|", c) >= 0 {
+			// '^' (xor) and '~' (bitwise not) complete the bitwise family the
+		// language already had (& | << >>).
+		if strings.IndexByte("+-*/%=<>!(){};,.[]&?:|^~", c) >= 0 {
 				push(Token{Kind: TPunct, Text: string(c), Line: line})
 				i++
 				continue

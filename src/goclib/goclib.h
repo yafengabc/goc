@@ -5,8 +5,9 @@
  * goclib.h -- internal umbrella header for the goclib C library.
  *
  * goc ships real standard headers (ctype.h / stddef.h / stdarg.h / stdio.h /
- * stdlib.h / string.h) under goclib/ and injects them on `#include <name.h>`;
- * user code includes those, never this header. Each goclib/*.c implementation
+ * stdlib.h / string.h / math.h, plus the macro-only limits.h and float.h)
+ * under goclib/ and injects them on `#include <name.h>`; user code includes
+ * those, never this header. Each goclib/*.c implementation
  * file (os.c / stdio.c / stdlib.c / string.c / ctype.c) includes goclib.h to
  * pull in the standard declarations it implements, plus the __goclib_*
  * platform primitives declared below -- the only pieces that touch the OS
@@ -34,6 +35,9 @@ void __goclib_exit(long code);
 void *__goclib_heap_alloc(long size);
 /* Free a block previously returned by __goclib_heap_alloc. */
 void  __goclib_heap_free(void *p);
+/* Resize a block from __goclib_heap_alloc, preserving its first min(old,new)
+ * bytes; a null `p` behaves like __goclib_heap_alloc. */
+void *__goclib_heap_realloc(void *p, long size);
 /* Read up to `len` bytes from standard input into `buf`; <=0 at EOF. */
 long __goclib_read(char *buf, long len);
 

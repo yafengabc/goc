@@ -83,6 +83,7 @@ BOOL   FileTimeToSystemTime(LPVOID ft, LPVOID st);
 /* ------------------------------------------------------------------ */
 LPVOID HeapAlloc(HANDLE heap, DWORD flags, SIZE_T bytes);
 BOOL   HeapFree(HANDLE heap, DWORD flags, LPVOID mem);
+LPVOID HeapReAlloc(HANDLE heap, DWORD flags, LPVOID mem, SIZE_T bytes);
 HANDLE GetProcessHeap(void);
 
 /* ------------------------------------------------------------------ */

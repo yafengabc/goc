@@ -33,7 +33,15 @@ type CG struct {
 	doubles    []float64
 	doubleLab  map[float64]string
 	label      int
-	vars       map[string]varInfo // per-function: param = +off, local = -off
+	// Block-scoped locals and parameters. Every declaration gets a unique
+	// uid; its home (off/reg/typ) lives in varEnts[uid]. Name resolution
+	// walks scopes (innermost last), so a declaration correctly shadows an
+	// outer one with the same name, and sibling blocks may reuse a name
+	// without their homes colliding.
+	varEnts map[int]varInfo  // uid -> home
+	scopes  []map[string]int // name -> uid; innermost scope is last
+	varUID  int              // next uid to assign
+	declUID map[*DeclStmt]int // declaration node -> uid (filled during gather)
 	localBytes int                // bytes consumed by stack-resident locals (incl. array padding)
 	regArea    int                // bytes reserved just below rbp for saved callee-save regs
 	globals    map[string]bool    // names of program-level (global/static) variables
@@ -49,6 +57,16 @@ type CG struct {
 	// string constant.
 	globalStrInits []struct {
 		glab, slab string
+		off        int
+	}
+	// globalFuncInits does the same job for a pointer slot initialised by a
+	// FUNCTION designator: "static H hooks = { malloc, free }" or a top-level
+	// "void *(*fp)(long) = malloc;". Same reason -- goa has no data
+	// relocations -- and the entry stub binds them with the same lea/mov.
+	// Registering the name through funcAddrSym is what pulls a goclib
+	// function into the emitted set when only its address is taken here.
+	globalFuncInits []struct {
+		glab, flab string
 		off        int
 	}
 	// Static locals: a "static int x;" inside a function gets a unique .data
@@ -768,7 +786,7 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 			c.resW = 8 // a function address is a pointer
 			return TInt, nil
 		}
-		vi, ok := c.vars[n.Name]
+		vi, ok := c.lookupVar(n.Name)
 		if !ok {
 			if lab, ok2 := c.staticVars[n.Name]; ok2 {
 				// Static local: loaded from its .data label, exactly like a
@@ -840,7 +858,7 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		}
 		t := c.memberType(n.Base, n.Name)
 		if t == nil {
-			return TInt, fmt.Errorf("unknown member %q", n.Name)
+			return TInt, fmt.Errorf("line %d: unknown member %q in type %v", n.Line, n.Name, c.exprType(n.Base))
 		}
 		if t.Kind == KStruct || t.Kind == KUnion {
 			// A nested aggregate member (e.g. "s.inner") is not a scalar that
@@ -881,6 +899,14 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		var sz int
 		if n.Typ != nil {
 			sz = sizeOf(n.Typ)
+		} else if sl, ok := n.E.(*StrLit); ok {
+			// A string literal is a char[N] array, so "sizeof("abc")" is 4
+			// (three characters plus the terminator) -- not 8. It only decays
+			// to a pointer when it is used as a value, and sizeof does not use
+			// it as a value. Real code leans on this: cJSON's strdup is
+			// "strlen(s) + sizeof("")", which read 8 instead of 1 here and
+			// copied (and later printed) a byte of neighbouring memory.
+			sz = len(sl.Bytes) + 1
 		} else {
 			sz = c.typeWidth(c.exprType(n.E))
 		}
@@ -1003,7 +1029,7 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		// Fast path: a simple scalar local/param on the left can be stored
 		// directly from its home register/stack slot, with no address needed.
 		if id, ok := n.Lhs.(*Ident); ok {
-			if vi, ok2 := c.vars[id.Name]; ok2 {
+			if vi, ok2 := c.lookupVar(id.Name); ok2 {
 				rt, err := c.genExprT(n.Rhs)
 				if err != nil {
 					return rt, err
@@ -1086,7 +1112,9 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 	c := &CG{
 		strLab:       map[*StrLit]string{},
 		doubleLab:    map[float64]string{},
-		vars:         map[string]varInfo{},
+		varEnts:      map[int]varInfo{},
+		scopes:       nil,
+		declUID:      map[*DeclStmt]int{},
 		funcs:        map[string]bool{},
 		funcDefs:     map[string]*FuncDecl{},
 		calls:        map[string]bool{},
@@ -1166,6 +1194,10 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 				c.need["exit"] = true
 			}
 		}
+	} else {
+		// The Windows PE entry point receives no argc/argv, so _start calls
+		// this goclib helper to build them from GetCommandLineA before main.
+		c.need["__goclib_get_args"] = true
 	}
 	if err := c.genClibFuncs(); err != nil {
 		return "", err
@@ -1264,20 +1296,40 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 		fmt.Fprintf(&strInit, "\tlea rax, [rip+%s]\n\tlea rdx, [rip+%s]\n\tmov [rax+%d], rdx\n",
 			si.glab, si.slab, si.off)
 	}
+	for _, fi := range c.globalFuncInits {
+		// Same dance for a function-pointer slot: goa cannot relocate a
+		// code address in .data either, so the .data image stays zero and
+		// the entry stub stores the function's address at startup.
+		fmt.Fprintf(&strInit, "\tlea rax, [rip+%s]\n\tlea rdx, [rip+%s]\n\tmov [rax+%d], rdx\n",
+			fi.glab, fi.flab, fi.off)
+	}
 
 	// Entry stub: align the stack, run main, and hand its return value to the
 	// platform's exit routine. Linux needs no shadow space and exits through
 	// the `exit` syscall stub; Windows uses ExitProcess.
 	out.WriteString("_start:\n")
+	// The SysV entry stack holds argc at [rsp] and argv just above it; capture
+	// them in callee-saved regs before realigning rsp. On Windows those slots
+	// are garbage, but reading them is harmless and the registers are
+	// overwritten before main is reached.
+	out.WriteString("\tmov r12, [rsp]\n")
+	out.WriteString("\tlea r13, [rsp+8]\n")
 	out.WriteString("\tand rsp, -16\n")
+	out.WriteString(strInit.String())
 	if c.linux {
-		out.WriteString(strInit.String())
+		out.WriteString("\tmov rdi, r12\n")
+		out.WriteString("\tmov rsi, r13\n")
 		out.WriteString("\tcall main\n")
 		out.WriteString("\tmov rdi, rax\n")
 		out.WriteString("\tcall exit\n\n")
 	} else {
 		out.WriteString("\tsub rsp, 48\n")
-		out.WriteString(strInit.String())
+		// A PE entry point receives no argc/argv, so build them from
+		// GetCommandLineA via the goclib helper before main runs.
+		out.WriteString("\tlea rcx, [rsp+32]\n")
+		out.WriteString("\tcall __goclib_get_args\n")
+		out.WriteString("\tmov rcx, rax\n")
+		out.WriteString("\tmov rdx, [rsp+32]\n")
 		out.WriteString("\tcall main\n")
 		out.WriteString("\tmov rcx, rax\n")
 		out.WriteString("\tcall ExitProcess\n\n")
@@ -2274,9 +2326,80 @@ func foldConstInit(e Expr) (int64, bool) {
 			return -v, true
 		case "+":
 			return v, true
+		case "~":
+			return ^v, true
 		}
+	case *Binary:
+		// Every integer constant operator C allows in a static initialiser.
+		// Shifts refuse counts outside [0,63] (x86 masks the count, so the
+		// folded value would disagree with the generated instruction), and
+		// division/modulo refuse a zero divisor instead of trapping.
+		l, ok1 := foldConstInit(n.L)
+		r, ok2 := foldConstInit(n.R)
+		if !ok1 || !ok2 {
+			return 0, false
+		}
+		switch n.Op {
+		case "+":
+			return l + r, true
+		case "-":
+			return l - r, true
+		case "*":
+			return l * r, true
+		case "/":
+			if r == 0 {
+				return 0, false
+			}
+			return l / r, true
+		case "%":
+			if r == 0 {
+				return 0, false
+			}
+			return l % r, true
+		case "<<":
+			if r < 0 || r > 63 {
+				return 0, false
+			}
+			return l << uint(r), true
+		case ">>":
+			if r < 0 || r > 63 {
+				return 0, false
+			}
+			return l >> uint(r), true
+		case "&":
+			return l & r, true
+		case "|":
+			return l | r, true
+		case "^":
+			return l ^ r, true
+		case "<":
+			return boolVal(l < r), true
+		case ">":
+			return boolVal(l > r), true
+		case "<=":
+			return boolVal(l <= r), true
+		case ">=":
+			return boolVal(l >= r), true
+		case "==":
+			return boolVal(l == r), true
+		case "!=":
+			return boolVal(l != r), true
+		case "&&":
+			return boolVal(l != 0 && r != 0), true
+		case "||":
+			return boolVal(l != 0 || r != 0), true
+		}
+		return 0, false
 	}
 	return 0, false
+}
+
+// boolVal turns a comparison result into the 0/1 integer C expects.
+func boolVal(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // foldFloatInit folds the constant initialiser of a global float/double down
@@ -2364,6 +2487,24 @@ func (c *CG) findAddressTaken(f *FuncDecl) map[string]bool {
 		case *Index:
 			walkExpr(n.Base)
 			walkExpr(n.Idx)
+		case *CastExpr:
+			// A cast does not hide the address-of inside it: "(char **)&x"
+			// is the common spelling when a function takes an out-parameter,
+			// and skipping this branch used to leave x in a register that
+			// had no address to take.
+			walkExpr(n.E)
+		case *CondExpr:
+			// Either arm may carry the "&x", so both have to be visited.
+			walkExpr(n.Cond)
+			walkExpr(n.Then)
+			walkExpr(n.Else)
+		case *CommaExpr:
+			walkExpr(n.Left)
+			walkExpr(n.Right)
+		case *IncDecExpr:
+			walkExpr(n.E)
+		case *MemberExpr:
+			walkExpr(n.Base)
 		case *Call:
 			// va_start(ap, ...) and va_end(ap) both require ap's address
 			// (va_start writes the cursor into it), and va_arg needs it too.
@@ -2451,8 +2592,47 @@ func (c *CG) findAddressTaken(f *FuncDecl) map[string]bool {
 	return taken
 }
 
+// --- block-scoped variable resolution -------------------------------------
+// pushScope opens a fresh (empty) lexical scope for declarations.
+func (c *CG) pushScope() { c.scopes = append(c.scopes, map[string]int{}) }
+
+// popScope discards the innermost lexical scope.
+func (c *CG) popScope() {
+	if len(c.scopes) > 0 {
+		c.scopes = c.scopes[:len(c.scopes)-1]
+	}
+}
+
+// declareVar registers name -> a fresh uid holding info in the current
+// (innermost) scope and returns the uid. Used for parameters (declared into
+// the function's outermost scope) and, implicitly, for locals when their
+// DeclStmt is emitted (see genStmt's *DeclStmt case).
+func (c *CG) declareVar(name string, info varInfo) int {
+	uid := c.varUID
+	c.varUID++
+	c.varEnts[uid] = info
+	c.scopes[len(c.scopes)-1][name] = uid
+	return uid
+}
+
+// lookupVar resolves name through the scope stack (innermost first). It covers
+// locals and parameters only; static locals and globals are handled by the
+// callers' own fallback logic.
+func (c *CG) lookupVar(name string) (varInfo, bool) {
+	for i := len(c.scopes) - 1; i >= 0; i-- {
+		if uid, ok := c.scopes[i][name]; ok {
+			return c.varEnts[uid], true
+		}
+	}
+	return varInfo{}, false
+}
+
 func (c *CG) genFunc(f *FuncDecl) error {
-	c.vars = map[string]varInfo{}
+	c.varEnts = map[int]varInfo{}
+	c.scopes = nil
+	c.varUID = 0
+	c.declUID = map[*DeclStmt]int{}
+	c.pushScope() // function / parameter scope (scope 0)
 	c.staticVars = map[string]string{} // fresh per function: static-local names do not leak across functions
 	c.curRet = f.Ret
 	c.curParam = f.ParamTypes
@@ -2469,17 +2649,19 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	}
 	argRegs := c.argRegs()
 	regCap := len(argRegs) - regShift
+	paramUIDs := make([]int, len(f.Params))
 	for i, p := range f.Params {
-		// Placeholder homes; the real ones are assigned in the frame-layout
-		// phase below. Registering early keeps param names out of the local
-		// declaration gather.
-		c.vars[p] = varInfo{off: 16 + 8*i, typ: f.ParamTypes[i]} // [rbp+16], ...
+		// Register the parameter in the function's outermost scope now; its
+		// final home (register-spill slot or stack slot) is assigned in the
+		// frame-layout phase below.
+		paramUIDs[i] = c.declareVar(p, varInfo{off: 16 + 8*i, typ: f.ParamTypes[i]})
 	}
 
-	// localDecl is one (name, type) pair for a function-local variable.
+	// localDecl is one (name, type, uid) triple for a function-local variable.
 	type localDecl struct {
 		name string
 		typ  *Type
+		uid  int
 	}
 
 	// Gather every local declaration (including those inside nested blocks)
@@ -2519,8 +2701,14 @@ func (c *CG) genFunc(f *FuncDecl) error {
 				// Extern local: a reference to a file-scope global of the same
 				// name. No frame slot; loadVar/genLValue fall through to
 				// c.globals to resolve it.
-			} else if _, ok := c.vars[n.Name]; !ok {
-				decls = append(decls, localDecl{n.Name, n.Typ})
+			} else {
+				// Each declaration -- even two with the same name in sibling
+				// blocks -- gets its own uid so their frame homes never
+				// collide. Name->uid scoping is rebuilt at emission time.
+				uid := c.varUID
+				c.varUID++
+				c.declUID[n] = uid
+				decls = append(decls, localDecl{n.Name, n.Typ, uid})
 			}
 		case *IfStmt:
 			gather(n.Then, swDepth)
@@ -2580,7 +2768,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 		if intClass && !addrTaken[d.name] && ri < len(regPool) {
 			regOf[d.name] = regPool[ri]
 			c.usedRegs = append(c.usedRegs, regPool[ri])
-			c.vars[d.name] = varInfo{reg: regPool[ri], typ: d.typ}
+			c.varEnts[d.uid] = varInfo{reg: regPool[ri], typ: d.typ}
 			ri++
 		} else {
 			stackDecls = append(stackDecls, d)
@@ -2636,16 +2824,16 @@ func (c *CG) genFunc(f *FuncDecl) error {
 		if !isAgg(pt) {
 			if i < regCap {
 				localBytes += 8
-				c.vars[p] = varInfo{off: -(regArea + localBytes), typ: pt}
+				c.varEnts[paramUIDs[i]] = varInfo{off: -(regArea + localBytes), typ: pt}
 			} else if c.linux {
-				c.vars[p] = varInfo{off: 16 + 8*(i-regCap), typ: pt}
+				c.varEnts[paramUIDs[i]] = varInfo{off: 16 + 8*(i-regCap), typ: pt}
 			} else {
-				c.vars[p] = varInfo{off: 16 + 8*(i+regShift), typ: pt}
+				c.varEnts[paramUIDs[i]] = varInfo{off: 16 + 8*(i+regShift), typ: pt}
 			}
 			continue
 		}
 		localBytes += aggSlotBytes(pt)
-		c.vars[p] = varInfo{off: -(regArea + localBytes), typ: pt}
+		c.varEnts[paramUIDs[i]] = varInfo{off: -(regArea + localBytes), typ: pt}
 		pc := paramCopy{name: p, typ: pt}
 		if i < regCap {
 			pc.srcReg = argRegs[i+regShift]
@@ -2676,7 +2864,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			}
 			off := -(regArea + localBytes + size)
 			localBytes += size
-			c.vars[d.name] = varInfo{off: off, typ: d.typ}
+			c.varEnts[d.uid] = varInfo{off: off, typ: d.typ}
 		} else {
 			// Scalar (or struct/union aggregate) slot. The slot width MUST
 			// match the width used by loadVar/storeVar/lvalueWidth, which all
@@ -2691,7 +2879,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 				w = 1
 			}
 			localBytes += w
-			c.vars[d.name] = varInfo{off: -(regArea + localBytes), typ: d.typ}
+			c.varEnts[d.uid] = varInfo{off: -(regArea + localBytes), typ: d.typ}
 		}
 	}
 	c.regArea = regArea
@@ -2781,7 +2969,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 		if isAgg(pt) {
 			continue // aggregate params are copied from their hidden pointer below
 		}
-		vi := c.vars[f.Params[i]]
+		vi, _ := c.lookupVar(f.Params[i])
 		if pt.IsFloating() {
 			// XMM index: Windows numbers XMM argument registers positionally
 			// (shared with the GP slot counter, hidden pointer included);
@@ -2808,7 +2996,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// Copy aggregate parameters out of their caller-owned hidden pointers
 	// into the local slots reserved above.
 	for _, pc := range paramCopies {
-		vi := c.vars[pc.name]
+		vi, _ := c.lookupVar(pc.name)
 		if pc.srcReg != "" {
 			c.emit("mov r10, %s", pc.srcReg)
 		} else {
@@ -2827,8 +3015,12 @@ func (c *CG) genFunc(f *FuncDecl) error {
 		}
 	}
 
+	// The function body is a block scope (child of the parameter scope): its
+	// top-level declarations live here, and nested blocks push their own.
+	c.pushScope()
 	for _, st := range f.Body.Stmts {
 		if err := c.genStmt(st); err != nil {
+			c.popScope()
 			return err
 		}
 	}
@@ -2839,6 +3031,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	if !c.blockEndsWithReturn(f.Body) {
 		c.emitEpilogue()
 	}
+	c.popScope() // function-body block scope
 	return nil
 }
 
@@ -2874,11 +3067,16 @@ func (c *CG) emitEpilogue() {
 func (c *CG) genStmt(s Stmt) error {
 	switch n := s.(type) {
 	case *Block:
+		// A compound statement opens a new lexical scope. Its declarations
+		// register themselves into this scope when their DeclStmt is emitted.
+		c.pushScope()
 		for _, st := range n.Stmts {
 			if err := c.genStmt(st); err != nil {
+				c.popScope()
 				return err
 			}
 		}
+		c.popScope()
 	case *DeclList:
 		// A multi-declarator declaration ("int a = 1, b = 2;") is one
 		// statement; without this case genStmt silently emitted nothing for
@@ -2895,7 +3093,14 @@ func (c *CG) genStmt(s Stmt) error {
 		if n.Storage == "static" || n.Storage == "extern" {
 			return nil
 		}
-		vi := c.vars[n.Name]
+		// Register this declaration into the current (innermost) lexical
+		// scope so later references resolve to its own uid -- this is what
+		// lets a declaration shadow an outer one with the same name, and lets
+		// sibling blocks reuse a name without their homes colliding.
+		if uid, ok := c.declUID[n]; ok {
+			c.scopes[len(c.scopes)-1][n.Name] = uid
+		}
+		vi, _ := c.lookupVar(n.Name)
 		if bi, ok := n.Init.(*BraceInit); ok {
 			// A braced initialiser stores each leaf directly into its frame
 			// slot and zero-fills what it leaves uncovered. A scalar target
@@ -2980,7 +3185,7 @@ func (c *CG) genStmt(s Stmt) error {
 		// Fast path: a simple scalar local on the left can be stored
 		// directly to its home register, with no need to compute an address.
 		if id, ok := n.Lhs.(*Ident); ok {
-			if vi, ok2 := c.vars[id.Name]; ok2 && vi.reg != "" {
+			if vi, ok2 := c.lookupVar(id.Name); ok2 && vi.reg != "" {
 				if _, err := c.genExprT(n.Rhs); err != nil {
 					return err
 				}
@@ -3074,15 +3279,23 @@ func (c *CG) genStmt(s Stmt) error {
 		}
 		c.emit("cmp rax, 0")
 		c.emit("je %s", lElse)
+		// Each branch is its own scope, so a bare declaration in "if (c) int x;"
+		// (or one inside a compound body) does not leak into the other branch.
+		c.pushScope()
 		if err := c.genStmt(n.Then); err != nil {
+			c.popScope()
 			return err
 		}
+		c.popScope()
 		if n.Else != nil {
 			c.emit("jmp %s", lEnd)
 			c.line(lElse + ":\n")
+			c.pushScope()
 			if err := c.genStmt(n.Else); err != nil {
+				c.popScope()
 				return err
 			}
+			c.popScope()
 			c.line(lEnd + ":\n")
 		} else {
 			c.line(lElse + ":\n")
@@ -3104,7 +3317,9 @@ func (c *CG) genStmt(s Stmt) error {
 		// condition at lTop.
 		c.loops = append(c.loops, loopLabels{breakLbl: lEnd, contLbl: lTop})
 		c.breaks = append(c.breaks, lEnd)
+		c.pushScope() // loop body scope
 		bodyErr := c.genStmt(n.Body)
+		c.popScope()
 		c.loops = c.loops[:len(c.loops)-1]
 		c.breaks = c.breaks[:len(c.breaks)-1]
 		if bodyErr != nil {
@@ -3116,17 +3331,25 @@ func (c *CG) genStmt(s Stmt) error {
 		lTop := c.newLabel("for")
 		lEnd := c.newLabel("forend")
 		lCont := c.newLabel("forcont")
+		// The for-statement scope covers the initialiser, the condition, the
+		// body and the post expression -- a declaration such as
+		// "for (int i = 0; ...)" is visible across all of them. A compound
+		// body opens its own nested scope on top of this one.
+		c.pushScope()
 		if n.Init != nil {
 			if err := c.genStmt(n.Init); err != nil {
+				c.popScope()
 				return err
 			}
 		}
 		c.line(lTop + ":\n")
 		if n.Cond != nil {
 			if _, err := c.genExprT(n.Cond); err != nil {
+				c.popScope()
 				return err
 			}
 			if err := c.ensureType(TInt); err != nil {
+				c.popScope()
 				return err
 			}
 			c.emit("cmp rax, 0")
@@ -3140,16 +3363,19 @@ func (c *CG) genStmt(s Stmt) error {
 		c.loops = c.loops[:len(c.loops)-1]
 		c.breaks = c.breaks[:len(c.breaks)-1]
 		if bodyErr != nil {
+			c.popScope()
 			return bodyErr
 		}
 		c.line(lCont + ":\n")
 		if n.Post != nil {
 			if _, err := c.genExprT(n.Post); err != nil {
+				c.popScope()
 				return err
 			}
 		}
 		c.emit("jmp %s", lTop)
 		c.line(lEnd + ":\n")
+		c.popScope()
 	case *DoWhileStmt:
 		// "do body while (cond);": the body runs first, so the condition is
 		// tested at the bottom. continue jumps to that test, not to the body.
@@ -3159,7 +3385,9 @@ func (c *CG) genStmt(s Stmt) error {
 		c.line(lTop + ":\n")
 		c.loops = append(c.loops, loopLabels{breakLbl: lEnd, contLbl: lCont})
 		c.breaks = append(c.breaks, lEnd)
+		c.pushScope() // loop body scope
 		bodyErr := c.genStmt(n.Body)
+		c.popScope()
 		c.loops = c.loops[:len(c.loops)-1]
 		c.breaks = c.breaks[:len(c.breaks)-1]
 		if bodyErr != nil {
@@ -3321,7 +3549,7 @@ func isAsmIdentByte(b byte) bool {
 // bindAsmLine rewrites one line of inline-assembly text so that every bare C
 // variable name becomes the memory operand that addresses it:
 //
-//	locals and parameters (c.vars)  -> [rbp+off]
+//	locals and parameters (resolved through c.lookupVar)  -> [rbp+off]
 //	globals and static locals       -> [rip+G_x]   (label via c.globalLab)
 //
 // Registers, mnemonics, numeric literals (0x10, 123), .L local labels and
@@ -3413,7 +3641,7 @@ func (c *CG) asmBindWord(w string, inBracket bool) string {
 	if asmReserved[w] {
 		return w
 	}
-	if vi, ok := c.vars[w]; ok {
+	if vi, ok := c.lookupVar(w); ok {
 		// vi.off is always set in a function that contains an asm block
 		// (hasAsm forces every local onto the stack); the register-home
 		// branch is a defensive no-op.
@@ -3489,6 +3717,9 @@ func (c *CG) genSwitch(n *SwitchStmt) error {
 		return err
 	}
 	c.emit("mov [rbp%+d], rax", slot)
+	// A switch body is a block scope; a declaration inside a case belongs to
+	// it and does not leak out of the switch.
+	c.pushScope()
 
 	var groups []swGroup
 	defIdx := -1
@@ -3541,6 +3772,7 @@ func (c *CG) genSwitch(n *SwitchStmt) error {
 	}
 	c.breaks = c.breaks[:len(c.breaks)-1]
 	c.line(lEnd + ":\n")
+	c.popScope()
 	c.swDepth--
 	return err
 }
@@ -3609,6 +3841,22 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 		}
 		return t, nil
 	}
+	// "~" -- one's complement. The operand has already been checked to be an
+	// integer; `not` flips all 64 bits of rax, so a narrow operand is
+	// promoted to int afterwards exactly like unary '-' does.
+	if n.Op == "~" {
+		c.emit("not rax")
+		w, s := c.resW, c.resSigned
+		if w < 4 {
+			w, s = 4, true
+		}
+		c.resW = w
+		if w == 4 {
+			c.canonInt(s)
+		}
+		c.resTyp = TInt
+		return TInt, nil
+	}
 	// "!" -- force the operand to int, then rax = (rax == 0)
 	if err := c.ensureType(TInt); err != nil {
 		return TInt, err
@@ -3641,7 +3889,7 @@ func (c *CG) genLValue(e Expr) error {
 			c.emit("lea r10, [rip+%s]", sym)
 			return nil
 		}
-		vi, ok := c.vars[n.Name]
+		vi, ok := c.lookupVar(n.Name)
 		if !ok {
 			if lab, ok2 := c.staticVars[n.Name]; ok2 {
 				// Address of a static local: rip-relative lea into .data.
@@ -3684,7 +3932,7 @@ func (c *CG) genLValue(e Expr) error {
 		islot := c.tmpSlot(c.tmpDepth)
 		c.emit("mov [rbp%+d], rax", islot)
 		if id, ok := n.Base.(*Ident); ok {
-			vi, ok2 := c.vars[id.Name]
+			vi, ok2 := c.lookupVar(id.Name)
 			if !ok2 {
 				if lab, ok3 := c.staticVars[id.Name]; ok3 {
 					// Static-local array: rip-relative lea of element 0.
@@ -3772,7 +4020,7 @@ func (c *CG) genLValue(e Expr) error {
 			st = c.exprType(n.Base)
 		}
 		if st == nil || (st.Kind != KStruct && st.Kind != KUnion) {
-			return fmt.Errorf("member access %q on non-struct type", n.Name)
+			return fmt.Errorf("line %d: member access %q on non-struct type %v", n.Line, n.Name, st)
 		}
 		off := 0
 		found := false
@@ -3803,13 +4051,31 @@ func (c *CG) genLValue(e Expr) error {
 	return fmt.Errorf("expression is not an lvalue")
 }
 
+// ptrArithElem returns the element type of a pointer-arithmetic expression
+// ("p + n", "p - n" or "n + p"): the result still points into the same array,
+// so its element type is the pointer operand's. It returns nil for anything
+// that is not pointer arithmetic -- including "p - q", whose result is an
+// integer, not a pointer.
+func (c *CG) ptrArithElem(e Expr) *Type {
+	b, ok := e.(*Binary)
+	if !ok || (b.Op != "+" && b.Op != "-") {
+		return nil
+	}
+	for _, sub := range []Expr{b.L, b.R} {
+		if t := c.exprType(sub); t != nil && (t.IsPtr() || t.IsArray()) && t.Elem != nil {
+			return t.Elem
+		}
+	}
+	return nil
+}
+
 // elemClassOf returns the codegen class (int vs double) of the value obtained
 // by dereferencing / indexing e. It inspects the structured type behind local
 // variables and the shape of nested dereferences / subscripts.
 func (c *CG) elemClassOf(e Expr) CType {
 	switch n := e.(type) {
 	case *Ident:
-		vi, ok := c.vars[n.Name]
+		vi, ok := c.lookupVar(n.Name)
 		if !ok {
 			// A static local shadows a same-named global; its type lives
 			// under its .data label, not the source name.
@@ -3937,7 +4203,10 @@ func (c *CG) exprIsPointer(e Expr) bool {
 // its Elem. Returns nil if base is not a struct/union or the member is absent.
 func (c *CG) memberType(base Expr, name string) *Type {
 	t := c.exprType(base)
-	if t != nil && t.Kind == KPtr && t.Elem != nil {
+	// "->" on an array-typed base is legal C too: "printbuffer buffer[1]"
+	// decays to a pointer, so "buffer->field" addresses element 0. Both the
+	// pointer and the array spelling therefore unwrap to the element type.
+	if t != nil && (t.Kind == KPtr || t.Kind == KArr) && t.Elem != nil {
 		t = t.Elem
 	}
 	if t == nil || (t.Kind != KStruct && t.Kind != KUnion) {
@@ -3956,7 +4225,7 @@ func (c *CG) memberType(base Expr, name string) *Type {
 func (c *CG) exprType(e Expr) *Type {
 	switch n := e.(type) {
 	case *Ident:
-		if vi, ok := c.vars[n.Name]; ok {
+		if vi, ok := c.lookupVar(n.Name); ok {
 			return vi.typ
 		}
 		// A static local's type is registered under its .data label, not its
@@ -3977,12 +4246,40 @@ func (c *CG) exprType(e Expr) *Type {
 				return t.Elem
 			}
 		}
+		if n.Op == "&" {
+			// "&x" is a pointer to x's type. Without this branch every
+			// "(&s)->member" resolved to a nil base type and failed with
+			// "member access on non-struct type" -- the C spelling a macro
+			// like `#define at(b) ((b)->field)` produces when it is handed
+			// "&local" instead of a pointer variable.
+			//
+			// A function designator already decays to a pointer to the
+			// function, so "&f" must keep that same type instead of
+			// becoming a pointer to a pointer to a function.
+			if t := c.exprType(n.E); t != nil {
+				if t.IsFunc() {
+					return PtrType(t)
+				}
+				if t.IsPtr() && t.Elem != nil && t.Elem.IsFunc() {
+					return t
+				}
+				return PtrType(t)
+			}
+		}
 	case *Index:
 		if t := c.exprType(n.Base); t != nil {
 			if t.IsPtr() || t.IsArray() {
 				return t.Elem
 			}
 		}
+	case *Binary:
+		// Pointer arithmetic keeps a pointer type, so "(p + 1) - base" is
+		// still pointer-minus-pointer. Without this branch exprType returned
+		// nil for any Binary, codegen classified the left operand as an
+		// integer and took the "integer - pointer" swap path instead -- the
+		// difference came out negated, and cJSON's parse_string decided
+		// every escape sequence ran off the end of its buffer.
+		return c.binaryType(n)
 	case *IncDecExpr:
 		return c.exprType(n.E)
 	case *MemberExpr:
@@ -4019,6 +4316,46 @@ func (c *CG) exprType(e Expr) *Type {
 	return nil
 }
 
+// binaryType mirrors the checker's pointer-arithmetic rules (checkBinary) so
+// codegen can classify an expression that is itself arithmetic: a pointer
+// plus or minus an integer is still a pointer, and pointer minus pointer is
+// an integer difference. Anything else is left nil, which every caller
+// already treats as "ordinary integer".
+func (c *CG) binaryType(n *Binary) *Type {
+	if n.Op != "+" && n.Op != "-" {
+		return nil
+	}
+	lt := c.exprType(n.L)
+	rt := c.exprType(n.R)
+	// A numeric literal is not in any type table, so exprType reports nil for
+	// it; on one side of a pointer operation that missing type is the
+	// integer it actually is.
+	intish := func(t *Type) bool { return t == nil || (!t.IsPtr() && !t.IsArray()) }
+	if lt != nil && lt.IsPtr() && rt != nil && rt.IsPtr() {
+		if n.Op == "-" {
+			return IntType() // pointer difference
+		}
+		return nil
+	}
+	// An array operand decays to a pointer to its element, exactly as it does
+	// in every other value context: "a + 2" has type int*, not int[4]. Keeping
+	// the array type made "(a + 2)[0]" look like an array lvalue and genLValue
+	// tried to take its address ("expression is not an lvalue").
+	decay := func(t *Type) *Type {
+		if t != nil && t.IsArray() && t.Elem != nil {
+			return PtrType(t.Elem)
+		}
+		return t
+	}
+	if lt != nil && (lt.IsPtr() || lt.IsArray()) && intish(rt) {
+		return decay(lt)
+	}
+	if rt != nil && (rt.IsPtr() || rt.IsArray()) && intish(lt) {
+		return decay(rt)
+	}
+	return nil
+}
+
 // elemWidthOf returns the byte width of the element referenced by a pointer or
 // array expression e (1 for char, 2 for short, 4 for int, 8 otherwise). For a
 // bare scalar (the value itself, not a container) it returns that scalar's
@@ -4027,7 +4364,7 @@ func (c *CG) exprType(e Expr) *Type {
 func (c *CG) elemWidthOf(e Expr) int {
 	switch n := e.(type) {
 	case *Ident:
-		vi, ok := c.vars[n.Name]
+		vi, ok := c.lookupVar(n.Name)
 		if !ok {
 			// A static local shadows a same-named global; its type lives
 			// under its .data label, not the source name.
@@ -4099,6 +4436,17 @@ func (c *CG) elemWidthOf(e Expr) int {
 		return 8
 	case *IncDecExpr:
 		return c.elemWidthOf(n.E)
+	case *Binary:
+		// Pointer arithmetic keeps the pointer's element type, so
+		// "(p + n)[i]" strides and loads that element -- 1 byte for
+		// "unsigned char *", not the 8-byte default. This is the shape a
+		// macro like `#define at(b) ((b)->content + (b)->offset)` expands
+		// to, and getting it wrong made every "switch (at(b)[i])" read a
+		// whole quadword and fall through to its default label.
+		if et := c.ptrArithElem(n); et != nil {
+			return c.typeWidth(et)
+		}
+		return 8
 	case *CastExpr:
 		// A cast to a pointer/array type changes what a subsequent
 		// dereference or subscript reads: *(int *)p loads 4 bytes at the
@@ -4454,6 +4802,25 @@ func (c *CG) braceElemLocal(t *Type, e Expr, off int) error {
 	return nil
 }
 
+// globalInitFuncName reports the function named by a global initialiser
+// expression, accepting both spellings C allows for a function designator:
+// a bare "malloc" and an explicit "&malloc". The name is only a candidate --
+// the caller still has to confirm through funcAddrSym that it really names a
+// function (and not, say, a global int whose address is being taken).
+func globalInitFuncName(e Expr) (string, bool) {
+	switch n := e.(type) {
+	case *Ident:
+		return n.Name, true
+	case *Unary:
+		if n.Op == "&" {
+			if id, ok := n.E.(*Ident); ok {
+				return id.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
 // walkGlobalInit scans a global/static-local initialiser for every pointer
 // slot initialised by a string literal and records the (label, byte offset,
 // string label) triple in c.globalStrInits so the entry stub can bind it at
@@ -4466,6 +4833,19 @@ func (c *CG) walkGlobalInit(t *Type, init Expr, glab string, off int) {
 	}
 	bi, ok := init.(*BraceInit)
 	if !ok {
+		// A bare function designator naming a function ("void *(*fp)(long) =
+		// malloc;", or a function-pointer member reached through a brace
+		// walk) needs the same startup binding a string literal does.
+		if fname, ok := globalInitFuncName(init); ok && t != nil && t.Kind == KPtr {
+			if sym, ok := c.funcAddrSym(fname); ok {
+				c.globalFuncInits = append(c.globalFuncInits,
+					struct {
+						glab, flab string
+						off        int
+					}{glab, sym, off})
+				return
+			}
+		}
 		if sl, ok := init.(*StrLit); ok && t.Kind == KPtr {
 			lab, ok := c.strLab[sl]
 			if !ok {
@@ -4810,7 +5190,7 @@ func (c *CG) releaseResStruct() {
 // answer for p[i] indexing but wrong for storing the pointer).
 func (c *CG) lvalueWidth(e Expr) int {
 	if id, ok := e.(*Ident); ok {
-		if vi, ok2 := c.vars[id.Name]; ok2 {
+		if vi, ok2 := c.lookupVar(id.Name); ok2 {
 			if vi.typ.IsPtr() {
 				return 8
 			}
@@ -4863,7 +5243,7 @@ func (c *CG) lvalueWidth(e Expr) int {
 // the lvalue e, used to pick the right store instruction for an assignment.
 func (c *CG) lvalueClass(e Expr) CType {
 	if id, ok := e.(*Ident); ok {
-		if vi, ok2 := c.vars[id.Name]; ok2 {
+		if vi, ok2 := c.lookupVar(id.Name); ok2 {
 			return vi.typ.Class()
 		}
 		// A static local shadows a same-named global; its type lives under
@@ -4953,7 +5333,7 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 	// Fast path: a register-cached scalar local (pointers are never
 	// register-allocated because they can be address-taken).
 	if id, ok := n.E.(*Ident); ok {
-		if vi, ok2 := c.vars[id.Name]; ok2 && vi.reg != "" {
+		if vi, ok2 := c.lookupVar(id.Name); ok2 && vi.reg != "" {
 			// -- must step down, not up. Pick the right mnemonic once so all
 			// four fast-path sites below emit inc/dec and add/sub correctly.
 			opInc := "inc"
@@ -5637,7 +6017,7 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 // global holding a function pointer. It returns the callee expression (the
 // variable read itself) together with the static function type behind it.
 func (c *CG) fnPtrVar(name string) (Expr, *Type, bool) {
-	if vi, ok := c.vars[name]; ok {
+	if vi, ok := c.lookupVar(name); ok {
 		if ft := funcTypeOf(vi.typ); ft != nil {
 			return &Ident{Name: name}, ft, true
 		}

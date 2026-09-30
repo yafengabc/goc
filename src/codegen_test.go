@@ -12,6 +12,34 @@ func genAsm(t *testing.T, src string) string {
 	return genAsmOpt(t, src, 0)
 }
 
+// fnAsm extracts the body of one top-level function from generated assembly:
+// the lines from its "name:" label up to the next top-level label (a line at
+// column 0 ending in ':'). Instructions are tab-indented, so any line that
+// starts at column 0 and ends in ':' is a fresh symbol, not code. Used to
+// scope assertions to the function under test and ignore helper glue (e.g. the
+// Windows _start emits __goclib_get_args, which legitimately contains imul).
+func fnAsm(asm, name string) string {
+	start := strings.Index(asm, name+":")
+	if start < 0 {
+		return asm
+	}
+	rest := asm[start:]
+	lines := strings.Split(rest, "\n")
+	for i := 1; i < len(lines); i++ {
+		ln := lines[i]
+		if ln == "" {
+			continue
+		}
+		if (ln[0] == '\t' || ln[0] == ' ') {
+			continue
+		}
+		if strings.HasSuffix(ln, ":") {
+			return strings.Join(lines[:i], "\n")
+		}
+	}
+	return rest
+}
+
 // genAsmOpt is genAsm at an explicit optimisation level.
 func genAsmOpt(t *testing.T, src string, opt int) string {
 	t.Helper()
@@ -73,11 +101,15 @@ func TestAddressTakenLocalStaysOnStack(t *testing.T) {
 // local (rv, defensive no-op branch) and two globals (g, st).
 func bindTestCG() *CG {
 	return &CG{
-		vars: map[string]varInfo{
-			"x":   {off: -8},
-			"arg": {off: 16},
-			"rv":  {off: -16, reg: "rbx"},
+		varEnts: map[int]varInfo{
+			0: {off: -8},
+			1: {off: 16},
+			2: {off: -16, reg: "rbx"},
 		},
+		scopes: []map[string]int{
+			{"x": 0, "arg": 1, "rv": 2},
+		},
+		declUID: map[*DeclStmt]int{},
 		globalLab: map[string]string{
 			"g":  "G_g",
 			"st": "G_st3_st",
@@ -803,5 +835,101 @@ int main(){
 }`)
 	if !strings.Contains(asm, "mov rax, [rax]") {
 		t.Errorf("*(long *)p did not emit an 8-byte load: %q", asm)
+	}
+}
+
+func TestSizeofStringLiteral(t *testing.T) {
+	// A string literal is a char[N] array, so sizeof("abc") is 4 -- three
+	// characters plus the terminator. It used to report 8 because exprType
+	// decays the literal to char*, and sizeof does not use its operand as a
+	// value. cJSON's strdup is "strlen(s) + sizeof("")", which then copied
+	// (and later printed) seven bytes of neighbouring memory.
+	asm := genAsm(t, `int main(){ return (int)sizeof("abc"); }`)
+	if !strings.Contains(asm, "mov rax, 4") {
+		t.Errorf("sizeof(\"abc\") did not fold to 4: %q", asm)
+	}
+	asm = genAsm(t, `int main(){ return (int)sizeof(""); }`)
+	if !strings.Contains(asm, "mov rax, 1") {
+		t.Errorf("sizeof(\"\") did not fold to 1: %q", asm)
+	}
+	// sizeof on the type name, and on a pointer expression, stay as they were
+	asm = genAsm(t, `int main(){ return (int)sizeof(char *); }`)
+	if !strings.Contains(asm, "mov rax, 8") {
+		t.Errorf("sizeof(char *) did not stay 8: %q", asm)
+	}
+}
+
+func TestPtrArithIndexWidth(t *testing.T) {
+	// "(p + n)[i]" keeps the pointer's element width, so indexing an
+	// "unsigned char *" loads one byte. This is the shape cJSON's
+	// `#define at(b) ((b)->content + (b)->offset)` macro expands to; the
+	// default 8-byte load made every character-class switch in the parser
+	// read a whole quadword and fall through to its default label, so
+	// parse_number gave up on the very first digit.
+	asm := genAsm(t, `
+struct B { const unsigned char *content; long length; long offset; };
+int main(){
+  struct B b;
+  int v;
+  b.content = (const unsigned char *)"123";
+  b.length = 3;
+  b.offset = 0;
+  v = (b.content + b.offset)[0];
+  return v;
+}`)
+	// "(p + n)[0]" must stride by 1 byte and load 1 byte out of the
+	// unsigned char* -- the old code defaulted the element width to 8.
+	if !strings.Contains(asm, "imul r11, 1") {
+		t.Errorf("(p + n)[i] on an unsigned char* did not stride by 1: %q", asm)
+	}
+	if !strings.Contains(asm, "mov al, [r10]") {
+		t.Errorf("(p + n)[i] on an unsigned char* did not emit a 1-byte load: %q", asm)
+	}
+	// An int* still strides and loads 4 bytes
+	asm = genAsm(t, `
+int main(){
+  int a[4] = {1, 2, 3, 4};
+  int v;
+  v = (a + 2)[0];
+  return v;
+}`)
+	if !strings.Contains(asm, "imul r11, 4") {
+		t.Errorf("(a + 2)[0] on an int* did not stride by 4: %q", asm)
+	}
+	if !strings.Contains(asm, "mov eax, [r10]") {
+		t.Errorf("(a + 2)[0] on an int* did not emit a 4-byte load: %q", asm)
+	}
+}
+
+func TestBinaryTypePtrArith(t *testing.T) {
+	// exprType had no *Binary branch, so the result of pointer arithmetic was
+	// typed nil. "(p + 1) - base" then classified its left operand as an
+	// integer, took genBinary's "integer - pointer" swap path and produced the
+	// negated difference. cJSON's parse_string bounds-checks every escape
+	// sequence with exactly this shape, so one escaped string anywhere in a
+	// JSON document made the whole parse fail.
+	asm := genAsm(t, `
+int main(){
+  const unsigned char *base = (const unsigned char *)"abcdefgh";
+  const unsigned char *p = base + 3;
+  long d;
+  d = (long)(p + 1 - base);
+  return (int)d;
+}`)
+	// Scope the checks to main: the Windows _start also emits
+	// __goclib_get_args, whose malloc-size arithmetic legitimately uses imul,
+	// and that must not trip the no-scaling assertion below.
+	main := fnAsm(asm, "main")
+	// The swap path reorders the operands before subtracting.
+	if strings.Contains(main, "mov r11, rax\n\tmov rax, r10\n\tmov r10, r11") {
+		t.Errorf("(p + 1) - base took the integer-minus-pointer swap path: %q", main)
+	}
+	// Pointer minus pointer: one subtraction, no element scaling (the
+	// pointed-to type is unsigned char, so the stride is 1).
+	if !strings.Contains(main, "sub r10, rax\n\tmov rax, r10") {
+		t.Errorf("(p + 1) - base did not emit a pointer difference: %q", main)
+	}
+	if strings.Contains(main, "imul") {
+		t.Errorf("(p + 1) - base scaled the difference by an element size: %q", main)
 	}
 }

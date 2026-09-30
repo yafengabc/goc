@@ -91,6 +91,19 @@ func PreprocessTarget(src, filename string, linux bool, incDirs ...string) ([]To
 		p.macros["_WIN32"] = &Macro{Name: "_WIN32", Body: []Token{tokNum(1, 0)}}
 		p.macros["_WIN64"] = &Macro{Name: "_WIN64", Body: []Token{tokNum(1, 0)}}
 	}
+	// Vendor extension keywords that real-world headers use but that carry no
+	// meaning for goc's code generator. They are predefined as macros that
+	// expand to nothing, so a declaration such as
+	// "__declspec(dllexport) void __stdcall f(void)" parses as plain C
+	// instead of dying on the first unknown token. This is what lets a
+	// portable library's Windows branch compile without patching its source.
+	// __declspec/__attribute__ take one parenthesised argument list.
+	p.macros["__declspec"] = &Macro{Name: "__declspec", Params: []string{"x"}, IsFunc: true}
+	p.macros["__attribute__"] = &Macro{Name: "__attribute__", Params: []string{"x"}, IsFunc: true}
+	for _, kw := range []string{"__stdcall", "__cdecl", "__fastcall", "__thiscall",
+		"__inline", "__forceinline", "__restrict", "__restrict__", "__extension__"} {
+		p.macros[kw] = &Macro{Name: kw}
+	}
 	p.baseDir = filepath.Dir(filename)
 	// User -I directories take priority over the base dir and the cwd.
 	p.searchDirs = append(p.searchDirs, incDirs...)
