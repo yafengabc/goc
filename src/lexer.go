@@ -132,6 +132,110 @@ func isAlpha(b byte) bool {
 	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
+// hexVal returns the numeric value (0-15) of a hexadecimal digit, or -1 if b
+// is not a hex digit.
+func hexVal(b byte) int {
+	switch {
+	case b >= '0' && b <= '9':
+		return int(b - '0')
+	case b >= 'a' && b <= 'f':
+		return int(b-'a') + 10
+	case b >= 'A' && b <= 'F':
+		return int(b-'A') + 10
+	}
+	return -1
+}
+
+// isHexDigit reports whether b is a hexadecimal digit.
+func isHexDigit(b byte) bool { return hexVal(b) >= 0 }
+
+// decodeEscape decodes one C escape sequence. i points at the first source
+// character *after* the backslash. It appends the decoded byte(s) to buf and
+// returns the buffer, the offset just past the escape, and any error. It
+// covers the simple escapes, octal \ooo (1-3 digits), hex \xhh (greedy), and
+// universal character names \uXXXX / \UXXXXXXXX (encoded as UTF-8), per C89
+// 6.1.3.4 and C99 6.4.3 / 6.4.4.4.
+func decodeEscape(buf []byte, src string, i, line int) ([]byte, int, error) {
+	n := len(src)
+	c := src[i]
+	switch c {
+	case 'n':
+		buf = append(buf, '\n')
+		i++
+	case 't':
+		buf = append(buf, '\t')
+		i++
+	case 'r':
+		buf = append(buf, '\r')
+		i++
+	case 'b':
+		buf = append(buf, '\b')
+		i++
+	case 'f':
+		buf = append(buf, '\f')
+		i++
+	case 'a':
+		buf = append(buf, '\a')
+		i++
+	case 'v':
+		buf = append(buf, '\v')
+		i++
+	case '\\':
+		buf = append(buf, '\\')
+		i++
+	case '\'':
+		buf = append(buf, '\'')
+		i++
+	case '"':
+		buf = append(buf, '"')
+		i++
+	case '?':
+		buf = append(buf, '?')
+		i++
+	case '0', '1', '2', '3', '4', '5', '6', '7':
+		v := int(c - '0')
+		i++
+		for k := 0; k < 2 && i < n && src[i] >= '0' && src[i] <= '7'; k++ {
+			v = v*8 + int(src[i]-'0')
+			i++
+		}
+		buf = append(buf, byte(v))
+	case 'x', 'X':
+		i++
+		if i >= n || !isHexDigit(src[i]) {
+			return buf, i, fmt.Errorf("line %d: '\\x' used with no following hex digits", line)
+		}
+		v := 0
+		for i < n && isHexDigit(src[i]) {
+			v = v*16 + hexVal(src[i])
+			i++
+		}
+		buf = append(buf, byte(v))
+	case 'u', 'U':
+		need := 4
+		if c == 'U' {
+			need = 8
+		}
+		i++
+		var cv uint32
+		for k := 0; k < need; k++ {
+			if i >= n || !isHexDigit(src[i]) {
+				return buf, i, fmt.Errorf("line %d: incomplete universal character name", line)
+			}
+			cv = cv*16 + uint32(hexVal(src[i]))
+			i++
+		}
+		if (cv >= 0xD800 && cv <= 0xDFFF) || cv > 0x10FFFF {
+			return buf, i, fmt.Errorf("line %d: universal character name \\u%X does not denote a character", line, cv)
+		}
+		buf = append(buf, []byte(string(rune(cv)))...)
+	default:
+		buf = append(buf, c)
+		i++
+	}
+	return buf, i, nil
+}
+
 // Lex turns C source into a token slice.
 //
 // The preprocessor runs on the token stream this produces, so the '#' that
@@ -369,7 +473,30 @@ func Lex(src string) ([]Token, error) {
 				// maps to the int64 minimum, so -9223372036854775808L works.
 				// Sscanf's %d overflows on it and leaves v == 0, which turns
 				// LONG_MIN into -0 == 0. Values beyond 2^64-1 stay 0.
-				u, err := strconv.ParseUint(text, 10, 64)
+				// A leading '0' that is not 0x/0b (handled above) denotes an octal
+				// constant (C89 6.1.3.1): 010 is 8, 0777 is 511. The octal
+				// reading only applies to a pure integer -- a literal that later
+				// shows a '.' or an exponent was already switched to the float path
+				// above, where its digits are read as decimal. An 8 or 9 directly
+				// after a leading zero is an invalid octal digit (gcc rejects).
+				base := 10
+				if len(text) > 0 && text[0] == '0' {
+					bad := byte(0)
+					octal := true
+					for k := 1; k < len(text); k++ {
+						if text[k] >= '8' {
+							octal = false
+							bad = text[k]
+							break
+						}
+					}
+					if octal {
+						base = 8
+					} else {
+						return nil, fmt.Errorf("line %d: invalid digit '%c' in octal constant", line, bad)
+					}
+				}
+				u, err := strconv.ParseUint(text, base, 64)
 				var v int64
 				if err == nil {
 					v = int64(u)
@@ -385,6 +512,39 @@ func Lex(src string) ([]Token, error) {
 			}
 			push(Token{Kind: TNum, Text: text, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
 		}
+		case c == '.' && i+1 < n && isDigit(src[i+1]):
+			// Leading-dot floating constant: .5, .5f, .5e2, .5L, .1'2 (C23).
+			// Only taken when a digit directly follows the '.', so member access
+			// "a.b", the "->" token, "..." and ternary are untouched.
+			start := i
+			i++ // consume leading '.'
+			for i < n && (isDigit(src[i]) || src[i] == 39) {
+				i++
+			}
+			// Exponent: [eE][+-]?digits, taken only when a digit follows.
+			if i < n && (src[i] == 'e' || src[i] == 'E') {
+				j := i + 1
+				if j < n && (src[j] == '+' || src[j] == '-') {
+					j++
+				}
+				if j < n && isDigit(src[j]) {
+					i = j
+					for i < n && (isDigit(src[i]) || src[i] == 39) {
+						i++
+					}
+				}
+			}
+			raw := src[start:i]
+			text := strings.ReplaceAll(raw, "'", "")
+			isFloat := false
+			for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
+				if src[i] == 'f' || src[i] == 'F' {
+					isFloat = true
+				}
+				i++
+			}
+			f, _ := strconv.ParseFloat(text, 64)
+			push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, Line: line})
 		case isAlpha(c):
 			start := i
 			for i < n && (isAlpha(src[i]) || isDigit(src[i])) {
@@ -425,33 +585,11 @@ func Lex(src string) ([]Token, error) {
 			for i < n && src[i] != '"' {
 				if src[i] == '\\' && i+1 < n {
 					i++
-					switch src[i] {
-					case 'n':
-						buf = append(buf, '\n')
-					case 't':
-						buf = append(buf, '\t')
-					case 'r':
-						buf = append(buf, '\r')
-					case 'b':
-						buf = append(buf, '\b')
-					case 'f':
-						buf = append(buf, '\f')
-					case 'a':
-						buf = append(buf, '\a')
-					case 'v':
-						buf = append(buf, '\v')
-					case '\\':
-						buf = append(buf, '\\')
-					case '\'':
-						buf = append(buf, '\'')
-					case '"':
-						buf = append(buf, '"')
-					case '0':
-						buf = append(buf, 0)
-					default:
-						buf = append(buf, src[i])
+					err := error(nil)
+					buf, i, err = decodeEscape(buf, src, i, line)
+					if err != nil {
+						return nil, err
 					}
-					i++
 				} else {
 					buf = append(buf, src[i])
 					i++
@@ -469,33 +607,15 @@ func Lex(src string) ([]Token, error) {
 			var ch byte
 			if i < n && src[i] == '\\' && i+1 < n {
 				i++
-				switch src[i] {
-				case 'n':
-					ch = '\n'
-				case 't':
-					ch = '\t'
-				case 'r':
-					ch = '\r'
-				case 'b':
-					ch = '\b'
-				case 'f':
-					ch = '\f'
-				case 'a':
-					ch = '\a'
-				case 'v':
-					ch = '\v'
-				case '\\':
-					ch = '\\'
-				case '\'':
-					ch = '\''
-				case '"':
-					ch = '"'
-				case '0':
-					ch = 0
-				default:
-					ch = src[i]
+				err := error(nil)
+				ebuf := []byte(nil)
+				ebuf, i, err = decodeEscape(ebuf, src, i, line)
+				if err != nil {
+					return nil, err
 				}
-				i++
+				if len(ebuf) > 0 {
+					ch = ebuf[0]
+				}
 			} else if i < n {
 				ch = src[i]
 				i++
@@ -504,7 +624,14 @@ func Lex(src string) ([]Token, error) {
 				return nil, fmt.Errorf("line %d: unterminated character literal", line)
 			}
 			i++ // closing quote
-			push(Token{Kind: TNum, Text: string(rune(ch)), Num: int64(ch), IsChar: true, Line: line})
+			// goc char is signed: a character constant's value is the byte
+			// sign-extended to int (C89 6.1.3.4), so '\377' (0xFF) is -1,
+			// matching gcc rather than the raw byte 255.
+			cv := int64(ch)
+			if cv >= 128 {
+				cv -= 256
+			}
+			push(Token{Kind: TNum, Text: string(rune(ch)), Num: cv, IsChar: true, Line: line})
 		default:
 			two := ""
 			if i+1 < n {

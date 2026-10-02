@@ -4,7 +4,7 @@
    Strategy   : case1 .5 assigned and printed; case2 .5f float suffix;
                 case3 .5e2 exponent; case4 .5L long double; baseline 0.5 for contrast.
                 gcc accepts all; goc fails to parse the leading "." token.
-   Status     : FAIL (verified 2026-10-02, goc vs gcc -std=c89)
+   Status     : PASS (verified 2026-10-02, goc vs gcc -std=c89)
    ============================================================ */
 #include <stdio.h>
 

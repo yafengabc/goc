@@ -133,3 +133,177 @@ func TestLexStringEscapeControls(t *testing.T) {
 	}
 	t.Fatal("no string literal token found")
 }
+
+// --- batch: lexer literal cluster (P0.3 octal, P0.4 UCN, P1.1 escapes, P1.2 leading dot) ---
+
+func TestLexOctalLiteral(t *testing.T) {
+	// A leading '0' (that is not 0x/0b) denotes an octal constant: 010 is 8,
+	// 0777 is 511, not the decimal 10/777 it used to silently misparse to.
+	cases := []struct {
+		src  string
+		want int64
+	}{
+		{"010", 8},
+		{"0777", 511},
+		{"0", 0},
+		{"007", 7},
+		{"077", 63},
+	}
+	for _, c := range cases {
+		if v, _ := numOf(t, c.src); v != c.want {
+			t.Errorf("%s lexed as %d, want %d (octal)", c.src, v, c.want)
+		}
+	}
+	// Suffix flags are still recorded on an octal literal.
+	toks, _ := Lex("010U")
+	for _, tok := range toks {
+		if tok.Kind == TNum {
+			if tok.Num != 8 || !tok.IsUnsig {
+				t.Errorf("010U = %d unsig=%v, want 8 true", tok.Num, tok.IsUnsig)
+			}
+		}
+	}
+	toks, _ = Lex("010L")
+	for _, tok := range toks {
+		if tok.Kind == TNum {
+			if tok.Num != 8 || !tok.IsLong {
+				t.Errorf("010L = %d long=%v, want 8 true", tok.Num, tok.IsLong)
+			}
+		}
+	}
+}
+
+func TestLexOctalInvalidDigitRejected(t *testing.T) {
+	// An 8 or 9 directly after a leading zero is an invalid octal constant
+	// (gcc rejects); goc must not silently read it as decimal.
+	for _, bad := range []string{"018", "019", "0778"} {
+		if _, err := Lex(bad); err == nil {
+			t.Errorf("Lex(%q) should reject as invalid octal digit", bad)
+		}
+	}
+	// A trailing-dot float still reads its digits as decimal, not octal.
+	toks, _ := Lex("010.5")
+	for _, tok := range toks {
+		if tok.Kind == TNum && tok.IsDbl {
+			if tok.Fval != 10.5 {
+				t.Errorf("010.5 = %v, want 10.5 (float, decimal)", tok.Fval)
+			}
+		}
+	}
+}
+
+func TestLexStringUCN(t *testing.T) {
+	// \u00e9 must decode to the UTF-8 encoding of U+00E9 (0xC3 0xA9), not
+	// the literal characters u00e9 (the backslash used to be swallowed).
+	toks, err := Lex(`"\u00e9"`)
+	if err != nil {
+		t.Fatalf("Lex error: %v", err)
+	}
+	want := []byte{0xC3, 0xA9}
+	for _, tok := range toks {
+		if tok.Kind == TStr {
+			if len(tok.Str) != len(want) || tok.Str[0] != want[0] || tok.Str[1] != want[1] {
+				t.Fatalf("string u00e9 = % x, want % x", tok.Str, want)
+			}
+			return
+		}
+	}
+	t.Fatal("no string token found")
+}
+
+func TestLexCharOctalHexEscape(t *testing.T) {
+	// \ooo (1-3 digits) and \xhh decode to a byte; goc char is signed so
+	// \377 (0xFF) is the int -1, matching gcc rather than the raw byte 255.
+	cases := []struct {
+		src  string
+		want int64
+	}{
+		{`'\101'`, 65},
+		{`'\x41'`, 65},
+		{`'\0'`, 0},
+		{`'\377'`, -1},
+		{`'\x7f'`, 127},
+		{`'\x7F'`, 127},
+		{`'\7'`, 7},
+	}
+	for _, c := range cases {
+		if v, _ := numOf(t, c.src); v != c.want {
+			t.Errorf("%s lexed as %d, want %d", c.src, v, c.want)
+		}
+	}
+}
+
+func TestLexStringOctalHexEscape(t *testing.T) {
+	toks, err := Lex(`"a\101b\x41"`)
+	if err != nil {
+		t.Fatalf("Lex error: %v", err)
+	}
+	want := []byte{'a', 65, 'b', 65}
+	for _, tok := range toks {
+		if tok.Kind == TStr {
+			if len(tok.Str) != len(want) {
+				t.Fatalf("bytes %v, want %v", tok.Str, want)
+			}
+			for i := range want {
+				if tok.Str[i] != want[i] {
+					t.Fatalf("bytes %v, want %v", tok.Str, want)
+				}
+			}
+			return
+		}
+	}
+	t.Fatal("no string token found")
+}
+
+func TestLexHexEscapeNoDigitRejected(t *testing.T) {
+	// \x with no hex digit is a clean error (gcc: "'\x' used with no
+	// following hex digits"), not a silent byte.
+	if _, err := Lex(`"\x"`); err == nil {
+		t.Error(`"\x" should reject (no hex digits)`)
+	}
+}
+
+func TestLexLeadingDotFloat(t *testing.T) {
+	// .5 / .5e2 / .1'2 (C23 separator) lex as floating constants starting
+	// at the leading dot.
+	cases := []struct {
+		src  string
+		want float64
+	}{
+		{".5", 0.5},
+		{".5e2", 50.0},
+		{".1'2", 0.12},
+	}
+	for _, c := range cases {
+		toks, err := Lex(c.src)
+		if err != nil {
+			t.Fatalf("Lex(%q) error: %v", c.src, err)
+		}
+		found := false
+		for _, tok := range toks {
+			if tok.Kind == TNum && tok.IsDbl {
+				found = true
+				if tok.Fval != c.want {
+					t.Errorf("%s = %v, want %v", c.src, tok.Fval, c.want)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%s did not lex as a float", c.src)
+		}
+	}
+	// .5f records the float (narrowing) flag.
+	toks, _ := Lex(".5f")
+	found := false
+	for _, tok := range toks {
+		if tok.Kind == TNum && tok.IsDbl {
+			found = true
+			if !tok.IsFloat {
+				t.Error(".5f should be a float constant")
+			}
+		}
+	}
+	if !found {
+		t.Error(".5f did not lex as a float")
+	}
+}

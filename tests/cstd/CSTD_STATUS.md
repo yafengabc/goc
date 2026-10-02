@@ -5,11 +5,11 @@
 - 被测对象：`D:\projects\goc\bin\goc.exe`（单模式：接受但忽略 `-std`，所有用例同一语义）
 - 验证日期：2026-10-02；重跑：`powershell -ExecutionPolicy Bypass -File tests\cstd\run_cstd_tests.ps1`（当前结果 0 MISMATCH，退出码 0）
 - 判定四类：**PASS** = goc 与 gcc 输出+退出码一致；**FAIL** = gcc 过而 goc 编译/运行错误（真实缺口，报错原文照录）；**UNSUPPORTED** = goc 明确设计取舍/后置；**PARTIAL** = 部分子用例通过
-- 汇总：**PASS=49 PARTIAL=5 FAIL=8 UNSUPPORTED=7 MISMATCH=0**
+- 汇总：**PASS=53 PARTIAL=5 FAIL=4 UNSUPPORTED=7 MISMATCH=0**
 
 ---
 
-## C89（36 文件：28 PASS / 3 PARTIAL / 4 FAIL / 1 UNSUPPORTED）
+## C89（36 文件：31 PASS / 3 PARTIAL / 1 FAIL / 1 UNSUPPORTED）
 
 ### 核心语言（16 文件，全 PASS）
 
@@ -41,9 +41,9 @@
 | c89_pp_cond.c | `#if`/`#ifdef`/defined/常量表达式/嵌套 | PASS | 6 | 一致 | 用嵌套 `#if/#else` 代替多 `#elif` 链（见 c89_pp_elif） |
 | c89_pp_include.c | `<>`/`""`/guard/嵌套（+c89_pp_include_inc.h） | PASS | 4 | 一致 | 放心用；勿 `#include 宏路径` |
 | c89_pp_misc.c | 块内宏/undef 后作标识符等 | PASS | 3 | 一致 | 避开 `#line`（行号差 1）与孤立 `#` |
-| c89_lit_int.c | 十/十六进制、U/L/UL、`%d%u%o%x%ld%lu` | PASS | 8 | 一致 | 避开前导 0 八进制（见 c89_lit_octal） |
-| c89_lit_char.c | 字符常量/基础转义/0xFF 符号性 | PASS | 4 | 一致（`(char)0xFF`→-1，char 有符号） | 避开 `\ooo`/`\xhh`/多字符 'AB' |
-| c89_lit_float.c | f/L 后缀/指数/`5.` 尾点/`%f%e%g` | PASS | 8 | 一致（含 %e/%g 格式） | 避开前导点 `.5`（见 c89_lit_dotfloat），写 `0.5` |
+| c89_lit_int.c | 十/十六进制、U/L/UL、`%d%u%o%x%ld%lu` | PASS | 8 | 一致 | 八进制字面量放心用（已修复 2026-10-02） |
+| c89_lit_char.c | 字符常量/基础转义/0xFF 符号性 | PASS | 4 | 一致（`(char)0xFF`→-1，char 有符号） | `\ooo`/`\xhh` 已修复放心用（2026-10-02）；多字符 'AB' 仍避开 |
+| c89_lit_float.c | f/L 后缀/指数/`5.` 尾点/`%f%e%g` | PASS | 8 | 一致（含 %e/%g 格式） | 前导点 `.5` 已修复放心用（2026-10-02） |
 | c89_lit_str.c | 拼接/转义/空串/sizeof/下标/数组 vs 指针 | PASS | 6 | 一致 | 放心用 |
 | c89_lib_stdio.c | printf 全家/sprintf/sscanf/文件 I/O 全链路 | PASS | 7 | 一致（临时文件自删） | 放心用 |
 | c89_lib_string.c | 19 个字符串函数（含 memmove 自重叠、strncpy 补零） | PASS | 10 | 一致 | 放心用 |
@@ -52,14 +52,14 @@
 | c89_lib_limits.c | limits.h + float.h + sizeof 汇总 | PARTIAL | 7 | LONG_MIN/MAX、ULONG_MAX、sizeof(long) 不同：goc long=8（LP64）vs gcc long=4（Windows LLP64）；float.h 全一致 | 勿按 long=4 假设；跨编译比对 long 值前先确认 ABI |
 | c89_lib_varargs.c | va_list int/double/混合、ptrdiff_t、offsetof | PASS | 4 | 一致（offsetof 用指针算术实现） | 标准 `offsetof(type,member)` 宏别用（见交叉发现） |
 | c89_trigraph.c | trigraph 探测 | UNSUPPORTED | — | goc：`parse error: line 13: expected ";", got "?"`；gcc 需 `-trigraphs` 才能编译 | 不要写 trigraph |
-| c89_lit_octal.c | 八进制字面量 `010`/`0777` 等 | **FAIL**（静默错译） | 4 | **无任何报错**，输出 `010=10 0777=777`（按十进制解析）；gcc 全对（8/511） | **严禁依赖 0 前缀八进制**；用 `0x` 或显式十进制 |
+| c89_lit_octal.c | 八进制字面量 `010`/`0777` 等 | PASS | 4 | 一致（`010=8 0777=511 010U=8 010L=8 010+010=16`；原静默按十进制解析已修 2026-10-02） | 八进制放心用；`0` 后接 8/9 会干净报错 |
 | c89_pp_elif.c | 多 `#elif` 链 | **FAIL** | 4 | case2 两段 `#elif` 链真分支被跳过、落 `#else`（输出 `else`，gcc 输出 `branch-5`）；单 `#elif` 与 `#elif defined` 反而正确 | 用嵌套 `#if/#else` 代替多 `#elif` 链 |
-| c89_lit_esc.c | `\ooo` 八进制与 `\xhh` 十六进制转义 | **FAIL**（硬错误） | 4 | `preprocess error: ... line 13: unterminated character literal`；gcc 编译运行、解码全对 | 避开 `\ooo`/`\xhh`；非打印字符用查表值 |
-| c89_lit_dotfloat.c | 前导点浮点 `.5`/`.5f`/`.5e2`/`.5L` | **FAIL**（硬错误） | 4 | `parse error: line 12: unexpected token "." in expression`；gcc 输出 0.5/50.0/0.5 全对 | 永远写 `0.5` 不写 `.5` |
+| c89_lit_esc.c | `\ooo` 八进制与 `\xhh` 十六进制转义 | PASS | 4 | 一致（`'\101'=65 '\x41'=65 '\377'=-1 '\x7f'=127`；原 preprocess 拒绝已修 2026-10-02） | `\ooo`/`\xhh` 放心用（char 有符号，`'\377'`=-1） |
+| c89_lit_dotfloat.c | 前导点浮点 `.5`/`.5f`/`.5e2`/`.5L` | PASS | 4 | 一致（`.5=0.5 .5f=0.5 .5e2=50.0 .5L=0.5`；原 parse error 已修 2026-10-02） | 前导点 `.5` 放心用 |
 
 ---
 
-## C99（21 文件：12 PASS / 1 PARTIAL / 4 FAIL / 4 UNSUPPORTED）
+## C99（21 文件：13 PASS / 1 PARTIAL / 3 FAIL / 4 UNSUPPORTED）
 
 | 文件 | 特性 | 状态 | 子用例 | goc 证据 / gcc 对拍 | 写标准库建议 |
 |---|---|---|---|---|---|
@@ -79,7 +79,7 @@
 | c99_complex.c | `<complex.h>`/`_Complex` | UNSUPPORTED | 1 | `note: skipping unavailable system header <complex.h>`；`parse error: line 12: expected ";", got "z"`；gcc(+lm) 通过 | 避开复数 |
 | c99_funcname.c | `__func__` 预定义标识符 | **FAIL** | 3 | `line 9: undeclared identifier "__func__"`（三处）；gcc 打印函数名 | 避开 `__func__` |
 | c99_pragma.c | `_Pragma()` 运算符 | UNSUPPORTED | 1 | `parse error: line 9: expected type specifier, got "_Pragma"`；gcc 编译期 message 正常 | 避开 `_Pragma` |
-| c99_ucn.c | 通用字符名 `\uXXXX` | **FAIL**（静默错译） | 1 | 字符串内 goc 吞反斜杠：`e-acute u00e9 5` vs gcc UTF-8 `e-acute é 5`（**不报错，静默 miscompile**）；标识符内 `int \u00e9` 则 `preprocess error: unexpected character '\'` | 避开 UCN |
+| c99_ucn.c | 通用字符名 `\uXXXX` | PASS | 1 | 字符串内一致：`e-acute é 5`（UTF-8 解码；原吞反斜杠静默错译已修 2026-10-02）；标识符内 UCN 仍未支持（另一独立缺口） | 字符串/字符字面量 UCN 放心用；标识符内 UCN 仍避开 |
 | c99_trailing.c | 枚举/初始化列表尾随逗号 | PASS | 3 | 一致 | 放心用 |
 | c99_vacopy.c | `va_copy`（stdarg.h） | **FAIL** | 1 | `codegen error: unknown function "va_copy": not in goclib (...)`；gcc 两路独立推进=60 60 | 避开 va_copy |
 | c99_math.c | C99 math 宏/函数 | PASS | 7 | 一致（round/trunc/floor/ceil/fabs/pow/sqrt/hypot/fmod、isnan/isinf/isfinite/signbit/fpclassify、nan()） | 放心用；**HUGE_VAL 未定义**（math.h 无），不要引用 |
@@ -121,14 +121,14 @@ goc 是 **LP64**（`sizeof(long)=8`、指针 8、size_t 8），本机 Windows gc
 ### 静默错译清单（最危险：无报错、退出码 0、输出错值）
 | 缺口 | 现象 | 出处 |
 |---|---|---|
-| 八进制字面量 | `010` 按十进制解析得 10（应为 8），无任何报错 | c89_lit_octal.c |
-| 字符串内 UCN | `"\u00e9"` 吞反斜杠输出字面 `u00e9`，不报错 | c99_ucn.c |
+| ~~八进制字面量~~ **已修复(2026-10-02)** | 原 `010` 按十进制解析得 10；现正确为 8 | c89_lit_octal.c |
+| ~~字符串内 UCN~~ **已修复(2026-10-02)** | 原 `"\u00e9"` 吞反斜杠输出字面 `u00e9`；现正确解码 UTF-8 | c99_ucn.c |
 | `sizeof(复合字面量)` | `sizeof((int[]){1,2,3})` 恒为 0（应为 12） | c99_compound.c case8 |
 | `%a` 十六进制浮点打印 | `printf("%a %a",...)` 退化成字面打印 `a a` | c99_hexfloat.c 对拍记录 |
 
 ### 硬错误缺口（gcc 过、goc 编译失败，报错原文）
-- `\ooo`/`\xhh` 转义：`preprocess error: ... line 13: unterminated character literal`
-- `.5` 前导点浮点：`parse error: line 12: unexpected token "." in expression`
+- ~~`\ooo`/`\xhh` 转义~~ **已修复(2026-10-02)**：原 `preprocess error: ... unterminated character literal`，现正确解码
+- ~~`.5` 前导点浮点~~ **已修复(2026-10-02)**：原 `parse error: unexpected token "."`，现正确解析
 - 多 `#elif` 链（真分支落 #else）；单 `#elif` 正确
 - stdint.h/inttypes.h 缺失：`note: skipping unavailable system header` + `expected ";", got "i8"`
 - `__func__`：`line 9: undeclared identifier "__func__"`
@@ -193,4 +193,4 @@ int=4、long=8（LP64）、long long=8、指针=8、float=4、double=8、long do
 
 ### 给标准库作者的最终建议（放心用 / 避开速查）
 - **放心用**：对象/函数宏（含 `#` `##`）、嵌套 `#if/#else`、`//` 注释、long long、`_Bool`、restrict、声明混排、十六进制浮点常量、尾随逗号、stdint 之外的全套 stdio/string/ctype/stdlib/math（含 C99 math 宏）、`_Generic`、`_Static_assert`、alignas/alignof、thread_local（静态/文件作用域）、`_Noreturn`、匿名 struct/union、stdckdint.h、`__FILE__/__LINE__`
-- **避开**：八进制字面量、`\ooo`/`\xhh`、`.5` 写法、多 `#elif` 链、UCN、`__func__`、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`%a` 打印、`sizeof(复合字面量)`、VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、va_copy、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）、stdint.h/inttypes.h
+- **避开**：多 `#elif` 链、`__func__`、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`%a` 打印、`sizeof(复合字面量)`、VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、va_copy、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）、stdint.h/inttypes.h

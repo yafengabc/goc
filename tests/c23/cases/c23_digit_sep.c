@@ -48,9 +48,18 @@ int main(void) {
     printf("case%d: 1.2'34e5=%.1f ok=%d\n", total, f, near(f, 123400.0));
     if (near(f, 123400.0)) passed++;
 
-    /* NOTE: '.1'2' (and the plain leading-dot float '.12') is rejected by goc
-     * ("parse error: unexpected token '.'"); goc only accepts floats with a digit
-     * before the decimal point. Recorded in group_D1.md; subcase omitted. */
+    /* Leading-dot floats (.12) and a separator right after the leading dot
+     * (.1'2): supported since the lexer leading-dot float fix (2026-10-02). */
+
+    ++total;
+    double g = .12;
+    printf("case%d: .12=%.2f ok=%d\n", total, g, near(g, 0.12));
+    if (near(g, 0.12)) passed++;
+
+    ++total;
+    double g2 = .1'2;
+    printf("case%d: .1'2=%.2f ok=%d\n", total, g2, near(g2, 0.12));
+    if (near(g2, 0.12)) passed++;
 
     ++total;
     double h = 1'000e3;   /* separator in mantissa, ordinary decimal float */

@@ -37,7 +37,7 @@
 | 值错误 | **u8 字面量类型** | u8 字符串按 `char*` 衰减、`sizeof(u8'A')=8`（应 1）；char8_t 类型名 goc 内建可用但语义仍 C11 模型 |
 | 值错误 | **`[[gnu::aligned(N)]]`** | 解析但不生效（_Alignof 仍自然对齐 4）；未知/vendor 属性静默忽略 |
 | 语义偏差 | **`[[fallthrough]]` switch 外** | goc 静默接受（gcc 硬错误） |
-| 语义偏差 | **非法数字分隔符** | goc 静默删 `'` 照常解析（`1''000`/`0x'FFFF'` 等 6 种全不报错）；前导小数点 `.12` 不支持；十六进制浮点指数内分隔符报 "unterminated character literal" |
+| 语义偏差 | **非法数字分隔符** | goc 静默删 `'` 照常解析（`1''000`/`0x'FFFF'` 等 6 种全不报错）；十六进制浮点指数内分隔符报 "unterminated character literal"（`0x1p10'0`，归 P2.13）；前导小数点 `.12`/`.1'2` 已支持（2026-10-02 lexer 前导点修复） |
 | 语义偏差 | **`__has_c_attribute` guard** | `defined(__has_c_attribute)` 恒为假，标准 portable guard 恒走 else（直接调用返回正确值） |
 | 语义偏差 | **nullptr_t 类型模型** | goc `typedef void* nullptr_t`、`typeof(nullptr)` 为 4 字节 int（gcc 为独立 8 字节类型）；gcc 侧 mingw 的 <stddef.h> 也不暴露 nullptr_t 类型名 |
 | 缺失头/宏 | **<stdbit.h>**、**<uchar.h>**（char16/32、mbrtoc16 系）、**<stdatomic.h>**、**<threads.h>**、**<stdnoreturn.h>**、**<stdbool.h>** | goc 全部缺失（"note: skipping unavailable system header"），mingw 侧 <stdbit.h> 也无 |
@@ -124,7 +124,7 @@
 | 特性 | 状态 | 子用例 | goc 证据 | gcc 对拍结论 | 写标准库建议 |
 |---|---|---|---|---|---|
 | 二进制字面量 0b/0B | **PASS** | 11 | 值/后缀（u/UL）/与 0xFF 对照/混算/`#if 0b1100==12` 全一致 | 一致 | 放心用（含 #if 中） |
-| 数字分隔符（合法位置） | **PASS** | 10 | 1'000'000/0xFF'FF/0b1010'1010/1.2'34e5/1'000UL/4'2L 全一致。**两个缺口移除**：`0x1p10'0`（hex 浮点指数内）→ `preprocess error: unterminated character literal`；`.1'2` 及普通 `.12` → `parse error: unexpected token "."`（前导小数点整体不支持） | 一致 | 合法位置放心用；**浮点必须写 `0.12` 不能写 `.12`** |
+| 数字分隔符（合法位置） | **PASS** | 12 | 1'000'000/0xFF'FF/0b1010'1010/1.2'34e5/.12/.1'2/1'000e3/3.14'15f/1'000UL/4'2L 全一致（SUMMARY 12/12）。`.12`/`.1'2` 前导点子用例已加回（2026-10-02 lexer 前导点修复）；`0x1p10'0`（hex 浮点指数内分隔符）仍 `preprocess error: unterminated character literal`，归 P2.13 | 一致 | 合法位置放心用；前导点 `.12` 亦支持；仅 `0x1p10'0` 指数内分隔符避开 |
 | 非法数字分隔符（负向） | **FAIL（goc 过宽）** | 6 构造 | goc **静默删 `'` 照常解析**（`1''000`/`0x'FFFF'`/`1'.2`/`1.'5`/`0x1'p0`/`123'` 全部接受并运行，exit 66661，无诊断） | gcc 全部拒绝（adjacent/after base/adjacent to point/exponent 各报错） | 别指望 goc 揪出分隔符笔误，写法自检 |
 | 十六进制浮点 | **PASS** | 10 | 0x1.8p3/0x.8p1/0x1p-2/f/L 后缀/== 比较与 gcc 一致。**%a 不支持**（打印字面 'a'）；**无指数形式 0x1.8 goc 接受（=1.5）但本 gcc 拒**（`require an exponent`，C23 新特性 gcc 16.2 未实现） | 一致（用 %.3f/== 对拍） | 带 p 指数放心用；别用 %a；0x1.8 是 goc 私有扩展，移植 gcc 不过 |
 | u8 字符串/字符值语义 | **PASS** | 8 | sizeof(u8"abc")=4、拼接 u8"ab""cd"、u8'x'=120、尾部 NUL 全一致 | 一致 | 值/大小/拼接/单字节字符放心用（原始串与多字节字符本 gcc c2x 也不接受，未纳入） |
@@ -163,7 +163,7 @@
 ## 附：跨组交叉发现与平台注意
 
 1. **字符串字面量直接下标 bug**（B 组）：`"hello"[0]` 在 goc 返回垃圾 `1819043176`（gcc 104）；先赋 `const char *p = "hello"; p[0]` 正常。标准库读字符串首字节须走指针变量。
-2. **前导小数点浮点不支持**（D1 组）：`.12`/`.1'2` 在 goc 报 `unexpected token "."`——所有浮点字面量写 `0.12`。
+2. **前导小数点浮点已支持**（D1 组，2026-10-02）：`.12`/`.1'2` 现正常解析（lexer 前导点 float 修复），与 gcc 逐行一致；此前报 `unexpected token "."` 的缺口已消除。
 3. **printf 能力**：goc 无 `%a`（十六进制浮点打印）、无 `%wN`（_BitInt）；`%p` 格式与 gcc 不同且 ASLR 漂移，对拍文件已规避。
 4. **LLP64 平台效应**（A1/D2/F 组交叉）：gcc 侧 `long`=32 位（LONG_WIDTH=32）；goc 侧 `long`/`unsigned long`=64 位；`_Generic` 的 long/unsigned 折叠即源于 goc 以宽度为主键比较。若目标是 LP64（Linux），long 相关结论需复测。
 5. **预定义宏全线缺失**（A 组 + 各负向探针）：goc 不定义 `__STDC_VERSION__`/`__STDC__`/`__STDC_HOSTED__`/`__STDC_NO_VLA__`，标准条件编译（版本判断、VLA 探测）全部失效。

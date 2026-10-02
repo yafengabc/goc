@@ -5,7 +5,7 @@
                 case3 boundary '\0' NUL and '\377' and '\x7f'; case4 octal escape
                 inside a string literal.  gcc decodes all; goc aborts the whole file
                 with a preprocess error.
-   Status     : FAIL (verified 2026-10-02, goc vs gcc -std=c89)
+   Status     : PASS (verified 2026-10-02, goc vs gcc -std=c89)
    ============================================================ */
 #include <stdio.h>
 

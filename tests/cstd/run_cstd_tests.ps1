@@ -71,10 +71,10 @@ $expected = @{
     'c89_lib_limits.c'  = @{ status = 'PARTIAL';     gocFails = $false; extra = '' }
     'c89_lib_varargs.c' = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_trigraph.c'    = @{ status = 'UNSUPPORTED'; gocFails = $true;  extra = '-trigraphs' }
-    'c89_lit_octal.c'   = @{ status = 'FAIL';        gocFails = $false; extra = '' }
+    'c89_lit_octal.c'   = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_pp_elif.c'     = @{ status = 'FAIL';        gocFails = $false; extra = '' }
-    'c89_lit_esc.c'     = @{ status = 'FAIL';        gocFails = $true;  extra = '' }
-    'c89_lit_dotfloat.c'= @{ status = 'FAIL';        gocFails = $true;  extra = '' }
+    'c89_lit_esc.c'     = @{ status = 'PASS';        gocFails = $false;  extra = '' }
+    'c89_lit_dotfloat.c'= @{ status = 'PASS';        gocFails = $false;  extra = '' }
     # ---------- C99 ----------
     'c99_comment.c'     = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_longlong.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
@@ -92,7 +92,7 @@ $expected = @{
     'c99_complex.c'     = @{ status = 'UNSUPPORTED'; gocFails = $true;  extra = '' }
     'c99_funcname.c'    = @{ status = 'FAIL';        gocFails = $true;  extra = '' }
     'c99_pragma.c'      = @{ status = 'UNSUPPORTED'; gocFails = $true;  extra = '' }
-    'c99_ucn.c'         = @{ status = 'FAIL';        gocFails = $false; extra = '' }
+    'c99_ucn.c'         = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_trailing.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_vacopy.c'      = @{ status = 'FAIL';        gocFails = $true;  extra = '' }
     'c99_math.c'        = @{ status = 'PASS';        gocFails = $false; extra = '' }

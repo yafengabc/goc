@@ -7,7 +7,7 @@
                 as DECIMAL: 010 prints 10 where gcc prints 8, 0777 prints 777
                 where gcc prints 511.  Silent wrong output is worse than a hard
                 compile error: never trust a 0-prefixed literal under goc.
-   Status     : FAIL (verified 2026-10-02, goc vs gcc -std=c89)
+   Status     : PASS (verified 2026-10-02, goc vs gcc -std=c89)
    ============================================================ */
 #include <stdio.h>
 
