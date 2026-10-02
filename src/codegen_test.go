@@ -586,20 +586,57 @@ func TestConstPropSubRegisters(t *testing.T) {
 		}
 	}
 
-	// A write to eax invalidates rax: the later use must NOT be inlined to 7,
-	// because `xor eax, eax` zeroed rax.
+	// T1.6 (C5): a 32-bit write is modelled exactly rather than merely
+	// invalidating rax -- writing eax clears rax's upper half, so `xor eax,
+	// eax` leaves rax == 0 and the later use folds to an immediate. (Before
+	// C5 the tracked rax was simply dropped here, emitting `mov rcx, rax`.)
 	got = lineTexts(constProp([]Inst{
 		peepIns("mov rax, 7"),
 		peepIns("xor eax, eax"),
 		peepIns("mov rcx, rax"),
 	}))
+	// `mov rax, 7` survives: `xor eax, eax` is a read-modify-write, which
+	// T1.2 classifies as a kept use rather than an inlinable one.
 	want = []string{
 		"\tmov rax, 7",
 		"\txor eax, eax",
+		"\tmov rcx, 0",
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("32-bit write must yield a known zero-extended rax: got %q want %q", got, want)
+	}
+
+	// A 16/8-bit write is still NOT modelled: it leaves the parent's upper
+	// bytes intact, so the tracked wide value must be dropped.
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov rax, 7"),
+		peepIns("mov al, 3"),
+		peepIns("mov rcx, rax"),
+	}))
+	want = []string{
+		"\tmov rax, 7",
+		"\tmov al, 3",
 		"\tmov rcx, rax",
 	}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
-		t.Fatalf("sub-register write must kill rax: got %q want %q", got, want)
+		t.Fatalf("8-bit write must kill rax: got %q want %q", got, want)
+	}
+
+	// movsxd sign-extends the low 32 bits, the inverse of the zero-extension a
+	// 32-bit write performs: a -1 materialized int (0xFFFFFFFF in eax) must
+	// read back as -1 in rax, not as 4294967295.
+	got = lineTexts(constProp([]Inst{
+		peepIns("mov eax, -1"),
+		peepIns("movsxd rax, eax"),
+		peepIns("mov rcx, rax"),
+	}))
+	want = []string{
+		"\tmov eax, -1",
+		"\tmovsxd rax, eax",
+		"\tmov rcx, -1",
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("movsxd must sign-extend the tracked value: got %q want %q", got, want)
 	}
 
 	// A sized store of the full register is still a store: no inlining, and

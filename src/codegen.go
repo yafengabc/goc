@@ -3706,37 +3706,73 @@ func reg64Name(r string) string {
 //
 // Folding only *records* the result in the value tracker; the instruction
 // itself still emits, so its flag effects stay exactly where they were.
-func foldALU(op string, a, b int64) (int64, bool) {
+// T1.6 (C5): width is the destination's width in bytes -- 8 for the 64-bit
+// forms and 4 for the 32-bit forms that now carry `int`. A 32-bit op wraps at
+// 2^32 and the result is ZERO-EXTENDED into the parent register (writing a
+// 32-bit register clears the upper half), which is exactly the int carry
+// model's invariant, so the folded value is the parent's new known value.
+// Shift counts are masked to 5 bits for a 32-bit op (x86: `shl eax,32` is
+// `shl eax,0`), and `sar` must go through int32 so a negative low half shifts
+// in sign bits instead of zeroes.
+func foldALU(op string, a, b int64, width int) (int64, bool) {
+	w4 := width == 4
 	switch op {
 	case "add":
-		return a + b, true
+		return truncWidth(a+b, w4), true
 	case "sub":
-		return a - b, true
+		return truncWidth(a-b, w4), true
 	case "and":
-		return a & b, true
+		return truncWidth(a&b, w4), true
 	case "or":
-		return a | b, true
+		return truncWidth(a|b, w4), true
 	case "xor":
-		return a ^ b, true
+		return truncWidth(a^b, w4), true
 	case "imul":
-		return a * b, true
+		// Only the low half of the product is defined; the low 32/64 bits of
+		// a product depend only on the low 32/64 bits of the operands.
+		return truncWidth(a*b, w4), true
 	case "shl":
-		if b < 0 || b > 63 {
+		if b < 0 || b > 63 || (w4 && b > 31) {
 			return 0, false
 		}
-		return a << uint(b), true
+		return truncWidth(a<<uint(b), w4), true
 	case "sar":
-		if b < 0 || b > 63 {
+		if b < 0 || b > 63 || (w4 && b > 31) {
 			return 0, false
+		}
+		if w4 {
+			return int64(uint32(int32(a) >> uint(b))), true
 		}
 		return a >> uint(b), true
 	case "shr":
-		if b < 0 || b > 63 {
+		if b < 0 || b > 63 || (w4 && b > 31) {
 			return 0, false
 		}
-		return int64(uint64(a) >> uint(b)), true
+		return truncWidth(int64(uint64(a)>>uint(b)), w4), true
 	}
 	return 0, false
+}
+
+// truncWidth reduces v to the destination width and zero-extends it back, so
+// the stored value is what the parent 64-bit register actually holds after a
+// 32-bit op.
+func truncWidth(v int64, w4 bool) int64 {
+	if w4 {
+		return int64(uint32(v))
+	}
+	return v
+}
+
+// isReg32 reports whether o is a 32-bit GP register spelling (eax, r10d).
+// Only 32-bit sub-registers are modelled: they are the ones T1.6 made the
+// `int` carrier. 16/8-bit writes stay unmodelled (conservatively killed).
+func isReg32(o string) bool {
+	switch o {
+	case "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+		"r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d":
+		return true
+	}
+	return false
 }
 
 func constProp(insts []Inst) []Inst {
@@ -3765,6 +3801,16 @@ func constProp(insts []Inst) []Inst {
 		if gp64Regs[o] {
 			v, ok := s.regs[o]
 			return v, ok
+		}
+		// T1.6 (C5): a 32-bit sub-register reads the low half of its parent's
+		// tracked value. The parent holds the zero-extended result of the last
+		// 32-bit write, so masking to 32 bits gives the operand's real value.
+		if isReg32(o) {
+			if fr, ok := fullRegOf(o); ok {
+				if v, ok := s.regs[fr]; ok {
+					return int64(uint32(v)), true
+				}
+			}
 		}
 		return 0, false
 	}
@@ -3928,6 +3974,23 @@ func constProp(insts []Inst) []Inst {
 					return 1, pl.operands[1], v, true
 				}
 			}
+			// T1.6 (C5): a 32-bit source register reads the low half of its
+			// parent's tracked value, so it can be inlined the same way. The
+			// guard is immFits, not "mov takes any immediate": the low half is
+			// zero-extended and can be up to 2^32-1, which no 32-bit immediate
+			// form can carry. Inlining leaves the instruction a 32-bit op, so
+			// the destination's zero-extension semantics are unchanged.
+			if len(pl.operands) == 2 && pl.operands[1] != pl.operands[0] &&
+				!isMemOperandSized(pl.operands[0]) && isReg32(pl.operands[1]) {
+				if fr, ok := fullRegOf(pl.operands[1]); ok {
+					if v, ok := s.regs[fr]; ok {
+						v32 := int64(uint32(v))
+						if immFits(v32) {
+							return 1, pl.operands[1], v32, true
+						}
+					}
+				}
+			}
 		case "cmp", "test":
 			// Only the right operand of cmp/test accepts an immediate, so only
 			// inline a known constant there (the left operand must stay a
@@ -3936,6 +3999,19 @@ func constProp(insts []Inst) []Inst {
 				if gp64Regs[pl.operands[1]] {
 					if v, ok := s.regs[pl.operands[1]]; ok {
 						return 1, pl.operands[1], v, true
+					}
+				}
+				// T1.6 (C5): same for a 32-bit right operand; the compare is
+				// already a 32-bit op, so the immFits guard is the only extra
+				// condition.
+				if isReg32(pl.operands[1]) {
+					if fr, ok := fullRegOf(pl.operands[1]); ok {
+						if v, ok := s.regs[fr]; ok {
+							v32 := int64(uint32(v))
+							if immFits(v32) {
+								return 1, pl.operands[1], v32, true
+							}
+						}
 					}
 				}
 			}
@@ -3978,7 +4054,12 @@ func constProp(insts []Inst) []Inst {
 		// the destination first, so checking operands[0] covers the writing
 		// form; a store like `mov [mem], eax` has a memory operand[0] and only
 		// READS eax, and is correctly left alone.
-		if len(pl.operands) > 0 && !gp64Regs[pl.operands[0]] {
+		//
+		// T1.6 (C5): a 32-bit destination is exempt -- the handlers below model
+		// it exactly (a 32-bit write clears the parent's upper half, so the
+		// parent gets a known zero-extended value). Deleting it here would
+		// make every 32-bit op a dead end again.
+		if len(pl.operands) > 0 && !gp64Regs[pl.operands[0]] && !isReg32(pl.operands[0]) {
 			if fr, isReg := fullRegOf(pl.operands[0]); isReg {
 				delete(s.regs, fr)
 			}
@@ -4021,9 +4102,36 @@ func constProp(insts []Inst) []Inst {
 					delete(s.regs, dst)
 				}
 			default:
-				// 32-bit destination or an indirect address: a partial write
-				// or an unknown source -- the wide value cannot be trusted.
-				killReg(dst)
+				// T1.6 (C5): a 32-bit destination is no longer a dead end.
+				// Writing a 32-bit register clears its parent's upper half, so
+				// a known source yields a KNOWN parent value: the zero-extended
+				// low 32 bits. This is the int carry model's invariant, and it
+				// is what lets constant propagation survive the 32-bit opcode
+				// forms that now carry every `int`.
+				if fr, ok := fullRegOf(dst); ok && isReg32(dst) {
+					switch {
+					case !isMemOperand(src):
+						if v, err := strconv.ParseInt(src, 10, 64); err == nil {
+							s.regs[fr] = int64(uint32(v))
+						} else if sv, ok := knownOperand(src); ok {
+							s.regs[fr] = int64(uint32(sv))
+						} else {
+							delete(s.regs, fr)
+						}
+					case isSlotOperand(src):
+						if v, known := s.imms[src]; known {
+							s.regs[fr] = int64(uint32(v))
+						} else {
+							delete(s.regs, fr)
+						}
+					default:
+						delete(s.regs, fr)
+					}
+				} else {
+					// A 16/8-bit write or an indirect address: a partial write
+					// or an unknown source -- the wide value cannot be trusted.
+					killReg(dst)
+				}
 			}
 			out = append(out, in)
 		case pl.op == "mov" && len(pl.operands) == 2 && isMemOperand(pl.operands[0]):
@@ -4047,6 +4155,22 @@ func constProp(insts []Inst) []Inst {
 				// indirect or sized store: may alias any slot. Registers are
 				// untouched (the store does not write one).
 				s.imms = map[string]int64{}
+			}
+			out = append(out, in)
+		case pl.op == "movsxd" && len(pl.operands) == 2:
+			// T1.6 (C5): movsxd sign-extends the low 32 bits -- the inverse of
+			// the zero-extension that a 32-bit write performs on the parent. A
+			// known source therefore yields a known FULL 64-bit destination,
+			// which is what keeps a materialized int propagating across the
+			// narrow sites (N5b/N11/N12/N17/N22) instead of dying there.
+			if gp64Regs[pl.operands[0]] {
+				if v, ok := knownOperand(pl.operands[1]); ok {
+					s.regs[pl.operands[0]] = int64(int32(v))
+				} else {
+					delete(s.regs, pl.operands[0])
+				}
+			} else {
+				reset()
 			}
 			out = append(out, in)
 		case pl.op == "lea" && len(pl.operands) == 2:
@@ -4080,7 +4204,7 @@ func constProp(insts []Inst) []Inst {
 				folded := false
 				if av, aok := s.regs[dst]; aok && len(pl.operands) == 2 {
 					if bv, bok := knownOperand(pl.operands[1]); bok {
-						if r, ok := foldALU(pl.op, av, bv); ok {
+						if r, ok := foldALU(pl.op, av, bv, 8); ok {
 							s.regs[dst] = r
 							folded = true
 						}
@@ -4089,9 +4213,31 @@ func constProp(insts []Inst) []Inst {
 				if !folded {
 					delete(s.regs, dst)
 				}
+			case isReg32(pl.operands[0]):
+				// T1.6 (C5): a 32-bit destination is the normal form for `int`
+				// now, so killing it here made every int computation a dead end
+				// for constant propagation. Fold at 32-bit width instead and
+				// record the zero-extended result in the PARENT register --
+				// writing a 32-bit register clears the parent's upper half, so
+				// the parent's value is known too, not just its low half.
+				dst := pl.operands[0]
+				folded := false
+				if av, aok := knownOperand(dst); aok && len(pl.operands) == 2 {
+					if bv, bok := knownOperand(pl.operands[1]); bok {
+						if r, ok := foldALU(pl.op, av, bv, 4); ok {
+							if fr, isReg := fullRegOf(dst); isReg {
+								s.regs[fr] = r
+								folded = true
+							}
+						}
+					}
+				}
+				if !folded {
+					killReg(dst)
+				}
 			case gpRegs[pl.operands[0]]:
-				// 32-bit destination: the zero-extension semantics and flag
-				// effects are not worth modelling -- drop the wide value.
+				// A 16/8-bit destination: a partial write whose extension
+				// semantics are not modelled -- drop the wide value.
 				killReg(pl.operands[0])
 			default:
 				reset() // exotic shape: play safe
