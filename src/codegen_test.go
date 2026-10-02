@@ -54,7 +54,7 @@ func genAsmOpt(t *testing.T, src string, opt int) string {
 	if errs := Check(prog); len(errs) > 0 {
 		t.Fatalf("type check: %v", errs)
 	}
-	asm, err := Gen(prog, false, opt)
+	asm, err := Gen(prog, false, opt, false)
 	if err != nil {
 		t.Fatalf("gen: %v", err)
 	}

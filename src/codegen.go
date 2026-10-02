@@ -23,6 +23,12 @@ type varInfo struct {
 	off int
 	typ *Type
 	reg string
+	// addr is set when the variable's address is taken somewhere in the
+	// function (&x). Such a variable can be written through an int* with a
+	// 4-byte store, which leaves the upper half of its 8-byte slot holding
+	// whatever was there before -- so loading it must re-extend from the
+	// 4-byte value instead of reading all 8 bytes (see loadVar).
+	addr bool
 }
 
 type CG struct {
@@ -41,7 +47,17 @@ type CG struct {
 	varEnts    map[int]varInfo   // uid -> home
 	scopes     []map[string]int  // name -> uid; innermost scope is last
 	varUID     int               // next uid to assign
+	// addrTaken holds the locals whose address is taken (&x) in the current
+	// function; declareVar copies the flag into each varInfo.addr.
+	addrTaken map[string]bool
 	declUID    map[*DeclStmt]int // declaration node -> uid (filled during gather)
+	// clOff maps each compound literal in the current function to its
+	// persistent frame slot. The unnamed object must stay addressable for as
+	// long as the statement/expression containing it runs (a call argument,
+	// an &-operand), so unlike transient tmpSlots it is never reused, and it
+	// is re-initialised on every evaluation (fresh object per evaluation --
+	// observable inside loops).
+	clOff      map[*CompoundLit]int
 	localBytes int               // bytes consumed by stack-resident locals (incl. array padding)
 	regArea    int               // bytes reserved just below rbp for saved callee-save regs
 	globals    map[string]bool   // names of program-level (global/static) variables
@@ -78,12 +94,22 @@ type CG struct {
 	staticVars map[string]string
 	staticList []staticEmit
 	staticSeq  int
+	// Thread-local storage: _Thread_local variables live in a dedicated .tls
+	// section (one instance per thread). c.tlsVars maps a source name to its
+	// layout; c.tlsList collects every TLS declaration (global or static local)
+	// for emission; tlsBytes tracks the running .tls offset for alignment.
+	tlsVars  map[string]*tlsVarInfo
+	tlsList  []*DeclStmt
+	tlsBytes int
 	usedRegs   []string        // callee-save registers actually used as local homes
 	tmpDepth   int             // live expression-temporary slots
+	grownMaxTmp int            // deepest maxTmp the frame has already been grown to cover
 	funcs      map[string]bool // user-defined functions (by name)
 	funcDefs   map[string]*FuncDecl
 	calls      map[string]bool // functions called that are not defined here
 	need       map[string]bool // goclib functions this program actually uses
+	mainTakesArgs bool          // main declares parameters: the Windows stub must build argc/argv
+	exitSym       string          // entry-stub terminator: "exit" (full C exit) or "__goclib_exit" (bare)
 	// Built-in C library (clibCStore): needed C functions are emitted through
 	// genFunc (which marks more needs, so Gen iterates to a fixpoint), and the
 	// library's file-scope variables join the .data pool -- but only those the
@@ -116,6 +142,17 @@ type CG struct {
 	resStructSz  int               // size in bytes of that struct
 	resStructK   int               // tmpSlot index of the first result-buffer slot
 	resStructSl  int               // number of tmp slots occupied by the result buffer
+	resBig       bool              // the last genExprT produced a _BitInt value: r10 holds its address
+	resBigT      *Type             // its exact _BitInt type
+	resBigK      int               // tmpSlot index of its result buffer (0: it is a plain lvalue)
+	resBigSl     int               // tmp slots claimed by that buffer (0 for a lvalue)
+	bigLits      [][]uint64        // wb/uwb literal pool (.rdata word arrays)
+	bigLab       map[string]string // literal key -> .rdata label
+	maxTmp       int               // deepest tmpSlot index reached by this function
+	frameIdx     int               // index (in c.insts) of the prologue's frame allocation
+	frameLen     int               // instruction count of that block (probe loop = several)
+	chkSeq       int               // stack-probe label counter
+	curFrame     int               // current frame bytes, grown by growFrameForTemps
 }
 
 // loopLabels records the break/continue targets of the innermost loop.
@@ -129,6 +166,16 @@ type loopLabels struct {
 type staticEmit struct {
 	lab string
 	d   *DeclStmt
+}
+
+// tlsVarInfo records the layout of one thread-local variable in the .tls
+// section. off is the byte offset from the .tls section start; lab is the
+// assembly label naming the variable (also its rip-resolvable address on Linux).
+// typ is the declared type (used for emission and access-code generation).
+type tlsVarInfo struct {
+	off int
+	lab string
+	typ *Type
 }
 
 // argRegs returns the integer argument registers for the target ABI.
@@ -176,47 +223,33 @@ const maxArgs = 16
 // the left operand of nested binary expressions. 32 is plenty for toy code.
 const scratchSlots = 32
 
-// externDLL resolves an imported symbol to the DLL that exports it. The
-// ownership table lives in goclib/win32.def (embedded, parsed by
-// loadWin32Def), so adding a Windows API is a one-line data change -- no Go
-// source edit, no recompile. Anything not listed there is a hard error rather
-// than a silent guess.
+// dllOf maps an imported Win32 symbol to the DLL that exports it. It is filled
+// from every prototype that names its import library inline, e.g.
 //
-// The C library itself (printf, strlen, malloc, ...) is implemented in
-// portable C (goclib/goclib.c) on top of kernel32 (Windows) or syscalls
-// (Linux), and goc compiles it into every program at start-up. There is no
-// msvcrt anywhere in the pipeline.
-var externDLL = loadWin32Def()
+//	extern BOOL CloseHandle(HANDLE h), kernel32;
+//
+// Each goclib header carries its own DLL name -- winbase.h -> kernel32,
+// winuser.h -> user32, wingdi.h -> gdi32, and the directory/stat APIs in
+// dirent.h/stat.h -> kernel32 -- so a source file is self-describing and there
+// is no central ownership table to keep in sync. dllOf is populated while the C
+// library and the user program are parsed: once at start-up for the built-in
+// library (buildClibC), and again for every user translation unit. It is the
+// single source of truth for the "extern Name, dll" imports Gen emits for the
+// PE target.
+//
+// The C library itself (printf, strlen, malloc, ...) is implemented in portable
+// C (goclib/*.c) on top of kernel32 (Windows) or syscalls (Linux), and goc
+// compiles it into every program at start-up. There is no msvcrt anywhere in
+// the pipeline.
+var dllOf = map[string]string{}
 
-// loadWin32Def parses the embedded goclib/win32.def table. A "# <dll>" line
-// starts a group; every following bare line is an exported function name of
-// that DLL. ";" comments and blanks are ignored. This is the single source of
-// truth for the "extern Name, dll" imports Gen emits for the PE target.
-func loadWin32Def() map[string]string {
-	b, err := goclibDefFS.ReadFile("goclib/win32.def")
-	if err != nil {
-		panic("goc: goclib/win32.def missing from embedded FS: " + err.Error())
-	}
-	m := map[string]string{}
-	dll := ""
-	for _, ln := range strings.Split(string(b), "\n") {
-		t := strings.TrimSpace(ln)
-		if t == "" || strings.HasPrefix(t, ";") {
-			continue
-		}
-		if strings.HasPrefix(t, "#") {
-			dll = strings.TrimSpace(strings.TrimPrefix(t, "#"))
-			continue
-		}
-		if dll == "" {
-			panic("goc: win32.def: function " + t + " appears before any '# dll' group")
-		}
-		if _, dup := m[t]; dup {
-			panic("goc: win32.def: duplicate function " + t)
-		}
-		m[t] = dll
-	}
-	return m
+// dllFor resolves the import library of an extern symbol. The DLL is named
+// directly on the prototype that declares the symbol; if no prototype names
+// one, the symbol is not a known Windows import and Gen reports a hard error
+// rather than a silent guess.
+func dllFor(name string) (string, bool) {
+	d, ok := dllOf[name]
+	return d, ok
 }
 
 // externLinux lists the syscall names an ELF-target program may reach for.
@@ -226,8 +259,13 @@ var externLinux = map[string]bool{
 	"read": true, "write": true, "open": true, "close": true,
 	"lseek": true, "mmap": true, "munmap": true, "brk": true, "ioctl": true,
 	"writev": true, "nanosleep": true, "getpid": true, "kill": true,
-	"exit": true, "exit_group": true, "gettimeofday": true, "clock_gettime": true,
+	"exit": true, "exit_group": true, "gettimeofday": true, "__goc_clock_gettime": true,
 	"unlink": true, "__goclib_rename": true,
+	"__goclib_stat": true, "__goclib_mkdir": true, "__goclib_rmdir": true,
+	"__goclib_getdents64": true,
+	"__goclib_getcwd": true, "__goclib_chmod": true, "__goclib_access": true,
+	"__goclib_fstat": true,
+	"__goclib_vfork": true, "__goclib_execve": true, "__goclib_wait4": true,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,9 +276,6 @@ var externLinux = map[string]bool{
 // goc compiles at start-up exactly like a user program, once per target.
 // Functions land in the output only when a program actually calls them (plus
 // their transitive callees), so a hello-world does not pay for malloc.
-
-//go:embed goclib/*.def
-var goclibDefFS embed.FS
 
 //go:embed goclib/*.c
 var goclibCFS embed.FS
@@ -286,6 +321,13 @@ var (
 	goclibErr  error
 )
 
+// calleeSaveAll is the complete set of callee-save GPRs the register allocator
+// may use as local-register homes (and as scratch). Every generated function
+// pushes and pops all of them so the callee-save ABI contract holds for its
+// callers: a callee that draws a home from this pool must not clobber a
+// caller's cached local. See the prologue/epilogue emission in genFunction.
+var calleeSaveAll = []string{"rbx", "r12", "r13", "r14"}
+
 // clibCStore picks the compiled C library for a target.
 func clibCStore(linux bool) *clibCProgram {
 	if linux {
@@ -318,6 +360,14 @@ func buildClibC(linux bool) (*clibCProgram, error) {
 			return fmt.Errorf("goclib/%s: %v", name, e)
 		}
 		lib.protos = append(lib.protos, prog.Prototypes...)
+		// A prototype may name its import library ("..., user32"); record it
+		// here too, because the library itself is parsed at start-up and only
+		// reaches Gen later, when the user program is generated.
+		for _, pr := range prog.Prototypes {
+			if pr.DLL != "" {
+				dllOf[pr.Name] = pr.DLL
+			}
+		}
 		for _, g := range prog.Globals {
 			lib.globals = append(lib.globals, g)
 		}
@@ -380,12 +430,154 @@ func (c *CG) newLabel(prefix string) string {
 	return fmt.Sprintf(".L%s%d", prefix, c.label)
 }
 
+// collectCompoundLits walks the function body -- statements and every nested
+// expression -- and returns each compound literal once, in evaluation order.
+// Mirrors check.go's walkStmts plus a full expression recursion.
+func (c *CG) collectCompoundLits(f *FuncDecl) []*CompoundLit {
+	var lits []*CompoundLit
+	var walkExpr func(Expr)
+	var walkStmt func(Stmt)
+	walkExpr = func(e Expr) {
+		switch n := e.(type) {
+		case nil:
+			return
+		case *Unary:
+			walkExpr(n.E)
+		case *Binary:
+			walkExpr(n.L)
+			walkExpr(n.R)
+		case *Call:
+			for _, a := range n.Args {
+				walkExpr(a)
+			}
+		case *IndirectCall:
+			// A UFCS-resolved call carries its whole rewritten form in
+			// n.UFCS; that is what codegen emits, so that is what we walk.
+			if n.UFCS != nil {
+				walkExpr(n.UFCS)
+			} else {
+				walkExpr(n.Fn)
+				for _, a := range n.Args {
+					walkExpr(a)
+				}
+			}
+		case *Index:
+			walkExpr(n.Base)
+			walkExpr(n.Idx)
+		case *CondExpr:
+			walkExpr(n.Cond)
+			walkExpr(n.Then)
+			walkExpr(n.Else)
+		case *CommaExpr:
+			walkExpr(n.Left)
+			walkExpr(n.Right)
+		case *CastExpr:
+			walkExpr(n.E)
+		case *IncDecExpr:
+			walkExpr(n.E)
+		case *MemberExpr:
+			walkExpr(n.Base)
+		case *SizeofExpr:
+			if n.E != nil {
+				walkExpr(n.E)
+			}
+		case *AssignExpr:
+			walkExpr(n.Lhs)
+			walkExpr(n.Rhs)
+		case *VaArgExpr:
+			walkExpr(n.Ap)
+		case *GenericExpr:
+			// Only the branch the checker selected reaches codegen.
+			if n.Chosen != nil {
+				walkExpr(n.Chosen)
+			}
+		case *BraceInit:
+			for _, el := range n.Elems {
+				walkExpr(el.E)
+			}
+		case *CompoundLit:
+			lits = append(lits, n)
+			if n.Init != nil {
+				walkExpr(n.Init)
+			}
+		}
+	}
+	walkStmt = func(s Stmt) {
+		switch n := s.(type) {
+		case nil:
+			return
+		case *Block:
+			for _, st := range n.Stmts {
+				walkStmt(st)
+			}
+		case *DeclList:
+			for _, d := range n.Decls {
+				walkStmt(d)
+			}
+		case *DeclStmt:
+			walkExpr(n.Init)
+		case *AssignStmt:
+			walkExpr(n.Lhs)
+			walkExpr(n.Rhs)
+		case *ExprStmt:
+			walkExpr(n.E)
+		case *ReturnStmt:
+			walkExpr(n.E)
+		case *IfStmt:
+			walkExpr(n.Cond)
+			walkStmt(n.Then)
+			walkStmt(n.Else)
+		case *WhileStmt:
+			walkExpr(n.Cond)
+			walkStmt(n.Body)
+		case *ForStmt:
+			walkStmt(n.Init)
+			walkExpr(n.Cond)
+			walkExpr(n.Post)
+			walkStmt(n.Body)
+		case *DoWhileStmt:
+			walkStmt(n.Body)
+			walkExpr(n.Cond)
+		case *SwitchStmt:
+			walkExpr(n.Src)
+			walkStmt(n.Body)
+		case *LabelStmt:
+			walkStmt(n.Stmt)
+		}
+	}
+	walkStmt(f.Body)
+	return lits
+}
+
 // tmpSlot returns the rbp offset of the k-th (1-indexed) expression
 // temporary. These live in the function frame, above the locals, and are
 // used to spill the left operand of a binary expression without touching
 // RSP (so 16-byte stack alignment at calls is preserved).
 func (c *CG) tmpSlot(k int) int {
+	// Remember the deepest temporary this function reaches: a wide _BitInt
+	// (or a large struct) can claim thousands of slots, far more than the
+	// fixed scratchSlots reservation, and the prologue's `sub rsp` is grown
+	// to match before the function ends (see growFrameForTemps).
+	if k > c.maxTmp {
+		c.maxTmp = k
+	}
 	return -(c.regArea + c.localBytes + 8*k)
+}
+
+// tmpSlotBlock returns the rbp offset of the BASE of an n-slot temporary
+// whose slot indices are k..k+n-1 (1-indexed, k being the shallowest).
+//
+// Multi-slot values (structs, unions, _BitInt) are written UPWARD from their
+// base, so the base must be the DEEPEST slot of the block: using the
+// shallowest slot makes the value spill into the slots above it -- which
+// belong to the last local or an earlier temporary. That overlap silently
+// corrupted "struct P b = mk(7)" (b.y came back as b.x) and crashed every
+// _BitInt operation whose result buffer sat against a wide local.
+func (c *CG) tmpSlotBlock(k, n int) int {
+	if n < 1 {
+		n = 1
+	}
+	return c.tmpSlot(k + n - 1)
 }
 
 // swSlot returns the rbp offset of the k-th (1-indexed) switch value slot.
@@ -428,6 +620,11 @@ func (c *CG) slotWidth(t *Type) int {
 	case KPtr, KFunc, KDouble:
 		return 8
 	case KStruct, KUnion:
+		if t.Size != 0 {
+			return t.Size
+		}
+	case KBitInt:
+		// A _BitInt(N) value occupies ceil(N/64) 8-byte words in its slot.
 		if t.Size != 0 {
 			return t.Size
 		}
@@ -621,6 +818,71 @@ func (c *CG) loadGlobal(lab string, gt *Type) (CType, error) {
 	return TInt, nil
 }
 
+// genTLSAddr loads the linear address of a thread-local variable named name into
+// r10 (mirroring genLValue for a normal variable). On Linux the .tls section is
+// the main thread's instance, so a rip-relative lea suffices; on Windows the
+// module's TLS block is reached through gs:0x58 (the TEB's
+// ThreadLocalStoragePointer), indexed by our module's TLS index (0 here), plus
+// the variable's offset inside the block.
+func (c *CG) genTLSAddr(name string) error {
+	t := c.tlsVars[name]
+	if t == nil {
+		return fmt.Errorf("internal: TLS variable %q has no layout", name)
+	}
+	if c.linux {
+		c.emit("lea r10, [rip+%s]", t.lab)
+		return nil
+	}
+	// Windows: the TEB's ThreadLocalStoragePointer (gs:0x58) is an array of
+	// per-module TLS block pointers; the module's index lives in the loader-
+	// filled goc_tls_index slot. Load it and index into the array to reach this
+	// thread's copy of the .tls template.
+	c.emit("mov ecx, [rip+G_goc_tls_index]")
+	c.emit("xor eax, eax")
+	c.emit("mov rax, gs:[rax+0x58]")
+	c.emit("mov rax, [rax+rcx*8]")
+	c.emit("lea r10, [rax+%d]", t.off)
+	return nil
+}
+
+// genTLSLoadValue loads the value of a thread-local variable (scalar, array
+// pointer, or floating point) into rax / xmm0, the same calling convention
+// loadGlobal uses for a normal global. Arrays/aggregates decay to a pointer to
+// element 0.
+func (c *CG) genTLSLoadValue(name string) error {
+	t := c.tlsVars[name]
+	if t == nil {
+		return fmt.Errorf("internal: TLS variable %q has no layout", name)
+	}
+	if err := c.genTLSAddr(name); err != nil {
+		return err
+	}
+	if t.typ != nil && (t.typ.IsArray() || isAgg(t.typ)) {
+		c.emit("mov rax, r10")
+		c.resTyp = TInt
+		c.resSigned = false
+		c.resW = 8
+		return nil
+	}
+	if t.typ != nil && t.typ.IsFloating() {
+		if t.typ.Kind == KFloat {
+			c.emit("movss xmm0, [r10]")
+			c.emit("cvtss2sd xmm0, xmm0")
+		} else {
+			c.emit("movsd xmm0, [r10]")
+		}
+		c.resTyp = TDouble
+		c.resSigned = false
+		c.resW = 8
+		return nil
+	}
+	c.emit("mov rax, [r10]")
+	c.resTyp = TInt
+	c.resSigned = t.typ != nil && t.typ.Kind == KInt && t.typ.Signed
+	c.resW = c.semWOf(t.typ)
+	return nil
+}
+
 // loadVar emits code that loads variable vi's value into rax (int) or xmm0
 // (double), and records the resulting type in c.resTyp.
 // movsd (not movq) is used for the XMM <-> memory moves: goa only knows the
@@ -673,7 +935,21 @@ func (c *CG) loadVar(vi varInfo) {
 		// NOT sign-extend here: that would truncate 64-bit pointers that live
 		// in int variables. 32-bit signed/unsigned arithmetic canonicalisation
 		// is applied at operation sites instead (genBinary).
-		c.emit("mov rax, [rbp%+d]", vi.off)
+		//
+		// The exception is a variable whose address was taken: it can also be
+		// written through an int*, and that store is 4 bytes wide
+		// (lvalueWidth reports the C width for a deref), so the top half of
+		// the slot is stale. Re-extending from the 4-byte value is what makes
+		// "int *p = &x; *p = -23;" read back as -23 instead of 4294967273.
+		if vi.addr && c.semWOf(vi.typ) == 4 {
+			if signed {
+				c.emit("movsxd rax, dword [rbp%+d]", vi.off)
+			} else {
+				c.emit("mov eax, [rbp%+d]", vi.off) // zero-extends to 64
+			}
+		} else {
+			c.emit("mov rax, [rbp%+d]", vi.off)
+		}
 	}
 	c.resTyp = TInt
 	c.resSigned = signed
@@ -721,6 +997,21 @@ func (c *CG) storeVar(vi varInfo) {
 // ensureType converts the value currently in rax/xmm0 to the requested type
 // (if they differ) and updates c.resTyp.
 func (c *CG) ensureType(want CType) error {
+	// A _BitInt value: conversion to int truncates to the low 64-bit word
+	// (the two's-complement low word IS the int64 pattern regardless of
+	// signedness). Conditions must use genTruth instead (full-width test).
+	if c.resBig {
+		if want == TInt {
+			c.emit("mov rax, [r10]")
+			c.tmpDepth -= c.resBigSl
+			c.resSigned = c.resBigT.Signed
+			c.resW = 8
+			c.resBig = false
+			c.resTyp = TInt
+			return nil
+		}
+		return fmt.Errorf("_BitInt values only convert to integer types (got %v)", want)
+	}
 	if c.resTyp == want {
 		return nil
 	}
@@ -737,11 +1028,589 @@ func (c *CG) ensureType(want CType) error {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// C23 _BitInt(N) ("bigint") support.
+//
+// A _BitInt(N) value is a little-endian array of ceil(N/64) 64-bit words in
+// memory (8-byte aligned). It rides the struct by-address value model: a
+// value-typed expression leaves the value's ADDRESS in r10 and sets resBig /
+// resBigT / resBigK / resBigSl. Arithmetic is emitted as calls to the pure-C
+// goclib/bitint.c helpers, with every operand materialised into a frame
+// temporary of the operation's result width first (bigOperand below).
+// ---------------------------------------------------------------------------
+
+func bigWordsOf(t *Type) int {
+	w := (t.Bits + 63) / 64
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+func ptWords(t *Type) int { return bigWordsOf(t) }
+
+// bigArg is one argument of a goclib bitint helper call: exactly one of
+// reg / imm / addrOff / valOff is set.
+type bigArg struct {
+	reg     string
+	imm     int64
+	addrOff int // lea reg, [rbp+off]
+	valOff  int // mov reg, [rbp+off]
+}
+
+// callBigLib emits a direct call to a goclib bitint helper. The result (when
+// the helper has one) arrives in rax. Claims shadow space on Windows and
+// restores RSP alignment afterwards, matching genCall's discipline.
+// emitCall grows the frame to cover any live big-aggregate temporaries, then
+// emits a direct or indirect call. Big temporaries live below RSP until the
+// prologue's `sub rsp` is widened to their full depth (see growFrameForTemps),
+// so a call emitted before that widening would trample them -- a _BitInt
+// expression like `*r = *r * base` keeps its left operand, base and the result
+// buffer in frame temps across the bi_mul call, and a too-small frame makes the
+// call clobber them (garbage result or an infinite loop inside the helper).
+// target == "" means an indirect call through rax. Once the frame already
+// covers maxTmp the grow is a cheap no-op, so calling this at every call site
+// costs nothing for ordinary functions.
+func (c *CG) emitCall(target string) {
+	c.growFrameForTemps()
+	if target == "" {
+		c.emit("call rax")
+	} else {
+		c.emit("call %s", target)
+	}
+}
+
+func (c *CG) callBigLib(name string, args []bigArg) {
+	aregs := c.argRegs()
+	extra := 0
+	if !c.linux {
+		extra = 32
+	}
+	if extra > 0 {
+		c.emit("sub rsp, %d", extra)
+	}
+	for i, a := range args {
+		ar := aregs[i]
+		switch {
+		case a.reg != "":
+			if a.reg != ar {
+				c.emit("mov %s, %s", ar, a.reg)
+			}
+		case a.addrOff != 0:
+			c.emit("lea %s, [rbp%+d]", ar, a.addrOff)
+		case a.valOff != 0:
+			c.emit("mov %s, [rbp%+d]", ar, a.valOff)
+		default:
+			c.emit("mov %s, %d", ar, a.imm)
+		}
+	}
+	c.need[name] = true
+	c.emitCall(name)
+	if extra > 0 {
+		c.emit("add rsp, %d", extra)
+	}
+}
+
+// claimBig reserves w consecutive tmp slots for a bitint temporary and
+// returns the slot index and its rbp offset.
+func (c *CG) claimBig(w int) (int, int) {
+	k := c.tmpDepth + 1
+	c.tmpDepth += w
+	return k, c.tmpSlotBlock(k, w)
+}
+
+// markBig records that the value just produced is a _BitInt living at the
+// claimed buffer (k, sl); r10 is left holding its address.
+func (c *CG) markBig(t *Type, k, sl int) {
+	c.resBig = true
+	c.resBigT = t
+	c.resBigK = k
+	c.resBigSl = sl
+	c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(k, sl))
+	c.resTyp = TInt
+	c.resW = 8
+	c.resSigned = t.Signed
+}
+
+// releaseResBig frees the pending big-value buffer (or falls back to the
+// struct-return result buffer for struct values).
+func (c *CG) releaseResBig() {
+	if c.resBig {
+		c.tmpDepth -= c.resBigSl
+		c.resBig = false
+		return
+	}
+	c.releaseResStruct()
+}
+
+// bigOperand evaluates e and materialises its value -- converted to want's
+// width and signedness -- into a freshly claimed temporary. Returns the slot
+// index, slot count and rbp offset. Claims stay live until the caller's bulk
+// unwind (operands must survive the helper call).
+func (c *CG) bigOperand(e Expr, want *Type) (int, int, int, error) {
+	et := c.exprType(e)
+	w := bigWordsOf(want)
+	k, off := c.claimBig(w)
+	if isBig(et) {
+		if _, err := c.genExprT(e); err != nil {
+			return 0, 0, 0, err
+		}
+		if !c.resBig {
+			return 0, 0, 0, fmt.Errorf("internal: _BitInt operand did not produce a value address")
+		}
+		c.emit("lea r11, [rbp%+d]", off)
+		if et.Bits == want.Bits {
+			c.copyBytes("r11", "r10", w*8)
+		} else {
+			name := "__goclib_bi_widen_u"
+			if et.Signed {
+				name = "__goclib_bi_widen_s"
+			}
+			c.callBigLib(name, []bigArg{
+				{addrOff: off}, {reg: "r10"}, {imm: int64(w)}, {imm: int64(bigWordsOf(et))},
+			})
+		}
+		return k, w, off, nil
+	}
+	if et != nil && et.IsFloating() {
+		return 0, 0, 0, fmt.Errorf("floating operands with _BitInt are not supported")
+	}
+	if _, err := c.genExprT(e); err != nil {
+		return 0, 0, 0, err
+	}
+	if err := c.ensureType(TInt); err != nil {
+		return 0, 0, 0, err
+	}
+	sg := int64(0)
+	if want.Signed {
+		sg = 1
+	}
+	c.callBigLib("__goclib_bi_from_i64", []bigArg{
+		{addrOff: off}, {reg: "rax"}, {imm: int64(w)}, {imm: sg},
+	})
+	return k, w, off, nil
+}
+
+// genBigValue emits a value-typed _BitInt expression: the value's address is
+// left in r10 and the resBig flags describe it.
+func (c *CG) genBigValue(e Expr, t *Type) (CType, error) {
+	switch n := e.(type) {
+	case *Binary:
+		return c.genBigBinary(n)
+	case *Unary:
+		if n.Op == "-" || n.Op == "~" || n.Op == "!" {
+			return c.genBigUnary(n, t)
+		}
+	case *NumLit:
+		if n.BigWords != nil {
+			return c.genBigLiteral(n, t)
+		}
+	case *CastExpr:
+		return c.genBigCast(n, t)
+	case *IncDecExpr:
+		return c.genBigIncDec(n)
+	case *Call:
+		return c.genBigFromCall(func() (CType, error) { return c.genCall(n.Name, nil, nil, n.Args) }, t)
+	case *IndirectCall:
+		return c.genBigFromCall(func() (CType, error) { return c.genIndirectCall(n) }, t)
+	}
+	// Default: lvalue-shaped (Ident / Member / Index / *p / CompoundLit).
+	if err := c.genLValue(e); err != nil {
+		return TInt, err
+	}
+	c.resBig = true
+	c.resBigT = t
+	c.resBigK = 0
+	c.resBigSl = 0
+	c.resTyp = TInt
+	c.resW = 8
+	c.resSigned = t.Signed
+	return TInt, nil
+}
+
+// genBigFromCall wraps a call whose result type is a _BitInt: the sret
+// machinery has left the value in a result buffer; transfer it to the resBig
+// carrier.
+func (c *CG) genBigFromCall(gen func() (CType, error), t *Type) (CType, error) {
+	ct, err := gen()
+	if err != nil {
+		return ct, err
+	}
+	if !c.resStruct {
+		return TInt, fmt.Errorf("internal: call did not produce a _BitInt result buffer")
+	}
+	c.resBig = true
+	c.resBigT = t
+	c.resBigK = c.resStructK
+	c.resBigSl = c.resStructSl
+	c.resStruct = false
+	c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(c.resBigK, c.resBigSl))
+	c.resTyp = TInt
+	c.resW = 8
+	c.resSigned = t.Signed
+	return TInt, nil
+}
+
+// bigLitKey identifies a literal by its word content and width.
+func bigLitKey(words []uint64, bits int) string {
+	return fmt.Sprintf("%d:%v", bits, words)
+}
+
+// genBigLiteral emits a wb/uwb literal: the words go into a .rdata constant
+// and the value's address is the expression's value. Literals are read-only
+// rvalues, so no per-use copy is needed; width conversion happens in
+// bigOperand when the operation's result type differs.
+func (c *CG) genBigLiteral(n *NumLit, t *Type) (CType, error) {
+	w := bigWordsOf(t)
+	words := make([]uint64, w)
+	for i := 0; i < w && i < len(n.BigWords); i++ {
+		words[i] = n.BigWords[i]
+	}
+	// A signed literal is non-negative by construction; zero-pad. (Values
+	// needing the sign bit cannot appear: the declared width holds the value.)
+	key := bigLitKey(words, t.Bits)
+	lab, ok := c.bigLab[key]
+	if !ok {
+		lab = fmt.Sprintf("LBIG%d", len(c.bigLits))
+		c.bigLits = append(c.bigLits, words)
+		c.bigLab[key] = lab
+	}
+	c.emit("lea r10, [rip+%s]", lab)
+	c.resBig = true
+	c.resBigT = t
+	c.resBigK = 0
+	c.resBigSl = 0
+	c.resTyp = TInt
+	c.resW = 8
+	c.resSigned = t.Signed
+	return TInt, nil
+}
+
+// genBigBinary emits an arithmetic / bitwise / shift / comparison operation
+// with at least one _BitInt operand.
+func (c *CG) genBigBinary(n *Binary) (CType, error) {
+	lt0, rt0 := c.exprType(n.L), c.exprType(n.R)
+	entryDepth := c.tmpDepth
+
+	switch n.Op {
+	case "==", "!=", "<", "<=", ">", ">=":
+		w := bigWordsOf(lt0)
+		if rw := bigWordsOf(rt0); rw > w {
+			w = rw
+		}
+		useSigned := int64(0)
+		if lt0.Signed && rt0.Signed {
+			useSigned = 1
+		}
+		ct := &Type{Kind: KBitInt, Bits: w * 64, Size: w * 8, Signed: useSigned == 1}
+		_, _, loff, err := c.bigOperand(n.L, ct)
+		if err != nil {
+			return TInt, err
+		}
+		_, _, roff, err := c.bigOperand(n.R, ct)
+		if err != nil {
+			return TInt, err
+		}
+		c.callBigLib("__goclib_bi_cmp", []bigArg{
+			{addrOff: loff}, {addrOff: roff}, {imm: int64(w)}, {imm: useSigned},
+		})
+		c.tmpDepth = entryDepth
+		switch n.Op {
+		case "==":
+			c.emit("cmp rax, 0")
+			c.emit("sete al")
+		case "!=":
+			c.emit("cmp rax, 0")
+			c.emit("setne al")
+		case "<":
+			c.emit("cmp rax, 0")
+			c.emit("setl al")
+		case "<=":
+			c.emit("cmp rax, 0")
+			c.emit("setle al")
+		case ">":
+			c.emit("cmp rax, 0")
+			c.emit("setg al")
+		case ">=":
+			c.emit("cmp rax, 0")
+			c.emit("setge al")
+		}
+		c.emit("movzx rax, al")
+		// The comparison yields a plain int; clear the big-value flag so
+		// truth-context callers do not re-test the (stale) r10 address.
+		c.resBig = false
+		c.resBigT = nil
+		c.resTyp = TInt
+		c.resSigned = true
+		c.resW = 4
+		return TInt, nil
+
+	case "<<", ">>":
+		if !isBig(lt0) {
+			return TInt, fmt.Errorf("left operand of %q must be a _BitInt, got %s", n.Op, lt0)
+		}
+		if isBig(rt0) {
+			return TInt, fmt.Errorf("_BitInt shift counts are not supported; use an integer count")
+		}
+		resT := lt0
+		w := bigWordsOf(resT)
+		rk, resOff := c.claimBig(w)
+		if _, lsl, loff, err := c.bigOperand(n.L, resT); err != nil {
+			return TInt, err
+		} else {
+			_ = lsl
+			// count: evaluate after the left operand is materialised
+			if _, err := c.genExprT(n.R); err != nil {
+				return TInt, err
+			}
+			if err := c.ensureType(TInt); err != nil {
+				return TInt, err
+			}
+			name := "__goclib_bi_shl"
+			if n.Op == ">>" {
+				name = "__goclib_bi_shr_u"
+				if resT.Signed {
+					name = "__goclib_bi_shr_s"
+				}
+			}
+			c.callBigLib(name, []bigArg{
+				{addrOff: resOff}, {addrOff: loff}, {reg: "rax"}, {imm: int64(w)},
+			})
+		}
+		c.tmpDepth = rk + w - 1
+		c.markBig(resT, rk, w)
+		return TInt, nil
+	}
+
+	// + - * / % & | ^
+	resT := bigArithResult(n.Op, lt0, rt0)
+	if !isBig(resT) {
+		return TInt, fmt.Errorf("internal: no result type for %q on %s and %s", n.Op, lt0, rt0)
+	}
+	w := bigWordsOf(resT)
+	rk, resOff := c.claimBig(w)
+	if _, _, loff, err := c.bigOperand(n.L, resT); err != nil {
+		return TInt, err
+	} else if _, _, roff, err := c.bigOperand(n.R, resT); err != nil {
+		return TInt, err
+	} else {
+		var name string
+		switch n.Op {
+		case "+":
+			name = "__goclib_bi_add"
+		case "-":
+			name = "__goclib_bi_sub"
+		case "*":
+			name = "__goclib_bi_mul"
+		case "&":
+			name = "__goclib_bi_and"
+		case "|":
+			name = "__goclib_bi_or"
+		case "^":
+			name = "__goclib_bi_xor"
+		case "/":
+			name = "__goclib_bi_div_u"
+			if resT.Signed {
+				name = "__goclib_bi_div_s"
+			}
+		case "%":
+			name = "__goclib_bi_mod_u"
+			if resT.Signed {
+				name = "__goclib_bi_mod_s"
+			}
+		}
+		c.callBigLib(name, []bigArg{
+			{addrOff: resOff}, {addrOff: loff}, {addrOff: roff}, {imm: int64(w)},
+		})
+	}
+	c.tmpDepth = rk + w - 1
+	c.markBig(resT, rk, w)
+	return TInt, nil
+}
+
+// genBigUnary emits unary '-' (negate), '~' (complement) and '!' (zero test)
+// on a _BitInt operand.
+func (c *CG) genBigUnary(n *Unary, t *Type) (CType, error) {
+	entryDepth := c.tmpDepth
+	w := bigWordsOf(t)
+	if n.Op == "!" {
+		if _, err := c.genExprT(n.E); err != nil {
+			return TInt, err
+		}
+		if !c.resBig {
+			return TInt, fmt.Errorf("internal: '!' operand did not produce a _BitInt value")
+		}
+		c.callBigLib("__goclib_bi_is_zero", []bigArg{{reg: "r10"}, {imm: int64(w)}})
+		c.emit("xor rax, 1")
+		c.tmpDepth = entryDepth
+		c.resBig = false
+		c.resTyp = TInt
+		c.resW = 4
+		c.resSigned = true
+		return TInt, nil
+	}
+	rk, resOff := c.claimBig(w)
+	if _, _, loff, err := c.bigOperand(n.E, t); err != nil {
+		return TInt, err
+	} else {
+		name := "__goclib_bi_neg"
+		if n.Op == "~" {
+			name = "__goclib_bi_not"
+		}
+		c.callBigLib(name, []bigArg{
+			{addrOff: resOff}, {addrOff: loff}, {imm: int64(w)},
+		})
+	}
+	c.tmpDepth = rk + w - 1
+	c.markBig(t, rk, w)
+	return TInt, nil
+}
+
+// genBigCast emits a cast whose target type is a _BitInt: the operand is
+// converted (int -> bitint, or bitint -> bitint by truncation/extension).
+func (c *CG) genBigCast(n *CastExpr, t *Type) (CType, error) {
+	w := bigWordsOf(t)
+	rk, resOff := c.claimBig(w)
+	if _, _, loff, err := c.bigOperand(n.E, t); err != nil {
+		return TInt, err
+	} else {
+		// same conversion rule as the operand path: copy / widen into the result
+		et := c.exprType(n.E)
+		if isBig(et) && et.Bits == t.Bits {
+			c.emit("lea r11, [rbp%+d]", resOff)
+			c.emit("lea r10, [rbp%+d]", loff)
+			c.copyBytes("r11", "r10", w*8)
+		} else if isBig(et) {
+			name := "__goclib_bi_widen_u"
+			if et.Signed {
+				name = "__goclib_bi_widen_s"
+			}
+			c.callBigLib(name, []bigArg{
+				{addrOff: resOff}, {addrOff: loff}, {imm: int64(w)}, {imm: int64(bigWordsOf(et))},
+			})
+		} else {
+			// operand was materialised into loff by bigOperand already
+			c.emit("lea r11, [rbp%+d]", resOff)
+			c.emit("lea r10, [rbp%+d]", loff)
+			c.copyBytes("r11", "r10", w*8)
+		}
+	}
+	c.tmpDepth = rk + w - 1
+	c.markBig(t, rk, w)
+	return TInt, nil
+}
+
+// genBigIncDec emits ++/-- on a _BitInt lvalue. Postfix yields the OLD value
+// from a claimed buffer; prefix yields the operand itself as an lvalue.
+func (c *CG) genBigIncDec(n *IncDecExpr) (CType, error) {
+	t := c.exprType(n.E)
+	w := bigWordsOf(t)
+	entryDepth := c.tmpDepth
+	// the "+1"/"-1" addend, materialised at the operation's width
+	k1, oneOff := c.claimBig(w)
+	_ = k1
+	{
+		sg := int64(0)
+		if t.Signed {
+			sg = 1
+		}
+		c.callBigLib("__goclib_bi_from_i64", []bigArg{
+			{addrOff: oneOff}, {imm: 1}, {imm: int64(w)}, {imm: sg},
+		})
+	}
+	resK, resSl := 0, 0
+	if !n.Prefix {
+		var resOff int
+		resK, resOff = c.claimBig(w)
+		_ = resOff
+		resSl = w
+	}
+	if err := c.genLValue(n.E); err != nil {
+		return TInt, err
+	}
+	if !n.Prefix {
+		// old value -> result buffer (r10 = operand address)
+		c.emit("lea r11, [rbp%+d]", c.tmpSlotBlock(resK, resSl))
+		c.copyBytes("r11", "r10", w*8)
+	}
+	name := "__goclib_bi_add"
+	if n.Op == "--" {
+		name = "__goclib_bi_sub"
+	}
+	c.callBigLib(name, []bigArg{
+		{reg: "r10"}, {reg: "r10"}, {addrOff: oneOff}, {imm: int64(w)},
+	})
+	if !n.Prefix {
+		c.tmpDepth = resK + resSl - 1
+		c.markBig(t, resK, resSl)
+	} else {
+		c.tmpDepth = entryDepth
+		c.resBig = true
+		c.resBigT = t
+		c.resBigK = 0
+		c.resBigSl = 0
+		c.resTyp = TInt
+		c.resW = 8
+		c.resSigned = t.Signed
+	}
+	return TInt, nil
+}
+
+// genTruth evaluates a condition: a _BitInt operand tests non-zero over its
+// FULL width (a low-word truncation would read 2^64 multiples as false).
+func (c *CG) genTruth(e Expr) error {
+	if _, err := c.genExprT(e); err != nil {
+		return err
+	}
+	if c.resBig {
+		w := bigWordsOf(c.resBigT)
+		sl := c.resBigSl
+		c.callBigLib("__goclib_bi_is_zero", []bigArg{{reg: "r10"}, {imm: int64(w)}})
+		c.emit("xor rax, 1")
+		c.tmpDepth -= sl
+		c.resBig = false
+		c.resTyp = TInt
+		c.resW = 4
+		c.resSigned = true
+		return nil
+	}
+	return c.ensureType(TInt)
+}
+
 // genExpr is the entry point for emitting an expression. The integer/double
 // type of the result is returned so callers can route it to the right
 // register.
 func (c *CG) genExprT(e Expr) (CType, error) {
+	// C23 _BitInt values ride a by-address model (like structs): a value-typed
+	// expression leaves the address of the value in r10 and sets resBig;
+	// consumers (binary ops, conditions, assignments, calls) read the flags.
+	if et := c.exprType(e); isBig(et) {
+		c.resBig = false
+		return c.genBigValue(e, et)
+	}
+	// A comparison whose operands are _BitInt yields an int, so the isBig
+	// dispatch above never fires and the scalar path would compare the
+	// operands' ADDRESSES. Route it to the big path explicitly.
+	if n, ok := e.(*Binary); ok {
+		switch n.Op {
+		case "==", "!=", "<", "<=", ">", ">=":
+			if isBig(c.exprType(n.L)) || isBig(c.exprType(n.R)) {
+				c.resBig = false
+				return c.genBigBinary(n)
+			}
+		}
+	}
+	c.resBig = false
 	switch n := e.(type) {
+	case *GenericExpr:
+		// C11/C23 generic selection: the controlling expression is never
+		// evaluated, so it is not emitted at all. The checker already picked
+		// (and type-checked) the matching association; only Chosen reaches
+		// codegen.
+		if n.Chosen == nil {
+			return TInt, fmt.Errorf("line %d: _Generic selection was not resolved by the type checker", n.Line)
+		}
+		return c.genExprT(n.Chosen)
 	case *NumLit:
 		if n.Kind == TDouble {
 			lab, ok := c.doubleLab[n.Fval]
@@ -756,13 +1625,16 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		}
 		c.emit("mov rax, %d", n.Val)
 		c.resTyp = TInt
-		c.resSigned = true
-		// An unsuffixed decimal literal is an int when it fits in 32 bits;
-		// larger values are long (8 bytes) and must not be truncated later.
+		// Width and signedness come from the literal itself, not just from
+		// its value: `1` is an int (32 bits) while `1LL` is 64 bits wide,
+		// and the difference is observable -- `1 << 52` is zero because the
+		// shift is done in 32 bits, while `1LL << 52` is 2^52. A value that
+		// does not fit in an int is long whether it has a suffix or not.
 		c.resW = 4
-		if n.Val > 0x7fffffff || n.Val < -0x80000000 {
+		if n.Long || n.Val > 0x7fffffff || n.Val < -0x80000000 {
 			c.resW = 8
 		}
+		c.resSigned = !n.Unsig
 		return TInt, nil
 	case *StrLit:
 		lab, ok := c.strLab[n]
@@ -777,59 +1649,97 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		c.resW = 8 // a string literal is a pointer
 		return TInt, nil
 	case *Ident:
-		// Resolution order mirrors the checker: locals (incl. parameters and
-		// static locals) and globals shadow a same-named function -- C block
-		// scoping hides file-scope names, function names included. Only when
-		// no variable of that name exists may the identifier name a function,
-		// in which case it decays to a pointer to that function ("fp = add;").
-		vi, ok := c.lookupVar(n.Name)
-		if !ok {
-			if lab, ok2 := c.staticVars[n.Name]; ok2 {
-				// Static local: loaded from its .data label, exactly like a
-				// true global.
-				return c.loadGlobal(lab, c.globalTyp[lab])
-			}
-			if c.globals[n.Name] {
-				// Global variable: load its value via rip-relative addressing
-				// into the .data section (arrays decay to a pointer to element
-				c.useLibGlobal(n.Name)
-				// 0, mirroring local arrays).
-				return c.loadGlobal(c.globalLab[n.Name], c.globalTyp[n.Name])
-			}
-			if sym, ok2 := c.funcAddrSym(n.Name); ok2 {
-				c.emit("lea rax, [rip+%s]", sym)
+		// Resolution order mirrors the checker and C block scoping: a
+		// function-local name (parameter or local variable) shadows any
+		// file-scope name of the same spelling, including a thread-local
+		// global. Resolving local scope FIRST prevents a library function's
+		// local (e.g. goclib's `char t[20]` in its integer formatter) from
+		// being mistaken for a user-declared thread-local global of the same
+		// name -- which would otherwise emit a TLS load whose runtime value
+		// corrupts the surrounding code (printf + initialised TLS).
+		if vi, ok := c.lookupVar(n.Name); ok {
+			if vi.typ.IsArray() {
+				// An array used as a value decays to a pointer to element 0.
+				c.emit("lea rax, [rbp%+d]", vi.off)
 				c.resTyp = TInt
 				c.resSigned = false
-				c.resW = 8 // a function address is a pointer
+				c.resW = 8
 				return TInt, nil
 			}
-			if ev, ok2 := enumConsts[n.Name]; ok2 {
-				// An enumerator is a compile-time integer constant.
-				c.emit("mov rax, %d", ev)
-				c.resTyp = TInt
-				c.resSigned = true
-				c.resW = 4
-				if ev > 0x7fffffff || ev < -0x80000000 {
-					c.resW = 8
-				}
-				return TInt, nil
+			if isAgg(vi.typ) {
+				// A whole struct/union value cannot be loaded into rax; consumers
+				// must go through genLValue (see structSrcAddr).
+				return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
 			}
-			return TInt, fmt.Errorf("undefined variable %q", n.Name)
+			c.loadVar(vi)
+			return c.resTyp, nil
 		}
-		if vi.typ.IsArray() {
-			// An array used as a value decays to a pointer to element 0.
-			c.emit("lea rax, [rbp%+d]", vi.off)
+		// File-scope names. A static local shadows a same-named TLS global
+		// within its function, but a static *thread-local* local still needs
+		// the segment reach (it is also registered in tlsVars).
+		if lab, ok2 := c.staticVars[n.Name]; ok2 {
+			if _, isTLS := c.tlsVars[n.Name]; !isTLS {
+				return c.loadGlobal(lab, c.globalTyp[lab])
+			}
+		}
+		if _, ok := c.tlsVars[n.Name]; ok {
+			// Thread-local variable: load via the fs/gs segment reach.
+			if err := c.genTLSLoadValue(n.Name); err != nil {
+				return TInt, err
+			}
+			return c.resTyp, nil
+		}
+		if lab, ok2 := c.staticVars[n.Name]; ok2 {
+			// Static local: loaded from its .data label, exactly like a
+			// true global.
+			return c.loadGlobal(lab, c.globalTyp[lab])
+		}
+		if c.globals[n.Name] {
+			// Global variable: load its value via rip-relative addressing
+			// into the .data section (arrays decay to a pointer to element
+			c.useLibGlobal(n.Name)
+			// 0, mirroring local arrays).
+			return c.loadGlobal(c.globalLab[n.Name], c.globalTyp[n.Name])
+		}
+		if sym, ok2 := c.funcAddrSym(n.Name); ok2 {
+			c.emit("lea rax, [rip+%s]", sym)
+			c.resTyp = TInt
+			c.resSigned = false
+			c.resW = 8 // a function address is a pointer
+			return TInt, nil
+		}
+		if ev, ok2 := enumConsts[n.Name]; ok2 {
+			// An enumerator is a compile-time integer constant.
+			c.emit("mov rax, %d", ev)
+			c.resTyp = TInt
+			c.resSigned = true
+			c.resW = 4
+			if ev > 0x7fffffff || ev < -0x80000000 {
+				c.resW = 8
+			}
+			return TInt, nil
+		}
+		return TInt, fmt.Errorf("undefined variable %q", n.Name)
+	case *CompoundLit:
+		// Compound literal as a value. Aggregate objects never enter rax:
+		// consumers take their address through genLValue/structSrcAddr (the
+		// initialisation runs there). Arrays decay; scalars load.
+		t := n.Typ
+		if isAgg(t) {
+			return TInt, fmt.Errorf("line %d: cannot load struct/union compound literal directly", n.Line)
+		}
+		if err := c.genLValue(n); err != nil {
+			return TInt, err
+		}
+		if t.IsArray() {
+			// Decay: an array literal's value is its address.
+			c.emit("mov rax, r10")
 			c.resTyp = TInt
 			c.resSigned = false
 			c.resW = 8
 			return TInt, nil
 		}
-		if isAgg(vi.typ) {
-			// A whole struct/union value cannot be loaded into rax; consumers
-			// must go through genLValue (see structSrcAddr).
-			return TInt, fmt.Errorf("cannot load struct/union value %q directly", n.Name)
-		}
-		c.loadVar(vi)
+		c.loadVar(varInfo{off: c.clOff[n], typ: t})
 		return c.resTyp, nil
 	case *Unary:
 		return c.genUnary(n)
@@ -919,10 +1829,7 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		c.resW = 8 // sizeof is a size_t (8 bytes) on this target
 		return TInt, nil
 	case *CondExpr:
-		if _, err := c.genExprT(n.Cond); err != nil {
-			return c.resTyp, err
-		}
-		if err := c.ensureType(TInt); err != nil {
+		if err := c.genTruth(n.Cond); err != nil {
 			return TInt, err
 		}
 		lElse := c.newLabel("else")
@@ -1007,6 +1914,39 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		// and "s = make(1, 2);" are compiled; the assignment expression's own
 		// value is left undefined (rarely used).
 		if lt := c.exprType(n.Lhs); isAgg(lt) {
+			// Scalar RHS assigned to a _BitInt lvalue: convert via from_i64.
+			if isBig(lt) && !isBig(c.exprType(n.Rhs)) {
+				if _, err := c.genExprT(n.Rhs); err != nil {
+					return lt.Class(), err
+				}
+				if err := c.ensureType(TInt); err != nil {
+					return lt.Class(), err
+				}
+				// Park the RHS value in a frame temporary: genLValue on the
+				// left side is free to clobber r11 (element addressing uses
+				// it as its scratch), and the parked value is the argument.
+				c.emit("mov r11, rax")
+				c.tmpDepth++
+				valSlot := c.tmpSlot(c.tmpDepth)
+				c.emit("mov [rbp%+d], r11", valSlot)
+				if err := c.genLValue(n.Lhs); err != nil {
+					c.tmpDepth--
+					return lt.Class(), err
+				}
+				c.emit("mov r11, [rbp%+d]", valSlot)
+				c.tmpDepth--
+				sg := int64(0)
+				if lt.Signed {
+					sg = 1
+				}
+				c.callBigLib("__goclib_bi_from_i64", []bigArg{
+					{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(lt))}, {imm: sg},
+				})
+				c.resTyp = TInt
+				c.resSigned = lt.Signed
+				c.resW = 8
+				return lt.Class(), nil
+			}
 			if err := c.structSrcAddr(n.Rhs, c.exprType(n.Rhs)); err != nil {
 				return lt.Class(), err
 			}
@@ -1022,8 +1962,20 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 			}
 			c.emit("mov r11, [rbp%+d]", srcSlot)
 			c.tmpDepth--
-			c.copyBytes("r10", "r11", lt.Size)
-			c.releaseResStruct()
+			// _BitInt assignment with mismatched widths converts by widening
+			// (or truncating) instead of a raw byte copy.
+			if rt2 := c.exprType(n.Rhs); isBig(lt) && isBig(rt2) && rt2.Bits != lt.Bits {
+				name := "__goclib_bi_widen_u"
+				if rt2.Signed {
+					name = "__goclib_bi_widen_s"
+				}
+				c.callBigLib(name, []bigArg{
+					{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(lt))}, {imm: int64(bigWordsOf(rt2))},
+				})
+			} else {
+				c.copyBytes("r10", "r11", lt.Size)
+			}
+			c.releaseResBig()
 			c.resTyp = lt.Class()
 			c.resSigned = false
 			c.resW = 8
@@ -1108,7 +2060,13 @@ func (c *CG) genExpr(e Expr) error {
 // the -O optimisation level; today no pass consumes it, so every level
 // produces identical output (the IR seed keeps it a documented no-op until
 // the first real pass lands).
-func Gen(prog *Program, linux bool, opt int) (string, error) {
+// The winGUI flag (-mwindows) applies to PE targets only: it emits goa's
+// `subsystem windows` directive so the Subsystem field in the PE header is 2
+// (windows GUI) instead of 3 (console) and Windows allocates no console
+// window. The entry point itself is unchanged -- WinMain's arguments are a
+// CRT convention, not something the OS entry point provides; a GUI program
+// gets hInstance from GetModuleHandleA(NULL) like any CRT would.
+func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 	if goclibErr != nil {
 		return "", goclibErr
 	}
@@ -1118,6 +2076,7 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 		varEnts:      map[int]varInfo{},
 		scopes:       nil,
 		declUID:      map[*DeclStmt]int{},
+		clOff:        map[*CompoundLit]int{},
 		funcs:        map[string]bool{},
 		funcDefs:     map[string]*FuncDecl{},
 		calls:        map[string]bool{},
@@ -1126,6 +2085,8 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 		globalLab:    map[string]string{},
 		globalTyp:    map[string]*Type{},
 		staticVars:   map[string]string{},
+		tlsVars:      map[string]*tlsVarInfo{},
+		tlsList:      nil,
 		libEmitted:   map[string]bool{},
 		libGlobNames: map[string]bool{},
 		libGlobUsed:  map[string]bool{},
@@ -1133,6 +2094,14 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 		opt:          opt,
 	}
 	for _, g := range prog.Globals {
+		if g.IsTLS {
+			// Thread-local global: lay it out in the .tls section, not .data.
+			off := c.tlsPlace(g.Typ)
+			c.tlsVars[g.Name] = &tlsVarInfo{off: off, lab: "TL_" + g.Name, typ: g.Typ}
+			c.tlsList = append(c.tlsList, g)
+			c.globalTyp[g.Name] = g.Typ
+			continue
+		}
 		c.globals[g.Name] = true
 		c.globalLab[g.Name] = "G_" + g.Name
 		c.globalTyp[g.Name] = g.Typ
@@ -1158,6 +2127,9 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 			if _, dup := c.funcDefs[pr.Name]; !dup {
 				c.funcDefs[pr.Name] = pr
 			}
+			if pr.DLL != "" {
+				dllOf[pr.Name] = pr.DLL
+			}
 		}
 		for _, name := range lib.order {
 			if _, dup := c.funcDefs[name]; !dup {
@@ -1168,13 +2140,24 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 	for _, f := range prog.Funcs {
 		c.funcs[f.Name] = true
 		c.funcDefs[f.Name] = f
+		if f.Name == "main" && len(f.Params) > 0 {
+			// main(int argc, char **argv) -- the Windows entry stub must
+			// parse the command line before calling it. main(void) skips
+			// that entirely (see the need["__goclib_get_args"] pull-in).
+			c.mainTakesArgs = true
+		}
 	}
-	// Prototypes (from #include'd headers) are registered only for call-site
-	// double-promotion; they are deliberately NOT added to c.funcs, so a
-	// prototype for a goclib function still triggers goclib inclusion.
-	for _, f := range prog.Prototypes {
-		c.funcDefs[f.Name] = f
-	}
+		// Prototypes (from #include'd headers) are registered only for call-site
+		// double-promotion; they are deliberately NOT added to c.funcs, so a
+		// prototype for a goclib function still triggers goclib inclusion.
+		for _, f := range prog.Prototypes {
+			c.funcDefs[f.Name] = f
+		}
+		for _, f := range prog.Prototypes {
+			if f.DLL != "" {
+				dllOf[f.Name] = f.DLL
+			}
+		}
 
 	var body strings.Builder
 	for _, f := range prog.Funcs {
@@ -1191,27 +2174,40 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 	// C library provides exit, that call must reach the C function (whose
 	// label would collide with an extern syscall stub of the same name), so
 	// pull its body in here rather than importing the symbol.
-	if c.linux {
-		if lib := clibCStore(c.linux); lib != nil {
-			if _, isC := lib.funcs["exit"]; isC {
-				c.need["exit"] = true
-			}
-		}
-	} else {
-		// The Windows PE entry point receives no argc/argv, so _start calls
-		// this goclib helper to build them from GetCommandLineA before main.
+	// Windows: a PE entry point receives no argc/argv. Parsing the command
+	// line is pure overhead for main(void) programs, so the stub only calls
+	// this goclib helper when main actually declares parameters (there is no
+	// other way to reach argc/argv in C).
+	if !c.linux && c.mainTakesArgs {
 		c.need["__goclib_get_args"] = true
-		// The entry stub terminates through the C library's exit (not a bare
-		// ExitProcess) so atexit handlers registered by main run on both
-		// platforms; exit itself ends in __goclib_exit -> ExitProcess.
-		if lib := clibCStore(c.linux); lib != nil {
-			if _, isC := lib.funcs["exit"]; isC {
-				c.need["exit"] = true
-			}
+	}
+	// Entry-stub terminator. Start from the bare __goclib_exit (just
+	// ExitProcess / exit_group) and upgrade to the full C exit -- atexit
+	// handlers plus the std*-stream flush the C standard requires -- only
+	// when the program actually touched stdout or stderr (every FILE-layer
+	// output goes through the __goclib_stdout/__goclib_stderr accessors) or
+	// registered an atexit handler. A program that never prints -- or prints
+	// only through the print builtin, whose __goclib_write is an unbuffered
+	// direct OS write -- then carries no flush machinery at all. Without a
+	// C library the stub keeps calling extern exit (legacy behaviour).
+	c.exitSym = "exit"
+	if lib := clibCStore(c.linux); lib != nil {
+		if _, ok := lib.funcs["__goclib_exit"]; ok {
+			c.need["__goclib_exit"] = true
+			c.exitSym = "__goclib_exit"
 		}
 	}
 	if err := c.genClibFuncs(); err != nil {
 		return "", err
+	}
+	if c.exitSym == "__goclib_exit" && c.needsFullExit() {
+		// Upgrade: pull the full C exit (its flush chain is partly there
+		// already) and generate whatever it needs in a second fixpoint.
+		c.need["exit"] = true
+		c.exitSym = "exit"
+		if err := c.genClibFuncs(); err != nil {
+			return "", err
+		}
 	}
 	// -O1 and above: structured passes over the whole-program body stream.
 	// Inlining first (its argument spills then feed constants to the
@@ -1276,10 +2272,10 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 			imports = append(imports, fmt.Sprintf("extern %s\n", name))
 			continue
 		}
-		dll, ok := externDLL[name]
+		dll, ok := dllFor(name)
 		if !ok {
-			return "", fmt.Errorf("unknown function %q: not in goclib (%s), and not in win32.def",
-				name, strings.Join(goclibNames(c.linux), ", "))
+			return "", fmt.Errorf("unknown function %q: not in goclib (%s), and no DLL named on its prototype (declare it as 'extern ret %s(args), dllname;')",
+				name, strings.Join(goclibNames(c.linux), ", "), name)
 		}
 		imports = append(imports, fmt.Sprintf("extern %s, %s\n", name, dll))
 	}
@@ -1289,6 +2285,9 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 	out.WriteString("; generated by goc -- assembled by goa, no gcc involved\n")
 	out.WriteString("section .text\n")
 	out.WriteString("global _start\n")
+	if !linux && winGUI {
+		out.WriteString("subsystem windows\n")
+	}
 	out.WriteString("\n")
 	for _, e := range imports {
 		out.WriteString(e)
@@ -1332,52 +2331,152 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 	out.WriteString("\tmov r12, [rsp]\n")
 	out.WriteString("\tlea r13, [rsp+8]\n")
 	out.WriteString("\tand rsp, -16\n")
+	if c.linux && c.tlsBytes > 0 {
+		// Point the fs base at the .tls block (arch_prctl ARCH_SET_FS=0x1002)
+		// so the main thread's TLS variables are reachable through the fs
+		// segment. arch_prctl is emitted inline (mov rax,158; syscall).
+		out.WriteString("\tlea rsi, [rip+__tls_start]\n")
+		out.WriteString("\tmov rdi, 0x1002\n")
+		out.WriteString("\tmov rax, 158\n")
+		out.WriteString("\tsyscall\n")
+	}
 	out.WriteString(strInit.String())
 	if c.linux {
 		out.WriteString("\tmov rdi, r12\n")
 		out.WriteString("\tmov rsi, r13\n")
 		out.WriteString("\tcall main\n")
 		out.WriteString("\tmov rdi, rax\n")
-		out.WriteString("\tcall exit\n\n")
+		out.WriteString("\tcall " + c.exitSym + "\n\n")
 	} else {
 		out.WriteString("\tsub rsp, 48\n")
-		// A PE entry point receives no argc/argv, so build them from
-		// GetCommandLineA via the goclib helper before main runs.
-		out.WriteString("\tlea rcx, [rsp+32]\n")
-		out.WriteString("\tcall __goclib_get_args\n")
-		out.WriteString("\tmov rcx, rax\n")
-		out.WriteString("\tmov rdx, [rsp+32]\n")
+		if c.mainTakesArgs {
+			// A PE entry point receives no argc/argv, so build them from
+			// GetCommandLineA via the goclib helper before main runs. Skipped
+			// for main(void) programs -- see the need[...] pull-in above.
+			out.WriteString("\tlea rcx, [rsp+32]\n")
+			out.WriteString("\tcall __goclib_get_args\n")
+			out.WriteString("\tmov rcx, rax\n")
+			out.WriteString("\tmov rdx, [rsp+32]\n")
+		}
 		out.WriteString("\tcall main\n")
 		out.WriteString("\tmov rcx, rax\n")
-		out.WriteString("\tcall exit\n\n")
+		out.WriteString("\tcall " + c.exitSym + "\n\n")
 	}
 	out.WriteString(body.String())
 
-	// Program-level (global / static) variables live in a writable .data
-	// section, referenced via rip. Only constant integer initialisers are
-	// supported today (goclib's globals are all simple constants). Arrays are
-	// zero-filled for their full byte size so rip-relative indexing works.
-	// Built-in library globals come last, and only those the program actually
-	// referenced (useLibGlobal).
-	if len(prog.Globals) > 0 || len(c.staticList) > 0 || len(c.libGlobUsed) > 0 {
-		out.WriteString("\nsection .data\n")
-		for _, g := range prog.Globals {
-			if err := c.emitGlobalVar(&out, g, c.globalLab[g.Name]); err != nil {
-				return "", err
+	// Program-level (global / static) variables live in writable sections,
+	// referenced via rip. Zero-initialised globals go to .bss (no file bytes,
+	// zero-filled by the loader), which shrinks the on-disk image without
+	// changing the run-time layout; non-zero globals stay in .data. Only
+	// constant integer initialisers are supported today (goclib's globals are
+	// all simple constants). Arrays are zero-filled for their full byte size so
+	// rip-relative indexing works. Built-in library globals come last, and only
+	// those the program actually referenced (useLibGlobal).
+	if len(prog.Globals) > 0 || len(c.staticList) > 0 || len(c.libGlobUsed) > 0 || c.tlsBytes > 0 {
+		// Decide which sections we actually need so we don't open an empty one.
+		needData := false
+		needBss := false
+		checkZero := func(g *DeclStmt) {
+			if g.IsTLS {
+				return
 			}
+			if c.isZeroInit(g) {
+				needBss = true
+			} else {
+				needData = true
+			}
+		}
+		for _, g := range prog.Globals {
+			checkZero(g)
 		}
 		for _, se := range c.staticList {
-			if err := c.emitGlobalVar(&out, se.d, se.lab); err != nil {
-				return "", err
-			}
+			checkZero(se.d)
 		}
 		for _, g := range c.libGlobals {
-			if !c.libGlobUsed[g.Name] {
-				continue
+			if c.libGlobUsed[g.Name] {
+				checkZero(g)
 			}
-			if err := c.emitGlobalVar(&out, g, c.globalLab[g.Name]); err != nil {
+		}
+		if needData {
+			out.WriteString("\nsection .data\n")
+			for _, g := range prog.Globals {
+				if g.IsTLS || c.isZeroInit(g) {
+					continue
+				}
+				if err := c.emitGlobalVar(&out, g, c.globalLab[g.Name]); err != nil {
+					return "", err
+				}
+			}
+			for _, se := range c.staticList {
+				if c.isZeroInit(se.d) {
+					continue
+				}
+				if err := c.emitGlobalVar(&out, se.d, se.lab); err != nil {
+					return "", err
+				}
+			}
+			for _, g := range c.libGlobals {
+				if !c.libGlobUsed[g.Name] || c.isZeroInit(g) {
+					continue
+				}
+				if err := c.emitGlobalVar(&out, g, c.globalLab[g.Name]); err != nil {
+					return "", err
+				}
+			}
+		}
+		if needBss {
+			out.WriteString("\nsection .bss\n")
+			for _, g := range prog.Globals {
+				if g.IsTLS || !c.isZeroInit(g) {
+					continue
+				}
+				c.emitGlobalBSS(&out, g, c.globalLab[g.Name])
+			}
+			for _, se := range c.staticList {
+				if !c.isZeroInit(se.d) {
+					continue
+				}
+				c.emitGlobalBSS(&out, se.d, se.lab)
+			}
+			for _, g := range c.libGlobals {
+				if !c.libGlobUsed[g.Name] || !c.isZeroInit(g) {
+					continue
+				}
+				c.emitGlobalBSS(&out, g, c.globalLab[g.Name])
+			}
+		}
+		if c.tlsBytes > 0 {
+			// TLS index slot, consumed by the Windows PE loader. The OS assigns
+			// this module's TLS index and writes it here at load time; the code
+			// generated for _Thread_local reads it to locate the thread's TLS
+			// block via gs:0x58. Zero is the right starting value (and is also
+			// what the loader overwrites). It lives in a real .data slot (not
+			// .bss) so the loader's write has a backing virtual address.
+			if !needData {
+				out.WriteString("\nsection .data\n")
+			}
+			out.WriteString("G_goc_tls_index dq 0\n")
+		}
+	}
+
+	// Thread-local storage: every _Thread_local variable (global or static
+	// local) is laid out in the .tls section, one 8-aligned block per thread.
+	// __tls_start names the section base; each variable carries its own label so
+	// the access code can lea it (Linux) or compute gs:[0x58]+offset (Windows).
+	if c.tlsBytes > 0 {
+		out.WriteString("\nsection .tls\n")
+		out.WriteString("__tls_start:\n")
+		pos := 0
+		for _, g := range c.tlsList {
+			t := c.tlsVars[g.Name]
+			if pos < t.off {
+				out.WriteString(fmt.Sprintf("db %d dup(0)\n", t.off-pos))
+				pos = t.off
+			}
+			if err := c.emitGlobalVar(&out, g, t.lab); err != nil {
 				return "", err
 			}
+			pos += c.tlsAlignedSize(g.Typ)
 		}
 	}
 
@@ -1393,6 +2492,17 @@ func Gen(prog *Program, linux bool, opt int) (string, error) {
 		for _, v := range c.doubles {
 			lab := c.doubleLab[v]
 			out.WriteString(fmt.Sprintf("%s dq %s\n", lab, formatDouble(v)))
+		}
+	}
+	if len(c.bigLits) > 0 {
+		out.WriteString("\nsection .rdata\n")
+		for i, words := range c.bigLits {
+			lab := fmt.Sprintf("LBIG%d", i)
+			parts := make([]string, len(words))
+			for j, w := range words {
+				parts[j] = fmt.Sprintf("0x%x", w)
+			}
+			out.WriteString(fmt.Sprintf("%s dq %s\n", lab, strings.Join(parts, ", ")))
 		}
 	}
 	asm := out.String()
@@ -2627,6 +3737,7 @@ func (c *CG) popScope() {
 func (c *CG) declareVar(name string, info varInfo) int {
 	uid := c.varUID
 	c.varUID++
+	info.addr = c.addrTaken[name]
 	c.varEnts[uid] = info
 	c.scopes[len(c.scopes)-1][name] = uid
 	return uid
@@ -2702,7 +3813,17 @@ func (c *CG) genFunc(f *FuncDecl) error {
 				gather(d, swDepth)
 			}
 		case *DeclStmt:
-			if n.Storage == "static" {
+			if n.IsTLS {
+				// Thread-local variable: one instance per thread, laid out in
+				// the .tls section. The offset is assigned up-front so the
+				// access code generated later can reach it. Address/value
+				// resolution goes through c.tlsVars (checked before staticVars).
+				off := c.tlsPlace(n.Typ)
+				lab := fmt.Sprintf("TL_st%d_%s", c.staticSeq, n.Name)
+				c.staticSeq++
+				c.tlsVars[n.Name] = &tlsVarInfo{off: off, lab: lab, typ: n.Typ}
+				c.tlsList = append(c.tlsList, n)
+			} else if n.Storage == "static" {
 				// Static local: lives in .data under a unique label, persists
 				// across calls, and is initialised once at load time. No frame
 				// slot is allocated; loadVar/genLValue resolve it via
@@ -2761,14 +3882,24 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// aggregates likewise never live in a register. Everything else that is a
 	// small int is a candidate for a callee-save register home.
 	addrTaken := c.findAddressTaken(f)
-	regPool := []string{"rbx", "r12", "r13", "r14"}
+	c.addrTaken = addrTaken
+	// regPool is the set of callee-save GPRs available for local-register
+	// homes in THIS function. It starts as the full calleeSaveAll pool; an
+	// inline-assembly function forces it empty so every local lives on the
+	// stack (the asm text only knows [rbp+off] slots). Regardless of how many
+	// homes are handed out, the prologue always pushes the WHOLE
+	// calleeSaveAll pool (see calleeSaveAll's doc comment) so the callee-save
+	// ABI contract is honoured for every caller.
+	regPool := calleeSaveAll
 	// A function that contains an inline-assembly block must keep every
 	// local on the stack: the asm text binds C variable names to their
 	// frame slots ([rbp+off]) or, worse, to a callee-save register home
 	// that the hand-written asm neither knows about nor preserves. Forcing
 	// the whole pool empty (regPool = nil below makes "ri < len(regPool)"
 	// always false) gives the asm a stable, addressable memory home for
-	// every variable it names.
+	// every variable it names. The callee-save registers are still pushed
+	// (and popped) so the asm block, if it uses them as scratch, cannot
+	// damage a caller's cached locals.
 	if hasAsm {
 		regPool = nil
 	}
@@ -2781,7 +3912,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 		// XMM registers like double (and is 4 bytes in memory), so it must
 		// stay on the stack.
 		intClass := d.typ != nil && !d.typ.IsArray() && !d.typ.IsFloating() &&
-			d.typ.Kind != KStruct && d.typ.Kind != KUnion
+			d.typ.Kind != KStruct && d.typ.Kind != KUnion && d.typ.Kind != KBitInt
 		if intClass && !addrTaken[d.name] && ri < len(regPool) {
 			regOf[d.name] = regPool[ri]
 			c.usedRegs = append(c.usedRegs, regPool[ri])
@@ -2800,7 +3931,20 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// (byte-packed, matching how string literals and malloc'd buffers are
 	// laid out), while a T[] keeps the 8-byte-per-element stride. Scalars
 	// always take an 8-byte slot in this relaxed toy model.
-	regArea := 8 * len(c.usedRegs)
+	// The callee-save save region lives just below rbp, laid down by the
+	// prologue as a chain of PUSHes: `push rbx; push r12; push r13; push r14`
+	// places the four registers at [rbp-8], [rbp-16], [rbp-24], [rbp-32] --
+	// each an 8-byte slot, so the save region physically spans [rbp-8..rbp-39]
+	// (the last slot is [rbp-32..rbp-39]). Locals must therefore start at
+	// rbp-40 -- 8 bytes below the save region -- or a sub-8-byte local
+	// (char/short/_Bool) would overlap r14's slot and be silently clobbered.
+	// regArea therefore carries an extra +8 gap on top of the
+	// 8*len(calleeSaveAll) push bytes. (The leading `push rbp` stores the
+	// caller's rbp AT rbp, i.e. offset 0, not within this region.) Every local
+	// and parameter-down offset is expressed relative to it. It is derived from
+	// len(calleeSaveAll), not len(c.usedRegs): even registers with no local
+	// home are pushed to honour the callee-save ABI contract.
+	regArea := 8*len(calleeSaveAll) + 8
 	localBytes := 0
 
 	// Parameter homes. Register parameters are spilled into this function's
@@ -2869,6 +4013,11 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	}
 
 	for _, d := range stackDecls {
+		// Honour a _Alignas(N) request: round the slot start up to the
+		// requested alignment (no-op when none was specified, Align==0).
+		if a := d.typ.Align; a > 1 {
+			localBytes = (localBytes + a - 1) / a * a
+		}
 		if d.typ != nil && d.typ.IsArray() {
 			ln := d.typ.Len
 			if ln < 1 {
@@ -2881,7 +4030,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			}
 			off := -(regArea + localBytes + size)
 			localBytes += size
-			c.varEnts[d.uid] = varInfo{off: off, typ: d.typ}
+			c.varEnts[d.uid] = varInfo{off: off, typ: d.typ, addr: c.addrTaken[d.name]}
 		} else {
 			// Scalar (or struct/union aggregate) slot. The slot width MUST
 			// match the width used by loadVar/storeVar/lvalueWidth, which all
@@ -2896,8 +4045,35 @@ func (c *CG) genFunc(f *FuncDecl) error {
 				w = 1
 			}
 			localBytes += w
-			c.varEnts[d.uid] = varInfo{off: -(regArea + localBytes), typ: d.typ}
+			c.varEnts[d.uid] = varInfo{off: -(regArea + localBytes), typ: d.typ,
+				addr: c.addrTaken[d.name]}
 		}
+	}
+	// Compound literals: each occurrence in the body gets its own persistent
+	// frame slot, allocated before the frame size is frozen.
+	for _, cl := range c.collectCompoundLits(f) {
+		t := cl.Typ
+		var size int
+		switch {
+		case t != nil && t.IsArray():
+			ln := t.Len
+			if ln < 1 {
+				ln = 1
+			}
+			size = c.typeWidth(t.Elem) * ln
+		case t != nil && isAgg(t):
+			size = t.Size
+		default:
+			size = c.slotWidth(t)
+		}
+		if size < 1 {
+			size = 1
+		}
+		if size%8 != 0 { // keep the next slot 8-byte aligned
+			size += 8 - size%8
+		}
+		localBytes += size
+		c.clOff[cl] = -(regArea + localBytes)
 	}
 	c.regArea = regArea
 	c.localBytes = localBytes
@@ -2929,7 +4105,13 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	if c.linux && f.Variadic {
 		pad = 8 * len(c.argRegs())
 	}
-	frame := pad + regArea + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave
+	// NOTE: regArea is intentionally NOT added here. The callee-save save
+	// region is now allocated by the prolog's pushes (below rbp), not by the
+	// `sub rsp` frame allocation, so `frame` covers only pad + locals + scratch
+	// + switch depth + variadic save area. The +8 mirrors the +8 gap baked into
+	// regArea above: the locals now start 8 bytes lower (rbp-40 instead of
+	// rbp-32), so the frame must grow by 8 to keep them inside it.
+	frame := 8 + pad + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave
 	if frame%16 != 0 {
 		frame += 16 - frame%16
 	}
@@ -2946,11 +4128,22 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	c.line(f.Name + ":\n")
 	c.emit("push rbp")
 	c.emit("mov rbp, rsp")
-	c.emit("sub rsp, %d", frame)
-	// Save only the callee-save registers we actually use as local homes.
-	for i, r := range c.usedRegs {
-		c.emit("mov [rbp-%d], %s", 8*(i+1), r)
+	// Save the ENTIRE callee-save pool (rbx, r12, r13, r14) by PUSHING them,
+	// not just the registers we happen to use as local homes. A push lands
+	// each reg at [rbp-8*(i+1)], and gocrun registers a per-function unwind
+	// table built from this exact prolog shape (the Windows x64 unwinder
+	// reverses pushes, not rbp-relative stores). Preserving all of them -- not
+	// only the ones with a local home -- is what makes the callee-save ABI
+	// contract hold: any callee that draws a home from this pool would
+	// otherwise clobber a caller's cached local across the call (e.g. a
+	// caller with `int a,b,c,d` whose c/d live in r13/r14 get trashed by
+	// printf, which legitimately uses r13/r14 for its own locals).
+	for _, r := range calleeSaveAll {
+		c.emit("push %s", r)
 	}
+	c.emitFrameAlloc(frame)
+	c.maxTmp = 0
+	c.grownMaxTmp = 0
 	// Park the hidden struct-return pointer in its frame slot before any
 	// call can clobber the first integer argument register.
 	if isSret {
@@ -3046,6 +4239,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// full epilogue, so emitting another here would leave dead code after the
 	// ret (e.g. `mov rsp, rbp; pop rbp; ret` that can never execute).
 	if !c.blockEndsWithReturn(f.Body) {
+		c.growFrameForTemps()
 		c.emitEpilogue()
 	}
 	c.popScope() // function-body block scope
@@ -3072,9 +4266,91 @@ func (c *CG) blockEndsWithReturn(b *Block) bool {
 
 // emitEpilogue restores the saved callee-save registers, then returns.
 // (goa has no `leave`, so spell it out.)
+// growFrameForTemps widens the prologue's `sub rsp, N` when the body claimed
+// more expression-temporary slots than the fixed scratchSlots reservation.
+// A _BitInt(N) temporary is ceil(N/64) slots wide, so a 512 KiB value needs
+// 65536 of them -- without this the temps would live below rsp and every
+// call would trample them.
+func (c *CG) emitFrameAlloc(n int) {
+	start := len(c.insts)
+	// Windows commits stack one guard page at a time, so a frame of many
+	// pages cannot simply be skipped over with `sub rsp, N`: touching a
+	// page below the guard page is an access violation, not a request to
+	// grow (that is what MSVC's __chkstk is for). Walk down a page at a
+	// time, probing each, then correct the overshoot. Linux expands the
+	// stack for any access below rsp within the rlimit, so it needs none.
+	if !c.linux && n > 4096 {
+		c.emit("mov r11, %d", n)
+		lab := fmt.Sprintf(".Lchkstk%d", c.chkSeq)
+		c.chkSeq++
+		c.line(lab + ":")
+		c.emit("sub rsp, 4096")
+		c.emit("sub r11, 4096")
+		c.emit("mov rax, [rsp]") // touch (mov does not disturb the flags)
+		c.emit("jg %s", lab)
+		c.emit("sub rsp, r11") // r11 <= 0: give back the overshoot
+	} else {
+		c.emit("sub rsp, %d", n)
+	}
+	c.frameIdx = start
+	c.frameLen = len(c.insts) - start
+	c.curFrame = n
+}
+
+func (c *CG) growFrameForTemps() {
+	if c.maxTmp <= scratchSlots || c.frameIdx < 0 || c.frameIdx+1 > len(c.insts) {
+		return
+	}
+	// Grow by the DELTA since the last growth, not the full 8*(maxTmp-32)
+	// again: this helper runs once per return/epilogue site (a function with
+	// hundreds of returns would otherwise multiply its frame by that count --
+	// pi100k's main reached a 402 MB frame and died with stack overflow).
+	from := c.grownMaxTmp
+	if from < scratchSlots {
+		from = scratchSlots
+	}
+	if c.maxTmp <= from {
+		return
+	}
+	extra := 8 * (c.maxTmp - from)
+	c.grownMaxTmp = c.maxTmp
+	need := c.curFrame + extra
+	if need%16 != 0 {
+		need += 16 - need%16
+	}
+	if need <= c.curFrame {
+		return
+	}
+	// Re-emit the whole allocation block in place: the frame may cross the
+	// stack-probe threshold only now that the body's temporaries are known.
+	rest := append([]Inst{}, c.insts[c.frameIdx+c.frameLen:]...)
+	c.insts = c.insts[:c.frameIdx]
+	c.emitFrameAlloc(need)
+	c.insts = append(c.insts, rest...)
+}
+
 func (c *CG) emitEpilogue() {
-	for i := len(c.usedRegs) - 1; i >= 0; i-- {
-		c.emit("mov %s, [rbp-%d]", c.usedRegs[i], 8*(i+1))
+	// Restore the callee-save registers saved by the prolog's PUSHes.
+	//
+	// The prolog does `push rbp; mov rbp,rsp; push rbx,r12,r13,r14; sub rsp,
+	// frame`, so the saved registers sit at fixed rbp-relative slots:
+	// rbx at [rbp-8], r12 at [rbp-16], r13 at [rbp-24], r14 at [rbp-32].
+	//
+	// It is essential to restore them with rbp-RELATIVE loads, NOT with `pop`:
+	// the prolog's `sub rsp, frame` is not undone until the later `mov rsp,
+	// rbp`, so at this point rsp is still at rbp-32-frame. A `pop` would read
+	// [rbp-32-frame] and friends -- the uninitialised local area, not the saved
+	// registers -- silently zeroing (or scrambling) every caller-cached local
+	// that lived in a callee-save register across the call (e.g. `int a,b,c,d`
+	// whose values a callee was supposed to preserve per the ABI). Because the
+	// restore must be position-independent w.r.t. rsp, we load from [rbp-8*(i+1)]
+	// exactly where the pushes stored them.
+	//
+	// Always the whole calleeSaveAll pool, not just c.usedRegs: a callee must
+	// restore every register it promised to preserve, even ones with no local
+	// home in this function, or a caller's cached locals would be lost.
+	for i := 0; i < len(calleeSaveAll); i++ {
+		c.emit("mov %s, [rbp-%d]", calleeSaveAll[i], 8*(i+1))
 	}
 	c.emit("mov rsp, rbp")
 	c.emit("pop rbp")
@@ -3164,13 +4440,43 @@ func (c *CG) genStmt(s Stmt) error {
 			// Whole-aggregate declaration: copy the initialiser's bytes (or
 			// zero-fill) into the local slot. The value never enters rax.
 			if n.Init != nil {
-				if err := c.structSrcAddr(n.Init, c.exprType(n.Init)); err != nil {
+				it := c.exprType(n.Init)
+				if isBig(vi.typ) && !isBig(it) {
+					// scalar initialiser for a _BitInt local
+					if _, err := c.genExprT(n.Init); err != nil {
+						return err
+					}
+					if err := c.ensureType(TInt); err != nil {
+						return err
+					}
+					c.emit("mov r11, rax")
+					c.emit("lea r10, [rbp%+d]", vi.off)
+					sg := int64(0)
+					if vi.typ.Signed {
+						sg = 1
+					}
+					c.callBigLib("__goclib_bi_from_i64", []bigArg{
+						{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(vi.typ))}, {imm: sg},
+					})
+					return nil
+				}
+				if err := c.structSrcAddr(n.Init, it); err != nil {
 					return err
 				}
 				c.emit("mov r11, r10") // r11 = source address
 				c.emit("lea r10, [rbp%+d]", vi.off)
-				c.copyBytes("r10", "r11", vi.typ.Size)
-				c.releaseResStruct()
+				if isBig(vi.typ) && isBig(it) && it.Bits != vi.typ.Bits {
+					name := "__goclib_bi_widen_u"
+					if it.Signed {
+						name = "__goclib_bi_widen_s"
+					}
+					c.callBigLib(name, []bigArg{
+						{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(vi.typ))}, {imm: int64(bigWordsOf(it))},
+					})
+				} else {
+					c.copyBytes("r10", "r11", vi.typ.Size)
+				}
+				c.releaseResBig()
 			} else {
 				c.emit("lea r10, [rbp%+d]", vi.off)
 				c.zeroBytes("r10", vi.typ.Size)
@@ -3188,7 +4494,23 @@ func (c *CG) genStmt(s Stmt) error {
 		} else if vi.reg != "" {
 			c.emit("xor %s, %s", vi.reg, vi.reg)
 		} else {
-			c.emit("mov [rbp%+d], 0", vi.off)
+			// Zero a stack scalar that has no initialiser. The store MUST use
+			// the variable's slot width: a 1-byte _Bool/char must emit
+			// `mov byte [...]`, otherwise goa lowers the bare `mov [mem], 0`
+			// to an 8-byte store that also zeroes the seven adjacent higher
+			// stack slots and silently corrupts neighbouring narrow locals
+			// (the #81 _Bool-local codegen bug). genStoreElem uses the same
+			// width switch.
+			switch c.slotWidth(vi.typ) {
+			case 1:
+				c.emit("mov byte [rbp%+d], 0", vi.off)
+			case 2:
+				c.emit("mov word [rbp%+d], 0", vi.off)
+			case 4:
+				c.emit("mov dword [rbp%+d], 0", vi.off)
+			default:
+				c.emit("mov [rbp%+d], 0", vi.off)
+			}
 		}
 	case *AssignStmt:
 		// Whole-aggregate assignment shares the AssignExpr code path (which
@@ -3245,23 +4567,56 @@ func (c *CG) genStmt(s Stmt) error {
 		if _, err := c.genExprT(n.E); err != nil {
 			return err
 		}
-		// A discarded struct-returning call leaves its result buffer live;
-		// nothing will consume it here, so release it.
-		c.releaseResStruct()
+		// A discarded value leaves its result buffer live; nothing will
+		// consume it here, so release it.
+		c.releaseResBig()
 	case *ReturnStmt:
 		if isAgg(c.curRet) {
-			// Struct/union return: copy the value through the hidden result
-			// pointer into the caller's buffer. rax is never used.
+			// Struct/union/_BitInt return: copy the value through the hidden
+			// result pointer into the caller's buffer. rax is never used.
 			if n.E == nil {
 				return fmt.Errorf("missing return value in function returning %s", c.curRet.String())
 			}
-			if err := c.structSrcAddr(n.E, c.exprType(n.E)); err != nil {
+			et := c.exprType(n.E)
+			if isBig(c.curRet) && !isBig(et) {
+				// scalar return value for a _BitInt function
+				if _, err := c.genExprT(n.E); err != nil {
+					return err
+				}
+				if err := c.ensureType(TInt); err != nil {
+					return err
+				}
+				c.emit("mov r11, rax")
+				c.emit("mov r10, [rbp%+d]", c.sretSlot)
+				sg := int64(0)
+				if c.curRet.Signed {
+					sg = 1
+				}
+				c.callBigLib("__goclib_bi_from_i64", []bigArg{
+					{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(c.curRet))}, {imm: sg},
+				})
+				c.growFrameForTemps()
+				c.emitEpilogue()
+				return nil
+			}
+			if err := c.structSrcAddr(n.E, et); err != nil {
 				return err
 			}
 			c.emit("mov r11, r10")                  // r11 = source address
 			c.emit("mov r10, [rbp%+d]", c.sretSlot) // r10 = caller's buffer
-			c.copyBytes("r10", "r11", c.curRet.Size)
-			c.releaseResStruct()
+			if isBig(c.curRet) && isBig(et) && et.Bits != c.curRet.Bits {
+				name := "__goclib_bi_widen_u"
+				if et.Signed {
+					name = "__goclib_bi_widen_s"
+				}
+				c.callBigLib(name, []bigArg{
+					{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(c.curRet))}, {imm: int64(bigWordsOf(et))},
+				})
+			} else {
+				c.copyBytes("r10", "r11", c.curRet.Size)
+			}
+			c.releaseResBig()
+			c.growFrameForTemps()
 			c.emitEpilogue()
 			return nil
 		}
@@ -3284,14 +4639,12 @@ func (c *CG) genStmt(s Stmt) error {
 		} else {
 			c.emit("mov rax, 0")
 		}
+		c.growFrameForTemps()
 		c.emitEpilogue()
 	case *IfStmt:
 		lElse := c.newLabel("else")
 		lEnd := c.newLabel("endif")
-		if _, err := c.genExprT(n.Cond); err != nil {
-			return err
-		}
-		if err := c.ensureType(TInt); err != nil {
+		if err := c.genTruth(n.Cond); err != nil {
 			return err
 		}
 		c.emit("cmp rax, 0")
@@ -3321,10 +4674,7 @@ func (c *CG) genStmt(s Stmt) error {
 		lTop := c.newLabel("while")
 		lEnd := c.newLabel("wend")
 		c.line(lTop + ":\n")
-		if _, err := c.genExprT(n.Cond); err != nil {
-			return err
-		}
-		if err := c.ensureType(TInt); err != nil {
+		if err := c.genTruth(n.Cond); err != nil {
 			return err
 		}
 		c.emit("cmp rax, 0")
@@ -3361,11 +4711,7 @@ func (c *CG) genStmt(s Stmt) error {
 		}
 		c.line(lTop + ":\n")
 		if n.Cond != nil {
-			if _, err := c.genExprT(n.Cond); err != nil {
-				c.popScope()
-				return err
-			}
-			if err := c.ensureType(TInt); err != nil {
+			if err := c.genTruth(n.Cond); err != nil {
 				c.popScope()
 				return err
 			}
@@ -3411,10 +4757,7 @@ func (c *CG) genStmt(s Stmt) error {
 			return bodyErr
 		}
 		c.line(lCont + ":\n")
-		if _, err := c.genExprT(n.Cond); err != nil {
-			return err
-		}
-		if err := c.ensureType(TInt); err != nil {
+		if err := c.genTruth(n.Cond); err != nil {
 			return err
 		}
 		c.emit("cmp rax, 0")
@@ -3901,34 +5244,82 @@ func (c *CG) genLValue(e Expr) error {
 	switch n := e.(type) {
 	case *Ident:
 		// Locals and globals shadow a same-named function (C block scoping,
-		// same order as the value path and the checker). Only after no
-		// variable matches may this name a function: "&add" is just another
-		// spelling of "add"; both yield the function's address.
-		vi, ok := c.lookupVar(n.Name)
-		if !ok {
-			if lab, ok2 := c.staticVars[n.Name]; ok2 {
-				// Address of a static local: rip-relative lea into .data.
+		// same order as the value path and the checker). A function-local
+		// name is resolved FIRST so it is never mistaken for a file-scope
+		// thread-local global of the same spelling. Only after no variable
+		// matches may this name a function: "&add" is just another spelling
+		// of "add"; both yield the function's address.
+		if vi, ok := c.lookupVar(n.Name); ok {
+			if vi.reg != "" {
+				// Reached only if a register-cached local had its address taken,
+				// which findAddressTaken should have prevented.
+				return fmt.Errorf("cannot take address of register-allocated variable %q", n.Name)
+			}
+			c.emit("lea r10, [rbp%+d]", vi.off)
+			return nil
+		}
+		// File-scope names. A static local shadows a same-named TLS global
+		// within its function, but a static thread-local local still needs the
+		// segment reach (also registered in tlsVars).
+		if lab, ok2 := c.staticVars[n.Name]; ok2 {
+			if _, isTLS := c.tlsVars[n.Name]; !isTLS {
 				c.emit("lea r10, [rip+%s]", lab)
 				return nil
 			}
-			if c.globals[n.Name] {
-				// Address of a global: rip-relative lea into .data.
-				c.useLibGlobal(n.Name)
-				c.emit("lea r10, [rip+%s]", c.globalLab[n.Name])
-				return nil
-			}
-			if sym, ok2 := c.funcAddrSym(n.Name); ok2 {
-				c.emit("lea r10, [rip+%s]", sym)
-				return nil
-			}
-			return fmt.Errorf("undefined variable %q", n.Name)
 		}
-		if vi.reg != "" {
-			// Reached only if a register-cached local had its address taken,
-			// which findAddressTaken should have prevented.
-			return fmt.Errorf("cannot take address of register-allocated variable %q", n.Name)
+		if _, ok := c.tlsVars[n.Name]; ok {
+			// Thread-local variable: its address is reached through the
+			// fs/gs segment, not a rip-relative .data label.
+			if err := c.genTLSAddr(n.Name); err != nil {
+				return err
+			}
+			return nil
 		}
-		c.emit("lea r10, [rbp%+d]", vi.off)
+		if lab, ok2 := c.staticVars[n.Name]; ok2 {
+			// Address of a static local: rip-relative lea into .data.
+			c.emit("lea r10, [rip+%s]", lab)
+			return nil
+		}
+		if c.globals[n.Name] {
+			// Address of a global: rip-relative lea into .data.
+			c.useLibGlobal(n.Name)
+			c.emit("lea r10, [rip+%s]", c.globalLab[n.Name])
+			return nil
+		}
+		if sym, ok2 := c.funcAddrSym(n.Name); ok2 {
+			c.emit("lea r10, [rip+%s]", sym)
+			return nil
+		}
+		return fmt.Errorf("undefined variable %q", n.Name)
+	case *CompoundLit:
+		// The unnamed object's address. Its initialisation runs HERE so that
+		// every consumer (a struct argument, &x, .member) sees initialised
+		// bytes; see the value path in genExprT for the decay/load cases.
+		off, ok := c.clOff[n]
+		if !ok {
+			return fmt.Errorf("line %d: internal: compound literal has no frame slot", n.Line)
+		}
+		if n.Typ.IsArray() || isAgg(n.Typ) {
+			if err := c.genBraceInitLocal(n.Typ, n.Init, off); err != nil {
+				return err
+			}
+		} else {
+			// Scalar: initialise from its single element; "{}" (C23) zeroes.
+			vi := varInfo{off: off, typ: n.Typ}
+			if len(n.Init.Elems) == 1 && n.Init.Elems[0].Desig == "" && n.Init.Elems[0].DesigIdx < 0 {
+				if _, err := c.genExprT(n.Init.Elems[0].E); err != nil {
+					return err
+				}
+				if err := c.ensureType(n.Typ.Class()); err != nil {
+					return err
+				}
+				c.storeVar(vi)
+			} else {
+				c.emit("lea r10, [rbp%+d]", off)
+				c.zeroBytes("r10", c.slotWidth(n.Typ))
+			}
+		}
+		c.emit("lea r10, [rbp%+d]", off)
 		return nil
 	case *Unary:
 		if n.Op != "*" {
@@ -3951,31 +5342,42 @@ func (c *CG) genLValue(e Expr) error {
 		islot := c.tmpSlot(c.tmpDepth)
 		c.emit("mov [rbp%+d], rax", islot)
 		if id, ok := n.Base.(*Ident); ok {
-			vi, ok2 := c.lookupVar(id.Name)
-			if !ok2 {
-				if lab, ok3 := c.staticVars[id.Name]; ok3 {
+			// Local scope wins (C block scoping); only then file-scope names.
+			// A static local shadows a same-named TLS global, but a static
+			// thread-local local still needs the segment reach.
+			if vi, ok2 := c.lookupVar(id.Name); ok2 {
+				if vi.typ.IsArray() {
+					c.emit("lea r10, [rbp%+d]", vi.off)
+				} else {
+					c.loadVar(vi) // rax = pointer value
+					c.emit("mov r10, rax")
+				}
+			} else if lab, ok3 := c.staticVars[id.Name]; ok3 {
+				if _, isTLS := c.tlsVars[id.Name]; !isTLS {
 					// Static-local array: rip-relative lea of element 0.
 					gt := c.globalTyp[lab]
 					if gt == nil || !gt.IsArray() {
 						return fmt.Errorf("cannot index non-array static local %q", id.Name)
 					}
 					c.emit("lea r10, [rip+%s]", lab)
-				} else if c.globals[id.Name] {
-					// Global array: rip-relative lea of element 0.
-					gt := c.globalTyp[id.Name]
-					if gt == nil || !gt.IsArray() {
-						return fmt.Errorf("cannot index non-array global %q", id.Name)
-					}
-					c.useLibGlobal(id.Name)
-					c.emit("lea r10, [rip+%s]", c.globalLab[id.Name])
-				} else {
-					return fmt.Errorf("undefined variable %q", id.Name)
+				} else if err := c.genTLSAddr(id.Name); err != nil {
+					return err
 				}
-			} else if vi.typ.IsArray() {
-				c.emit("lea r10, [rbp%+d]", vi.off)
+			} else if _, okTLS := c.tlsVars[id.Name]; okTLS {
+				// Thread-local array/struct: reach it through the segment.
+				if err := c.genTLSAddr(id.Name); err != nil {
+					return err
+				}
+			} else if c.globals[id.Name] {
+				// Global array: rip-relative lea of element 0.
+				gt := c.globalTyp[id.Name]
+				if gt == nil || !gt.IsArray() {
+					return fmt.Errorf("cannot index non-array global %q", id.Name)
+				}
+				c.useLibGlobal(id.Name)
+				c.emit("lea r10, [rip+%s]", c.globalLab[id.Name])
 			} else {
-				c.loadVar(vi) // rax = pointer value
-				c.emit("mov r10, rax")
+				return fmt.Errorf("undefined variable %q", id.Name)
 			}
 		} else if u, ok := n.Base.(*Unary); ok && u.Op == "*" {
 			if _, err := c.genExprT(u.E); err != nil {
@@ -4172,6 +5574,43 @@ func (c *CG) elemClassOf(e Expr) CType {
 	return TInt
 }
 
+// tlsAlignOf returns the alignment used to lay out a thread-local variable in
+// the .tls section. goc keeps every variable in an 8-byte-aligned slot (scalars
+// are emitted as an 8-byte dq by emitGlobalVar), so all TLS variables are simply
+// 8-aligned -- this matches how they are later reached through the fs/gs segment.
+func (c *CG) tlsAlignOf(t *Type) int {
+	return 8
+}
+
+// tlsAlignedSize returns the exact number of bytes emitGlobalVar will write for
+// t, so the per-variable offset bookkeeping stays in lockstep with the emitted
+// .tls image. Scalars are emitted as an 8-byte dq (a float single is 4 bytes);
+// arrays/aggregates are rounded up to 8. Matching this exactly is what keeps
+// each variable's label at the byte emitGlobalVar actually wrote.
+func (c *CG) tlsAlignedSize(t *Type) int {
+	if t != nil && t.Kind == KFloat {
+		return 4
+	}
+	sz := c.typeWidth(t)
+	if sz < 1 {
+		sz = 1
+	}
+	n := (sz + 7) &^ 7
+	if n < 8 {
+		n = 8
+	}
+	return n
+}
+
+// tlsPlace aligns the running .tls offset to t's alignment, records the variable
+// there, and returns its offset, advancing the running offset past it.
+func (c *CG) tlsPlace(t *Type) int {
+	align := c.tlsAlignOf(t)
+	off := (c.tlsBytes + align - 1) &^ (align - 1)
+	c.tlsBytes = off + c.tlsAlignedSize(t)
+	return off
+}
+
 // typeWidth returns the byte width used to lay out / step over a value of type
 // t: char=1, short=2, int/long=4/8, double/pointer=8, array=element*len,
 // struct/union=its computed Size.
@@ -4186,6 +5625,8 @@ func (c *CG) typeWidth(t *Type) int {
 		return 4
 	case KDouble:
 		return 8
+	case KBitInt:
+		return sizeOf(t)
 	case KArr:
 		if t.Elem != nil {
 			return c.typeWidth(t.Elem) * t.Len
@@ -4243,6 +5684,17 @@ func (c *CG) memberType(base Expr, name string) *Type {
 // variable table / declarators the code generator already knows about.
 func (c *CG) exprType(e Expr) *Type {
 	switch n := e.(type) {
+	case *CompoundLit:
+		// The unnamed object's own declared type (arrays included: callers
+		// decide between value-address and decay handling).
+		return n.Typ
+	case *GenericExpr:
+		// The selection's type is the type of the chosen branch (the
+		// controlling expression's own type is irrelevant after the pick).
+		if n.Chosen != nil {
+			return c.exprType(n.Chosen)
+		}
+		return nil
 	case *Ident:
 		if vi, ok := c.lookupVar(n.Name); ok {
 			return vi.typ
@@ -4260,6 +5712,12 @@ func (c *CG) exprType(e Expr) *Type {
 		}
 		return c.globalTyp[n.Name]
 	case *Unary:
+		// A unary '-'/~ on a _BitInt keeps the operand's own type. Without
+		// this branch exprType returned nil and the genExprT big-value
+		// intercept never fired for unary expressions.
+		if (n.Op == "-" || n.Op == "~") && isBig(c.exprType(n.E)) {
+			return c.exprType(n.E)
+		}
 		if n.Op == "*" {
 			if t := c.exprType(n.E); t != nil && t.IsPtr() {
 				return t.Elem
@@ -4335,17 +5793,37 @@ func (c *CG) exprType(e Expr) *Type {
 	return nil
 }
 
-// binaryType mirrors the checker's pointer-arithmetic rules (checkBinary) so
-// codegen can classify an expression that is itself arithmetic: a pointer
+// binaryType mirrors the checker's rules (checkBinary) so codegen can
+// classify an expression that is itself arithmetic: a _BitInt operation
+// yields its converted bit-precise result type (bigArithResult), a pointer
 // plus or minus an integer is still a pointer, and pointer minus pointer is
 // an integer difference. Anything else is left nil, which every caller
 // already treats as "ordinary integer".
 func (c *CG) binaryType(n *Binary) *Type {
+	lt := c.exprType(n.L)
+	rt := c.exprType(n.R)
+	// C23 bit-precise arithmetic: the result type comes from the usual
+	// arithmetic conversions over the _BitInt operands.
+	if isBig(lt) || isBig(rt) {
+		switch n.Op {
+		case "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^":
+			if (lt == nil || lt.IsIntClass() || isBig(lt)) && (rt == nil || rt.IsIntClass() || isBig(rt)) {
+				lt2 := lt
+				if lt2 == nil {
+					lt2 = IntType()
+				}
+				rt2 := rt
+				if rt2 == nil {
+					rt2 = IntType()
+				}
+				return bigArithResult(n.Op, lt2, rt2)
+			}
+		}
+		return nil
+	}
 	if n.Op != "+" && n.Op != "-" {
 		return nil
 	}
-	lt := c.exprType(n.L)
-	rt := c.exprType(n.R)
 	// A numeric literal is not in any type table, so exprType reports nil for
 	// it; on one side of a pointer operation that missing type is the
 	// integer it actually is.
@@ -4667,6 +6145,34 @@ func (c *CG) copyBytes(dst, src string, n int) {
 	if n <= 0 {
 		return
 	}
+	// A wide aggregate (a _BitInt(524288) is 64 KiB, a big struct can be
+	// larger still) would expand into thousands of MOV pairs. Past a few
+	// words, call memcpy instead. r10/r11 are volatile across a call, so
+	// they are parked in scratch slots and restored afterwards.
+	if n > 64 {
+		ar := c.argRegs()
+		c.tmpDepth++
+		s1 := c.tmpSlot(c.tmpDepth)
+		c.tmpDepth++
+		s2 := c.tmpSlot(c.tmpDepth)
+		c.emit("mov [rbp%+d], r10", s1)
+		c.emit("mov [rbp%+d], r11", s2)
+		c.emit("mov %s, %s", ar[0], dst)
+		c.emit("mov %s, %s", ar[1], src)
+		c.emit("mov %s, %d", ar[2], n)
+		if !c.linux {
+			c.emit("sub rsp, 32")
+		}
+		c.need["memcpy"] = true
+		c.emitCall("memcpy")
+		if !c.linux {
+			c.emit("add rsp, 32")
+		}
+		c.emit("mov r10, [rbp%+d]", s1)
+		c.emit("mov r11, [rbp%+d]", s2)
+		c.tmpDepth -= 2
+		return
+	}
 	off := 0
 	for off+8 <= n {
 		c.emit("mov rax, [%s+%d]", src, off)
@@ -4680,10 +6186,11 @@ func (c *CG) copyBytes(dst, src string, n int) {
 	}
 }
 
-// isAgg reports whether t is a struct/union aggregate, i.e. a value that is
-// never loaded into a register but always handled by address + copyBytes.
+// isAgg reports whether t is a struct/union aggregate (or a C23 _BitInt,
+// which rides the same by-address value model), i.e. a value that is never
+// loaded into a register but always handled by address + copyBytes.
 func isAgg(t *Type) bool {
-	return t != nil && (t.IsStruct() || t.IsUnion())
+	return t != nil && (t.IsStruct() || t.IsUnion() || t.Kind == KBitInt)
 }
 
 // zeroBytes emits code that stores n zero bytes at the memory pointed to by
@@ -4691,6 +6198,28 @@ func isAgg(t *Type) bool {
 // union locals that have no initialiser.
 func (c *CG) zeroBytes(dst string, n int) {
 	if n <= 0 {
+		return
+	}
+	// Wide aggregates go through memset (see copyBytes) -- a _BitInt(524288)
+	// zeroed with MOVs would be 8k instructions per declaration.
+	if n > 64 {
+		ar := c.argRegs()
+		c.tmpDepth++
+		s1 := c.tmpSlot(c.tmpDepth)
+		c.emit("mov [rbp%+d], r10", s1)
+		c.emit("mov %s, %s", ar[0], dst)
+		c.emit("mov %s, 0", ar[1])
+		c.emit("mov %s, %d", ar[2], n)
+		if !c.linux {
+			c.emit("sub rsp, 32")
+		}
+		c.need["memset"] = true
+		c.emitCall("memset")
+		if !c.linux {
+			c.emit("add rsp, 32")
+		}
+		c.emit("mov r10, [rbp%+d]", s1)
+		c.tmpDepth--
 		return
 	}
 	c.emit("xor eax, eax")
@@ -4712,6 +6241,30 @@ func (c *CG) zeroBytes(dst string, n int) {
 func (c *CG) genBraceInitLocal(t *Type, bi *BraceInit, off int) error {
 	c.emit("lea r10, [rbp%+d]", off)
 	c.zeroBytes("r10", c.typeWidth(t))
+	// C23 _BitInt braced init: "{}" zero-fills; "{v}" converts the single
+	// value. Designators do not apply (there are no members).
+	if isBig(t) {
+		if len(bi.Elems) == 1 && bi.Elems[0].Desig == "" && bi.Elems[0].DesigIdx < 0 {
+			if _, err := c.genExprT(bi.Elems[0].E); err != nil {
+				return err
+			}
+			if err := c.ensureType(TInt); err != nil {
+				return err
+			}
+			c.emit("mov r11, rax")
+			c.emit("lea r10, [rbp%+d]", off)
+			sg := int64(0)
+			if t.Signed {
+				sg = 1
+			}
+			c.callBigLib("__goclib_bi_from_i64", []bigArg{
+				{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(t))}, {imm: sg},
+			})
+		} else if len(bi.Elems) > 1 {
+			return fmt.Errorf("too many initialisers for %s", t)
+		}
+		return nil
+	}
 	return c.braceWalkLocal(t, bi, off)
 }
 
@@ -4763,8 +6316,9 @@ func (c *CG) braceWalkLocal(t *Type, bi *BraceInit, off int) error {
 			}
 			return nil
 		}
+		vis := posMembers(t)
 		for i, el := range bi.Elems {
-			if i >= len(t.Members) {
+			if i >= len(vis) {
 				break
 			}
 			if el.DesigIdx >= 0 {
@@ -4773,7 +6327,7 @@ func (c *CG) braceWalkLocal(t *Type, bi *BraceInit, off int) error {
 			if el.Desig != "" {
 				return fmt.Errorf("cannot mix positional and designated (\".%s =\") initialisers", el.Desig)
 			}
-			m := t.Members[i]
+			m := vis[i]
 			if err := c.braceElemLocal(m.Type, el.E, off+m.Offset); err != nil {
 				return err
 			}
@@ -4785,7 +6339,11 @@ func (c *CG) braceWalkLocal(t *Type, bi *BraceInit, off int) error {
 			return nil
 		}
 		el := bi.Elems[0]
-		m := t.Members[0]
+		vis := posMembers(t)
+		var m *Member
+		if len(vis) > 0 {
+			m = vis[0]
+		}
 		if el.DesigIdx >= 0 {
 			return fmt.Errorf("array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
 		}
@@ -4793,6 +6351,9 @@ func (c *CG) braceWalkLocal(t *Type, bi *BraceInit, off int) error {
 			if mi := memberIndex(t, el.Desig); mi >= 0 {
 				m = t.Members[mi]
 			}
+		}
+		if m == nil {
+			return nil
 		}
 		return c.braceElemLocal(m.Type, el.E, off+m.Offset)
 	}
@@ -4867,6 +6428,12 @@ func (c *CG) walkGlobalInit(t *Type, init Expr, glab string, off int) {
 	if t == nil {
 		return
 	}
+	if isBig(t) {
+		// Global _BitInt: the .bss/.data image is already zero, which is the
+		// only supported global initialisation ("{}" or none). Non-zero
+		// initialisers are rejected at emission (emitGlobalVar).
+		return
+	}
 	bi, ok := init.(*BraceInit)
 	if !ok {
 		// A bare function designator naming a function ("void *(*fp)(long) =
@@ -4924,11 +6491,12 @@ func (c *CG) walkGlobalInit(t *Type, init Expr, glab string, off int) {
 			}
 			return
 		}
+		vis := posMembers(t)
 		for i, el := range bi.Elems {
-			if i >= len(t.Members) {
+			if i >= len(vis) {
 				break
 			}
-			m := t.Members[i]
+			m := vis[i]
 			c.walkGlobalInit(m.Type, el.E, glab, off+m.Offset)
 		}
 		return
@@ -4938,19 +6506,62 @@ func (c *CG) walkGlobalInit(t *Type, init Expr, glab string, off int) {
 			return
 		}
 		el := bi.Elems[0]
-		m := t.Members[0]
+		var m *Member
 		if el.Desig != "" {
 			if mi := memberIndex(t, el.Desig); mi >= 0 {
 				m = t.Members[mi]
 			}
+		} else if vis := posMembers(t); len(vis) > 0 {
+			m = vis[0]
 		}
-		c.walkGlobalInit(m.Type, el.E, glab, off+m.Offset)
+		if m != nil {
+			c.walkGlobalInit(m.Type, el.E, glab, off+m.Offset)
+		}
 		return
 	}
 	if len(bi.Elems) != 1 {
 		return
 	}
 	c.walkGlobalInit(t, bi.Elems[0].E, glab, off)
+}
+
+// bigInitWords folds a static (global / static-local / TLS) _BitInt
+// initialiser into its little-endian word image. Supported forms are: no
+// initialiser, "{}", "{v}", a wb/uwb literal (already split into words by the
+// lexer) and a plain integer constant (sign- or zero-extended to the declared
+// width). Anything else folds to zero -- the front end rejects non-constant
+// static initialisers, so this is only a defensive fallback.
+func bigInitWords(t *Type, init Expr) []uint64 {
+	w := bigWordsOf(t)
+	if w < 1 {
+		w = 1
+	}
+	words := make([]uint64, w)
+	if init == nil {
+		return words
+	}
+	if bi, ok := init.(*BraceInit); ok {
+		if len(bi.Elems) == 0 {
+			return words
+		}
+		init = bi.Elems[0].E
+	}
+	nl, ok := init.(*NumLit)
+	if !ok {
+		return words
+	}
+	for i := 0; i < w && i < len(nl.BigWords); i++ {
+		words[i] = nl.BigWords[i]
+	}
+	if nl.BigWords == nil {
+		words[0] = uint64(nl.Val)
+		if t != nil && t.Signed && nl.Val < 0 {
+			for i := 1; i < w; i++ {
+				words[i] = ^uint64(0)
+			}
+		}
+	}
+	return words
 }
 
 // emitGlobalVar lays out one program-level variable (true global or static
@@ -4961,6 +6572,20 @@ func (c *CG) walkGlobalInit(t *Type, init Expr, glab string, off int) {
 // is 4 bytes of IEEE single or a double quad; everything else is an integer
 // dq (zero when the initialiser does not fold).
 func (c *CG) emitGlobalVar(out *strings.Builder, g *DeclStmt, lab string) error {
+	// Global _BitInt: zero image only (the storage is a word array; the
+	// isZeroInit classification sends the zero case to .bss).
+	if isBig(g.Typ) {
+		words := bigInitWords(g.Typ, g.Init)
+		out.WriteString(lab + " dq ")
+		for i, wv := range words {
+			if i > 0 {
+				out.WriteString(", ")
+			}
+			out.WriteString(fmt.Sprintf("0x%x", wv))
+		}
+		out.WriteString("\n")
+		return nil
+	}
 	if bi, ok := g.Init.(*BraceInit); ok {
 		return c.emitGlobalBrace(out, g.Typ, bi, lab)
 	}
@@ -5019,6 +6644,81 @@ func (c *CG) emitGlobalVar(out *strings.Builder, g *DeclStmt, lab string) error 
 	}
 	out.WriteString(fmt.Sprintf("%s dq %d\n", lab, val))
 	return nil
+}
+
+// isZeroInit reports whether a global's initialiser is entirely zero (or absent),
+// so it can be placed in .bss instead of .data. This shrinks the on-disk image
+// without changing run-time layout: the loader zero-fills .bss. Pointers are kept
+// in .data to preserve the exact existing behaviour for address-initialised
+// (stub-written) globals.
+func (c *CG) isZeroInit(g *DeclStmt) bool {
+	if g.Init == nil {
+		return true
+	}
+	// A _BitInt global carries real words when its initialiser is a literal:
+	// the generic aggregate rule below would call everything zero.
+	if isBig(g.Typ) {
+		for _, w := range bigInitWords(g.Typ, g.Init) {
+			if w != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	if g.Typ != nil && g.Typ.IsPtr() {
+		return false
+	}
+	if bi, ok := g.Init.(*BraceInit); ok {
+		size := c.typeWidth(g.Typ)
+		if size < 1 {
+			size = 1
+		}
+		img := make([]byte, size)
+		if err := c.fillBraceImage(g.Typ, bi, img, 0); err == nil {
+			for _, b := range img {
+				if b != 0 {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	}
+	// A char array initialised by a string literal carries real bytes.
+	if g.Typ != nil && g.Typ.IsArray() && g.Typ.Elem.IsChar() {
+		if _, ok := g.Init.(*StrLit); ok {
+			return false
+		}
+	}
+	if g.Typ != nil && g.Typ.IsFloating() {
+		f := 0.0
+		if v, ok := foldFloatInit(g.Init); ok {
+			f = v
+		}
+		return f == 0.0
+	}
+	if g.Typ != nil && (g.Typ.IsArray() || isAgg(g.Typ)) {
+		// No braced initialiser and not a string: zero-filled (checked above for
+		// the scalar/string cases that reached here).
+		return true
+	}
+	val := int64(0)
+	if v, ok := foldConstInit(g.Init); ok {
+		val = v
+	}
+	return val == 0
+}
+
+// emitGlobalBSS emits an uninitialised global as a .bss reservation. The size is
+// rounded up to 8 bytes so every global stays 8-aligned, matching the dq-block
+// layout used in .data (the trailing padding is simply unused).
+func (c *CG) emitGlobalBSS(out *strings.Builder, g *DeclStmt, lab string) {
+	size := c.typeWidth(g.Typ)
+	if size < 1 {
+		size = 1
+	}
+	n := (size + 7) / 8
+	out.WriteString(fmt.Sprintf("%s resq %d\n", lab, n))
 }
 
 // emitGlobalBrace lays out a global aggregate from a braced initialiser as a
@@ -5091,8 +6791,9 @@ func (c *CG) fillBraceImage(t *Type, bi *BraceInit, img []byte, off int) error {
 			}
 			return nil
 		}
+		vis := posMembers(t)
 		for i, el := range bi.Elems {
-			if i >= len(t.Members) {
+			if i >= len(vis) {
 				break
 			}
 			if el.DesigIdx >= 0 {
@@ -5101,7 +6802,7 @@ func (c *CG) fillBraceImage(t *Type, bi *BraceInit, img []byte, off int) error {
 			if el.Desig != "" {
 				return fmt.Errorf("cannot mix positional and designated (\".%s =\") initialisers", el.Desig)
 			}
-			m := t.Members[i]
+			m := vis[i]
 			if err := c.fillBraceElem(m.Type, el.E, img, off+m.Offset); err != nil {
 				return err
 			}
@@ -5113,14 +6814,19 @@ func (c *CG) fillBraceImage(t *Type, bi *BraceInit, img []byte, off int) error {
 			return nil
 		}
 		el := bi.Elems[0]
-		m := t.Members[0]
-		if el.DesigIdx >= 0 {
-			return fmt.Errorf("array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
-		}
+		var m *Member
 		if el.Desig != "" {
 			if mi := memberIndex(t, el.Desig); mi >= 0 {
 				m = t.Members[mi]
 			}
+		} else if vis := posMembers(t); len(vis) > 0 {
+			m = vis[0]
+		}
+		if m == nil {
+			return nil
+		}
+		if el.DesigIdx >= 0 {
+			return fmt.Errorf("array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
 		}
 		return c.fillBraceElem(m.Type, el.E, img, off+m.Offset)
 	}
@@ -5206,7 +6912,7 @@ func (c *CG) structSrcAddr(e Expr, t *Type) error {
 			if !c.resStruct {
 				return fmt.Errorf("call %q does not produce a struct value", call.Name)
 			}
-			c.emit("lea r10, [rbp%+d]", c.tmpSlot(c.resStructK))
+			c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(c.resStructK, c.resStructSl))
 			return nil
 		}
 	case *IndirectCall:
@@ -5217,9 +6923,16 @@ func (c *CG) structSrcAddr(e Expr, t *Type) error {
 			if !c.resStruct {
 				return fmt.Errorf("function-pointer call does not produce a struct value")
 			}
-			c.emit("lea r10, [rbp%+d]", c.tmpSlot(c.resStructK))
+			c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(c.resStructK, c.resStructSl))
 			return nil
 		}
+	}
+	// A _BitInt value expression: genExprT's big intercept always leaves the
+	// value address in r10 (lvalues directly; computed values in their own
+	// claimed buffer).
+	if isBig(t) {
+		_, err := c.genExprT(e)
+		return err
 	}
 	return c.genLValue(e)
 }
@@ -5253,7 +6966,7 @@ func (c *CG) lvalueWidth(e Expr) int {
 				// float is a genuine 4-byte IEEE single.
 				return c.slotWidth(vi.typ)
 			}
-			if vi.typ.Kind == KStruct || vi.typ.Kind == KUnion {
+			if vi.typ.Kind == KStruct || vi.typ.Kind == KUnion || vi.typ.Kind == KBitInt {
 				return vi.typ.Size
 			}
 			return 8
@@ -5268,9 +6981,16 @@ func (c *CG) lvalueWidth(e Expr) int {
 				if gt.Kind == KFloat {
 					return 4
 				}
-				if gt.Kind == KStruct || gt.Kind == KUnion {
-					return gt.Size
-				}
+			if gt.Kind == KStruct || gt.Kind == KUnion || gt.Kind == KBitInt {
+				return gt.Size
+			}
+			}
+			return 8
+		}
+		// A thread-local variable lives in .tls; its type lives in tlsVars.
+		if t, ok2 := c.tlsVars[id.Name]; ok2 {
+			if t.typ != nil && t.typ.Kind == KFloat {
+				return 4
 			}
 			return 8
 		}
@@ -5304,6 +7024,13 @@ func (c *CG) lvalueClass(e Expr) CType {
 		if lab, ok2 := c.staticVars[id.Name]; ok2 {
 			if gt := c.globalTyp[lab]; gt != nil {
 				return gt.Class()
+			}
+			return TInt
+		}
+		// A thread-local variable lives in .tls; its type lives in tlsVars.
+		if t, ok2 := c.tlsVars[id.Name]; ok2 {
+			if t.typ != nil {
+				return t.typ.Class()
 			}
 			return TInt
 		}
@@ -5580,6 +7307,35 @@ func (c *CG) emitCompare(jmpIfTrue string) {
 	c.line(lEnd + ":\n")
 }
 
+/*
+ * emitCompareDbl is emitCompare for a comparison whose ucomisd has already
+ * been issued. ucomisd reports "unordered" (an operand was NaN) by setting
+ * PF alongside ZF, and every C comparison must read that: an unordered pair
+ * is neither equal nor less nor greater, so `==`, `<`, `<=`, `>`, `>=` are
+ * all false for NaN -- while `!=` is the one comparison that is TRUE for it,
+ * which is exactly what makes the classic `x != x` NaN test work.
+ *
+ * Without the PF test, `je` sees ZF=1 for an unordered pair and reports
+ * NaN == NaN as true, so isnan() silently answers 0 for every value.
+ */
+func (c *CG) emitCompareDbl(jmpIfTrue string) {
+	lTrue := c.newLabel("cmp")
+	lFalse := c.newLabel("cmpf")
+	lEnd := c.newLabel("cmpe")
+	if jmpIfTrue == "jne" {
+		c.emit("jp %s", lTrue) // unordered -> not equal -> 1
+	} else {
+		c.emit("jp %s", lFalse) // unordered -> 0 for every ordered test
+	}
+	c.emit("%s %s", jmpIfTrue, lTrue)
+	c.line(lFalse + ":\n")
+	c.emit("mov rax, 0")
+	c.emit("jmp %s", lEnd)
+	c.line(lTrue + ":\n")
+	c.emit("mov rax, 1")
+	c.line(lEnd + ":\n")
+}
+
 // normalizeBool canonicalises the 64-bit value in rax to exactly 0 or 1 using
 // a conditional branch (goa has no setcc). It is applied whenever a _Bool is
 // stored: C semantics say any non-zero value becomes 1. It is idempotent on
@@ -5601,18 +7357,12 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 	case "&&":
 		lFalse := c.newLabel("andf")
 		lEnd := c.newLabel("andd")
-		if _, err := c.genExprT(n.L); err != nil {
-			return TInt, err
-		}
-		if err := c.ensureType(TInt); err != nil {
+		if err := c.genTruth(n.L); err != nil {
 			return TInt, err
 		}
 		c.emit("cmp rax, 0")
 		c.emit("je %s", lFalse)
-		if _, err := c.genExprT(n.R); err != nil {
-			return TInt, err
-		}
-		if err := c.ensureType(TInt); err != nil {
+		if err := c.genTruth(n.R); err != nil {
 			return TInt, err
 		}
 		c.emit("cmp rax, 0")
@@ -5629,18 +7379,12 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 	case "||":
 		lTrue := c.newLabel("ort")
 		lEnd := c.newLabel("ore")
-		if _, err := c.genExprT(n.L); err != nil {
-			return TInt, err
-		}
-		if err := c.ensureType(TInt); err != nil {
+		if err := c.genTruth(n.L); err != nil {
 			return TInt, err
 		}
 		c.emit("cmp rax, 0")
 		c.emit("jne %s", lTrue)
-		if _, err := c.genExprT(n.R); err != nil {
-			return TInt, err
-		}
-		if err := c.ensureType(TInt); err != nil {
+		if err := c.genTruth(n.R); err != nil {
 			return TInt, err
 		}
 		c.emit("cmp rax, 0")
@@ -5929,6 +7673,13 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 			case "!=":
 				jmp = "jne"
 			}
+			// NaN-aware: emitCompareDbl reads PF (set by ucomisd for an
+			// unordered pair) as well as the condition flags.
+			c.emitCompareDbl(jmp)
+			c.resTyp = TInt
+			c.resSigned = true
+			c.resW = 4 // a comparison yields a (signed) int
+			return TInt, nil
 		} else {
 			_, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
 			c.emit("mov r10, [rbp%+d]", off)
@@ -6055,6 +7806,18 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		c.resTyp = TInt
 		return TInt, nil
 	}
+	// Constant-format printf/fprintf fast path: a format string literal with
+	// no '%' and no extra arguments turns the format engine into a pure echo,
+	// so call fwrite directly. This keeps vfmt -- and the floating-point
+	// conversion machinery it statically pulls in (log/frexp/fmod/...) -- out
+	// of binaries that never use a conversion. fwrite returns the number of
+	// bytes written, exactly what printf would return here, so value
+	// semantics are unchanged.
+	if n.Name == "printf" || n.Name == "fprintf" {
+		if repl := c.constantFormatFwrite(n); repl != nil {
+			return c.genCallExpr(repl)
+		}
+	}
 	// A call whose name designates a VARIABLE holding a function pointer is an
 	// indirect call: C spells it exactly like a direct call ("fp(x)"), but the
 	// address has to be loaded from the variable at run time. A local (or
@@ -6064,6 +7827,58 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		return c.genCall("", e, ft, n.Args)
 	}
 	return c.genCall(n.Name, nil, nil, n.Args)
+}
+
+// constantFormatFwrite rewrites printf("lit") / fprintf(stream, "lit") with a
+// '%'-free literal format and no further arguments into an fwrite call.
+// It returns nil when the rewrite does not apply: extra arguments (whose
+// evaluation would be lost), a format that contains conversions, or a
+// user-defined fwrite / function-pointer variable of that name in the way.
+func (c *CG) constantFormatFwrite(n *Call) *Call {
+	fmtIdx := 1 // fprintf: the stream comes first, the format second
+	if n.Name == "printf" {
+		fmtIdx = 0
+	}
+	if len(n.Args) != fmtIdx+1 {
+		return nil
+	}
+	lit, ok := n.Args[fmtIdx].(*StrLit)
+	if !ok || strings.Contains(string(lit.Bytes), "%") {
+		return nil
+	}
+	if c.funcs["fwrite"] {
+		return nil // the program defines its own fwrite
+	}
+	if _, _, shadowed := c.fnPtrVar("fwrite"); shadowed {
+		return nil
+	}
+	stream := Expr(&Call{Name: "__goclib_stdout"})
+	if fmtIdx == 1 {
+		stream = n.Args[0]
+	}
+	return &Call{Name: "fwrite", Args: []Expr{
+		lit,
+		&NumLit{Val: 1, Kind: TInt},
+		&NumLit{Val: int64(len(lit.Bytes)), Kind: TInt},
+		stream,
+	}}
+}
+
+// needsFullExit reports whether the entry stub must terminate through the
+// full C exit (atexit handlers + std*-stream flush) instead of the bare
+// __goclib_exit. Called after the first goclib fixpoint, so the need set is
+// complete: everything that writes stdout/stderr goes through the
+// __goclib_stdout/__goclib_stderr accessors, and atexit/exit (the program's
+// own call) require the full teardown by definition. The print builtin is
+// deliberately absent: __goclib_write is an unbuffered direct OS write, so
+// it never needs a flush.
+func (c *CG) needsFullExit() bool {
+	for _, name := range [...]string{"__goclib_stdout", "__goclib_stderr", "atexit", "exit"} {
+		if c.need[name] {
+			return true
+		}
+	}
+	return false
 }
 
 // fnPtrVar resolves a name that designates a local variable, parameter or
@@ -6217,10 +8032,82 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 		consumed++
 	}
 	for i := 0; i < nargs; i++ {
+		pt := (*Type)(nil)
+		if !varargs && i < len(paramTypes) {
+			pt = paramTypes[i]
+		}
+		at := c.exprType(args[i])
+		// _BitInt parameter: the value travels by address. A scalar argument
+		// is converted via from_i64; a mismatched-width _BitInt argument is
+		// widened/truncated into a parameter-width temporary first.
+		if isBig(pt) {
+			pw := bigWordsOf(pt)
+			// keep a computed argument's own buffer alive until the call
+			protect := func() {
+				if c.resBig && c.resBigSl > 0 {
+					c.tmpDepth += c.resBigSl
+					consumed += c.resBigSl
+					c.resBig = false
+				} else {
+					c.resBig = false
+				}
+			}
+			if isBig(at) {
+				if err := c.structSrcAddr(args[i], at); err != nil {
+					return TInt, err
+				}
+				protect()
+				if at.Bits != pt.Bits {
+					// convert into a parameter-width temporary
+					k, off := c.claimBig(pw)
+					name := "__goclib_bi_widen_u"
+					if at.Signed {
+						name = "__goclib_bi_widen_s"
+					}
+					c.callBigLib(name, []bigArg{
+						{addrOff: off}, {reg: "r10"}, {imm: int64(pw)}, {imm: int64(bigWordsOf(at))},
+					})
+					// the temporary must stay live until the call; it is
+					// released together with the argument spill slots
+					consumed += pw
+					c.tmpDepth++
+					c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(k, pw))
+					c.emit("mov [rbp%+d], r10", c.tmpSlot(c.tmpDepth))
+				} else {
+					c.tmpDepth++
+					c.emit("mov [rbp%+d], r10", c.tmpSlot(c.tmpDepth))
+				}
+				slots[i] = argSlot{slot: c.tmpDepth, typ: TInt}
+				consumed++
+				continue
+			}
+			// scalar argument converted to the _BitInt parameter
+			if _, err := c.genExprT(args[i]); err != nil {
+				return TInt, err
+			}
+			if err := c.ensureType(TInt); err != nil {
+				return TInt, err
+			}
+			k, off := c.claimBig(pw)
+			s := int64(0)
+			if pt.Signed {
+				s = 1
+			}
+			c.callBigLib("__goclib_bi_from_i64", []bigArg{
+				{addrOff: off}, {reg: "rax"}, {imm: int64(pw)}, {imm: s},
+			})
+			consumed += pw
+			c.tmpDepth++
+			c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(k, pw))
+			c.emit("mov [rbp%+d], r10", c.tmpSlot(c.tmpDepth))
+			slots[i] = argSlot{slot: c.tmpDepth, typ: TInt}
+			consumed++
+			continue
+		}
 		// Struct/union arguments are passed by hidden pointer: evaluate the
 		// ADDRESS of the value into r10 and spill that address into one GP
 		// slot (the callee copies the bytes into its own local slot).
-		if at := c.exprType(args[i]); isAgg(at) {
+		if isAgg(at) {
 			if err := c.structSrcAddr(args[i], at); err != nil {
 				return TInt, err
 			}
@@ -6243,6 +8130,15 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 		t, err := c.genExprT(args[i])
 		if err != nil {
 			return TInt, err
+		}
+		if c.resBig {
+			// A _BitInt argument passed to a scalar parameter: truncate to the
+			// low 64 bits (the two's-complement low word is the int64 value).
+			c.emit("mov rax, [r10]")
+			c.tmpDepth -= c.resBigSl
+			c.resBig = false
+			t = TInt
+			c.resTyp = TInt
 		}
 		// C's usual conversion at call sites: an int argument passed to a
 		// declared floating parameter is widened to double before it is
@@ -6336,15 +8232,15 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 	// The hidden result pointer rides in the first integer argument
 	// register; its buffer was reserved below the argument slots.
 	if sretSz > 0 {
-		c.emit("lea %s, [rbp%+d]", argRegs[0], c.tmpSlot(resK))
+		c.emit("lea %s, [rbp%+d]", argRegs[0], c.tmpSlotBlock(resK, resSl))
 	}
 	if indirect {
 		// Reload the target address last: marshalling the arguments above is
 		// free to clobber rax, but nothing between here and the call needs it.
 		c.emit("mov rax, [rbp%+d]", c.tmpSlot(tgtSlot))
-		c.emit("call rax")
+		c.emitCall("")
 	} else {
-		c.emit("call %s", target)
+		c.emitCall(target)
 	}
 	// Windows API imports return 32-bit values (BOOL/DWORD/int) in EAX; the
 	// upper 32 bits of RAX are not guaranteed to be zero, unlike goclib
@@ -6354,7 +8250,7 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 	// for unsigned (DWORD/UINT). 8-byte returns (HANDLE, LONG, pointers) are
 	// left untouched.
 	if !c.linux && !indirect {
-		if f, ok := c.funcDefs[name]; ok && externDLL[name] != "" &&
+		if f, ok := c.funcDefs[name]; ok && dllOf[name] != "" &&
 			f.Ret != nil && f.Ret.Kind == KInt && f.Ret.Width < 8 {
 			sh := 64 - 8*f.Ret.Width
 			c.emit("shl rax, %d", sh)
