@@ -686,8 +686,11 @@ func (c *CG) canonInt(signed bool) {
 		c.emitWrap("shl rax, 32")
 		c.emitWrap("sar rax, 32")
 	} else {
-		c.emit("shl rax, 32")
-		c.emit("shr rax, 32")
+		// T1.6 (C5-b): mark the zero-extending half too. Only a marked pair is
+		// visible to elimRedundantExt, so without this the unsigned form could
+		// never be dropped or collapsed at all.
+		c.emitWrap("shl rax, 32")
+		c.emitWrap("shr rax, 32")
 	}
 }
 
@@ -3694,6 +3697,36 @@ func reg64Name(r string) string {
 	}
 	if len(r) == 4 && r[0] == 'r' && r[3] == 'd' { // r8d..r15d
 		return r[:3]
+	}
+	return r
+}
+
+// reg32Name returns the 32-bit spelling of a 64-bit GP register
+// (rax -> eax, r10 -> r10d), or r unchanged when it is not one. It is the
+// inverse of reg64Name and is what the shl/sar -> movsxd collapse needs.
+func reg32Name(r string) string {
+	switch r {
+	case "rax":
+		return "eax"
+	case "rbx":
+		return "ebx"
+	case "rcx":
+		return "ecx"
+	case "rdx":
+		return "edx"
+	case "rsi":
+		return "esi"
+	case "rdi":
+		return "edi"
+	case "rbp":
+		return "ebp"
+	case "rsp":
+		return "esp"
+	}
+	if gp64Regs[r] && len(r) >= 2 && r[0] == 'r' {
+		if n, err := strconv.Atoi(r[1:]); err == nil && n >= 8 && n <= 15 {
+			return r + "d"
+		}
 	}
 	return r
 }

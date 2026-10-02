@@ -104,7 +104,17 @@ func TestExtFlagWriterAllows(t *testing.T) {
 	in = append(in, mkPair("rax")...)
 	in = append(in, Inst{Kind: instInstr, Text: "\tcmp rax, 0"})
 	got := runExt(in)
-	if countText(got, "shl rax, 32") != 1 || countText(got, "cmp rax, 0") != 1 {
+	// C5-b: the first pair collapses to the equivalent single `movsxd rax, eax`
+	// (nothing reads its flags before the cmp), and the second pair is then
+	// genuinely redundant and disappears entirely. So no shl survives at all,
+	// where before C5 the first pair stayed as two instructions.
+	if countText(got, "shl rax, 32") != 0 {
+		t.Fatalf("flag writer must let the first pair collapse, got %v", got)
+	}
+	if countText(got, "movsxd rax, eax") != 1 {
+		t.Fatalf("first pair must collapse to one movsxd, got %v", got)
+	}
+	if countText(got, "cmp rax, 0") != 1 {
 		t.Fatalf("flag writer must allow deletion, got %v", got)
 	}
 	if countText(got, "mov [rbp-16], rax") != 1 {
@@ -203,8 +213,11 @@ func TestExtNarrowDestClearsCanon(t *testing.T) {
 	}
 	load = append(load, mkPair("rax")...)
 	load = append(load, Inst{Kind: instInstr, Text: "\tcmp rax, 0"})
-	if got := runExt(load); countText(got, "shl rax, 32") != 1 {
-		t.Fatalf("pair after mov eax,[m] must stay, got %v", got)
+	// The pair must NOT be dropped -- the narrow write cleared canonicality, so
+	// the sign extension is still needed. C5-b: it is now emitted as the
+	// equivalent single `movsxd` instead of `shl`+`sar`.
+	if got := runExt(load); countText(got, "movsxd rax, eax") != 1 || countText(got, "shl rax, 32") != 0 {
+		t.Fatalf("pair after mov eax,[m] must survive as one movsxd, got %v", got)
 	}
 	alu := []Inst{
 		{Kind: instInstr, Text: "\tmov rax, 5"}, // canonical
@@ -212,8 +225,8 @@ func TestExtNarrowDestClearsCanon(t *testing.T) {
 	}
 	alu = append(alu, mkPair("rax")...)
 	alu = append(alu, Inst{Kind: instInstr, Text: "\tcmp rax, 0"})
-	if got := runExt(alu); countText(got, "shl rax, 32") != 1 {
-		t.Fatalf("pair after xor eax,eax must stay, got %v", got)
+	if got := runExt(alu); countText(got, "movsxd rax, eax") != 1 || countText(got, "shl rax, 32") != 0 {
+		t.Fatalf("pair after xor eax,eax must survive as one movsxd, got %v", got)
 	}
 }
 

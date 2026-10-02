@@ -80,10 +80,33 @@ func elimRedundantExt(insts []Inst) []Inst {
 		r := pl.operands[0]
 		nxt := insts[i+1]
 		if np, ok2 := parseBodyLine(nxt.Text); ok2 && nxt.IntWrap &&
-			np.op == "sar" && len(np.operands) == 2 &&
+			(np.op == "sar" || np.op == "shr") && len(np.operands) == 2 &&
 			np.operands[0] == r && np.operands[1] == "32" {
 			if signCanon[r] && (prevWrap[r] || extDeletable(insts, i+2)) {
 				skip = 1 // drop both halves; the output tail keeps the same flags
+				continue
+			}
+			// T1.6 (C5-b): the pair cannot be dropped, but it is still exactly
+			// equivalent to ONE widening move -- `shl r,32; sar r,32` is
+			// `movsxd r, r32` and `shl r,32; shr r,32` is `mov r32, r32`
+			// (writing a 32-bit register zero-extends). The only behavioural
+			// difference is that shl/sar/shr write the flags and the moves do
+			// not, so the collapse is legal only when nothing reads the flags
+			// before the next flag writer -- which is exactly extDeletable.
+			if extDeletable(insts, i+2) {
+				r32 := reg32Name(r)
+				if np.op == "sar" {
+					out = append(out, Inst{Kind: instInstr,
+						Text: "\tmovsxd " + r + ", " + r32})
+				} else {
+					out = append(out, Inst{Kind: instInstr,
+						Text: "\tmov " + r32 + ", " + r32})
+				}
+				// movsxd leaves a sign-canonical value; the zero-extending
+				// form does not (the low half may have its top bit set).
+				signCanon[r] = np.op == "sar"
+				prevWrap = nil
+				i++
 				continue
 			}
 			signCanon[r] = true
