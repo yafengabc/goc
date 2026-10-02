@@ -2883,6 +2883,77 @@ func isMemOperand(s string) bool {
 	return strings.HasPrefix(s, "[")
 }
 
+// regToFull64 maps every integer GP register (64-bit, 32-bit, 16-bit and
+// 8-bit forms) emitted by goc to its 64-bit parent register. It is empty for
+// non-register operands.
+var regToFull64 = func() map[string]string {
+	m := map[string]string{}
+	for r := range gp64Regs {
+		m[r] = r
+	}
+	// classic 8: explicit 32/16/8-bit sub-registers
+	subs := map[string]string{
+		"eax": "rax", "ax": "rax", "al": "rax", "ah": "rax",
+		"ebx": "rbx", "bx": "rbx", "bl": "rbx", "bh": "rbx",
+		"ecx": "rcx", "cx": "rcx", "cl": "rcx", "ch": "rcx",
+		"edx": "rdx", "dx": "rdx", "dl": "rdx", "dh": "rdx",
+		"esi": "rsi", "si": "rsi", "sil": "rsi",
+		"edi": "rdi", "di": "rdi", "dil": "rdi",
+		"ebp": "rbp", "bp": "rbp", "bpl": "rbp",
+		"esp": "rsp", "sp": "rsp", "spl": "rsp",
+	}
+	for k, v := range subs {
+		m[k] = v
+	}
+	for i := 8; i < 16; i++ {
+		n := fmt.Sprintf("r%d", i)
+		m[n+"d"] = n
+		m[n+"w"] = n
+		m[n+"b"] = n
+	}
+	return m
+}()
+
+// fullRegOf returns the 64-bit parent of a (possibly sub-) register operand, and
+// whether o is an integer GP register at all.
+func fullRegOf(o string) (string, bool) {
+	r, ok := regToFull64[o]
+	return r, ok
+}
+
+// subRegOf reports whether o is a STRICT sub-register of the 64-bit GP register
+// reg (eax/ax/al/ah are sub-registers of rax). It is false when o == reg itself,
+// so callers that already handle the full register specially stay correct.
+func subRegOf(reg, o string) bool {
+	if !gp64Regs[reg] || o == reg {
+		return false
+	}
+	fr, ok := regToFull64[o]
+	return ok && fr == reg
+}
+
+// memSizePrefixes are the optional size mnemonics that may precede a memory
+// operand ("dword [rax]", "byte [rbp-3]", ...).
+var memSizePrefixes = map[string]bool{
+	"byte": true, "word": true, "dword": true, "qword": true,
+	"tbyte": true, "xmmword": true, "ymmword": true,
+}
+
+// isMemOperandSized is isMemOperand plus sized memory operands such as
+// "dword [r10]" -- goc emits these for narrow stores/loads, and they must be
+// recognised as memory so value tracking and use-classification stay correct.
+func isMemOperandSized(s string) bool {
+	if isMemOperand(s) {
+		return true
+	}
+	if i := strings.Index(s, "["); i > 0 {
+		if memSizePrefixes[strings.TrimSpace(s[:i])] {
+			return true
+		}
+	}
+	return false
+}
+
 // isLoadForm reports whether pl is `mov <reg>, [<mem>]` and isStoreForm
 // whether it is `mov [<mem>], <reg>` -- the two shapes around every
 // stack-resident variable access, and the shapes the pair rules match on.
@@ -3569,6 +3640,16 @@ func constProp(insts []Inst) []Inst {
 	}
 	s := state{regs: map[string]int64{}, imms: map[string]int64{}}
 	reset := func() { s.regs = map[string]int64{}; s.imms = map[string]int64{} }
+	// isBoundary reports whether an instruction is a control transfer or an
+	// implicit-register clobber that must end a dead-constant scan and wipe all
+	// tracked knowledge: calls and jumps are obvious; on the ELF target goc
+	// emits raw `syscall`/`sysenter` whose number lives in rax (set by a
+	// preceding `mov rax, N`) and which clobbers every caller-save register.
+	isBoundary := func(op string) bool {
+		return op == "call" || strings.HasPrefix(op, "j") ||
+			op == "syscall" || op == "sysenter" || op == "sysret" ||
+			op == "cpuid" || op == "int"
+	}
 	// killReg drops knowledge of the 64-bit register a destination overlaps.
 	killReg := func(dst string) { delete(s.regs, reg64Name(dst)) }
 	knownOperand := func(o string) (int64, bool) {
@@ -3581,9 +3662,188 @@ func constProp(insts []Inst) []Inst {
 		}
 		return 0, false
 	}
+	// immFits reports whether v can be encoded as an x86 imm32 (sign-extended),
+	// which the two-operand ALU/cmp/test immediate forms require. `mov` takes a
+	// full 64-bit immediate, so it never needs this check.
+	immFits := func(v int64) bool { return v >= -(1<<31) && v < (1<<31) }
+
+	// useKind classifies how an instruction mentions reg as an operand.
+	type useKind int
+	const (
+		useNone useKind = iota
+		useInline // a safe-to-inline source reference (constant can replace reg)
+		useOther  // a reference we must keep (memory base, dst, push, call, ...)
+	)
+	classifyUse := func(pl parsedLine, reg string) useKind {
+		// Sub-register references (eax/ax/al/ah for rax, r8d/r8w/r8b for r8,
+		// ...) read only part of the tracked 64-bit value, so we can neither
+		// replace them with the full constant nor conclude that feeding the
+		// full register is dead. Treat every strict sub-register mention as a
+		// kept use: the definition survives. (o == reg is NOT a sub-register,
+		// so the full-register inlinable cases below still work.)
+		for _, o := range pl.operands {
+			if subRegOf(reg, o) {
+				return useOther
+			}
+		}
+		switch pl.op {
+		case "mov":
+			if len(pl.operands) == 2 {
+				// A store `mov [mem], reg` reads reg but writing an immediate
+				// into memory is the one inlining we do NOT perform (the
+				// constant width, base-register edge cases, and the fact that
+				// we would lose slot knowledge make it unsafe). Treat it as a
+				// kept use so the feeding constant definition is preserved.
+				if isMemOperandSized(pl.operands[0]) {
+					return useOther
+				}
+				if pl.operands[1] == reg && pl.operands[0] != reg {
+					return useInline // src is a pure source use
+				}
+				if pl.operands[0] == reg && pl.operands[1] == reg {
+					return useOther // self-copy reads reg
+				}
+			}
+			// operands[0] == reg is a pure overwrite (no read); otherwise reg
+			// is absent. Neither is an inlinable use.
+			return useNone
+		case "cmp", "test":
+			// x86 cmp/test take an immediate only on the RIGHT operand; the
+			// left operand is the destination-style operand and must stay a
+			// register (or memory). Only a right-operand register reference is
+			// safely inlinable.
+			if len(pl.operands) == 2 && pl.operands[0] != pl.operands[1] {
+				if pl.operands[1] == reg {
+					return useInline
+				}
+				if pl.operands[0] == reg {
+					return useOther
+				}
+			}
+			return useNone
+		case "add", "sub", "and", "or", "xor":
+			if len(pl.operands) == 2 && pl.operands[0] != pl.operands[1] {
+				if pl.operands[1] == reg {
+					return useInline // src is a pure source use
+				}
+				if pl.operands[0] == reg {
+					return useOther // dst is read then written
+				}
+			}
+			return useNone
+		}
+		// Any other instruction: if reg is mentioned (memory base, implicit
+		// operand, ...) it is a use we cannot inline.
+		for _, o := range pl.operands {
+			if o == reg {
+				return useOther
+			}
+		}
+		return useNone
+	}
+	writesReg := func(pl parsedLine, reg string) bool {
+		if len(pl.operands) > 0 && pl.operands[0] == reg {
+			return true
+		}
+		switch pl.op {
+		case "mul", "imul", "div", "idiv", "cqo", "cdq":
+			if reg == "rax" || reg == "rdx" {
+				return true
+			}
+		}
+		return false
+	}
+	// isDeadConstDef reports whether the `mov reg, imm` at index i is dead:
+	// every reference to reg before it is next redefined (or the stream resets)
+	// is an inlinable one, so the constant can be substituted at each use and
+	// the definition dropped outright (T1.2: constant folding that truly
+	// deletes instructions, not just records values).
+	isDeadConstDef := func(i int, reg string) bool {
+		for j := i + 1; j < len(insts); j++ {
+			in := insts[j]
+			if in.Kind != instInstr {
+				return false // label / inline asm: value may be live past it
+			}
+			pl, ok := parseBodyLine(in.Text)
+			if !ok {
+				return false
+			}
+			if isBoundary(pl.op) {
+				return false
+			}
+			redef := writesReg(pl, reg)
+			if !redef {
+				switch classifyUse(pl, reg) {
+				case useOther:
+					return false
+				case useInline:
+					// A non-mov inlinable consumer needs an imm32; if the
+					// constant is too wide the substitution cannot happen, so
+					// the definition must survive.
+					if pl.op != "mov" {
+						if v, ok := s.regs[reg]; !ok || !immFits(v) {
+							return false
+						}
+					}
+				case useNone:
+				}
+			} else {
+				// reg is overwritten. A pure overwrite (`mov reg, X`) ends the
+				// scan and makes the constant definition dead. But a
+				// read-and-write instruction consumes the old value first
+				// (`add reg, Y` reads reg before writing it; the mul/div family
+				// reads rax/rdx implicitly), so the definition is still live.
+				if classifyUse(pl, reg) == useOther {
+					return false
+				}
+				switch pl.op {
+				case "mul", "imul", "div", "idiv", "cqo", "cdq":
+					if reg == "rax" || reg == "rdx" {
+						return false
+					}
+				}
+				return true
+			}
+		}
+		return true
+	}
+	// inlineableSrc returns (operand index, reg, value) when pl consumes a
+	// known-constant register in a position that accepts an immediate.
+	inlineableSrc := func(pl parsedLine) (int, string, int64, bool) {
+		switch pl.op {
+		case "mov", "add", "sub", "and", "or", "xor":
+			// Only inline into a register-destination instruction. A store
+			// (`mov [mem], reg` / `add [mem], reg`) writes memory with the
+			// constant, which we deliberately leave to its source register so
+			// the width and aliasing stay correct.
+			if len(pl.operands) == 2 && pl.operands[1] != pl.operands[0] &&
+				!isMemOperandSized(pl.operands[0]) && gp64Regs[pl.operands[1]] {
+				if v, ok := s.regs[pl.operands[1]]; ok {
+					return 1, pl.operands[1], v, true
+				}
+			}
+		case "cmp", "test":
+			// Only the right operand of cmp/test accepts an immediate, so only
+			// inline a known constant there (the left operand must stay a
+			// register/memory).
+			if len(pl.operands) == 2 && pl.operands[0] != pl.operands[1] {
+				if gp64Regs[pl.operands[1]] {
+					if v, ok := s.regs[pl.operands[1]]; ok {
+						return 1, pl.operands[1], v, true
+					}
+				}
+			}
+		}
+		return 0, "", 0, false
+	}
+	buildInlined := func(pl parsedLine, idx int, v int64) Inst {
+		ops := append([]string(nil), pl.operands...)
+		ops[idx] = strconv.FormatInt(v, 10)
+		return Inst{Kind: instInstr, Text: "\t" + pl.op + " " + strings.Join(ops, ", ")}
+	}
 
 	out := make([]Inst, 0, len(insts))
-	for _, in := range insts {
+	for i, in := range insts {
 		if in.Kind != instInstr {
 			out = append(out, in)
 			reset()
@@ -3594,6 +3854,37 @@ func constProp(insts []Inst) []Inst {
 			out = append(out, in)
 			reset()
 			continue
+		}
+		// T1.2: a constant definition `mov reg, imm` whose every later use is
+		// inlinable is dead -- record the constant so the uses get it directly,
+		// then drop the definition entirely.
+		if pl.op == "mov" && len(pl.operands) == 2 && gp64Regs[pl.operands[0]] && !isMemOperand(pl.operands[1]) {
+			if iv, err := strconv.ParseInt(pl.operands[1], 10, 64); err == nil {
+				if isDeadConstDef(i, pl.operands[0]) {
+					s.regs[pl.operands[0]] = iv
+					continue
+				}
+			}
+		}
+		// A write to a STRICT sub-register (`xor eax, eax`, `add eax, 1`,
+		// `mov eax, 5`) changes part of the 64-bit register, so the tracked
+		// full-register value is no longer valid. goc's Intel-syntax IR puts
+		// the destination first, so checking operands[0] covers the writing
+		// form; a store like `mov [mem], eax` has a memory operand[0] and only
+		// READS eax, and is correctly left alone.
+		if len(pl.operands) > 0 && !gp64Regs[pl.operands[0]] {
+			if fr, isReg := fullRegOf(pl.operands[0]); isReg {
+				delete(s.regs, fr)
+			}
+		}
+		// T1.2: inline a known-constant source operand into a safe consumer,
+		// turning e.g. `mov rbx, rax` (rax=5) into `mov rbx, 5` and
+		// `add rbx, rax` into `add rbx, 5` directly at the use site.
+		if idx, _, v, iok := inlineableSrc(pl); iok {
+			if pl.op == "mov" || immFits(v) {
+				in = buildInlined(pl, idx, v)
+				pl, _ = parseBodyLine(in.Text)
+			}
 		}
 		switch {
 		case pl.op == "mov" && len(pl.operands) == 2 && gpRegs[pl.operands[0]]:
@@ -3632,10 +3923,12 @@ func constProp(insts []Inst) []Inst {
 		case pl.op == "mov" && len(pl.operands) == 2 && isMemOperand(pl.operands[0]):
 			dst, src := pl.operands[0], pl.operands[1]
 			if isSlotOperand(dst) {
-				// 8-byte store from a known 64-bit register: the slot becomes
-				// known. Any other source (unknown value, 32-bit register)
-				// invalidates it.
-				if gp64Regs[src] {
+				// A store of a known value (a tracked register, or a constant
+				// once T1.2 has inlined one into the source) makes the slot
+				// known. Anything else invalidates it.
+				if v, err := strconv.ParseInt(src, 10, 64); err == nil {
+					s.imms[dst] = v
+				} else if gp64Regs[src] {
 					if v, ok := s.regs[src]; ok {
 						s.imms[dst] = v
 					} else {
@@ -3653,7 +3946,7 @@ func constProp(insts []Inst) []Inst {
 		case pl.op == "lea" && len(pl.operands) == 2:
 			killReg(pl.operands[0]) // addresses are values we do not track
 			out = append(out, in)
-		case pl.op == "call" || strings.HasPrefix(pl.op, "j"):
+		case isBoundary(pl.op):
 			// calls may store through pointers to any slot; a jump makes the
 			// following instructions reachable from elsewhere, and the label
 			// rule below is what keeps merge points safe -- be consistent
