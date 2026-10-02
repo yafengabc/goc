@@ -120,37 +120,6 @@ void __goclib_bi_from_i64_trunc(unsigned long long *r, long long v, long bits, l
     __goclib_bi_conv(r, &tmp, bits, dstSigned, 64, dstSigned);
 }
 
-/* Convert a bitint from (srcBits, srcSigned) to (dstBits, dstSigned). Widens
- * with sign/zero extension and narrows with wrap-around to dstBits (C23
- * conversion rules: reduce modulo 2^dstBits, then interpret the result). */
-void __goclib_bi_conv(unsigned long long *r, const unsigned long long *a,
-                      long dstBits, long dstSigned, long srcBits, long srcSigned) {
-    long nDst = (dstBits + 63) / 64;
-    long nSrc = (srcBits + 63) / 64;
-    long long fill = 0;
-    if (srcSigned && (a[nSrc - 1] >> 63) & 1) fill = -1;
-    for (long i = 0; i < nDst; i++) {
-        if (i < nSrc) r[i] = a[i];
-        else r[i] = (unsigned long long)fill;
-    }
-    if (dstBits < 64) {
-        unsigned long long mask = (1ULL << dstBits) - 1;
-        r[0] &= mask;
-        if (dstSigned && (r[0] >> (dstBits - 1)) & 1) {
-            r[0] |= ~mask;
-            for (long i = 1; i < nDst; i++) r[i] = ~0ULL;
-        }
-    }
-}
-
-/* int64 -> _BitInt with wrap-around to the target width: reduce modulo 2^bits,
- * then sign-extend when the target is signed (C23 6.3.1.3 conversion). */
-void __goclib_bi_from_i64_trunc(unsigned long long *r, long long v, long bits, long dstSigned) {
-    unsigned long long tmp;
-    tmp = (unsigned long long)v;
-    __goclib_bi_conv(r, &tmp, bits, dstSigned, 64, dstSigned);
-}
-
 /* Truncating read of the low 64 bits: the two's-complement low word IS the
  * int64 value pattern regardless of the bitint's signedness. */
 long long __goclib_bi_to_i64(const unsigned long long *a, long n) {
