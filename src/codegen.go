@@ -5850,6 +5850,10 @@ func (c *CG) genSwitch(n *SwitchStmt) error {
 		c.swDepth--
 		return err
 	}
+	// N21: an int switch value is materialized (high 32 = 0); the case
+	// comparisons must be 32-bit so a negative case constant (imm sign-extended
+	// by the CPU in a 32-bit cmp) matches. A long/pointer value keeps 64-bit.
+	swW := c.resW
 	c.emit("mov [rbp%+d], rax", slot)
 	// A switch body is a block scope; a declaration inside a case belongs to
 	// it and does not leak out of the switch.
@@ -5875,12 +5879,21 @@ func (c *CG) genSwitch(n *SwitchStmt) error {
 	}
 
 	lEnd := c.newLabel("swend")
-	c.emit("mov rax, [rbp%+d]", slot)
+	if swW == 4 {
+		c.emit("mov eax, [rbp%+d]", slot)
+	} else {
+		c.emit("mov rax, [rbp%+d]", slot)
+	}
 	for _, g := range groups {
 		if g.isDefault {
 			continue
 		}
-		c.emit("cmp rax, %d", g.val)
+		if swW == 4 {
+			// N21: 32-bit compare against the materialized int switch value.
+			c.emit("cmp eax, %d", g.val)
+		} else {
+			c.emit("cmp rax, %d", g.val)
+		}
 		c.emit("je %s", g.lbl)
 	}
 	if defIdx >= 0 {
@@ -6118,6 +6131,12 @@ func (c *CG) genLValue(e Expr) error {
 		if _, err := c.genExprT(n.Idx); err != nil {
 			return err
 		}
+		// N11: capture the index's own width/sign -- a signed int index is
+		// materialized (high 32 = 0), so the 64-bit scaled add below needs
+		// movsxd for negative indexes (p[-3]). An unsigned int index must stay
+		// zero-extended (large indexes >= 2^31 address real memory), and a long
+		// index is already full width.
+		iw, is := c.resW, c.resSigned
 		c.tmpDepth++
 		islot := c.tmpSlot(c.tmpDepth)
 		c.emit("mov [rbp%+d], rax", islot)
@@ -6183,7 +6202,13 @@ func (c *CG) genLValue(e Expr) error {
 			}
 			c.emit("mov r10, rax")
 		}
-		c.emit("mov r11, [rbp%+d]", islot)
+		if iw == 4 && is {
+			// N11: sign-extend a signed int index from the slot's low dword
+			// (the spilled materialized value) for the 64-bit scale-and-add.
+			c.emit("movsxd r11, dword [rbp%+d]", islot)
+		} else {
+			c.emit("mov r11, [rbp%+d]", islot)
+		}
 		// byte offset = index * element_width. Char elements pack one byte
 		// per slot (string literals, char arrays, char* buffers); everything
 		// else keeps the 8-byte slot stride. goa supports imul-with-immediate,
@@ -8017,34 +8042,42 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 				return TInt, nil
 			}
 			if n.Prefix {
-				if step == 1 {
-					c.emit("%s %s", opInc, vi.reg)
-				} else {
-					c.emit("%s %s, %d", opAdd, vi.reg, step)
-				}
-				c.emit("mov rax, %s", vi.reg)
 				if resW == 4 {
-					// Canonicalise both the result and the cached register: an
-					// int wraps at 32 bits, and the register must stay canonical
-					// for later loads of this variable.
-					c.canonInt(signed)
-					c.emit("mov %s, rax", vi.reg)
+					// N7: 32-bit inc/dec wraps at 32 and zero-extends to rax --
+					// the materialized-int invariant -- so no canonInt round-trip
+					// is needed. (resW==8 long/pointer vars keep the 64-bit form.)
+					reg32 := gpReg32(vi.reg)
+					if step == 1 {
+						c.emit("%s %s", opInc, reg32)
+					} else {
+						c.emit("%s %s, %d", opAdd, reg32, step)
+					}
+					c.emit("mov rax, %s", vi.reg)
+				} else {
+					if step == 1 {
+						c.emit("%s %s", opInc, vi.reg)
+					} else {
+						c.emit("%s %s, %d", opAdd, vi.reg, step)
+					}
+					c.emit("mov rax, %s", vi.reg)
 				}
 			} else {
 				c.emit("mov rax, %s", vi.reg) // old value (already canonical)
-				if step == 1 {
-					c.emit("%s %s", opInc, vi.reg)
-				} else {
-					c.emit("%s %s, %d", opAdd, vi.reg, step)
-				}
 				if resW == 4 {
-					// Canonicalise the register's new value through a scratch
-					// round-trip; rax keeps returning the old value.
-					c.emit("mov rdx, rax") // save old value
-					c.emit("mov rax, %s", vi.reg)
-					c.canonInt(signed)
-					c.emit("mov %s, rax", vi.reg)
-					c.emit("mov rax, rdx") // restore old value as the result
+					// N7: same 32-bit step on the cached register; rax keeps the
+					// old (materialized) value as the postfix result.
+					reg32 := gpReg32(vi.reg)
+					if step == 1 {
+						c.emit("%s %s", opInc, reg32)
+					} else {
+						c.emit("%s %s, %d", opAdd, reg32, step)
+					}
+				} else {
+					if step == 1 {
+						c.emit("%s %s", opInc, vi.reg)
+					} else {
+						c.emit("%s %s, %d", opAdd, vi.reg, step)
+					}
 				}
 			}
 			c.resTyp = TInt
@@ -8124,7 +8157,23 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 		c.emit("mov [rbp%+d], rax", os)
 		saved = true
 	}
-	if n.Op == "++" {
+	// N8: a width-4 lvalue loads as the materialized int (mov eax); stepping
+	// with a 32-bit inc/dec wraps at 32 and zero-extends to rax, preserving the
+	// invariant without a canonInt. char/short (extended by genLoadElem) and
+	// long/pointer (full 64-bit) keep the 64-bit step.
+	if width == 4 && n.Op == "++" {
+		if step == 1 {
+			c.emit("inc eax")
+		} else {
+			c.emit("add eax, %d", step)
+		}
+	} else if width == 4 {
+		if step == 1 {
+			c.emit("dec eax")
+		} else {
+			c.emit("sub eax, %d", step)
+		}
+	} else if n.Op == "++" {
 		if step == 1 {
 			c.emit("inc rax")
 		} else {
@@ -8148,12 +8197,6 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 	c.resTyp = TInt
 	c.resSigned = signed
 	c.resW = resW
-	if resW == 4 {
-		// Keep the result a canonical 32-bit int (prefix results wrap at 32
-		// bits; the postfix old value was already canonical, so this is a
-		// no-op there).
-		c.canonInt(signed)
-	}
 	return TInt, nil
 }
 

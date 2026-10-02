@@ -620,3 +620,39 @@ int main(){ return isz(0); }`
 		t.Fatalf("isz must contain a test instruction, got:\n%s", body)
 	}
 }
+
+// TestC2IntCarryModel pins the T1.6 C2 invariants: int inc/dec steps in 32-bit
+// (no canonInt shl/sar round-trip), signed int indexes sign-extend into the
+// 64-bit scale-and-add, and int switch dispatch compares 32-bit so a negative
+// case constant matches the materialized value.
+func TestC2IntCarryModel(t *testing.T) {
+	// N7/N8: an int inc/dec (memory-backed here) emits a 32-bit step and no
+	// canonInt pair.
+	src1 := `int f(int x){ x++; --x; return x; }
+int main(){ return f(3); }`
+	asm1 := genAsmOpt(t, src1, 2)
+	body1 := fnAsm(asm1, "f")
+	if strings.Contains(body1, "shl rax, 32") || strings.Contains(body1, "sar rax, 32") {
+		t.Fatalf("int inc/dec must not canonicalise, got:\n%s", body1)
+	}
+	if !strings.Contains(body1, "inc eax") && !strings.Contains(body1, "inc rax") {
+		t.Fatalf("int inc/dec must step the loaded value, got:\n%s", body1)
+	}
+	// N11: a signed int negative index sign-extends before the 64-bit add.
+	src2 := `int f(int *p){ return p[-2]; }
+int main(){ int a[8]; return f(a+4); }`
+	asm2 := genAsmOpt(t, src2, 2)
+	body2 := fnAsm(asm2, "f")
+	if !strings.Contains(body2, "movsxd r11, dword [rbp") {
+		t.Fatalf("signed int index must sign-extend, got:\n%s", body2)
+	}
+	// N21: an int switch compares 32-bit (negative case constants match the
+	// materialized value, whose high 32 bits are zero).
+	src3 := `int f(int x){ switch(x){ case -1: return 7; default: return 0; } }
+int main(){ return f(-1); }`
+	asm3 := genAsmOpt(t, src3, 2)
+	body3 := fnAsm(asm3, "f")
+	if !strings.Contains(body3, "cmp eax, -1") {
+		t.Fatalf("int switch must compare eax against the case constant, got:\n%s", body3)
+	}
+}
