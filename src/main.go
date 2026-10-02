@@ -297,12 +297,18 @@ type buildCfg struct {
 }
 
 // optFromSuffix maps the suffix of an -O flag to a numeric optimisation
-// level: -O/-Og mean 1 (gcc semantics), -O0..-O3 the number itself, -Os/-Oz
-// 2, -Ofast 3. Level 2 is size-first: every cleanup pass runs, inlining
-// (the only pass that grows the program) does not. Numeric -O2 maps to 3,
-// like gcc's, where -O2 already inlines; goc has no pass between. -1 means
-// "not a level we model": the flag stays accepted-and-ignored, like every
-// unimplemented gcc option.
+// level (2026-10-02 real layering, T1.1):
+//
+//	1 = -O/-Og/-O1 : the full current pass set
+//	2 = -Os/-Oz    : size-first; every cleanup pass runs, inlining (the only
+//	                 pass that grows the program) does not
+//	3 = -O2        : level 1 + constant-folding enhancements (T1.2 hook)
+//	4 = -O3/-Ofast : level 3 + strength reduction / register caching (T1.3,
+//	                 Tier 2 hooks)
+//
+// Levels 3 and 4 currently execute the same passes; the distinct numbers are
+// the hook points future passes gate on. -1 means "not a level we model":
+// the flag stays accepted-and-ignored, like every unimplemented gcc option.
 func optFromSuffix(s string) int {
 	switch s {
 	case "", "g":
@@ -310,11 +316,14 @@ func optFromSuffix(s string) int {
 	case "s", "z":
 		return 2
 	case "fast":
-		return 3
+		return 4
 	}
-	if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 3 {
-		if n == 2 {
+	if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 4 {
+		switch n {
+		case 2:
 			return 3
+		case 3:
+			return 4
 		}
 		return n
 	}

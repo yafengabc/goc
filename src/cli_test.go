@@ -80,8 +80,8 @@ func TestParseArgsOptLevels(t *testing.T) {
 		flag string
 		want int
 	}{
-		{"-O0", 0}, {"-O1", 1}, {"-O2", 3}, {"-O3", 3},
-		{"-O", 1}, {"-Og", 1}, {"-Os", 2}, {"-Oz", 2}, {"-Ofast", 3},
+		{"-O0", 0}, {"-O1", 1}, {"-O2", 3}, {"-O3", 4},
+		{"-O", 1}, {"-Og", 1}, {"-Os", 2}, {"-Oz", 2}, {"-Ofast", 4}, {"-O4", 4},
 	}
 	for _, tc := range cases {
 		cfg, _ := parseArgs([]string{"-c", tc.flag, "a.c"})

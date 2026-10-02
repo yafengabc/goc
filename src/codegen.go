@@ -2538,7 +2538,9 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 	// opt 2 (-Os/-Oz) is the size-first level: inlining is the only pass
 	// here that grows the program (measured +17KB across the examples), so
 	// it stays off; every other pass only deletes instructions and runs
-	// exactly as at -O1.
+	// exactly as at -O1. Levels 3 (-O2) and 4 (-O3/-Ofast) are the T1.1 hook
+	// points: they run this same set today and future passes gate on
+	// c.opt >= 3 / c.opt >= 4.
 	if c.opt >= 1 {
 		if c.opt != 2 {
 			c.insts = inlineCalls(c.insts)
