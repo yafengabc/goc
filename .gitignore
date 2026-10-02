@@ -47,3 +47,10 @@ __pycache__/
 
 # Scratch dirs from the C89-C17 / C23 test-suite builders (probes, temp exes).
 .tmp/
+
+# C23/C89-C17 suite build dirs (dual-compiler harness scratch).
+tests/*/_build/
+
+# Perf-benchmark dir: keep only the .c sources, ignore built artifacts.
+bench/*
+!bench/*.c
