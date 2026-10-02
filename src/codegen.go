@@ -1085,23 +1085,37 @@ func (c *CG) callBigLib(name string, args []bigArg) {
 	extra := 0
 	if !c.linux {
 		extra = 32
+		// Windows x64: 5th+ arguments go on the caller stack below the
+		// 32-byte shadow space ([rsp+32], [rsp+40], ...).
+		if len(args) > len(aregs) {
+			extra += (len(args) - len(aregs)) * 8
+		}
 	}
 	if extra > 0 {
 		c.emit("sub rsp, %d", extra)
 	}
 	for i, a := range args {
-		ar := aregs[i]
-		switch {
-		case a.reg != "":
-			if a.reg != ar {
-				c.emit("mov %s, %s", ar, a.reg)
+		if i < len(aregs) {
+			ar := aregs[i]
+			switch {
+			case a.reg != "":
+				if a.reg != ar {
+					c.emit("mov %s, %s", ar, a.reg)
+				}
+			case a.addrOff != 0:
+				c.emit("lea %s, [rbp%+d]", ar, a.addrOff)
+			case a.valOff != 0:
+				c.emit("mov %s, [rbp%+d]", ar, a.valOff)
+			default:
+				c.emit("mov %s, %d", ar, a.imm)
 			}
-		case a.addrOff != 0:
-			c.emit("lea %s, [rbp%+d]", ar, a.addrOff)
-		case a.valOff != 0:
-			c.emit("mov %s, [rbp%+d]", ar, a.valOff)
-		default:
-			c.emit("mov %s, %d", ar, a.imm)
+		} else {
+			// Extra argument past the register window: push it on the
+			// caller stack (immediates only today, routed through rax).
+			// growFrameForTemps only rewrites the prologue allocation, so
+			// the [rsp+..] slot stays put across the call.
+			c.emit("mov rax, %d", a.imm)
+			c.emit("mov [rsp%+d], rax", c.stackArgOff(i-len(aregs)))
 		}
 	}
 	c.need[name] = true
@@ -1294,12 +1308,23 @@ func (c *CG) genBigBinary(n *Binary) (CType, error) {
 
 	switch n.Op {
 	case "==", "!=", "<", "<=", ">", ">=":
-		w := bigWordsOf(lt0)
-		if rw := bigWordsOf(rt0); rw > w {
+		// A bare numeric literal is not in any type table (exprType reports
+		// nil for it), so treat a missing operand type as int instead of
+		// dereferencing a nil *Type -- bigWordsOf(nil) panicked on "x > 200".
+		lt := lt0
+		if lt == nil {
+			lt = IntType()
+		}
+		rt := rt0
+		if rt == nil {
+			rt = IntType()
+		}
+		w := bigWordsOf(lt)
+		if rw := bigWordsOf(rt); rw > w {
 			w = rw
 		}
 		useSigned := int64(0)
-		if lt0.Signed && rt0.Signed {
+		if lt.Signed && rt.Signed {
 			useSigned = 1
 		}
 		ct := &Type{Kind: KBitInt, Bits: w * 64, Size: w * 8, Signed: useSigned == 1}
@@ -1422,6 +1447,18 @@ func (c *CG) genBigBinary(n *Binary) (CType, error) {
 		c.callBigLib(name, []bigArg{
 			{addrOff: resOff}, {addrOff: loff}, {addrOff: roff}, {imm: int64(w)},
 		})
+		// C23 arithmetic on a narrow _BitInt wraps to the operand's own
+		// width; the goclib helpers compute in 64-bit words, so truncate a
+		// <64-bit result back into range (e.g. U8 200+100 -> 44).
+		if resT.Bits < 64 {
+			sg := int64(0)
+			if resT.Signed {
+				sg = 1
+			}
+			c.callBigLib("__goclib_bi_conv", []bigArg{
+				{addrOff: resOff}, {addrOff: resOff}, {imm: int64(resT.Bits)}, {imm: sg}, {imm: 64}, {imm: sg},
+			})
+		}
 	}
 	c.tmpDepth = rk + w - 1
 	c.markBig(resT, rk, w)
@@ -1480,19 +1517,28 @@ func (c *CG) genBigCast(n *CastExpr, t *Type) (CType, error) {
 			c.emit("lea r11, [rbp%+d]", resOff)
 			c.emit("lea r10, [rbp%+d]", loff)
 			c.copyBytes("r11", "r10", w*8)
-		} else if isBig(et) {
-			name := "__goclib_bi_widen_u"
-			if et.Signed {
-				name = "__goclib_bi_widen_s"
-			}
-			c.callBigLib(name, []bigArg{
-				{addrOff: resOff}, {addrOff: loff}, {imm: int64(w)}, {imm: int64(bigWordsOf(et))},
-			})
-		} else {
-			// operand was materialised into loff by bigOperand already
-			c.emit("lea r11, [rbp%+d]", resOff)
-			c.emit("lea r10, [rbp%+d]", loff)
-			c.copyBytes("r11", "r10", w*8)
+			} else if isBig(et) {
+				ssg := int64(0)
+				if et.Signed {
+					ssg = 1
+				}
+				dsg := int64(0)
+				if t.Signed {
+					dsg = 1
+				}
+				c.callBigLib("__goclib_bi_conv", []bigArg{
+					{addrOff: resOff}, {addrOff: loff}, {imm: int64(t.Bits)}, {imm: dsg}, {imm: int64(et.Bits)}, {imm: ssg},
+				})
+			} else {
+				// scalar operand: bigOperand materialised it at 64-bit width in
+				// loff; convert with wrap-around to the target width.
+				sg := int64(0)
+				if t.Signed {
+					sg = 1
+				}
+				c.callBigLib("__goclib_bi_conv", []bigArg{
+					{addrOff: resOff}, {addrOff: loff}, {imm: int64(t.Bits)}, {imm: sg}, {imm: 64}, {imm: sg},
+				})
 		}
 	}
 	c.tmpDepth = rk + w - 1
@@ -1949,8 +1995,8 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 				if lt.Signed {
 					sg = 1
 				}
-				c.callBigLib("__goclib_bi_from_i64", []bigArg{
-					{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(lt))}, {imm: sg},
+				c.callBigLib("__goclib_bi_from_i64_trunc", []bigArg{
+					{reg: "r10"}, {reg: "r11"}, {imm: int64(lt.Bits)}, {imm: sg},
 				})
 				c.resTyp = TInt
 				c.resSigned = lt.Signed
@@ -1974,14 +2020,18 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 			c.tmpDepth--
 			// _BitInt assignment with mismatched widths converts by widening
 			// (or truncating) instead of a raw byte copy.
-			if rt2 := c.exprType(n.Rhs); isBig(lt) && isBig(rt2) && rt2.Bits != lt.Bits {
-				name := "__goclib_bi_widen_u"
-				if rt2.Signed {
-					name = "__goclib_bi_widen_s"
-				}
-				c.callBigLib(name, []bigArg{
-					{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(lt))}, {imm: int64(bigWordsOf(rt2))},
-				})
+				if rt2 := c.exprType(n.Rhs); isBig(lt) && isBig(rt2) && rt2.Bits != lt.Bits {
+					ssg := int64(0)
+					if rt2.Signed {
+						ssg = 1
+					}
+					dsg := int64(0)
+					if lt.Signed {
+						dsg = 1
+					}
+					c.callBigLib("__goclib_bi_conv", []bigArg{
+						{reg: "r10"}, {reg: "r11"}, {imm: int64(lt.Bits)}, {imm: dsg}, {imm: int64(rt2.Bits)}, {imm: ssg},
+					})
 			} else {
 				c.copyBytes("r10", "r11", lt.Size)
 			}
@@ -2287,6 +2337,17 @@ func (c *CG) genBigCompoundAssign(n *AssignExpr) (CType, error) {
 	c.callBigLib(name, []bigArg{
 		{addrOff: resOff}, {addrOff: loff}, {addrOff: roff}, {imm: int64(w)},
 	})
+	// C23 compound assignment converts the result back to the lvalue's
+	// type, so a narrow (<64-bit) lvalue wraps (e.g. U8 x; x += 300 -> 44).
+	if lt != nil && isBig(lt) && lt.Bits < 64 {
+		sg := int64(0)
+		if lt.Signed {
+			sg = 1
+		}
+		c.callBigLib("__goclib_bi_conv", []bigArg{
+			{addrOff: resOff}, {addrOff: resOff}, {imm: int64(lt.Bits)}, {imm: sg}, {imm: 64}, {imm: sg},
+		})
+	}
 	// 5. Store back: the result is converted to the lvalue's type, so only
 	//    the lvalue's (sw) low words are written when the result is wider.
 	sw2 := w
@@ -4764,8 +4825,8 @@ func (c *CG) genStmt(s Stmt) error {
 					if vi.typ.Signed {
 						sg = 1
 					}
-					c.callBigLib("__goclib_bi_from_i64", []bigArg{
-						{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(vi.typ))}, {imm: sg},
+					c.callBigLib("__goclib_bi_from_i64_trunc", []bigArg{
+						{reg: "r10"}, {reg: "r11"}, {imm: int64(vi.typ.Bits)}, {imm: sg},
 					})
 					return nil
 				}
@@ -4774,14 +4835,18 @@ func (c *CG) genStmt(s Stmt) error {
 				}
 				c.emit("mov r11, r10") // r11 = source address
 				c.emit("lea r10, [rbp%+d]", vi.off)
-				if isBig(vi.typ) && isBig(it) && it.Bits != vi.typ.Bits {
-					name := "__goclib_bi_widen_u"
-					if it.Signed {
-						name = "__goclib_bi_widen_s"
-					}
-					c.callBigLib(name, []bigArg{
-						{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(vi.typ))}, {imm: int64(bigWordsOf(it))},
-					})
+					if isBig(vi.typ) && isBig(it) && it.Bits != vi.typ.Bits {
+						ssg := int64(0)
+						if it.Signed {
+							ssg = 1
+						}
+						dsg := int64(0)
+						if vi.typ.Signed {
+							dsg = 1
+						}
+						c.callBigLib("__goclib_bi_conv", []bigArg{
+							{reg: "r10"}, {reg: "r11"}, {imm: int64(vi.typ.Bits)}, {imm: dsg}, {imm: int64(it.Bits)}, {imm: ssg},
+						})
 				} else {
 					c.copyBytes("r10", "r11", vi.typ.Size)
 				}
@@ -4901,8 +4966,8 @@ func (c *CG) genStmt(s Stmt) error {
 				if c.curRet.Signed {
 					sg = 1
 				}
-				c.callBigLib("__goclib_bi_from_i64", []bigArg{
-					{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(c.curRet))}, {imm: sg},
+				c.callBigLib("__goclib_bi_from_i64_trunc", []bigArg{
+					{reg: "r10"}, {reg: "r11"}, {imm: int64(c.curRet.Bits)}, {imm: sg},
 				})
 				c.growFrameForTemps()
 				c.emitEpilogue()
@@ -4913,14 +4978,18 @@ func (c *CG) genStmt(s Stmt) error {
 			}
 			c.emit("mov r11, r10")                  // r11 = source address
 			c.emit("mov r10, [rbp%+d]", c.sretSlot) // r10 = caller's buffer
-			if isBig(c.curRet) && isBig(et) && et.Bits != c.curRet.Bits {
-				name := "__goclib_bi_widen_u"
-				if et.Signed {
-					name = "__goclib_bi_widen_s"
-				}
-				c.callBigLib(name, []bigArg{
-					{reg: "r10"}, {reg: "r11"}, {imm: int64(bigWordsOf(c.curRet))}, {imm: int64(bigWordsOf(et))},
-				})
+				if isBig(c.curRet) && isBig(et) && et.Bits != c.curRet.Bits {
+					ssg := int64(0)
+					if et.Signed {
+						ssg = 1
+					}
+					dsg := int64(0)
+					if c.curRet.Signed {
+						dsg = 1
+					}
+					c.callBigLib("__goclib_bi_conv", []bigArg{
+						{reg: "r10"}, {reg: "r11"}, {imm: int64(c.curRet.Bits)}, {imm: dsg}, {imm: int64(et.Bits)}, {imm: ssg},
+					})
 			} else {
 				c.copyBytes("r10", "r11", c.curRet.Size)
 			}
@@ -6859,6 +6928,23 @@ func bigInitWords(t *Type, init Expr) []uint64 {
 		}
 		init = bi.Elems[0].E
 	}
+	// Peel casts and a leading unary minus: "(signed _BitInt(8))200" arrives
+	// as a CastExpr over a NumLit, and "(signed _BitInt(64))-1" parses as
+	// CastExpr(Unary("-", NumLit(1))). The C23 conversion to the target width
+	// happens below, so the emitted .data image wraps exactly like the
+	// runtime path.
+	neg := false
+	for {
+		ce, ok := init.(*CastExpr)
+		if !ok {
+			break
+		}
+		init = ce.E
+	}
+	if u, ok := init.(*Unary); ok && u.Op == "-" {
+		neg = true
+		init = u.E
+	}
 	nl, ok := init.(*NumLit)
 	if !ok {
 		return words
@@ -6866,9 +6952,35 @@ func bigInitWords(t *Type, init Expr) []uint64 {
 	for i := 0; i < w && i < len(nl.BigWords); i++ {
 		words[i] = nl.BigWords[i]
 	}
+	if neg {
+		// two's complement negation across the whole word image
+		carry := uint64(1)
+		for i := 0; i < w; i++ {
+			words[i] = ^words[i] + carry
+			if words[i] != 0 || carry == 0 {
+				carry = 0
+			}
+		}
+	}
 	if nl.BigWords == nil {
-		words[0] = uint64(nl.Val)
-		if t != nil && t.Signed && nl.Val < 0 {
+		if neg {
+			words[0] = uint64(-nl.Val)
+		} else {
+			words[0] = uint64(nl.Val)
+		}
+		if nl.Val < 0 || neg {
+			for i := 1; i < w; i++ {
+				words[i] = ^uint64(0)
+			}
+		}
+	}
+	// C23 conversion to a narrower _BitInt: reduce modulo 2^Bits, then
+	// sign-extend when the target is signed (6.3.1.3).
+	if t != nil && t.Bits < 64 {
+		mask := (uint64(1) << t.Bits) - 1
+		words[0] &= mask
+		if t.Signed && (words[0]>>(t.Bits-1))&1 != 0 {
+			words[0] |= ^mask
 			for i := 1; i < w; i++ {
 				words[i] = ^uint64(0)
 			}
@@ -6894,7 +7006,9 @@ func (c *CG) emitGlobalVar(out *strings.Builder, g *DeclStmt, lab string) error 
 			if i > 0 {
 				out.WriteString(", ")
 			}
-			out.WriteString(fmt.Sprintf("0x%x", wv))
+			// signed decimal keeps the bit pattern while staying within goa's
+			// dq ParseInt range ("0xffffffffffffffc8" overflows int64 there).
+			out.WriteString(fmt.Sprintf("%d", int64(wv)))
 		}
 		out.WriteString("\n")
 		return nil
@@ -7218,7 +7332,7 @@ func (c *CG) fillBraceElem(t *Type, e Expr, img []byte, off int) error {
 func (c *CG) structSrcAddr(e Expr, t *Type) error {
 	switch call := e.(type) {
 	case *Call:
-		if isAgg(t) {
+		if t.IsStruct() || t.IsUnion() {
 			if _, err := c.genExprT(call); err != nil {
 				return err
 			}
@@ -7229,7 +7343,7 @@ func (c *CG) structSrcAddr(e Expr, t *Type) error {
 			return nil
 		}
 	case *IndirectCall:
-		if isAgg(t) {
+		if t.IsStruct() || t.IsUnion() {
 			if _, err := c.genExprT(call); err != nil {
 				return err
 			}

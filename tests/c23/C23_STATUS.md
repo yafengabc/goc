@@ -1,15 +1,16 @@
 # C23 特性就绪度状态矩阵（goc tests\c23）
 
-> 测试套件：`D:\projects\goc\tests\c23\`（cases 64 个用例文件 + 一键重跑脚本 `run_c23_tests.ps1` + 对拍引擎 `_tools\check_case.ps1`）
+> 测试套件：`D:\projects\goc\tests\c23\`（cases 65 个用例文件 + 一键重跑脚本 `run_c23_tests.ps1` + 对拍引擎 `_tools\check_case.ps1`）
 > 对拍基线：`D:\projects\goc\bin\goc.exe`（2026-10-02 版本）vs `D:\msys\ucrt64\bin\gcc.exe -std=c2x -Wall -Wextra`（GCC 16.2.0，MSYS2 UCRT64，Windows LLP64）
 > 判定四类：**PASS**（goc 与 gcc 行为一致）/ **FAIL**（gcc 通过而 goc 错误 = 真实缺口，附报错原文）/ **UNSUPPORTED**（goc 明确设计取舍）/ **PARTIAL**（部分子用例通过，含两侧输出不同但都能跑的 DIFF 情形）
-> 全量机械判定：42 PASS / 8 PARTIAL / 7 FAIL / 5 DIFF / 2 UNSUPPORTED（详见下方分组表；机械判定与语义判定差异处已注明）
-> 所有用例均在 gcc -std=c2x 下编译运行通过（负向用例为双方拒绝），源代码 LF/UTF-8 无 BOM/纯 ASCII，未改动 src\ 任何文件、未触碰 gocregress 基线。
+> 全量机械判定：44 PASS / 7 PARTIAL / 7 FAIL / 5 DIFF / 2 UNSUPPORTED（详见下方分组表；机械判定与语义判定差异处已注明）
+> 所有用例均在 gcc -std=c2x 下编译运行通过（负向用例为双方拒绝），源代码 LF/UTF-8 无 BOM/纯 ASCII。
+> 2026-10-02 更新：P0 _BitInt 修复落地（src\codegen.go、src\goclib\bitint.c/h），`c23_bitint.c` 由 PARTIAL(12/15) 转 **PASS(15/15)**，新增 `c23_bitint_edge.c`（PASS 7/7，覆盖裸字面量比较/全局与 static 非零初始化/嵌套同宽 cast/6 参 conv 栈通道）；go test 全绿，C89-C17 套件 0 MISMATCH。
 
 ## 0. 对写标准库的核心结论（先看这个）
 
 ### 能放心用（PASS，可直接采用）
-- **基础类型**：`bool/true/false`（勿 include <stdbool.h>，goc 无此头）、`nullptr` 判空、`typeof/typeof_unqual`（实参限类型名或标量变量）、`auto` 推导、`_BitInt(N)` **>64 位**（128/256/1024 大整数，与 gcc 逐位一致）
+- **基础类型**：`bool/true/false`（勿 include <stdbool.h>，goc 无此头）、`nullptr` 判空、`typeof/typeof_unqual`（实参限类型名或标量变量）、`auto` 推导、`_BitInt(N)` **全宽度**（1..1024 位，≤64 位回绕、跨宽度符号扩展、嵌套 cast、裸字面量比较均与 gcc 逐位一致）
 - **存储/聚合**：文件作用域 `thread_local` 与函数内 `static thread_local`、单层匿名 struct/union、无参 `f()` ≡ `f(void)`、普通整数位域（含纯 int 位域按有符号，与 gcc 一致）
 - **预处理**：`#embed`（基本 + limit + prefix/suffix/if_empty）、`#elifdef/#elifndef`、`#warning`、`__has_include`（直接调用）、`__VA_OPT__`、空参宏、宏展开 30 层嵌套、`#if` 常量表达式（含 0b、intmax 回绕）
 - **字面量**：0b 二进制、数字分隔符（合法位置）、带 p 指数的十六进制浮点、u8 字符串值/大小/拼接、自动存储期空 `{}` 初始化（关键处用 `{0}` 更稳）
@@ -26,7 +27,6 @@
 | 编译器直接报错 | **属性在类型位置** | `struct [[nodiscard]] T`、参数上属性、typedef 尾属性全部 parse error |
 | 编译器直接报错 | **_Atomic / <stdatomic.h>** | `_Atomic int` 连语法都不解析（roadmap #129 "语法接受"不成立）；头缺失 |
 | 编译器直接报错 | **块作用域 constexpr**、`static T = {}`、无消息 `static_assert(e)`、结构体内 static_assert、`__typeof__`/嵌套 typeof、`typeof(&x)` | 均解析拒绝 |
-| 值错误 | **_BitInt ≤64 位** | 不按 N 位回绕：`(S8)200→200`（应 -56）、`(U8)200+100→300`（应 44）、`(U32)0-1→2^64-1`（应 2^32-1） |
 | 值错误 | **双层嵌套匿名成员** | 夹具名字段的两级匿名字段错位（`a=11` vs gcc `a=10`）；位域成员不可花括号初始化 |
 | 值错误 | **alignas 对齐成员/数组** | 标量变量真对齐，但结构体成员/字符数组/alignas(64) 局部数组实际未对齐（偏移 8/8/48） |
 | 值错误 | **enum E:T 布局** | 语法与枚举值对，但 sizeof(enum) 恒为 4（`enum:uchar`/`enum:llong` 都 4，gcc 为 1/8） |
@@ -43,11 +43,11 @@
 | 缺失宏 | **limits.h/float.h 全部 C23 宏** | CHAR_WIDTH…ULLONG_WIDTH、BOOL_WIDTH、BITINT_MAXWIDTH、FLT_NORM_MAX、FLT_IS_IEC_60559 等 goc 一个都没有；LLONG_MAX 也没有 |
 | 缺失设施 | **offsetof / max_align_t** | goc stddef.h 明写 "deliberately not provided" |
 | 平台细节 | **printf %a / %wN / `"hello"[0]` 直接下标** | goc 无 %a（打印字面 'a'）、无 %wN；字符串字面量直接下标返回垃圾值 1819043176（先赋 `const char*` 再下标） |
-| 编译器崩溃 | **_BitInt 与裸字面量比较**、**块作用域非 static thread_local** | goc 编译期 Go panic（nil 解引用，exit 2）——前者须显式 `(T)0` 强转，后者是非法 C（gcc 拒绝） |
+| 编译器崩溃 | **块作用域非 static thread_local** | goc 编译期 Go panic（nil 解引用，exit 2）——非法 C（gcc 拒绝），合法形式须 `static thread_local` |
 
 ### 需要上报 goc 的缺陷清单（按优先级）
-1. `_BitInt` ≤64 位不做宽度掩码（赋值/运算不回绕）——P1
-2. `_BitInt` 与无类型整数字面量比较触发编译器 panic（codegen.go bigWordsOf nil 解引用）——P1
+1. ~~`_BitInt` ≤64 位不做宽度掩码（赋值/运算不回绕）~~ ——**已修复**（2026-10-02：8 处转换落点改 `from_i64_trunc`/`conv` 按目标宽度回绕 + 算术/复合赋值就地回绕）
+2. ~~`_BitInt` 与无类型整数字面量比较触发编译器 panic~~ ——**已修复**（比较分支 nil 类型兜底 `IntType()`）；另修复：全局/static 非零初始化被静默丢弃（bigInitWords 剥 cast 链+回绕+负值全宽扩展）、goa dq 拒 16 位十六进制、callBigLib 5+ 参栈通道、同宽 big->big cast 缺失 copyBytes、返回 _BitInt 的函数调用误判 struct
 3. 块作用域非 static `thread_local` 触发编译器 panic——P1
 4. 空 `{}` 初始化：首个标量不归零（codegen bug）、static 存储期被拒——P1
 5. `_Generic` 在 LLP64 把 long/unsigned 折叠为 int（genericTypeMatch 宽度相等时丢符号/类型）——P2
@@ -77,7 +77,8 @@
 | static_assert 两形式 | **PASS（附缺口）** | 4 | `static_assert(e,"msg")`/`_Static_assert(e,"msg")` 文件与块作用域可用；**拒**无消息形式 `static_assert(e)`（`expected "," after static_assert condition`）与结构体内形式 | 4/4 全支持 | 放心用但**必须带消息**；勿写无消息形式、勿放 struct 体内 |
 | static_assert(0) 假条件（负向） | **PASS（双方拒）** | 1 | `parse error: static_assert failed: this condition is always false` | `error: static assertion failed` | 一致拒绝 |
 | 匿名 struct/union 成员 | **PARTIAL** | 7 | 单层（扁平访问/union 重叠/指示符/箭头/sizeof）全对；**双层嵌套匿名错位**（`a=11` vs gcc `a=10`）；位域成员不可花括号初始化（`cannot brace-initialise bit-field member "lo"`） | 7/7 | 单层放心用；**双层嵌套避开**；位域用逐字段赋值 |
-| _BitInt(N) 大整数 | **PARTIAL** | 15 | >64 位（128/256/1024）算术/跨宽度符号扩展/除法与 gcc 逐位一致；**≤64 位不回绕**：`(S8)200→200`（应 -56）、`(U8)200+100→300`（应 44）、`(U32)0-1→2^64-1`（应 2^32-1）；**与裸字面量比较会编译期 panic**（`main.bigWordsOf ... codegen.go:1043`）；`sizeof(_BitInt(1..32))=8`（gcc 1/2/4） | 15/15；gcc printf 无 %wN（实测） | **>64 位放心用**（128/256/1024 位大整数）；**≤64 位当窄整型会错**（等价 int/uint64 行为）；比较须显式 `(T)0` 强转 |
+| _BitInt(N) 大整数 | **PASS** | 15 | 全部宽度（1/8/17/31/32/64/65/127/128/256/1024）回绕/算术/移位/跨宽度符号扩展/除法/嵌套同宽 cast 与 gcc 逐位一致；`sizeof(_BitInt(1..32))=8`（gcc 1/2/4，ABI 差异，非缺陷） | 15/15 逐行一致 | **全宽度放心用**（2026-10-02 P0 修复后）；≤64 位当窄整型用回绕正确；比较可直接写裸字面量 |
+| _BitInt 边界用例（edge） | **PASS** | 7 | 裸字面量比较（S8/U64）、文件作用域/static 非零初始化（含嵌套 cast、负值全宽扩展）、全局算术、嵌套同宽 cast 的声明/赋值/传参/返回、窄化 6 参 conv 全部与 gcc 一致（`cases\c23_bitint_edge.c`，2026-10-02 新增） | 7/7 逐行一致 | 覆盖本次 P0 修复的全部触发点，写标准库回归必跑 |
 | u8 字面量类型身份（char8_t） | **PARTIAL（DIFF）** | 5 | u8 字符串按 `char*` 衰减（C11 模型）；`sizeof(u8'A')=8`（异常，应 1）；goc 内建 char8_t 类型名（无需 uchar.h） | gcc：u8"abc"=unsigned char*、u8'A'=unsigned char、sizeof=1；不 include <uchar.h> 时不暴露 char8_t 名 | 别按 char8_t 类型身份判断；u8 字符串当普通 char* 用 |
 | 无参 f() == f(void) | **PASS** | 5 | 声明等价/重声明兼容/函数指针类型同一，全对 | 5/5 逐行一致 | 放心用 |
 | __STDC_VERSION__ 等预定义宏 | **FAIL** | 5 | **goc 不定义**：`type error(s): line 14: undeclared identifier "__STDC_VERSION__"`（__STDC__/__STDC_HOSTED__ 同样未定义） | `__STDC_VERSION__=202311`、`__STDC__=1`、`__STDC_HOSTED__=1` | **条件编译失效**：不能 `#if __STDC_VERSION__ >= 202311L`；写标准库用自身 feature 宏替代 |
@@ -165,8 +166,8 @@
 4. **LLP64 平台效应**（A1/D2/F 组交叉）：gcc 侧 `long`=32 位（LONG_WIDTH=32）；goc 侧 `long`/`unsigned long`=64 位；`_Generic` 的 long/unsigned 折叠即源于 goc 以宽度为主键比较。若目标是 LP64（Linux），long 相关结论需复测。
 5. **预定义宏全线缺失**（A 组 + 各负向探针）：goc 不定义 `__STDC_VERSION__`/`__STDC__`/`__STDC_HOSTED__`/`__STDC_NO_VLA__`，标准条件编译（版本判断、VLA 探测）全部失效。
 6. **`defined()` 不可见**（B 组 + 组织者探针）：`defined(__has_include)`/`defined(__has_c_attribute)` 在 goc 恒为假；直接调用可用。契约里推荐的 portable guard 写法对 goc 不成立。
-7. **编译器健壮性**（A2 组）：块作用域非 static `thread_local`、_BitInt 与裸字面量比较会触发 goc 编译期 Go panic（nil 解引用，exit 2）——非法/边界写法直接让 goc 崩溃而非报错。
-8. **roadmap 修正汇总**：#129 _Atomic"语法接受+lock 前缀"不成立（parse 拒绝）；#131 _BitInt 窄宽度掩码缺失（π 对拍只覆盖宽宽度）；<stdbit.h>/<uchar.h> 后置成立；long double 降级成立但标记宏未定义；#embed prefix/suffix/if_empty 已支持（"后置未确认"不准确）；stdckdint "已支持"仅 32 位成立；stddef.h 的 offsetof/max_align_t 缺失未记录。
+7. **编译器健壮性**（A2 组）：块作用域非 static `thread_local` 会触发 goc 编译期 Go panic（nil 解引用，exit 2）——非法写法直接让 goc 崩溃而非报错；_BitInt 与裸字面量比较的同类 panic 已于 2026-10-02 修复。
+8. **roadmap 修正汇总**：#129 _Atomic"语法接受+lock 前缀"不成立（parse 拒绝）；#131 _BitInt 窄宽度掩码缺失（π 对拍只覆盖宽宽度）——**已于 2026-10-02 修复**；<stdbit.h>/<uchar.h> 后置成立；long double 降级成立但标记宏未定义；#embed prefix/suffix/if_empty 已支持（"后置未确认"不准确）；stdckdint "已支持"仅 32 位成立；stddef.h 的 offsetof/max_align_t 缺失未记录。
 
 ## 附：重跑方法
 

@@ -11,6 +11,12 @@
 void __goclib_bi_zero(unsigned long long *r, long n);
 void __goclib_bi_copy(unsigned long long *r, const unsigned long long *a, long n);
 void __goclib_bi_from_i64(unsigned long long *r, long long v, long n, long dstSigned);
+void __goclib_bi_from_i64_trunc(unsigned long long *r, long long v, long bits, long dstSigned);
+void __goclib_bi_conv(unsigned long long *r, const unsigned long long *a,
+                      long dstBits, long dstSigned, long srcBits, long srcSigned);
+void __goclib_bi_from_i64_trunc(unsigned long long *r, long long v, long bits, long dstSigned);
+void __goclib_bi_conv(unsigned long long *r, const unsigned long long *a,
+                      long dstBits, long dstSigned, long srcBits, long srcSigned);
 long long __goclib_bi_to_i64(const unsigned long long *a, long n);
 long __goclib_bi_is_zero(const unsigned long long *a, long n);
 void __goclib_bi_add(unsigned long long *r, const unsigned long long *a,

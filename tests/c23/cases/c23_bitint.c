@@ -4,8 +4,9 @@
  *             + - * / % and == != < >= ; casts to long long/int/unsigned and between widths;
  *             mod-2^N wrap; sizeof. NOTE: gcc 16.2.0 printf has no %wN modifier, so <=64-bit
  *             values are cast to long long/%ll and >64-bit values use a hand /10 decimal printer.
- *             All comparisons use explicit (T) casts (goc otherwise panics on literal compare).
- * Status:     PARTIAL (wide >64-bit widths match gcc; narrow <=64-bit widths are NOT masked)
+ *             (2026-10-02 P0 _BitInt fix: <=64-bit widths wrap, literal compare no longer
+ *             panics, nested same-width casts copy the value).
+ * Status:     PASS (goc == gcc, 15/15; see also c23_bitint_edge.c for the fix's edge cases)
  * EXPECT: PASS
  */
 #include <stdio.h>
