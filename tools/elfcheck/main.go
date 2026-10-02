@@ -5,7 +5,8 @@
 // It can still run the image through a hand-written interpreter, but that mode
 // no longer decides whether a program's output is correct: an interpreter we
 // wrote can only ever agree with our own ideas about what x86-64 should do.
-// ucrun.py executes the same ELF on QEMU's CPU core (TCG, via Unicorn), and
+// tools/ucrun/ucrun.exe executes the same ELF on QEMU's CPU core (TCG, via
+// Unicorn), and
 // that is the authority this project defers to. Pass -structure-only for the
 // ordinary check; the golden-output comparison belongs to the QEMU leg.
 package main
@@ -25,7 +26,8 @@ func main() {
 	path := os.Args[len(os.Args)-1]
 	verbose := len(os.Args) > 2 && os.Args[1] == "-v"
 	// Structure-only mode stops after the header/segment checks. Deciding what a
-	// program *prints* is no longer this tool's job: ucrun.py runs the ELF on
+	// program *prints* is no longer this tool's job: tools/ucrun/ucrun.exe runs
+	// the ELF on
 	// QEMU's CPU core (TCG), whose instruction semantics we did not hand-write.
 	structureOnly := len(os.Args) > 2 &&
 		(os.Args[1] == "-structure-only" || os.Args[1] == "--structure-only")

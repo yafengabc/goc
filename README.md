@@ -17,8 +17,9 @@ bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面�
 ./bin/goc.exe -c -target linux src/examples/hello.c  # 出 Linux ELF64（无后缀）
 ```
 
-Windows 产物只导入 **Windows 系统 DLL**（`win32.def` 列出的 kernel32/user32/gdi32
-导出，按程序实际调用取子集）；Linux 产物是静态 ELF，一条动态链接都没有，只用
+Windows 产物只导入 **Windows 系统 DLL**（kernel32/user32/gdi32
+导出，按程序实际调用取子集；每个 API 的归属 DLL 写在同名头文件的 `extern ... , dll` 原型里，例如
+`winbase.h` 里的 `extern BOOL CloseHandle(HANDLE), kernel32;`）；Linux 产物是静态 ELF，一条动态链接都没有，只用
 syscall（`write` / `read` / `brk` / `exit_group`）。两头都没有 msvcrt / glibc，
 也没有 gcc。
 
@@ -50,7 +51,6 @@ zip 文件名和 Release 的 tag 上。Windows zip 含 `goc.exe` / `cc.exe` /
 │   │   ├── stddef.h  stdarg.h  stdio.h  stdlib.h       #   内置标准头（可被 #include）
 │   │   │   string.h  ctype.h
 │   │   ├── windows.h  windef.h  winbase.h  wingdi.h  winuser.h
-│   │   ├── win32.def                                   #   Windows 导入名 -> DLL（embed 进 goc）
 │   │   └── README.md                                   #   库的实现机制
 │   └── examples/*.c  expected/*.txt                    # goc 的用例与 golden
 ├── tools/                                              # 验证工具（独立 go 模块）
@@ -131,8 +131,8 @@ goc 启动时会注入 `_WIN32`/`_WIN64` 或 `__linux__`/`__linux`，所以库�
 | `__goclib_read(buf,len)` | `GetStdHandle`+`ReadFile` | `read`(fd=0) |
 
 Windows 侧原语只建立在 kernel32 之上，所以**依赖表里依然没有 msvcrt**；Linux 侧
-只依赖 syscall。Win 侧 extern 的 DLL 归属由 `goclib/win32.def`（embed 进二进制）
-回答 —— 改了它必须重建 goc。
+只依赖 syscall。Win 侧 extern 的归属 DLL 写在内置头文件的原型里（如 `winbase.h` 的
+`extern ... , kernel32;`），由 `dllOf` 表在编译期收集，无需单独的中心表。
 
 goc 在启动时把整个库当普通 C 程序编译**两次**（每个目标一次），函数体经常规代码
 生成器按需发射：程序**实际调用到**的函数（及其传递闭包）才会进产物，只用

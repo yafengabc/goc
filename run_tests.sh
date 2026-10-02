@@ -13,7 +13,8 @@
 # independent of each other (disjoint output dirs and /tmp log names), so by
 # default they run IN PARALLEL: each leg logs to /tmp/leg_<id>.log and the
 # driver waits for all of them, then prints every leg's report and the summed
-# pass/fail counts. GOC_PARALLEL=0 restores the old sequential behaviour.
+# pass/fail counts. Runs SEQUENTIAL by default now (parallel caused flaky
+# failures under AV/IO contention); set GOC_PARALLEL=1 to re-enable it.
 #
 # Usage:  bash run_tests.sh
 # Exit:   0 if every example matches, 1 otherwise.
@@ -38,33 +39,29 @@ echo "== building goa =="
 
 # elfcheck verifies the ELF *structure* (headers, segments, entry). It no longer
 # decides whether the program's output is right -- the Linux binaries below are
-# executed by Unicorn, which is QEMU's CPU core (TCG). See find_python().
+# executed by ucrun.exe, which wraps QEMU's CPU core (TCG). See find_ucrun().
 echo "== building elfcheck =="
 (cd tools && go build -o ../bin/elfcheck.exe ./elfcheck) || { echo "ELFCHECK BUILD FAILED"; exit 1; }
 
-# Find a Python that can import unicorn. Unicorn exposes QEMU's TCG x86-64 core
-# as a library, so ucrun.py gives us real instruction semantics (flags, SSE2,
-# addressing) instead of a hand-written guess at them -- which matters because
-# an interpreter that agrees with our own codegen is only agreeing with itself.
-find_python() {
-    if [ -n "${GOC_PYTHON:-}" ] && [ -x "$GOC_PYTHON" ]; then echo "$GOC_PYTHON"; return 0; fi
-    for c in python3 python py; do
-        if command -v "$c" >/dev/null 2>&1 && "$c" -c "import unicorn" >/dev/null 2>&1; then
-            command -v "$c"; return 0
-        fi
+# Find ucrun.exe (standalone unicorn ELF emulator, tools/ucrun/ucrun.c).
+# Unicorn exposes QEMU's TCG x86-64 core, so the Linux binaries below get real
+# instruction semantics (flags, SSE2, addressing) instead of a hand-written
+# guess at them -- which matters because an interpreter that agrees with our
+# own codegen is only agreeing with itself.
+find_ucrun() {
+    if [ -n "${UCRUN:-}" ] && [ -f "$UCRUN" ]; then echo "$UCRUN"; return 0; fi
+    for c in bin/ucrun.exe ../../bin/ucrun.exe ../bin/ucrun.exe; do
+        if [ -f "$c" ]; then echo "$c"; return 0; fi
     done
-    for p in /d/msys/ucrt64/bin/python3.exe /c/msys64/ucrt64/bin/python3.exe \
-             /c/msys64/mingw64/bin/python3.exe; do
-        if [ -x "$p" ]; then echo "$p"; return 0; fi
-    done
+    command -v ucrun.exe >/dev/null 2>&1 && { command -v ucrun.exe; return 0; }
     return 1
 }
-UCPY=""
-if UCPY="$(find_python)"; then
-    echo "== linux runner: $UCPY -c 'import unicorn' ok =="
+UCRUN=""
+if UCRUN="$(find_ucrun)"; then
+    echo "== linux runner: $UCRUN (unicorn/QEMU) =="
 else
-    echo "== WARNING: no Python with the unicorn/QEMU bindings found; the Linux"
-    echo "==          leg will be SKIPPED. Set GOC_PYTHON=/path/to/python to enable it. =="
+    echo "== WARNING: ucrun.exe not found; the Linux"
+    echo "==          leg will be SKIPPED. Build it: gcc tools/ucrun/ucrun.c -I<d>/include -L<d>/lib -lunicorn -o bin/ucrun.exe =="
 fi
 
 # Fresh output dirs: goc -o <dir> writes every .exe/ELF there. The -o1/-os
@@ -177,7 +174,7 @@ run_linux_leg() {  # <dirSuffix> <label> [extra goc flags...]
             continue
         fi
 
-        if [ -z "$UCPY" ]; then
+        if [ -z "$UCRUN" ]; then
             skipped=$((skipped + 1))
             continue
         fi
@@ -192,7 +189,7 @@ run_linux_leg() {  # <dirSuffix> <label> [extra goc flags...]
         # *output* comes from the QEMU run.
         ./bin/elfcheck.exe --structure-only "$out/$name" >/dev/null 2>&1
 
-        "$UCPY" tools/ucrun.py "$out/$name" 2>"/tmp/gocl${dir}_$name.err" | tr -d '\r' >"/tmp/gocl${dir}_$name.out"
+        "${UCRUN:?}" "$out/$name" 2>"/tmp/gocl${dir}_$name.err" | tr -d '\r' >"/tmp/gocl${dir}_$name.out"
         rc=${PIPESTATUS[0]}
 
         # Diff unconditionally: `rc != 0 || !diff` short-circuits before diff
@@ -235,7 +232,7 @@ run_unit() {  # <mod> <logfile>
 # reports exit codes separately from stdout, which catches a crash that
 # happens to print the right prefix.
 run_goa() {
-    if GOC_PYTHON="${UCPY:-}" bash src/goa/run_tests.sh; then
+    if UCRUN="${UCRUN:-}" bash src/goa/run_tests.sh; then
         echo "ok    goa examples suite"
         echo "LEGSTATS pass=1 fail=0"
     else
@@ -256,7 +253,7 @@ aggregate() {  # <logfile>...: sum every leg's LEGSTATS line
     done
 }
 
-if [ "${GOC_PARALLEL:-1}" = "1" ]; then
+if [ "${GOC_PARALLEL:-0}" = "1" ]; then
     echo "== running 6 example legs + goa suite + 3 unit modules in parallel =="
     run_win_leg  ""   ""           >/tmp/leg_win0.log   2>&1 & p0=$!
     run_win_leg  "-o1" "O1/"  -O1  >/tmp/leg_wino1.log  2>&1 & p1=$!
