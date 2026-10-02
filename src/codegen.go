@@ -29,6 +29,11 @@ type varInfo struct {
 	// whatever was there before -- so loading it must re-extend from the
 	// 4-byte value instead of reading all 8 bytes (see loadVar).
 	addr bool
+	// ptr is set when the ptrCapable analysis (see src/ptrcap.go) determined
+	// that this int-typed variable may hold a 64-bit pointer value. Narrow
+	// consumption sites then skip the movsxd (T1.6 C4): the high 32 bits are
+	// meaningful pointer bits, not a materialized int's zero padding.
+	ptr bool
 }
 
 type CG struct {
@@ -50,6 +55,16 @@ type CG struct {
 	// addrTaken holds the locals whose address is taken (&x) in the current
 	// function; declareVar copies the flag into each varInfo.addr.
 	addrTaken map[string]bool
+	// ptrCapable holds the current function's ptrCapable analysis result
+	// (variable name -> may hold a 64-bit pointer); declareVar copies the flag
+	// into each varInfo.ptr. Built once per function by analyzePtrCapable
+	// before any declareVar runs (see src/ptrcap.go).
+	ptrCapable map[string]bool
+	// resPtr records whether the value currently in rax was loaded from a
+	// ptrCapable variable: such a value's high 32 bits are pointer bits, and
+	// the narrow sites (N5b/N11/N12/N17/N22) must not movsxd it. Every
+	// expression evaluation resets it except a bare load of a marked variable.
+	resPtr bool
 	declUID    map[*DeclStmt]int // declaration node -> uid (filled during gather)
 	// clOff maps each compound literal in the current function to its
 	// persistent frame slot. The unnamed object must stay addressable for as
@@ -915,6 +930,7 @@ func (c *CG) loadVar(vi varInfo) {
 		c.resTyp = TInt
 		c.resSigned = vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Signed
 		c.resW = c.semWOf(vi.typ)
+		c.resPtr = vi.ptr // T1.6 (C4): reg-cached loads return before the tail
 		return
 	}
 	if vi.typ != nil && vi.typ.IsFloating() {
@@ -965,6 +981,9 @@ func (c *CG) loadVar(vi varInfo) {
 	c.resTyp = TInt
 	c.resSigned = signed
 	c.resW = c.semWOf(vi.typ)
+	// T1.6 (C4): a load of a ptrCapable variable leaves a 64-bit pointer
+	// candidate in rax; the narrow sites must not movsxd it.
+	c.resPtr = vi.ptr
 }
 
 // storeVar emits code that stores the value currently in rax (int) or xmm0
@@ -982,7 +1001,7 @@ func (c *CG) storeVar(vi varInfo) {
 	narrow := vi.typ != nil && !vi.typ.IsFloating() && vi.typ.Kind != KBool &&
 		c.slotWidth(vi.typ) == 8 &&
 		(vi.typ.Kind != KInt || vi.typ.Width == 8) &&
-		c.resW == 4 && c.resSigned
+		c.resW == 4 && c.resSigned && !c.resPtr
 	if vi.reg != "" {
 		// Register-cached int local: keep it in the callee-save (which
 		// survives function calls, so no spill is needed).
@@ -1053,8 +1072,9 @@ func (c *CG) ensureType(want CType) error {
 		// T1.6 (N22): a signed materialized int (low 32 valid, high 32 = 0)
 		// must be sign-extended before cvtsi2sd, or -5 converts to
 		// 4294967291.0. An unsigned int is already zero-extended (correct); a
-		// long (resW==8) is a full 64-bit value.
-		if c.resW == 4 && c.resSigned {
+		// long (resW==8) is a full 64-bit value; a ptrCapable int (C4) holds
+		// pointer bits and must pass through unextended.
+		if c.resW == 4 && c.resSigned && !c.resPtr {
 			c.emit("movsxd rax, eax")
 		}
 		c.emit("cvtsi2sd xmm0, rax")
@@ -1669,7 +1689,24 @@ func (c *CG) genTruth(e Expr) error {
 // genExpr is the entry point for emitting an expression. The integer/double
 // type of the result is returned so callers can route it to the right
 // register.
+// genExprT evaluates e into rax (int) or xmm0 (double) and records the
+// result's type class in c.resTyp plus width/signedness in c.resW/c.resSigned.
+// c.resPtr (T1.6 C4) tells the narrow sites whether rax may hold a 64-bit
+// pointer loaded from a ptrCapable variable: only a bare variable reference
+// leaves that flag set (loadVar sets it; the Ident case clears it for every
+// non-local path), every other expression yields an ordinary value and the
+// wrapper resets the flag. Internal recursive calls route through this
+// wrapper too, so a flag captured after an operand evaluation is the operand's
+// own, not a leftover.
 func (c *CG) genExprT(e Expr) (CType, error) {
+	t, err := c.genExprT1(e)
+	if _, ok := e.(*Ident); !ok {
+		c.resPtr = false
+	}
+	return t, err
+}
+
+func (c *CG) genExprT1(e Expr) (CType, error) {
 	// C23 _BitInt values ride a by-address model (like structs): a value-typed
 	// expression leaves the address of the value in r10 and sets resBig;
 	// consumers (binary ops, conditions, assignments, calls) read the flags.
@@ -1766,6 +1803,11 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		// File-scope names. A static local shadows a same-named TLS global
 		// within its function, but a static *thread-local* local still needs
 		// the segment reach (it is also registered in tlsVars).
+		// T1.6 (C4): a non-local load never yields a ptrCapable value, so the
+		// flag is cleared here -- genExprT's wrapper only preserves resPtr for
+		// bare Ident evaluations (i.e. loadVar), and this branch must not leak
+		// an earlier load's flag into the caller.
+		c.resPtr = false
 		if lab, ok2 := c.staticVars[n.Name]; ok2 {
 			if _, isTLS := c.tlsVars[n.Name]; !isTLS {
 				return c.loadGlobal(lab, c.globalTyp[lab])
@@ -1980,7 +2022,7 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		// which is exactly the movsxd pattern. resW==8 sources and unsigned
 		// int sources (already zero-extended, the correct widening) need none.
 		if t == TInt && n.Typ != nil && n.Typ.Kind == KInt && n.Typ.Width == 8 &&
-			c.resW == 4 && c.resSigned {
+			c.resW == 4 && c.resSigned && !c.resPtr {
 			c.emit("movsxd rax, eax")
 		}
 		if err := c.ensureType(n.Typ.Class()); err != nil {
@@ -4488,6 +4530,7 @@ func (c *CG) declareVar(name string, info varInfo) int {
 	uid := c.varUID
 	c.varUID++
 	info.addr = c.addrTaken[name]
+	info.ptr = c.ptrCapable[name]
 	c.varEnts[uid] = info
 	c.scopes[len(c.scopes)-1][name] = uid
 	return uid
@@ -4510,6 +4553,10 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	c.scopes = nil
 	c.varUID = 0
 	c.declUID = map[*DeclStmt]int{}
+	// T1.6 (C4): mark the int-typed locals/parameters that may hold a 64-bit
+	// pointer before any declareVar consults the flag (loadVar/slot layouts
+	// depend on varInfo.ptr).
+	c.ptrCapable = c.analyzePtrCapable(f)
 	c.pushScope()                      // function / parameter scope (scope 0)
 	c.staticVars = map[string]string{} // fresh per function: static-local names do not leak across functions
 	c.curRet = f.Ret
@@ -4666,7 +4713,9 @@ func (c *CG) genFunc(f *FuncDecl) error {
 		if intClass && !addrTaken[d.name] && ri < len(regPool) {
 			regOf[d.name] = regPool[ri]
 			c.usedRegs = append(c.usedRegs, regPool[ri])
-			c.varEnts[d.uid] = varInfo{reg: regPool[ri], typ: d.typ}
+			// T1.6 (C4): this direct varEnts construction bypasses declareVar,
+			// so the ptrCapable flag must be copied here explicitly.
+			c.varEnts[d.uid] = varInfo{reg: regPool[ri], typ: d.typ, ptr: c.ptrCapable[d.name]}
 			ri++
 		} else {
 			stackDecls = append(stackDecls, d)
@@ -4735,16 +4784,18 @@ func (c *CG) genFunc(f *FuncDecl) error {
 		if !isAgg(pt) {
 			if i < regCap {
 				localBytes += 8
-				c.varEnts[paramUIDs[i]] = varInfo{off: -(regArea + localBytes), typ: pt}
+				// T1.6 (C4): these layout writes overwrite the declareVar
+				// entries, so the ptrCapable flag must be carried over.
+				c.varEnts[paramUIDs[i]] = varInfo{off: -(regArea + localBytes), typ: pt, ptr: c.ptrCapable[p]}
 			} else if c.linux {
-				c.varEnts[paramUIDs[i]] = varInfo{off: 16 + 8*(i-regCap), typ: pt}
+				c.varEnts[paramUIDs[i]] = varInfo{off: 16 + 8*(i-regCap), typ: pt, ptr: c.ptrCapable[p]}
 			} else {
-				c.varEnts[paramUIDs[i]] = varInfo{off: 16 + 8*(i+regShift), typ: pt}
+				c.varEnts[paramUIDs[i]] = varInfo{off: 16 + 8*(i+regShift), typ: pt, ptr: c.ptrCapable[p]}
 			}
 			continue
 		}
 		localBytes += aggSlotBytes(pt)
-		c.varEnts[paramUIDs[i]] = varInfo{off: -(regArea + localBytes), typ: pt}
+		c.varEnts[paramUIDs[i]] = varInfo{off: -(regArea + localBytes), typ: pt, ptr: c.ptrCapable[p]}
 		pc := paramCopy{name: p, typ: pt}
 		if i < regCap {
 			pc.srcReg = argRegs[i+regShift]
@@ -4795,8 +4846,9 @@ func (c *CG) genFunc(f *FuncDecl) error {
 				w = 1
 			}
 			localBytes += w
+			// T1.6 (C4): carry the ptrCapable flag (see the parameter loop).
 			c.varEnts[d.uid] = varInfo{off: -(regArea + localBytes), typ: d.typ,
-				addr: c.addrTaken[d.name]}
+				addr: c.addrTaken[d.name], ptr: c.ptrCapable[d.name]}
 		}
 	}
 	// Compound literals: each occurrence in the body gets its own persistent
@@ -6149,6 +6201,9 @@ func (c *CG) genLValue(e Expr) error {
 		// zero-extended (large indexes >= 2^31 address real memory), and a long
 		// index is already full width.
 		iw, is := c.resW, c.resSigned
+		// T1.6 (C4): a ptrCapable index holds pointer bits; the movsxd below
+		// is skipped so the full 64-bit index reaches the scaled add.
+		ip := c.resPtr
 		c.tmpDepth++
 		islot := c.tmpSlot(c.tmpDepth)
 		c.emit("mov [rbp%+d], rax", islot)
@@ -6214,7 +6269,7 @@ func (c *CG) genLValue(e Expr) error {
 			}
 			c.emit("mov r10, rax")
 		}
-		if iw == 4 && is {
+		if iw == 4 && is && !ip {
 			// N11: sign-extend a signed int index from the slot's low dword
 			// (the spilled materialized value) for the 64-bit scale-and-add.
 			c.emit("movsxd r11, dword [rbp%+d]", islot)
@@ -8334,6 +8389,9 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 	// are always the left operand). The right operand is only a count.
 	leftSigned := c.resSigned
 	leftW := c.resW
+	// T1.6 (C4): whether each operand is a ptrCapable load (pointer bits in
+	// the high 32) -- the narrow sites below skip movsxd for such operands.
+	leftPtr := c.resPtr
 	if lt == TDouble {
 		c.emit("movsd [rbp%+d], xmm0", off)
 	} else {
@@ -8347,6 +8405,7 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 	// For symmetric comparisons the two operands normally share signedness,
 	// so the right operand's flag is an acceptable proxy there.
 	rightSigned := c.resSigned
+	rightPtr := c.resPtr
 	rightW := c.resW
 
 	// The right operand is now in rax (int) or xmm0 (double).
@@ -8359,8 +8418,9 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		} else {
 			c.emit("mov rax, [rbp%+d]", off)
 			// T1.6 (N22): sign-extend a signed materialized int left operand
-			// (low 32 valid, high 32 = 0) before cvtsi2sd.
-			if leftW == 4 && leftSigned {
+			// (low 32 valid, high 32 = 0) before cvtsi2sd; a ptrCapable
+			// operand (C4) passes through unextended.
+			if leftW == 4 && leftSigned && !leftPtr {
 				c.emit("movsxd rax, eax")
 			}
 			c.emit("cvtsi2sd xmm0, rax")
@@ -8402,10 +8462,10 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		// full width. This single site covers the + - * / arithmetic AND the
 		// pointer-arithmetic branch below (which returns before the switch).
 		if w == 8 {
-			if rightW == 4 && rightSigned {
+			if rightW == 4 && rightSigned && !rightPtr {
 				c.emit("movsxd rax, eax")
 			}
-			if leftW == 4 && leftSigned {
+			if leftW == 4 && leftSigned && !leftPtr {
 				c.emit("movsxd r10, r10d")
 			}
 		}
@@ -8540,11 +8600,11 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		} else {
 			// T1.6 (N17): narrow materialized signed int operands before the
 			// 64-bit idiv -- see the + - * / site above.
-			if rightW == 4 && rightSigned {
+			if rightW == 4 && rightSigned && !rightPtr {
 				c.emit("movsxd rax, eax")
 			}
 			c.emit("mov r11, rax") // divisor
-			if leftW == 4 && leftSigned {
+			if leftW == 4 && leftSigned && !leftPtr {
 				c.emit("movsxd r10, r10d")
 			}
 			c.emit("mov rax, r10") // dividend
@@ -8657,10 +8717,10 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 			// T1.6 (N17): narrow materialized signed int operands before the
 			// 64-bit and/or/xor -- see the + - * / site above. rax = right,
 			// r11 = left (reloaded from the spill slot).
-			if rightW == 4 && rightSigned {
+			if rightW == 4 && rightSigned && !rightPtr {
 				c.emit("movsxd rax, eax")
 			}
-			if leftW == 4 && leftSigned {
+			if leftW == 4 && leftSigned && !leftPtr {
 				c.emit("movsxd r11, r11d")
 			}
 			switch n.Op {
@@ -8723,11 +8783,12 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 				// is a materialized value whose high 32 is zero, so it must
 				// be sign-extended before the 64-bit compare or a negative int
 				// would read as a huge positive. Width 1/2 sides are already
-				// sign/zero-extended by loadVar; long sides are full width.
-				if leftW == 4 && leftSigned {
+				// sign/zero-extended by loadVar; long sides are full width;
+				// ptrCapable sides (C4) hold pointer bits, not int values.
+				if leftW == 4 && leftSigned && !leftPtr {
 					c.emit("movsxd r10, r10d")
 				}
-				if rightW == 4 && rightSigned {
+				if rightW == 4 && rightSigned && !rightPtr {
 					c.emit("movsxd rax, eax")
 				}
 				c.emit("cmp r10, rax")
@@ -9205,8 +9266,9 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 				f32 = pt.Kind == KFloat
 				if t == TInt {
 					// T1.6 (N22): sign-extend a signed materialized int
-					// argument before cvtsi2sd (negative int -> double).
-					if c.resW == 4 && c.resSigned {
+					// argument before cvtsi2sd (negative int -> double);
+					// a ptrCapable argument (C4) passes unextended.
+					if c.resW == 4 && c.resSigned && !c.resPtr {
 						c.emit("movsxd rax, eax")
 					}
 					c.emit("cvtsi2sd xmm0, rax")
