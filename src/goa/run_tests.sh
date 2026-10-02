@@ -22,28 +22,28 @@ echo "== building goa =="
 go build -trimpath -ldflags="-s -w" -o goa.exe . || { echo "BUILD FAILED"; exit 1; }
 (cd ../../tools && go build -o msgboxcheck.exe ./msgboxcheck) || { echo "TOOL BUILD FAILED"; exit 1; }
 # elfcheck verifies the ELF *structure*; deciding what the program prints is
-# ucrun.py's job now (see find_python below).
+# ucrun.exe's job now (see find_ucrun below).
 (cd ../../tools && go build -o elfcheck.exe ./elfcheck) || { echo "TOOL BUILD FAILED"; exit 1; }
 
-# Find a Python that can import unicorn. Unicorn is QEMU's CPU core, so the
-# ELF examples get real instruction semantics instead of elfcheck's
-# hand-written model -- which could only ever agree with our own reading of
-# the ISA. Set GOC_PYTHON to override; without one this leg is skipped loudly.
-find_python() {
-    if [ -n "${GOC_PYTHON:-}" ] && [ -x "$GOC_PYTHON" ]; then echo "$GOC_PYTHON"; return 0; fi
-    for c in python3 python py; do
-        if command -v "$c" >/dev/null 2>&1 && "$c" -c "import unicorn" >/dev/null 2>&1; then
-            command -v "$c"; return 0
-        fi
+# Find ucrun.exe (standalone unicorn ELF emulator, statically linked against
+# libunicorn.a -- a single self-contained file, no runtime DLLs or PATH fiddling
+# needed). Unicorn is QEMU's CPU core, so the ELF examples get real
+# instruction semantics instead of elfcheck's hand-written model. Set UCRUN to
+# override; without it this leg is skipped loudly.
+find_ucrun() {
+    if [ -n "${UCRUN:-}" ] && [ -f "$UCRUN" ]; then echo "$UCRUN"; return 0; fi
+    for c in ../../bin/ucrun.exe ../bin/ucrun.exe bin/ucrun.exe; do
+        if [ -f "$c" ]; then echo "$c"; return 0; fi
     done
+    if command -v ucrun.exe >/dev/null 2>&1; then command -v ucrun.exe; return 0; fi
     return 1
 }
-UCPY=""
-if UCPY="$(find_python)"; then
-    echo "== linux runner: $UCPY (unicorn/QEMU) =="
+UCRUN=""
+if UCRUN="$(find_ucrun)"; then
+    echo "== linux runner: $UCRUN (unicorn ELF emulator) =="
 else
-    echo "== WARNING: no Python with unicorn found; the Linux leg will be SKIPPED."
-    echo "==          Set GOC_PYTHON=/path/to/python to enable it. =="
+    echo "== WARNING: ucrun.exe not found; the Linux leg will be SKIPPED."
+    echo "==          Build it (gcc tools/ucrun/ucrun.c -I<inc> <lib>/libunicorn.a -static -lstdc++ -lgcc -lwinpthread -o bin/ucrun.exe) to enable it. =="
 fi
 
 pass=0
@@ -96,14 +96,14 @@ echo "-----------------------------"
 echo "pass=$pass fail=$fail"
 
 # Linux examples: assembled with -f elf, then executed by QEMU's CPU core
-# through ucrun.py, since a Windows box cannot exec an ELF itself.
+# through ucrun.exe, since a Windows box cannot exec an ELF itself.
 echo "== linux (ELF, executed under QEMU/Unicorn) =="
 for asm in examples/linux/*.asm; do
     name="$(basename "$asm" .asm)"
     exp="expected/linux_$name.txt"
 
-    if [ -z "$UCPY" ]; then
-        echo "SKIP  linux/$name  (needs a Python with unicorn)"
+    if [ -z "$UCRUN" ]; then
+        echo "SKIP  linux/$name  (needs ucrun.exe)"
         continue
     fi
 
@@ -122,7 +122,7 @@ for asm in examples/linux/*.asm; do
     # the instructions behave.
     ../../tools/elfcheck.exe -structure-only "examples/linux/$name" >/dev/null 2>&1
 
-    "$UCPY" ../../tools/ucrun.py "examples/linux/$name" 2>"/tmp/goa_$name.err" \
+    "$UCRUN" "examples/linux/$name" 2>"/tmp/goa_$name.err" \
         | tr -d '\r' >"/tmp/goa_$name.out"
     rc=${PIPESTATUS[0]}
     # Unconditional diff, same reason as the Windows leg above: the `rc!=0`

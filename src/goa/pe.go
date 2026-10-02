@@ -17,6 +17,10 @@ import (
 const (
 	sectAlign = 0x1000
 	fileAlign = 0x200
+	// Default base address for a PE32+ executable. The TLS directory fields
+	// (StartAddressOfRawData / EndAddressOfRawData / AddressOfIndex) are
+	// absolute virtual addresses, so they must be emitted as ImageBase + RVA.
+	imageBase = 0x140000000
 )
 
 func align(v, a int) int {
@@ -187,11 +191,33 @@ func (a *Assembler) BuildPE(outPath string) error {
 
 	idata, iatSymOff, dirRVA, dirSize, iatRVA, iatSize := a.buildIData(idataBase)
 
+	// Provisional virtual bases for the data-derived sections, computed before
+	// the merged .data blob is assembled so that symbol and fixup resolution
+	// (which runs next) can reach .tls and .bss globals via RIP-relative
+	// addressing. tlsBase/bssBase are page-aligned; the loader maps .tls and
+	// .bss at these addresses with zero-filled memory.
+	mergedLen := idOff + len(idata)
+	var tls *Section
+	var bss *Section
+	tlsBase, tlsLen, bssBase := 0, 0, 0
+	tls = a.sectionByName(".tls")
+	bss = a.sectionByName(".bss")
+	if tls != nil && len(tls.Data) > 0 {
+		tlsLen = len(tls.Data)
+		tlsBase = dataBase + align(mergedLen, sectAlign)
+	}
+	bssBase = dataBase + align(mergedLen, sectAlign)
+	if tlsBase != 0 {
+		bssBase = tlsBase + align(tlsLen, sectAlign)
+	}
+
 	// Base RVA per *source* section, used to resolve symbol references.
 	symBase := map[string]int{
 		".text":  textBase,
 		".rdata": dataBase + rdOff,
 		".data":  dataBase + dOff,
+		".tls":   tlsBase,
+		".bss":   bssBase,
 	}
 
 	// Resolve symbol RVAs.
@@ -234,15 +260,51 @@ func (a *Assembler) BuildPE(outPath string) error {
 	}
 	merged = append(merged, idata...)
 
-	type outSec struct {
-		name string
-		va   int
-		data []byte
-		ch   uint32
+	// TLS directory: if a .tls section was emitted, add IMAGE_TLS_DIRECTORY64
+	// into the merged .data section. Windows resolves each thread's copy of the
+	// .tls template through the TEB's gs:0x58 ThreadLocalStoragePointer[index];
+	// the loader fills the dword at goc_tls_index (emitted as G_goc_tls_index in
+	// .data by the code generator) with the real module index.
+	var tlsDirRVA, tlsDirSize, tlsIdxRVA int
+	if tls != nil && len(tls.Data) > 0 {
+		if loc, ok := a.syms["G_goc_tls_index"]; ok {
+			tlsIdxRVA = dataBase + dOff + loc.off // filled by the OS loader
+		}
+		dirOff := len(merged)
+		merged = append(merged, make([]byte, 40)...) // IMAGE_TLS_DIRECTORY64
+		// These fields are ABSOLUTE virtual addresses (ImageBase + RVA), not
+		// RVAs. The Windows loader uses them as-is, so omitting ImageBase makes
+		// it write the TLS index to a near-zero address and AV (fault == Idx).
+		putU64at(merged, dirOff+0, uint64(imageBase+tlsBase))       // StartAddressOfRawData
+		putU64at(merged, dirOff+8, uint64(imageBase+tlsBase+tlsLen)) // EndAddressOfRawData
+		putU64at(merged, dirOff+16, uint64(imageBase+tlsIdxRVA))    // AddressOfIndex
+		putU64at(merged, dirOff+24, 0)                  // AddressOfCallBacks (none)
+		putU32at(merged, dirOff+32, 0)                 // SizeOfZeroFill
+		putU32at(merged, dirOff+36, 0)                 // Characteristics
+		tlsDirRVA = dataBase + dirOff
+		tlsDirSize = 40
 	}
-	sections := []outSec{{".text", textBase, text.Data, 0x60000020}}
+
+	type outSec struct {
+		name  string
+		va    int
+		data  []byte
+		vsize int  // virtual size; equals len(data) for normal sections
+		ch    uint32
+		bss   bool // uninitialised: no file bytes, only virtual space
+	}
+	sections := []outSec{{".text", textBase, text.Data, len(text.Data), 0x60000020, false}}
 	if len(merged) > 0 {
-		sections = append(sections, outSec{".data", dataBase, merged, 0xC0000040})
+		sections = append(sections, outSec{".data", dataBase, merged, len(merged), 0xC0000040, false})
+	}
+	if tlsBase != 0 {
+		// IMAGE_SCN_MEM_TLS_SET (0x04000000) marks the thread-local template.
+		sections = append(sections, outSec{".tls", tlsBase, tls.Data, len(tls.Data), 0xC4000040, false})
+	}
+	if bss != nil && bss.cur > 0 {
+		// IMAGE_SCN_CNT_UNINITIALIZED_DATA (0x80) + read/write. No file bytes;
+		// the loader zero-fills the virtual range at bssBase..bssBase+bss.cur.
+		sections = append(sections, outSec{".bss", bssBase, nil, bss.cur, 0xC0000080, true})
 	}
 
 	// SizeOfImage must cover the end of the last section's virtual range
@@ -252,7 +314,7 @@ func (a *Assembler) BuildPE(outPath string) error {
 	// the file as malformed.
 	imageSize := 0
 	for _, s := range sections {
-		end := s.va + align(len(s.data), sectAlign)
+		end := s.va + align(s.vsize, sectAlign)
 		if end > imageSize {
 			imageSize = end
 		}
@@ -283,7 +345,7 @@ func (a *Assembler) BuildPE(outPath string) error {
 	putU32at(hdr, oh+8, uint32(len(merged)))
 	putU32at(hdr, oh+16, uint32(entryRVA))
 	putU32at(hdr, oh+20, uint32(textBase))
-	putU64at(hdr, oh+24, 0x140000000) // ImageBase
+	putU64at(hdr, oh+24, imageBase) // ImageBase
 	putU32at(hdr, oh+32, sectAlign)   // SectionAlignment
 	putU32at(hdr, oh+36, fileAlign)   // FileAlignment
 	putU16at(hdr, oh+40, 6)           // OS major version
@@ -291,10 +353,10 @@ func (a *Assembler) BuildPE(outPath string) error {
 	putU32at(hdr, oh+56, uint32(imageSize))
 	putU32at(hdr, oh+60, uint32(headerSize))
 	putU16at(hdr, oh+68, a.subsystem) // Subsystem (2 = GUI, 3 = console)
-	putU64at(hdr, oh+72, 0x100000)
-	putU64at(hdr, oh+80, 0x1000)
-	putU64at(hdr, oh+88, 0x100000)
-	putU64at(hdr, oh+96, 0x1000)
+	putU64at(hdr, oh+72, 0x4000000) // SizeOfStackReserve: 64 MiB (wide _BitInt values live on the stack)
+	putU64at(hdr, oh+80, 0x1000)    // SizeOfStackCommit
+	putU64at(hdr, oh+88, 0x100000)  // SizeOfHeapReserve
+	putU64at(hdr, oh+96, 0x1000)    // SizeOfHeapCommit
 	putU32at(hdr, oh+108, 16) // NumberOfRvaAndSizes
 	// Data directories at oh+112
 	dd := oh + 112
@@ -306,7 +368,12 @@ func (a *Assembler) BuildPE(outPath string) error {
 		putU32at(hdr, dd+12*8, uint32(iatRVA)) // IAT (index 12)
 		putU32at(hdr, dd+12*8+4, uint32(iatSize))
 	}
+	if tlsDirSize > 0 {
+		putU32at(hdr, dd+9*8, uint32(tlsDirRVA)) // TLS (index 9)
+		putU32at(hdr, dd+9*8+4, uint32(tlsDirSize))
+	}
 	// Section table at oh+240; raw pointers advance by file-aligned sizes.
+	// BSS sections contribute no file bytes (rawSize 0, PointerToRawData 0).
 	st := oh + 240
 	filePtr := headerSize
 	for _, s := range sections {
@@ -317,20 +384,32 @@ func (a *Assembler) BuildPE(outPath string) error {
 				hdr[st+i] = ' '
 			}
 		}
-		rawSize := align(len(s.data), fileAlign)
-		putU32at(hdr, st+8, uint32(len(s.data))) // VirtualSize
-		putU32at(hdr, st+12, uint32(s.va))       // VirtualAddress
-		putU32at(hdr, st+16, uint32(rawSize))    // SizeOfRawData
-		putU32at(hdr, st+20, uint32(filePtr))    // PointerToRawData
+		rawSize := 0
+		if !s.bss {
+			rawSize = align(len(s.data), fileAlign)
+		}
+		putU32at(hdr, st+8, uint32(s.vsize))   // VirtualSize
+		putU32at(hdr, st+12, uint32(s.va))     // VirtualAddress
+		putU32at(hdr, st+16, uint32(rawSize))  // SizeOfRawData
+		ptr := uint32(0)
+		if !s.bss {
+			ptr = uint32(filePtr)
+		}
+		putU32at(hdr, st+20, ptr)              // PointerToRawData
 		putU32at(hdr, st+36, s.ch)
 		st += 40
-		filePtr += rawSize
+		if !s.bss {
+			filePtr += rawSize
+		}
 	}
 
 	// Assemble final file.
 	out := make([]byte, 0, filePtr)
 	out = append(out, hdr...)
 	for _, s := range sections {
+		if s.bss {
+			continue
+		}
 		out = append(out, s.data...)
 		out = append(out, make([]byte, align(len(s.data), fileAlign)-len(s.data))...)
 	}

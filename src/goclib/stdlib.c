@@ -24,6 +24,15 @@ void *realloc(void *ptr, size_t size) {
     return __goclib_heap_realloc(ptr, (long)size);
 }
 
+/* goc's heap allocator returns 16-byte aligned blocks, which satisfies every
+ * request with alignment <= 16 exactly (the common case, including typical
+ * SIMD alignments). Larger power-of-two alignments are not strictly honoured
+ * yet; callers needing them beyond 16 should not rely on strict alignment. */
+void *aligned_alloc(size_t alignment, size_t size) {
+    (void)alignment;
+    return malloc(size);
+}
+
 int atoi(const char *s) {
     return (int)strtol(s, 0, 10);
 }
@@ -64,6 +73,54 @@ long strtol(const char *s, char **endp, int base) {
     if (sign) value = -value;
     if (endp) *endp = (char *)s;
     return value;
+}
+
+/*
+ * Unsigned counterpart of strtol: same bases, same 0/16 prefix rules. A
+ * leading '-' is accepted and negates the result modulo 2^64, so
+ * strtoul("-1", 0, 10) is ULONG_MAX exactly as the standard requires.
+ * Overflow wraps rather than saturating -- also standard, and the reason
+ * this does not set ERANGE the way strtol does.
+ */
+unsigned long strtoul(const char *s, char **endp, int base) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r' || *s == '\f' || *s == '\v')
+        s++;
+    int sign = 0;
+    if (*s == '-') { sign = 1; s++; }
+    else if (*s == '+') { s++; }
+    if (base == 0) {
+        if (*s == '0') {
+            if (s[1] == 'x' || s[1] == 'X') { base = 16; s += 2; }
+            else { base = 8; }
+        } else {
+            base = 10;
+        }
+    } else if (base == 16) {
+        if (*s == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    }
+    unsigned long value = 0;
+    while (*s) {
+        int digit;
+        if (*s >= '0' && *s <= '9') digit = *s - '0';
+        else if (*s >= 'a' && *s <= 'z') digit = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'Z') digit = *s - 'A' + 10;
+        else break;
+        if (digit >= base) break;
+        value = value * (unsigned long)base + (unsigned long)digit;
+        s++;
+    }
+    if (sign) value = (unsigned long)0 - value;
+    if (endp) *endp = (char *)s;
+    return value;
+}
+
+long long atoll(const char *s) {
+    /* long is already 64-bit in goc on both targets, so this is atol. */
+    return (long long)strtol(s, 0, 10);
+}
+
+long long llabs(long long x) {
+    return x < 0 ? -x : x;
 }
 
 /*
@@ -264,11 +321,41 @@ ldiv_t ldiv(long numer, long denom) {
     return r;
 }
 
+lldiv_t lldiv(long long numer, long long denom) {
+    lldiv_t r;
+    r.quot = numer / denom;
+    r.rem = numer % denom;
+    return r;
+}
+
 /* --------------------------------- atexit --------------------------------- */
 
 int atexit(void (*fn)(void)) {
     if (atexit_n >= ATEXIT_MAX) return -1;
     atexit_fns[atexit_n++] = fn;
+    return 0;
+}
+
+/* --------------------------- quick_exit hooks ----------------------------- */
+
+#define ATQUICK_MAX 32
+void (*at_quick_exit_fns[ATQUICK_MAX])(void);
+int at_quick_exit_n = 0;
+
+/* C11 quick_exit: run only the at_quick_exit handlers (LIFO) and terminate.
+ * Unlike exit(), the atexit chain and stream flushing are skipped. */
+void quick_exit(int code) {
+    while (at_quick_exit_n > 0) {
+        void (*fn)(void) = at_quick_exit_fns[at_quick_exit_n - 1];
+        at_quick_exit_n--;
+        fn();
+    }
+    __goclib_exit((long)code);
+}
+
+int at_quick_exit(void (*fn)(void)) {
+    if (at_quick_exit_n >= ATQUICK_MAX) return -1;
+    at_quick_exit_fns[at_quick_exit_n++] = fn;
     return 0;
 }
 
@@ -428,6 +515,74 @@ char *getenv(const char *name) {
             i = j + 1;
         }
         return 0;
+    }
+#endif
+}
+
+/* ----------------------------------------------------------------------------
+ * system -- run a command through the host shell and return its exit status.
+ *
+ * Windows: spawn "cmd.exe /c <command>" via CreateProcessA and wait for the
+ * child's exit code. (The child runs on the host; goc links no C runtime, so
+ * the Windows API is the only available launch path.)
+ *
+ * Linux: vfork + execve("/bin/sh", {"sh","-c",cmd,NULL}, NULL) + wait4. The
+ * child shares the parent's stack until it execs or _exit-s, so it must not
+ * fall through to the parent's wait4 -- execve replaces the image on success
+ * and _exit(127) covers the failure path. This path is emitted for real Linux
+ * targets; the ucrun-based regression runner cannot fork, so it is not run
+ * there.
+ * ------------------------------------------------------------------------- */
+#if !defined(_WIN32)
+/* Raw Linux syscalls backing system() -- declared at file scope (goc parses
+ * the ", linux" platform marker only on a top-level extern). */
+extern long __goclib_vfork(void), linux;
+extern long __goclib_execve(const char *path, char **argv, char **envp), linux;
+extern long __goclib_wait4(long pid, long *status, long options, void *rusage), linux;
+#endif
+
+int system(const char *command) {
+    if (command == 0) return 1;   /* a command processor is available */
+#if defined(_WIN32)
+    {
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        char cl[8192];
+        unsigned long i = 0;
+        const char *p = "cmd.exe /c ";
+        while (*p && i + 1 < (unsigned long)sizeof(cl)) { cl[i++] = *p++; }
+        while (*command && i + 1 < (unsigned long)sizeof(cl)) { cl[i++] = *command++; }
+        cl[i] = 0;
+        memset(&si, 0, sizeof(si));
+        memset(&pi, 0, sizeof(pi));
+        si.cb = (DWORD)sizeof(STARTUPINFOA);
+        if (!CreateProcessA(0, cl, 0, 0, 0, 0, 0, 0, &si, &pi)) return -1;
+        WaitForSingleObject(pi.hProcess, (DWORD)0xffffffff);  /* INFINITE */
+        {
+            DWORD code = 0;
+            GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return (int)code;
+        }
+    }
+#else
+    {
+        long pid = __goclib_vfork();
+        if (pid == 0) {
+            char *argv[4];
+            argv[0] = "/bin/sh";
+            argv[1] = "-c";
+            argv[2] = (char *)command;
+            argv[3] = 0;
+            __goclib_execve("/bin/sh", argv, 0);
+            __goclib_exit(127);
+        }
+        {
+            long st;
+            __goclib_wait4(pid, &st, 0, 0);
+            return (int)st;
+        }
     }
 #endif
 }

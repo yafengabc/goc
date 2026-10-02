@@ -5,7 +5,8 @@
 
 /* goc winuser.h -- user32 API surface: window classes, message loop,
  * drawing primitives, system metrics and the GUI constants. Included by
- * <windows.h>. Functions import from user32.dll (see goclib/win32.def).
+ * <windows.h>. Every function is a user32 import declared inline, e.g.
+ *     extern int MessageBoxA(HWND, LPCSTR, LPCSTR, UINT), user32;
  */
 
 /* ------------------------------------------------------------------ */
@@ -376,102 +377,102 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 /* System metrics / colours */
-int    GetSystemMetrics(int index);
-DWORD  GetSysColor(int index);
-UINT   GetDoubleClickTime(void);
+extern int    GetSystemMetrics(int index), user32;
+extern DWORD  GetSysColor(int index), user32;
+extern UINT   GetDoubleClickTime(void), user32;
 
 /* Message boxes */
-int    MessageBoxA(HWND parent, LPCSTR text, LPCSTR caption, UINT flags);
-int    MessageBoxW(HWND parent, LPCWSTR text, LPCWSTR caption, UINT flags);
+extern int    MessageBoxA(HWND parent, LPCSTR text, LPCSTR caption, UINT flags), user32;
+extern int    MessageBoxW(HWND parent, LPCWSTR text, LPCWSTR caption, UINT flags), user32;
 
 /* Window enumeration / text */
-HWND   FindWindowA(LPCSTR cls, LPCSTR title);
-HWND   FindWindowExA(HWND parent, HWND after, LPCSTR cls, LPCSTR title);
-int    GetWindowTextA(HWND h, LPSTR buf, int n);
-int    GetWindowTextLengthA(HWND h);
-BOOL   SetWindowTextA(HWND h, LPCSTR text);
-HWND   GetForegroundWindow(void);
-HWND   GetDesktopWindow(void);
-HWND   GetParent(HWND h);
-BOOL   IsWindow(HWND h);
-BOOL   EnableWindow(HWND h, BOOL enable);
-BOOL   IsWindowEnabled(HWND h);
-BOOL   IsWindowVisible(HWND h);
-HWND   SetFocus(HWND h);
-HWND   GetFocus(void);
+extern HWND   FindWindowA(LPCSTR cls, LPCSTR title), user32;
+extern HWND   FindWindowExA(HWND parent, HWND after, LPCSTR cls, LPCSTR title), user32;
+extern int    GetWindowTextA(HWND h, LPSTR buf, int n), user32;
+extern int    GetWindowTextLengthA(HWND h), user32;
+extern BOOL   SetWindowTextA(HWND h, LPCSTR text), user32;
+extern HWND   GetForegroundWindow(void), user32;
+extern HWND   GetDesktopWindow(void), user32;
+extern HWND   GetParent(HWND h), user32;
+extern BOOL   IsWindow(HWND h), user32;
+extern BOOL   EnableWindow(HWND h, BOOL enable), user32;
+extern BOOL   IsWindowEnabled(HWND h), user32;
+extern BOOL   IsWindowVisible(HWND h), user32;
+extern HWND   SetFocus(HWND h), user32;
+extern HWND   GetFocus(void), user32;
 
 /* Visibility / position / size */
-BOOL   ShowWindow(HWND h, int cmd);
-BOOL   UpdateWindow(HWND h);
-BOOL   GetClientRect(HWND h, LPRECT rc);
-BOOL   GetWindowRect(HWND h, LPRECT rc);
-BOOL   MoveWindow(HWND h, int x, int y, int w, int h, BOOL repaint);
-BOOL   InvalidateRect(HWND h, LPRECT rc, BOOL erase);
-BOOL   SetWindowPos(HWND h, HWND after, int x, int y, int w, int h, UINT flags);
-BOOL   ScreenToClient(HWND h, LPPOINT pt);
-BOOL   ClientToScreen(HWND h, LPPOINT pt);
-BOOL   SetCursorPos(int x, int y);
-BOOL   GetCursorPos(LPPOINT pt);
-HWND   WindowFromPoint(POINT pt);
+extern BOOL   ShowWindow(HWND h, int cmd), user32;
+extern BOOL   UpdateWindow(HWND h), user32;
+extern BOOL   GetClientRect(HWND h, LPRECT rc), user32;
+extern BOOL   GetWindowRect(HWND h, LPRECT rc), user32;
+extern BOOL   MoveWindow(HWND h, int x, int y, int w, int h, BOOL repaint), user32;
+extern BOOL   InvalidateRect(HWND h, LPRECT rc, BOOL erase), user32;
+extern BOOL   SetWindowPos(HWND h, HWND after, int x, int y, int w, int h, UINT flags), user32;
+extern BOOL   ScreenToClient(HWND h, LPPOINT pt), user32;
+extern BOOL   ClientToScreen(HWND h, LPPOINT pt), user32;
+extern BOOL   SetCursorPos(int x, int y), user32;
+extern BOOL   GetCursorPos(LPPOINT pt), user32;
+extern HWND   WindowFromPoint(POINT pt), user32;
 
 /* Messages */
-LRESULT SendMessageA(HWND h, UINT msg, WPARAM wp, LPARAM lp);
-BOOL   PostMessageA(HWND h, UINT msg, WPARAM wp, LPARAM lp);
-BOOL   PostQuitMessage(int exitCode);
-BOOL   GetMessageA(MSG *msg, HWND h, UINT min, UINT max);
-BOOL   PeekMessageA(MSG *msg, HWND h, UINT min, UINT max, UINT remove);
-BOOL   TranslateMessage(const MSG *msg);
-LRESULT DispatchMessageA(const MSG *msg);
-LRESULT DefWindowProcA(HWND h, UINT msg, WPARAM wp, LPARAM lp);
-LRESULT CallWindowProcA(WNDPROC prev, HWND h, UINT msg, WPARAM wp, LPARAM lp);
+extern LRESULT SendMessageA(HWND h, UINT msg, WPARAM wp, LPARAM lp), user32;
+extern BOOL   PostMessageA(HWND h, UINT msg, WPARAM wp, LPARAM lp), user32;
+extern BOOL   PostQuitMessage(int exitCode), user32;
+extern BOOL   GetMessageA(MSG *msg, HWND h, UINT min, UINT max), user32;
+extern BOOL   PeekMessageA(MSG *msg, HWND h, UINT min, UINT max, UINT remove), user32;
+extern BOOL   TranslateMessage(const MSG *msg), user32;
+extern LRESULT DispatchMessageA(const MSG *msg), user32;
+extern LRESULT DefWindowProcA(HWND h, UINT msg, WPARAM wp, LPARAM lp), user32;
+extern LRESULT CallWindowProcA(WNDPROC prev, HWND h, UINT msg, WPARAM wp, LPARAM lp), user32;
 
 /* Timers (WM_TIMER is dispatched through the message loop) */
-UINT_PTR SetTimer(HWND h, UINT_PTR id, UINT ms, void *proc);
-BOOL     KillTimer(HWND h, UINT_PTR id);
+extern UINT_PTR SetTimer(HWND h, UINT_PTR id, UINT ms, void *proc), user32;
+extern BOOL     KillTimer(HWND h, UINT_PTR id), user32;
 
 /* Window classes */
-WORD   RegisterClassA(const WNDCLASS *cls);
-WORD   RegisterClassExA(const WNDCLASSEX *cls);
-BOOL   UnregisterClassA(LPCSTR name, HINSTANCE h);
-ATOM   GlobalAddAtomA(LPCSTR name);
-ATOM   GlobalFindAtomA(LPCSTR name);
+extern WORD   RegisterClassA(const WNDCLASS *cls), user32;
+extern WORD   RegisterClassExA(const WNDCLASSEX *cls), user32;
+extern BOOL   UnregisterClassA(LPCSTR name, HINSTANCE h), user32;
+extern ATOM   GlobalAddAtomA(LPCSTR name), user32;
+extern ATOM   GlobalFindAtomA(LPCSTR name), user32;
 
 /* Window creation: 12 args -- the longest Win32 API goc supports (maxArgs). */
-HWND   CreateWindowExA(DWORD exStyle, LPCSTR cls, LPCSTR name, DWORD style,
+extern HWND   CreateWindowExA(DWORD exStyle, LPCSTR cls, LPCSTR name, DWORD style,
                        int x, int y, int w, int h,
-                       HWND parent, HMENU menu, HINSTANCE inst, LPVOID param);
-HWND   CreateWindowA(LPCSTR cls, LPCSTR name, DWORD style,
+                       HWND parent, HMENU menu, HINSTANCE inst, LPVOID param), user32;
+extern HWND   CreateWindowA(LPCSTR cls, LPCSTR name, DWORD style,
                      int x, int y, int w, int h,
-                     HWND parent, HMENU menu, HINSTANCE inst, LPVOID param);
-HWND   DestroyWindow(HWND h);
-int    GetWindowLongA(HWND h, int index);
-int    SetWindowLongA(HWND h, int index, int value);
-LONG_PTR GetWindowLongPtrA(HWND h, int index);
-LONG_PTR SetWindowLongPtrA(HWND h, int index, LONG_PTR value);
+                     HWND parent, HMENU menu, HINSTANCE inst, LPVOID param), user32;
+extern HWND   DestroyWindow(HWND h), user32;
+extern int    GetWindowLongA(HWND h, int index), user32;
+extern int    SetWindowLongA(HWND h, int index, int value), user32;
+extern LONG_PTR GetWindowLongPtrA(HWND h, int index), user32;
+extern LONG_PTR SetWindowLongPtrA(HWND h, int index, LONG_PTR value), user32;
 
 /* Cursors and icons */
-HCURSOR LoadCursorA(HINSTANCE h, LPCSTR name);
-HICON  LoadIconA(HINSTANCE h, LPCSTR name);
-HCURSOR SetCursor(HCURSOR cur);
+extern HCURSOR LoadCursorA(HINSTANCE h, LPCSTR name), user32;
+extern HICON  LoadIconA(HINSTANCE h, LPCSTR name), user32;
+extern HCURSOR SetCursor(HCURSOR cur), user32;
 
 /* DC access */
-HDC    GetDC(HWND h);
-HDC    GetWindowDC(HWND h);
-int    ReleaseDC(HWND h, HDC dc);
-HDC    BeginPaint(HWND h, PAINTSTRUCT *ps);
-BOOL   EndPaint(HWND h, const PAINTSTRUCT *ps);
+extern HDC    GetDC(HWND h), user32;
+extern HDC    GetWindowDC(HWND h), user32;
+extern int    ReleaseDC(HWND h, HDC dc), user32;
+extern HDC    BeginPaint(HWND h, PAINTSTRUCT *ps), user32;
+extern BOOL   EndPaint(HWND h, const PAINTSTRUCT *ps), user32;
 
 /* Drawing / painting */
-BOOL   DrawTextA(HDC dc, LPCSTR text, int len, LPRECT rc, UINT fmt);
-BOOL   FillRect(HDC dc, LPRECT rc, HBRUSH brush);
-BOOL   FrameRect(HDC dc, LPRECT rc, HBRUSH brush);
-BOOL   InvertRect(HDC dc, LPRECT rc);
-BOOL   InflateRect(LPRECT rc, int dx, int dy);
-BOOL   SetRect(LPRECT rc, int l, int t, int r, int b);
-int    DrawTextExA(HDC dc, LPSTR text, int len, LPRECT rc, UINT fmt, LPVOID prm);
-BOOL   DrawIcon(HDC dc, int x, int y, HICON icon);
-BOOL   DrawIconEx(HDC dc, int x, int y, HICON icon, int w, int h,
-                  UINT step, HBRUSH brush, UINT flags);
-BOOL   SetLayeredWindowAttributes(HWND h, COLORREF key, BYTE alpha, DWORD flags);
+extern BOOL   DrawTextA(HDC dc, LPCSTR text, int len, LPRECT rc, UINT fmt), user32;
+extern BOOL   FillRect(HDC dc, LPRECT rc, HBRUSH brush), user32;
+extern BOOL   FrameRect(HDC dc, LPRECT rc, HBRUSH brush), user32;
+extern BOOL   InvertRect(HDC dc, LPRECT rc), user32;
+extern BOOL   InflateRect(LPRECT rc, int dx, int dy), user32;
+extern BOOL   SetRect(LPRECT rc, int l, int t, int r, int b), user32;
+extern int    DrawTextExA(HDC dc, LPSTR text, int len, LPRECT rc, UINT fmt, LPVOID prm), user32;
+extern BOOL   DrawIcon(HDC dc, int x, int y, HICON icon), user32;
+extern BOOL   DrawIconEx(HDC dc, int x, int y, HICON icon, int w, int h,
+                  UINT step, HBRUSH brush, UINT flags), user32;
+extern BOOL   SetLayeredWindowAttributes(HWND h, COLORREF key, BYTE alpha, DWORD flags), user32;
 
 #endif /* GOC_WINUSER_H */

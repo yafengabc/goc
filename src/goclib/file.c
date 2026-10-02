@@ -34,7 +34,7 @@ typedef struct __goclib_FILE {
 } __goclib_FILE;
 
 #if defined(_WIN32)
-/* ---- Windows: kernel32 externs (mapped to DLLs by win32.def) ------------- */
+/* ---- Windows: kernel32 externs (DLL named inline on each prototype) ------- */
 extern void *CreateFileA(const char *name, long access, long share,
                         long secattr, long disp, long flags, long templ);
 extern long  ReadFile(void *h, void *buf, long n, long *got, long overlapped);

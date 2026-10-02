@@ -91,15 +91,32 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             else tmp[t++] = (char)((spec == 'X' ? 'A' : 'a') + (d - 10));
         }
         while (t-- > 0) field[fl++] = tmp[t];
-    } else if (spec == 'f' || spec == 'g') {
+    } else if (spec == 'f' || spec == 'F' || spec == 'e' || spec == 'E' ||
+                   spec == 'g' || spec == 'G') {
             /* %f: <prec> fractional digits, rounded half to even, no
-             * exponent. %g: the same conversion, then trailing fractional
-             * zeros are stripped. Both share __goclib_double_to_buf with
-             * the array printers, so the floating-point conversion lives
-             * in exactly one place (see below). */
+             * exponent. %e: the same digits in scientific notation.
+             * %g: <prec> SIGNIFICANT digits (C, not fractional), rendered
+             * as %f while the decimal exponent stays in [-4, prec) and as
+             * %e outside it, with trailing zeros stripped either way.
+             * All three share __goclib_double_to_buf with the array
+             * printers, so the conversion lives in exactly one place. */
             double x = va_arg(ap, double);
-            fl = __goclib_double_to_buf(field, x, prec);
-            if (spec == 'g') fl = __goclib_double_strip_g(field, fl);
+            int upper = (spec == 'E' || spec == 'G' || spec == 'F');
+            if (spec == 'f' || spec == 'F') {
+                fl = __goclib_double_to_buf(field, x, prec);
+            } else if (spec == 'e' || spec == 'E') {
+                fl = __goclib_double_to_exp(field, x, prec, upper, 0);
+            } else {
+                int sig = prec;
+                int e10 = fmt_g_exp(x);
+                if (sig == 0) sig = 1;          /* "%.0g" means one digit */
+                if (e10 < -4 || e10 >= sig) {
+                    fl = __goclib_double_to_exp(field, x, sig - 1, upper, 1);
+                } else {
+                    fl = __goclib_double_to_buf(field, x, sig - 1 - e10);
+                    fl = __goclib_double_strip_g(field, fl);
+                }
+            }
         } else if (spec == 'p') {
             /* %p: "0x" followed by 16 hex digits (full 64-bit address). */
             void *pv = va_arg(ap, void *);
@@ -119,7 +136,8 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
         {
             int numeric = (spec == 'd' || spec == 'i' || spec == 'u' ||
                            spec == 'o' || spec == 'x' || spec == 'X' ||
-                           spec == 'f' || spec == 'g');
+                           spec == 'f' || spec == 'F' || spec == 'e' ||
+                           spec == 'E' || spec == 'g' || spec == 'G');
             int clen = (spec == 's') ? (int)strlen(s) : fl;
             if (clen >= width || width <= 0) {
                 if (spec == 's') { while (*s) { if (limit<0||n<limit) out[n]=*s; n++; s++; } }
@@ -154,15 +172,59 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
  * __goclib_double_strip_g drops trailing fractional zeros (the %g form);
  * __goclib_double_g is the default-%g shorthand the array printers use.
  * Rounding runs first, so "0.999999" becomes "1". */
+/*
+ * Emit the integer part of a finite non-negative double in decimal.
+ *
+ * The 10^9 chunking is the whole point: a double past 2^63 has no exact
+ * integer cast, so `(long)1e19` is undefined and came back as 0, which is
+ * what made printf("%g", 1e19) print nothing at all. Every chunk handed to
+ * the `unsigned long long` conversion here is below 10^9, so each one is
+ * exact, and the recursion stitches the rest of the number together.
+ */
+static void fmt_int_part(char *buf, int *n, double v) {
+    char tmp[24];
+    unsigned long long u;
+    int t = 0;
+    int k;
+    if (v >= 1e9) {
+        double hi = floor(v / 1e9);
+        double lo = v - hi * 1e9;
+        fmt_int_part(buf, n, hi);
+        u = (unsigned long long)lo;
+        for (k = 8; k >= 0; k--) { tmp[k] = (char)('0' + (u % 10)); u /= 10; }
+        for (k = 0; k < 9; k++) buf[(*n)++] = tmp[k];
+        return;
+    }
+    u = (unsigned long long)v;
+    if (u == 0) { buf[(*n)++] = '0'; return; }
+    while (u > 0) { tmp[t++] = (char)('0' + (u % 10)); u /= 10; }
+    while (t-- > 0) buf[(*n)++] = tmp[t];
+}
+
 int __goclib_double_to_buf(char *buf, double x, int prec) {
     int n = 0;
     int neg = 0;
-    if (x < 0) { neg = 1; x = -x; }
-    if (prec > 17) prec = 17;          /* past double's precision */
-    long whole = (long)x;
-    double frac = x - (double)whole;
+    double whole;                      /* integer part, kept as a double */
+    double frac;
     char dig[20];                      /* prec+1 digits to round on */
     int k;
+    /* Infinity and NaN have no digits to convert; spell them out instead of
+     * letting floor() propagate them into nonsense. */
+    if (x != x) {
+        buf[0] = 'n'; buf[1] = 'a'; buf[2] = 'n';
+        return 3;
+    }
+    if (x > 1.7976931348623157e308 || x < -1.7976931348623157e308) {
+        if (x < 0) { buf[0] = '-'; n = 1; }
+        buf[n] = 'i'; buf[n+1] = 'n'; buf[n+2] = 'f';
+        return n + 3;
+    }
+    /* signbit, not `x < 0`: -0.0 is negative to print even though it is not
+     * less than zero, and it is reachable (copysign makes one). */
+    if (signbit(x)) { neg = 1; x = -x; }
+    if (prec > 17) prec = 17;          /* past double's precision */
+    whole = floor(x);
+    frac = x - whole;
     for (k = 0; k <= prec; k++) {
         frac *= 10.0;
         int d = (int)frac;
@@ -171,33 +233,37 @@ int __goclib_double_to_buf(char *buf, double x, int prec) {
     }
     /* round half to even on the prec-th digit */
     {
-        int tail = (int)(frac * 10.0 + 0.5); /* nonzero past prec+1? */
+        /* Whatever is left in `frac` -- however far out -- means the digits
+         * are not an exact tie. The old test looked at the single next digit
+         * only, so 0.125001 rounded down to 0.12: its (prec+2)-th digit is a
+         * 0 and the 1 behind it went unseen. The digits of a binary-friendly
+         * value (0.125, 2.5) come out exact, so a genuine tie still leaves a
+         * clean 0.0 here and takes the half-to-even path. */
+        int tail = (frac > 0.0);
+        int carry = 0;
         if (prec == 0) {
             int d0 = dig[0];
-            if (d0 > 5 || (d0 == 5 && (tail != 0 || (whole & 1) != 0)))
-                whole++;
+            /* Parity of the integer part decides the tie: fmod is exact
+             * because whole is a whole number below 2^53 or a multiple of
+             * a large power of two (always even). */
+            int odd = (fmod(whole, 2.0) != 0.0);
+            if (d0 > 5 || (d0 == 5 && (tail != 0 || odd))) carry = 1;
         } else {
             int dp = dig[prec];
             if (dp > 5 || (dp == 5 && (tail != 0 || (dig[prec-1] & 1) != 0))) {
                 int j = prec - 1;
                 dig[j]++;
                 while (j > 0 && dig[j] > 9) { dig[j] = 0; dig[--j]++; }
-                if (dig[0] > 9) { dig[0] = 0; whole++; }
+                if (dig[0] > 9) { dig[0] = 0; carry = 1; }
             }
         }
+        if (carry) whole = whole + 1.0;
     }
     if (neg) {
         buf[n] = '-';
         n++;
     }
-    {
-        char tmp[32];
-        int t = 0;
-        if (whole == 0) tmp[t++] = '0';
-        long w = whole;
-        while (w > 0) { tmp[t++] = (char)('0' + (w % 10)); w /= 10; }
-        while (t-- > 0) { buf[n] = tmp[t]; n++; }
-    }
+    fmt_int_part(buf, &n, whole);
     if (prec > 0) {
         buf[n] = '.';
         n++;
@@ -226,10 +292,121 @@ int __goclib_double_strip_g(char *buf, int n) {
     return n; /* no '.', nothing to strip */
 }
 
-/* __goclib_double_g: the %g conversion with the default six fractional
- * digits -- exactly what printf("%g") prints for a double. */
+/* -------------------- scientific notation (%e / %g) ------------------------
+ * %e needs the decimal exponent of the value; %g needs it to decide which of
+ * the two shapes to print. Neither can be left to a plain (int)log10: the
+ * estimate is off by one often enough to matter, so it is only used to get
+ * close and the real value of x settles it.
+ */
+/* 10^k, in groups of eight so the accumulated rounding error stays within a
+ * couple of ulps. Clamped to 1e-308 .. 1e308 so the result is never 0 or inf
+ * -- the renormalising loop in fmt_split_dec undoes the clamp, which is what
+ * makes printf("%e", 5e-324) print 4.94066e-324 instead of spinning. */
+static double fmt_pow10(int k) {
+    int neg = 0;
+    double r = 1.0;
+    if (k > 308) k = 308;
+    if (k < -308) k = -308;
+    if (k < 0) { neg = 1; k = -k; }
+    while (k >= 8) { r = r * 1e8; k = k - 8; }
+    while (k > 0) { r = r * 10.0; k = k - 1; }
+    if (neg) r = 1.0 / r;
+    return r;
+}
+
+/* Splits a finite non-negative x into a mantissa in [1, 10) and the matching
+ * decimal exponent (floor(log10 x), 0 for x == 0). */
+static double fmt_split_dec(double x, int *e10) {
+    int e;
+    double m;
+    if (x == 0.0) { *e10 = 0; return 0.0; }
+    e = (int)floor(log10(x));
+    /* Clamp here as well as inside fmt_pow10: below 1e-308 the power
+     * underflows, so `e` has to agree with what was actually divided by --
+     * otherwise the walk-back loop below subtracts the clamp distance a
+     * second time and 5e-324 comes out as e-340. */
+    if (e > 308) e = 308;
+    if (e < -308) e = -308;
+    m = x / fmt_pow10(e);
+    while (m >= 10.0) { m = m / 10.0; e = e + 1; }
+    while (m > 0.0 && m < 1.0) { m = m * 10.0; e = e - 1; }
+    *e10 = e;
+    return m;
+}
+
+/* floor(log10|x|) for the %g decision; inf/nan give 0 because their digits
+ * are spelled out before anyone asks. */
+static int fmt_g_exp(double x) {
+    int e = 0;
+    if (x != x) return 0;
+    if (x > 1.7976931348623157e308 || x < -1.7976931348623157e308) return 0;
+    if (x < 0) x = -x;
+    fmt_split_dec(x, &e);
+    return e;
+}
+
+/* Scientific notation: [-]d.dddd e(+|-)XX with `prec` digits after the point
+ * and at least two exponent digits -- printf's %e. `strip` drops trailing
+ * fractional zeros, which is the %g shape ("1.5e+10"). */
+int __goclib_double_to_exp(char *buf, double x, int prec, int upper, int strip) {
+    int n = 0, neg = 0, e, i, ml;
+    double m;
+    char mant[64];
+    if (x != x) {
+        buf[0] = 'n'; buf[1] = 'a'; buf[2] = 'n';
+        return 3;
+    }
+    if (x > 1.7976931348623157e308 || x < -1.7976931348623157e308) {
+        if (x < 0) { buf[0] = '-'; n = 1; }
+        buf[n] = 'i'; buf[n+1] = 'n'; buf[n+2] = 'f';
+        return n + 3;
+    }
+    if (prec < 0) prec = 0;
+    if (prec > 17) prec = 17;
+    if (signbit(x)) { neg = 1; x = -x; }
+    m = fmt_split_dec(x, &e);
+    ml = __goclib_double_to_buf(mant, m, prec);
+    /* Rounding can carry a 9.999... mantissa up to 10; renormalise rather
+     * than print a leading "10.". */
+    {
+        int ip = 0;
+        while (ip < ml && mant[ip] != '.') ip++;
+        if (ip > 1) {
+            m = m / 10.0;
+            e = e + 1;
+            ml = __goclib_double_to_buf(mant, m, prec);
+        }
+    }
+    if (strip) ml = __goclib_double_strip_g(mant, ml);
+    if (neg) { buf[n] = '-'; n++; }
+    for (i = 0; i < ml; i++) { buf[n] = mant[i]; n++; }
+    buf[n] = upper ? 'E' : 'e';
+    n++;
+    {
+        int ae = e;
+        if (ae < 0) { buf[n] = '-'; ae = -ae; } else { buf[n] = '+'; }
+        n++;
+        /* Two exponent digits minimum, three only when needed -- C asks for
+         * "at least two", and this is what both glibc and mingw print. */
+        if (ae >= 100) {
+            buf[n] = (char)('0' + ae / 100); n++;
+            buf[n] = (char)('0' + (ae / 10) % 10); n++;
+            buf[n] = (char)('0' + ae % 10); n++;
+        } else {
+            buf[n] = (char)('0' + ae / 10); n++;
+            buf[n] = (char)('0' + ae % 10); n++;
+        }
+    }
+    return n;
+}
+
+/* __goclib_double_g: printf("%g") for a double -- six significant digits,
+ * the %e shape once the exponent leaves [-4, 6), trailing zeros dropped.
+ * The array printers share it, so a float array reads the same way. */
 int __goclib_double_g(char *buf, double x) {
-    return __goclib_double_strip_g(buf, __goclib_double_to_buf(buf, x, 6));
+    int e10 = fmt_g_exp(x);
+    if (e10 < -4 || e10 >= 6) return __goclib_double_to_exp(buf, x, 5, 0, 1);
+    return __goclib_double_strip_g(buf, __goclib_double_to_buf(buf, x, 5 - e10));
 }
 
 int sprintf(char *buf, const char *fmt, ...) {
@@ -241,16 +418,35 @@ int sprintf(char *buf, const char *fmt, ...) {
     return n;
 }
 
-/* vfprintf formats into a stack buffer and writes it to `stream`. A buffer
- * cap of 4096 matches the file layer's block size; like printf, output longer
- * than that is truncated, which is acceptable for this teaching lib. */
+/* vfprintf formats the text and writes it to `stream`.
+ *
+ * The old implementation always formatted into a 4096-byte stack buffer, so
+ * anything longer was silently truncated -- and a large %s (say a 100,000
+ * digit number from _BitInt) was cut to 4094 characters. Formatting is now
+ * measured first (limit 0 writes nothing but still counts), and only then
+ * written: short text stays on the stack, anything larger gets an exactly
+ * sized heap buffer. */
 int vfprintf(FILE *stream, const char *fmt, va_list ap) {
-    char buf[4096];
-    int n = vfmt(buf, 4096, fmt, ap);
-    if (n < 0) n = 0;
-    if (n > 4096) n = 4096;
-    fwrite(buf, 1, n, stream);
-    return n;
+    va_list measure = ap;              /* va_list is a pointer: copying restarts it */
+    long n = vfmt(0, 0, fmt, measure); /* pass 1: length only */
+    if (n <= 0) return (int)n;
+    if (n <= 512) {
+        char buf[512];
+        vfmt(buf, n, fmt, ap);
+        fwrite(buf, 1, n, stream);
+        return (int)n;
+    }
+    char *big = (char *)malloc(n + 1);
+    if (big != 0) {
+        vfmt(big, n, fmt, ap);
+        fwrite(big, 1, n, stream);
+        free(big);
+        return (int)n;
+    }
+    char buf[4096];                    /* out of memory: never crash the caller */
+    vfmt(buf, 4096, fmt, ap);
+    fwrite(buf, 1, 4096, stream);
+    return 4096;
 }
 
 int fprintf(FILE *stream, const char *fmt, ...) {
@@ -542,8 +738,7 @@ static unsigned long scan_uint(const char **pp, int base, int width, int *ok) {
     return v;
 }
 
-int sscanf(const char *s, const char *fmt, ...) {
-    va_list ap;
+int vsscanf(const char *s, const char *fmt, va_list ap) {
     const char *sp = s;
     const char *fp = fmt;
     int assigned = 0;
@@ -556,7 +751,6 @@ int sscanf(const char *s, const char *fmt, ...) {
     unsigned long uv;
     char *dst;
 
-    va_start(ap, fmt);
     while (*fp != '\0') {
         /* Whitespace in the format matches any run of whitespace in the
          * input, including none -- it never causes a mismatch. */
@@ -669,15 +863,10 @@ int sscanf(const char *s, const char *fmt, ...) {
         }
         uv = scan_uint(&sp, base, width, &ok);
         if (!ok) break;
-        /* The five pointer targets below deliberately carry distinct names
-         * (i16/i32/i64/f32/f64): goc resolves a local by name alone, so two
-         * sibling blocks declaring "out" with different pointee types would
-         * collide and store through the wrong width. See README/known bugs.
-         */
+        /* A single target pointer: goc now scopes block-local declarations
+         * correctly (the old i16/i32/i64/f32/f64 name-mangling workaround that
+         * masked the shadowing bug is gone -- see task #38). */
         if (!suppress) {
-            /* A single target pointer; goc now scopes block-local declarations
-             * correctly, so the old i16/i32/i64/f32/f64 name-mangling workaround
-             * is no longer needed. */
             void *out = va_arg(ap, void *);
             if (lmod == 'h') {
                 *(short *)out = (short)(neg ? -(long)uv : (long)uv);
@@ -691,11 +880,21 @@ int sscanf(const char *s, const char *fmt, ...) {
         fp++;
         continue;
     }
-    va_end(ap);
     /* Nothing assigned AND nothing consumed means the input ran out before
-     * the first conversion could finish -- the C "EOF" answer. */
+     * the first conversion could finish -- the C "EOF" answer. The va_list
+     * is owned by the caller (sscanf), which calls va_end. */
     if (assigned == 0 && sp == s) return -1;
     return assigned;
+}
+
+/* sscanf is a thin wrapper over vsscanf: pull the va_list and forward. */
+int sscanf(const char *s, const char *fmt, ...) {
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    r = vsscanf(s, fmt, ap);
+    va_end(ap);
+    return r;
 }
 
 /* =============================================================================
@@ -739,8 +938,7 @@ static int __fs_digit(int c, int base) {
     return -1;
 }
 
-int fscanf(FILE *stream, const char *fmt, ...) {
-    va_list ap;
+int vfscanf(FILE *stream, const char *fmt, va_list ap) {
     __fscan sc;
     const char *fp = fmt;
     int assigned = 0, suppress, lmod, base, ok, neg, c, cnt;
@@ -750,7 +948,6 @@ int fscanf(FILE *stream, const char *fmt, ...) {
 
     if (stream == 0) return -1;
     sc.f = stream; sc.pushed = -1; sc.got_any = 0;
-    va_start(ap, fmt);
     while (*fp != '\0') {
         if (*fp == ' ' || *fp == '\t' || *fp == '\n') {
             __fs_ws(&sc);
@@ -912,7 +1109,55 @@ int fscanf(FILE *stream, const char *fmt, ...) {
         fp++;
         continue;
     }
-    va_end(ap);
     if (assigned == 0 && !sc.got_any) return -1;
     return assigned;
+}
+
+int fscanf(FILE *stream, const char *fmt, ...) {
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    r = vfscanf(stream, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int vscanf(const char *fmt, va_list ap) {
+    return vfscanf(__goclib_stdin(), fmt, ap);
+}
+
+int scanf(const char *fmt, ...) {
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    r = vscanf(fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+/* setbuf is the simple two-argument form of setvbuf. goc's streams do not
+ * honour caller-supplied buffers, so this mirrors setvbuf and is effectively a
+ * no-op -- but it links and is callable, as a real libc provides. */
+void setbuf(FILE *stream, char *buf) {
+    setvbuf(stream, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
+}
+
+/* tmpnam writes a unique (not-yet-created) file name into `s`, or into an
+ * internal static buffer when `s` is null, and returns it. */
+char *tmpnam(char *s) {
+    static char name[40];
+    static long seq = 0;
+    char *dst = s ? s : name;
+    long i = 0, v;
+    const char *pre = "goc_tmp_";
+    while (pre[i]) { dst[i] = pre[i]; i++; }
+    v = ++seq;
+    if (v == 0) { dst[i++] = '0'; }
+    else {
+        char t[20]; int k = 0;
+        while (v > 0) { t[k++] = (char)('0' + (v % 10)); v /= 10; }
+        while (k > 0) { dst[i++] = t[--k]; }
+    }
+    dst[i++] = '.'; dst[i++] = 't'; dst[i++] = 'm'; dst[i++] = 'p'; dst[i] = 0;
+    return dst;
 }

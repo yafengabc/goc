@@ -111,6 +111,32 @@ func (c *checker) checkBlock(b *Block, fn *FuncDecl) {
 func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 	switch n := st.(type) {
 	case *DeclStmt:
+		// C23 type inference: the parser stamped the autoDeduceType placeholder
+		// ("auto x = expr;"). The declared type is the type of the initialiser
+		// after lvalue/array-to-pointer/function-to-pointer decay -- exactly
+		// what checkExpr returns -- or the type of the single element of the
+		// braced form "auto x = { expr };" (C23 6.7.9). Deduction checks the
+		// initialiser, so nothing further is validated here.
+		if n.Typ != nil && n.Typ.AutoDeduce {
+			ph := n.Typ
+			if n.Init == nil {
+				c.errf(n.Line, "auto declaration of %q requires an initialiser", n.Name)
+				n.Typ = IntType()
+			} else {
+				n.Typ = c.deduceAutoType(n.Init, fn, n.Line)
+			}
+			// Qualifiers on the placeholder ("const auto x = 5;") carry over
+			// to the deduced type (C23 6.7.9). Stamp a clone: the deduced type
+			// may be a pointer to another variable's stored type, which must
+			// not be mutated in place.
+			if ph.Const && !n.Typ.Const {
+				t2 := *n.Typ
+				t2.Const = true
+				n.Typ = &t2
+			}
+			c.put(n.Name, n.Typ, n.Line)
+			return
+		}
 		// Initialiser forms, in order of specificity: a string literal for a
 		// char array (the one array initialiser C allows outside braces), a
 		// braced initialiser for any aggregate (or scalar), and everything
@@ -328,6 +354,122 @@ func walkStmts(s Stmt, visit func(Stmt)) {
 	}
 }
 
+// checkGeneric resolves a _Generic selection at compile time (C11 6.5.1.1 /
+// C23 6.5.1.1). The controlling expression is type-checked but never
+// evaluated; its type after lvalue conversion -- checkExpr already applies
+// array-to-pointer and function-to-pointer decay, and top-level qualifiers
+// are dropped here -- selects the association with an exactly matching type,
+// falling back to the (single) default. Only the selected branch is
+// type-checked: unselected branches are syntax, not semantics.
+func (c *checker) checkGeneric(n *GenericExpr, fn *FuncDecl) *Type {
+	ct := c.checkExpr(n.Control, fn)
+	if ct != nil && ct.Const {
+		t2 := *ct
+		t2.Const = false
+		ct = &t2
+	}
+	defaultIdx := -1
+	chosen := -1
+	for i := range n.Assocs {
+		a := &n.Assocs[i]
+		if a.IsDefault {
+			if defaultIdx >= 0 {
+				c.errf(n.Line, "more than one default association in _Generic")
+			}
+			defaultIdx = i
+			continue
+		}
+		for j := 0; j < i; j++ {
+			if !n.Assocs[j].IsDefault && genericTypeMatch(n.Assocs[j].Typ, a.Typ) {
+				c.errf(n.Line, "type %s appears twice in the _Generic association list", a.Typ)
+			}
+		}
+		if chosen < 0 && genericTypeMatch(a.Typ, ct) {
+			chosen = i
+		}
+	}
+	if chosen < 0 {
+		if defaultIdx >= 0 {
+			chosen = defaultIdx
+		} else {
+			c.errf(n.Line, "controlling expression of type %s matches no _Generic association and there is no default", ct)
+			return IntType()
+		}
+	}
+	n.ChosenIdx = chosen
+	n.Chosen = n.Assocs[chosen].E
+	return c.checkExpr(n.Chosen, fn)
+}
+
+// genericTypeMatch reports whether a controlling expression of type ctl
+// selects an association of type assoc under _Generic's exact-match rule.
+// Unlike typesEqual (which treats every integer kind as interchangeable --
+// fine for assignments, where the 8-byte slot absorbs the width), _Generic
+// distinguishes int from long long from unsigned, and int* from char*: the
+// whole point of the feature is type-dependent selection, so the comparison
+// recurses with exact integer width/signedness.
+func genericTypeMatch(assoc, ctl *Type) bool {
+	if assoc == nil || ctl == nil {
+		return false
+	}
+	if assoc.Kind != ctl.Kind {
+		return false
+	}
+	switch assoc.Kind {
+	case KInt:
+		return assoc.Width == ctl.Width && assoc.Signed == ctl.Signed
+	case KPtr:
+		return genericTypeMatch(assoc.Elem, ctl.Elem)
+	case KArr:
+		return assoc.Len == ctl.Len && genericTypeMatch(assoc.Elem, ctl.Elem)
+	case KFunc:
+		if !genericTypeMatch(assoc.Ret, ctl.Ret) || len(assoc.Params) != len(ctl.Params) {
+			return false
+		}
+		for i := range assoc.Params {
+			if !genericTypeMatch(assoc.Params[i], ctl.Params[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	// double/float/bool are distinct kinds already; struct/union compare by
+	// tag (and anonymous struct members rarely appear in associations).
+	return typesEqual(assoc, ctl)
+}
+
+// deduceAutoType implements C23 6.7.9 type inference for "auto": the declared
+// type is the type of the initialiser expression (checkExpr already applies
+// array-to-pointer / function-to-pointer decay), or of the single element of
+// the braced form. Integer literals keep their suffix width and signedness
+// ("auto x = 1LL;" really is long long), mirroring typeof(constant).
+func (c *checker) deduceAutoType(init Expr, fn *FuncDecl, line int) *Type {
+	if bi, ok := init.(*BraceInit); ok {
+		if len(bi.Elems) != 1 {
+			c.errf(line, "auto deduction from a braced initialiser requires exactly one element")
+			return IntType()
+		}
+		el := bi.Elems[0]
+		if el.Desig != "" || el.DesigIdx >= 0 {
+			c.errf(line, "designators are not allowed in an auto initialiser")
+			return IntType()
+		}
+		if _, nested := el.E.(*BraceInit); nested {
+			c.errf(line, "auto deduction does not support nested brace initialisers")
+			return IntType()
+		}
+		return c.deduceAutoType(el.E, fn, line)
+	}
+	if nl, ok := init.(*NumLit); ok && nl.Kind != TDouble {
+		w := 4
+		if nl.Long {
+			w = 8
+		}
+		return &Type{Kind: KInt, Width: w, Signed: !nl.Unsig}
+	}
+	return c.checkExpr(init, fn)
+}
+
 // checkLValue returns the type of e and whether e is a modifiable lvalue.
 func (c *checker) checkLValue(e Expr, fn *FuncDecl) (*Type, bool) {
 	switch n := e.(type) {
@@ -389,6 +531,15 @@ func (c *checker) checkLValue(e Expr, fn *FuncDecl) (*Type, bool) {
 		return IntType(), false
 	case *MemberExpr:
 		return c.checkMemberLValue(n, fn)
+	case *CompoundLit:
+		// A compound literal is a modifiable lvalue: "(T){...} = ..." is
+		// nonsense but "&(T){...}" and "(T){...}.member" are ordinary C.
+		c.checkExpr(n, fn)
+		if n.Typ.Const {
+			c.errf(n.Line, "compound literal is const-qualified")
+			return n.Typ, false
+		}
+		return n.Typ, true
 	}
 	c.errf(0, "expression is not an lvalue")
 	return IntType(), false
@@ -453,7 +604,31 @@ func (c *checker) findStructMember(n *MemberExpr, fn *FuncDecl) *Member {
 
 func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 	switch n := e.(type) {
+	case *GenericExpr:
+		return c.checkGeneric(n, fn)
+	case *CompoundLit:
+		// C99 compound literal. The unnamed object has block scope and
+		// automatic storage; file-scope literals (static storage) are not
+		// supported -- the fn==nil guard is exactly the file-scope signal,
+		// since Check() walks globals with fn == nil.
+		if fn == nil {
+			c.errf(n.Line, "compound literal requires block scope (file-scope static literals are not supported)")
+			return IntType()
+		}
+		// Validates the brace list against T and fills an incomplete array's
+		// length ("(int[]){1,2,3}").
+		c.checkBraceInit(n.Typ, n.Init, fn, n.Line)
+		if n.Typ.IsArray() {
+			// An array literal used as a value decays to a pointer to its
+			// first element, exactly like a named array.
+			return PtrType(n.Typ.Elem)
+		}
+		return n.Typ
 	case *NumLit:
+		if n.BigWords != nil {
+			w := (n.BigBits + 63) / 64
+			return &Type{Kind: KBitInt, Bits: n.BigBits, Size: w * 8, Signed: n.BigSigned}
+		}
 		if n.Kind == TDouble {
 			if n.IsFloat {
 				return FloatType()
@@ -492,22 +667,26 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		switch n.Op {
 		case "-":
 			t := c.checkExpr(n.E, fn)
-			if !t.IsArith() {
+			if !t.IsArith() && t.Kind != KBitInt {
 				c.errf(0, "operand of '-' must be arithmetic, got %s", t)
 			}
 			return t
 		case "!":
 			t := c.checkExpr(n.E, fn)
-			if !t.IsScalar() {
+			if !t.IsScalar() && t.Kind != KBitInt {
 				c.errf(0, "operand of '!' must be scalar, got %s", t)
 			}
 			return IntType()
 		case "~":
 			// Bitwise complement: integer operands only, and the operand
 			// promotes to int exactly like the binary bitwise operators do.
+			// A _BitInt operand keeps its own width and signedness.
 			t := c.checkExpr(n.E, fn)
-			if !t.IsIntClass() {
+			if !t.IsIntClass() && t.Kind != KBitInt {
 				c.errf(0, "operand of '~' must be an integer, got %s", t)
+			}
+			if t.Kind == KBitInt {
+				return t
 			}
 			return IntType()
 		case "&":
@@ -603,7 +782,7 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		if !ok {
 			return IntType()
 		}
-		if !lt.IsArith() && !lt.IsPtr() && !lt.IsBool() {
+		if !lt.IsArith() && !lt.IsPtr() && !lt.IsBool() && lt.Kind != KBitInt {
 			c.errf(0, "operand of %s must be arithmetic or pointer, got %s", n.Op, lt)
 		}
 		return lt
@@ -665,7 +844,7 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 	rt := c.checkExpr(n.R, fn)
 	switch n.Op {
 	case "+", "-", "*", "/", "%":
-		if n.Op == "%" && !(lt.IsIntClass() && rt.IsIntClass()) {
+		if n.Op == "%" && !(lt.IsIntClass() && rt.IsIntClass()) && !isBig(lt) && !isBig(rt) {
 			c.errf(0, "operator '%%' requires integer operands, got %s and %s", lt, rt)
 		}
 		// Pointer arithmetic: ptr +/- int, ptr - ptr.
@@ -688,6 +867,10 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 		// value is carried in an XMM register; only its 4/8-byte storage
 		// footprint differs.
 		if lt.IsFloating() || rt.IsFloating() {
+			if isBig(lt) || isBig(rt) {
+				c.errf(0, "floating operands with _BitInt are not supported (%s and %s)", lt, rt)
+				return lt
+			}
 			if n.Op == "%" {
 				c.errf(0, "operator '%%' requires integer operands, got %s and %s", lt, rt)
 			}
@@ -696,20 +879,37 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 			}
 			return FloatType()
 		}
+		// C23 bit-precise arithmetic: the wider _BitInt wins (equal widths
+		// resolve to unsigned); an int-class operand converts to the bitint
+		// side. Pointer mixes were handled above, so this is safe.
+		if isBig(lt) || isBig(rt) {
+			if !(lt.IsIntClass() || isBig(lt)) || !(rt.IsIntClass() || isBig(rt)) {
+				c.errf(0, "invalid operands with _BitInt: %s and %s", lt, rt)
+				return IntType()
+			}
+			return bigArithResult(n.Op, lt, rt)
+		}
 		return IntType()
 	case "<", ">", "<=", ">=", "==", "!=":
-		if !(lt.IsScalar() && rt.IsScalar()) {
+		if !(lt.IsScalar() && rt.IsScalar()) && !isBig(lt) && !isBig(rt) {
 			c.errf(0, "relational operator requires scalar operands, got %s and %s", lt, rt)
 		}
 		return IntType()
 	case "&&", "||":
-		if !(lt.IsScalar() && rt.IsScalar()) {
+		if !(lt.IsScalar() && rt.IsScalar()) && !isBig(lt) && !isBig(rt) {
 			c.errf(0, "logical operator requires scalar operands, got %s and %s", lt, rt)
 		}
 		return IntType()
 	case "<<", ">>", "&", "|", "^":
-		if !(lt.IsIntClass() && rt.IsIntClass()) {
+		if !(lt.IsIntClass() && rt.IsIntClass()) && !isBig(lt) && !isBig(rt) {
 			c.errf(0, "operator %q requires integer operands, got %s and %s", n.Op, lt, rt)
+		}
+		if isBig(lt) || isBig(rt) {
+			if !(lt.IsIntClass() || isBig(lt)) || !(rt.IsIntClass() || isBig(rt)) {
+				c.errf(0, "invalid operands with _BitInt: %s and %s", lt, rt)
+				return IntType()
+			}
+			return bigArithResult(n.Op, lt, rt)
 		}
 		return IntType()
 	}
@@ -768,7 +968,14 @@ func (c *checker) checkArgs(what string, params []*Type, variadic bool, args []E
 		}
 		for i, a := range args {
 			if i >= len(params) {
-				break // trailing variadic arguments are not type-checked here
+				// Trailing variadic arguments have no parameter to check
+				// assignability against, but they are still walked: every
+				// argument must be a valid expression, and expression nodes
+				// that resolve at check time (e.g. _Generic selections)
+				// must be resolved even when the code generator will read
+				// them out of a variadic position.
+				c.checkExpr(a, fn)
+				continue
 			}
 			at := c.checkExpr(a, fn)
 			if !assignable(params[i], at) {
@@ -830,6 +1037,8 @@ func (c *checker) checkIndirectCall(n *IndirectCall, fn *FuncDecl) *Type {
 
 // assignable reports whether a value of src may be stored into a location of
 // dst under C's implicit conversion rules (relaxed for the toy model).
+func isBig(t *Type) bool { return t != nil && t.Kind == KBitInt }
+
 func assignable(dst, src *Type) bool {
 	if dst == nil || src == nil {
 		return true // an error was already reported upstream
@@ -844,6 +1053,9 @@ func assignable(dst, src *Type) bool {
 		return true // int -> bool conversion (0/1)
 	case dst.IsIntClass() && src.IsBool():
 		return true // bool -> int conversion
+	case dst.IsPtr() && src.IsPtr() && src.Elem != nil && src.Elem.Kind == KBitInt &&
+		dst.Elem != nil && (dst.Elem.IsIntClass() || dst.Elem.IsVoid()):
+		return true // a _BitInt's word array is addressable as unsigned long long*
 	case dst.IsPtr() && src.IsPtr():
 		de, se := dst.Elem, src.Elem
 		if de == nil || se == nil || de.IsVoid() || se.IsVoid() {
@@ -858,6 +1070,16 @@ func assignable(dst, src *Type) bool {
 		return typesEqual(dst, src) // whole-struct assignment
 	case dst.IsUnion() && src.IsUnion():
 		return typesEqual(dst, src)
+	case dst.Kind == KBitInt && src.Kind == KBitInt:
+		return true // different widths convert by truncation/sign-extension
+	case dst.Kind == KBitInt && src.IsIntClass():
+		return true
+	case dst.IsIntClass() && src.Kind == KBitInt:
+		return true // truncating conversion to the integer type
+	case dst.IsBool() && src.Kind == KBitInt:
+		return true
+	case dst.IsPtr() && src.Kind == KBitInt:
+		return false // bitint is not a pointer source
 	}
 	return false
 }
@@ -889,7 +1111,9 @@ func (c *checker) checkBraceInit(t *Type, bi *BraceInit, fn *FuncDecl, line int)
 				n = len(bi.Elems)
 			}
 			if n == 0 {
-				c.errf(line, "empty initialiser for array of incomplete length")
+				// empty {} on an incomplete array: a zero-length array, which
+				// zero-initialises (no elements).
+				t.Len = 0
 				return
 			}
 			t.Len = n
@@ -927,26 +1151,33 @@ func (c *checker) checkBraceInit(t *Type, bi *BraceInit, fn *FuncDecl, line int)
 			return
 		}
 		el := bi.Elems[0]
-		mi := 0
+		var m *Member
 		if el.DesigIdx >= 0 {
 			c.errf(line, "array designator \"[%d] =\" is only valid in an array initialiser", el.DesigIdx)
 			return
 		}
 		if el.Desig != "" {
-			mi = memberIndex(t, el.Desig)
+			mi := memberIndex(t, el.Desig)
 			if mi < 0 {
 				c.errf(line, "union has no member %q", el.Desig)
 				return
 			}
+			m = t.Members[mi]
+		} else if vis := posMembers(t); len(vis) > 0 {
+			m = vis[0]
 		}
-		if mi < len(t.Members) {
-			if t.Members[mi].BitWidth > 0 {
-				c.errf(line, "cannot brace-initialise bit-field member %q", t.Members[mi].Name)
+		if m != nil {
+			if m.BitWidth > 0 {
+				c.errf(line, "cannot brace-initialise bit-field member %q", m.Name)
 				return
 			}
-			c.checkBraceElem(t.Members[mi].Type, el.E, fn, line)
+			c.checkBraceElem(m.Type, el.E, fn, line)
 		}
 	default:
+		// C23 empty brace initialiser "T x = {};" zero-initialises the object.
+		if len(bi.Elems) == 0 {
+			return
+		}
 		// C allows a scalar to be initialised from a single braced value.
 		if len(bi.Elems) != 1 || bi.Elems[0].Desig != "" {
 			c.errf(line, "invalid initialiser for scalar type %s", t)
@@ -991,8 +1222,9 @@ func (c *checker) checkStructBrace(t *Type, bi *BraceInit, fn *FuncDecl, line in
 		}
 		return
 	}
+	vis := posMembers(t)
 	for i, el := range bi.Elems {
-		if i >= len(t.Members) {
+		if i >= len(vis) {
 			c.errf(line, "too many initialisers for struct %s", t)
 			break
 		}
@@ -1003,11 +1235,11 @@ func (c *checker) checkStructBrace(t *Type, bi *BraceInit, fn *FuncDecl, line in
 			c.errf(line, "cannot mix positional and designated (\".%s =\") initialisers", el.Desig)
 			return
 		}
-		if t.Members[i].BitWidth > 0 {
-			c.errf(line, "cannot brace-initialise bit-field member %q", t.Members[i].Name)
+		if vis[i].BitWidth > 0 {
+			c.errf(line, "cannot brace-initialise bit-field member %q", vis[i].Name)
 			continue
 		}
-		c.checkBraceElem(t.Members[i].Type, el.E, fn, line)
+		c.checkBraceElem(vis[i].Type, el.E, fn, line)
 	}
 }
 

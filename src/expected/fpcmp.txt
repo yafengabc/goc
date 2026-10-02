@@ -1,0 +1,14 @@
+nan!=nan=1
+nan==nan=0
+nan<1=0 nan>1=0
+nan<=nan=0 nan>=nan=0
+inf!=inf=0
+inf>0=1 -inf<0=1
+isnan=1 isinf=1 isfinite=1
+1<2=1 2<=2=1 3>4=0
+int 1<2=1 -1<1=1
+1e19=1e+19
+1e20=1e+20
+1e19 f=10000000000000000000.0
+inf=inf nan=nan
+-1e19=-1e+19

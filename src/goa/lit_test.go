@@ -102,6 +102,54 @@ func TestArithMemSrcBad(t *testing.T) {
 	}
 }
 
+// TestSegPrefix verifies FS/GS segment-override prefixes on memory operands.
+// The prefix byte is a legacy prefix and must precede REX/opcode. TLS access
+// uses a base register (the CPU adds the segment base to the effective address),
+// e.g. gs:[rax+0x58] reads the TEB field at linear 0x58 when rax==0.
+func TestSegPrefix(t *testing.T) {
+	a := NewAssembler()
+	src := `section .text
+mov rax, fs:[rbx]
+mov rax, gs:[rbx]
+mov eax, fs:[rbx]
+mov rax, fs:[rbx+0x58]
+mov rax, fs:[rbx+0x200]
+mov rax, fs:[rbp-8]
+add eax, gs:[rbp-16]
+mov rax, gs:[rdx+rbx*4]
+mov rax, fs:[rbx+8]
+`
+	if err := a.Assemble(src); err != nil {
+		t.Fatalf("assemble: %v", err)
+	}
+	var got []byte
+	for _, s := range a.sections {
+		if s.Name == ".text" {
+			got = s.Data
+			break
+		}
+	}
+	want := []byte{
+		0x64, 0x48, 0x8B, 0x03,                   // mov rax, fs:[rbx]
+		0x65, 0x48, 0x8B, 0x03,                   // mov rax, gs:[rbx]
+		0x64, 0x8B, 0x03,                         // mov eax, fs:[rbx]
+		0x64, 0x48, 0x8B, 0x43, 0x58,             // mov rax, fs:[rbx+0x58]  (disp8)
+		0x64, 0x48, 0x8B, 0x83, 0x00, 0x02, 0x00, 0x00, // mov rax, fs:[rbx+0x200] (disp32)
+		0x64, 0x48, 0x8B, 0x45, 0xF8,             // mov rax, fs:[rbp-8]
+		0x65, 0x03, 0x45, 0xF0,                   // add eax, gs:[rbp-16]
+		0x65, 0x48, 0x8B, 0x04, 0x9A,             // mov rax, gs:[rdx+rbx*4]
+		0x64, 0x48, 0x8B, 0x43, 0x08,             // mov rax, fs:[rbx+8]
+	}
+	if len(got) != len(want) {
+		t.Fatalf("text len = %d, want %d\n got %x\nwant %x", len(got), len(want), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("text[%d] = 0x%02x, want 0x%02x\n got %x\nwant %x", i, got[i], want[i], got, want)
+		}
+	}
+}
+
 // TestStripCommentInString guards stripComment against ';' and "//" inside
 // string literals, and against an escaped quote closing the string early.
 func TestStripCommentInString(t *testing.T) {

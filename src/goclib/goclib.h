@@ -27,6 +27,14 @@
 #include <string.h>
 #include <errno.h>
 #include <assert.h>
+#include <math.h>
+/* The goclib implementation files call into kernel32/user32/gdi32 (ExitProcess,
+ * CreateFileA, ...). Those imports are now self-describing: each prototype in
+ * the windows.h family names its DLL inline (e.g. `extern void ExitProcess(DWORD),
+ * kernel32;`). Pulling windows.h in here makes every binding visible to the
+ * library translation units, which is what the old central win32.def provided
+ * globally. User code that never touches the OS simply does not call them. */
+#include <windows.h>
 
 /* ---- platform primitives (implemented in goclib.c, OS glue) ---------------- */
 /* Write `len` bytes from `buf` to standard output. Returns bytes written. */

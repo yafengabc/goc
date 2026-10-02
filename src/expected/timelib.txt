@@ -1,0 +1,16 @@
+gmtime: 2026-01-01 00:00:00
+wday=4 yday=0 isdst=-1
+asctime: Thu Jan  1 00:00:00 2026
+F/T: 2026-01-01 00:00:00
+names: Thursday January 01 2026 001 4
+12h: 12:00 AM 01/01/26 00:00
+odd: % literal 26-01- 1
+short: n=10 buf=2026
+leap: 2020-03-01 yday=60
+2020-02-29 -> 2020-02-29
+2021-02-29 -> 2021-03-01
+overflow -> 2020-02-02 02:02:01
+mktime(localtime(t)) == t: 1
+difftime=3661
+clock ok=1
+time now > 2026: 1

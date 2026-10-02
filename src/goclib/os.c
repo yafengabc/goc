@@ -4,8 +4,9 @@
  * os.c -- the five __goclib_* OS primitives.
  *
  * This is the only file in goclib that knows the OS. On Windows the calls go
- * through the win32.def import table; on Linux goa turns each extern name
- * into a "mov rax,N; syscall; ret" stub (see externLinux in codegen.go).
+ * through kernel32 imports whose DLL is named inline on each prototype; on Linux
+ * goa turns each extern name into a "mov rax,N; syscall; ret" stub (see
+ * externLinux in codegen.go).
  * Everything else in goclib is portable C and lives in the sibling .c files,
  * which are compiled per target in name order (os.c, stdio.c, stdlib.c,
  * string.c) after the goclib.h umbrella TU.

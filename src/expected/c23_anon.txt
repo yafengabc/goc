@@ -1,0 +1,9 @@
+tag=1 x=2 y=3 c=Z
+inner a=10 b=20
+sizeof S1=24
+lo=2 hi=3
+sizeof U1=4
+k=A bytes=DCBA
+d=2.50 sizeof S2=16
+arrow i=1094861636
+q=7 0 0 0 55 ?

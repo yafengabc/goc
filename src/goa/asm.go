@@ -39,13 +39,34 @@ type Operand struct {
 	memWidth   int    // K_MEM: explicit operand width from byte/word/dword/qword prefix (0 = infer)
 	isRip      bool   // K_MEM: true => [rip+sym], false => register-based memory
 	sym        string // K_SYM
+	memSeg     int    // K_MEM: segment override prefix (segNone/segFS/segGS); emitted before REX
 }
+
+// Segment-override prefixes for memory operands. A memory operand may carry one
+// of these; the assembler emits the byte as a legacy prefix -- strictly before
+// the REX prefix -- so `mov rax, fs:[rbx]` assembles to 64 48 8B 03 (0x64 FS,
+// 0x48 REX.W, 0x8B MOV, ModRM). x86-64 uses FS for the Linux TLS base and GS for
+// the Windows TEB/TLS pointer.
+const (
+	segNone = 0
+	segFS   = 0x64 // FS segment override
+	segGS   = 0x65 // GS segment override
+)
 
 type Section struct {
 	Name     string
 	Writable bool
 	Code     bool
 	Data     []byte
+	// cur is the current virtual offset within the section. For normal sections
+	// it tracks len(Data); for a .bss section it advances on resb/resq without
+	// any bytes being appended to Data, so the file stays empty while symbol
+	// offsets remain correct.
+	cur int
+	// Bss marks an uninitialised-data section. Its bytes are zero-filled by the
+	// loader, never written to the file, and its virtual size is cur (not
+	// len(Data), which stays 0).
+	Bss bool
 }
 
 type symLoc struct {
@@ -85,6 +106,90 @@ type Assembler struct {
 	// `jmp short label` spelling and cleared once that jump is encoded, so
 	// the flag can never leak onto a following instruction.
 	shortNext bool
+	// Unwind metadata collection (ELF target only). For every function whose
+	// prolog is the canonical `push rbp; mov rbp, rsp; push <callee-saves>;
+	// sub rsp, N`, we record enough to let the Windows gocrun loader register a
+	// per-function RUNTIME_FUNCTION table via RtlAddFunctionTable. Without it
+	// the x64 unwinder faults while walking guest frames during a Win32
+	// syscall's internal exception dispatch (it has no PE unwind info).
+	uwRecs []*uwFunc
+	uwCur  *uwFunc
+}
+
+// uwFunc records one function's prolog for unwind-table emission.
+type uwFunc struct {
+	sect      int   // section index the function lives in (.text)
+	start     int   // offset of the function label within the section
+	end       int   // offset of the next label (or section end) within sect
+	pushes      []int // register numbers pushed, in execution order (incl. rbp)
+	alloc       int   // `sub rsp, N` amount (0 if no frame alloc)
+	hasProlog   bool  // saw at least `push rbp`
+	prologDone  bool  // finished capturing the prolog shape
+}
+
+// uwRegNum maps an x86-64 register name to its unwind-code register number.
+func uwRegNum(name string) (int, bool) {
+	switch name {
+	case "rax":
+		return 0, true
+	case "rcx":
+		return 1, true
+	case "rdx":
+		return 2, true
+	case "rbx":
+		return 3, true
+	case "rsp":
+		return 4, true
+	case "rbp":
+		return 5, true
+	case "rsi":
+		return 6, true
+	case "rdi":
+		return 7, true
+	}
+	if len(name) >= 2 && name[0] == 'r' {
+		if n, err := strconv.Atoi(name[1:]); err == nil && n >= 8 && n <= 15 {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+func uwParsePush(t string) (int, bool) {
+	if !strings.HasPrefix(t, "push ") {
+		return 0, false
+	}
+	return uwRegNum(strings.TrimSpace(t[len("push "):]))
+}
+
+func uwParseSubRsp(t string) (int, bool) {
+	const p = "sub rsp, "
+	if !strings.HasPrefix(t, p) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(t[len(p):]))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// uwCloseFunc finalizes the in-progress function record (if any) using the
+// offset of the label that ends it. When the ending label lives in a different
+// section, the function spans to the end of its own section instead.
+func (a *Assembler) uwCloseFunc(off, sect int) {
+	if a.uwCur == nil {
+		return
+	}
+	if sect == a.uwCur.sect {
+		a.uwCur.end = off
+	} else {
+		a.uwCur.end = len(a.sections[a.uwCur.sect].Data)
+	}
+	if a.uwCur.hasProlog {
+		a.uwRecs = append(a.uwRecs, a.uwCur)
+	}
+	a.uwCur = nil
 }
 
 // isLocalLabel reports whether a label name is file-local.
@@ -130,9 +235,24 @@ var linuxSyscalls = map[string]int64{
 	"kill":          62,
 	"exit_group":    231,
 	"gettimeofday":  96,
-	"clock_gettime": 228,
+	"__goc_clock_gettime": 228,
 	"unlink":        87,
 	"rename":        82,
+	"__goclib_vfork":   58, // used by system() on Linux
+	"__goclib_execve":  59,
+	"__goclib_wait4":   61,
+	// Directory and metadata calls used by goclib/dir.c. The __goclib_* aliases
+	// exist for the same reason as __goclib_rename: the wrapper that carries
+	// the C name (stat/mkdir/rmdir) cannot extern that same name, or the stub
+	// call would resolve to the wrapper itself.
+	"__goclib_stat":        4,  // stat
+	"__goclib_mkdir":       83,
+	"__goclib_rmdir":       84,
+	"__goclib_getdents64":  217,
+	"__goclib_getcwd":      79, // getcwd
+	"__goclib_chmod":       90, // chmod
+	"__goclib_access":      21, // access
+	"__goclib_fstat":       5,  // fstat
 	// __goclib_rename: the alias goclib's rename() wrapper calls for the raw
 	// syscall. The wrapper cannot `extern rename` itself -- the name resolves
 	// to its own definition, an infinite recursion (see goclib/file.c).
@@ -218,20 +338,31 @@ func (a *Assembler) curSection() *Section {
 }
 
 func (a *Assembler) emitByte(b byte) {
-	a.curSection().Data = append(a.curSection().Data, b)
+	s := a.curSection()
+	s.Data = append(s.Data, b)
+	s.cur = len(s.Data)
 }
 func (a *Assembler) emitBytes(bs []byte) {
-	a.curSection().Data = append(a.curSection().Data, bs...)
+	s := a.curSection()
+	s.Data = append(s.Data, bs...)
+	s.cur = len(s.Data)
 }
 func (a *Assembler) emitInt32(v int32) {
-	a.curSection().Data = append(a.curSection().Data, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	s := a.curSection()
+	s.Data = append(s.Data, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	s.cur = len(s.Data)
 }
 func (a *Assembler) emitInt64(v int64) {
 	for i := 0; i < 8; i++ {
 		a.emitByte(byte(v >> (8 * i)))
 	}
 }
-func (a *Assembler) curOff() int { return len(a.curSection().Data) }
+// reserve grows the current section's virtual offset by n bytes without writing
+// any file bytes -- the basis of the BSS resb/resq/resd/resw directives.
+func (a *Assembler) reserve(n int) {
+	a.curSection().cur += n
+}
+func (a *Assembler) curOff() int { return a.curSection().cur }
 
 func (a *Assembler) defineSym(name string) {
 	if _, exists := a.syms[name]; exists {
@@ -317,13 +448,23 @@ func (a *Assembler) Assemble(src string) error {
 			return err
 		}
 	}
+	// Close the final function record (spans to the end of its section).
+	if a.uwCur != nil {
+		a.uwCur.end = len(a.sections[a.uwCur.sect].Data)
+		if a.uwCur.hasProlog {
+			a.uwRecs = append(a.uwRecs, a.uwCur)
+		}
+		a.uwCur = nil
+	}
 	return nil
 }
 
 // emitSyscallStubs defines one stub per declared extern when targeting ELF.
-// Each stub is `mov rax, <number>; syscall; ret`, placed at the start of
-// .text, so `call write` reaches the kernel with the SysV argument registers
-// (rdi, rsi, rdx, ...) untouched.
+// Each stub is `mov rax, <number>; call __goc_syscall; ret`, placed at the
+// start of .text. Routing every syscall through the single __goc_syscall
+// symbol (defined just below) lets a non-Linux loader substitute a Win32-backed
+// translator without CPU emulation or code scanning; on real Linux __goc_syscall
+// is just `syscall; ret` so the ELF stays self-contained and native.
 func (a *Assembler) emitSyscallStubs() error {
 	names := make([]string, 0, len(a.exts))
 	for n := range a.exts {
@@ -347,10 +488,27 @@ func (a *Assembler) emitSyscallStubs() error {
 			a.cur = prev
 			return err
 		}
-		a.emitByte(0x0F) // syscall
-		a.emitByte(0x05)
+		// Route every syscall through a single __goc_syscall chokepoint instead
+		// of emitting the raw `syscall` instruction. On real Linux the loader
+		// (kernel) provides __goc_syscall; in the Windows test harness the
+		// gocrun loader rewrites __goc_syscall's body to a Win32-backed
+		// translator. Either way the guest runs natively -- no CPU emulation.
+		a.emitByte(0xE8) // call rel32
+		off := a.curOff()
+		a.emitInt32(0)
+		a.fixup(off, "__goc_syscall")
 		a.emitByte(0xC3) // ret
 	}
+	// Single chokepoint for every Linux syscall. Defined here (in .text) so the
+	// ELF is self-contained and runs natively on real Linux. The two trailing
+	// NOPs leave room for a 5-byte `jmp rel32` patch the Windows loader applies
+	// to redirect __goc_syscall to its Win32 translator.
+	a.defineSym("__goc_syscall")
+	a.emitByte(0x0F) // syscall
+	a.emitByte(0x05)
+	a.emitByte(0xC3) // ret
+	a.emitByte(0x90) // nop (patch padding)
+	a.emitByte(0x90) // nop (patch padding)
 	a.cur = prev
 	return nil
 }
@@ -450,8 +608,9 @@ func (a *Assembler) processLine(ln string) error {
 				}
 			}
 		} else {
-			writable := name == ".data" || name == ".idata"
+			writable := name == ".data" || name == ".idata" || name == ".tls" || name == ".bss"
 			s := a.newSection(name, writable, name == ".text")
+			s.Bss = name == ".bss"
 			a.cur = len(a.sections) - 1
 			_ = s
 		}
@@ -491,8 +650,18 @@ func (a *Assembler) processLine(ln string) error {
 	if label, rest, ok := splitLabel(ln); ok {
 		if !isLocalLabel(label) {
 			a.curGlobal = label
+			a.defineSym(a.qualify(label))
+			off := a.curOff()
+			// Finalize the previous function record (closes its [start,end)
+			// range) and open a fresh one for this global entry label only.
+			// Local labels (.Lxxx) are internal branch targets inside the
+			// current function and must NOT reset the record, or the function
+			// body between two local labels would be left without unwind info.
+			a.uwCloseFunc(off, a.cur)
+			a.uwCur = &uwFunc{sect: a.cur, start: off}
+		} else {
+			a.defineSym(a.qualify(label))
 		}
-		a.defineSym(a.qualify(label))
 		if rest != "" {
 			return a.processLine(rest)
 		}
@@ -500,7 +669,8 @@ func (a *Assembler) processLine(ln string) error {
 	}
 	// label without colon in front of a data directive: "name db ..." / "name dq ..."
 	if fields := strings.Fields(ln); len(fields) >= 2 &&
-		(fields[1] == "db" || fields[1] == "dq" || fields[1] == "du") {
+		(fields[1] == "db" || fields[1] == "dq" || fields[1] == "du" ||
+			fields[1] == "resb" || fields[1] == "resw" || fields[1] == "resd" || fields[1] == "resq") {
 		label := fields[0]
 		if _, isReg := regIndexMap[label]; !isReg {
 			if !isLocalLabel(label) {
@@ -509,6 +679,24 @@ func (a *Assembler) processLine(ln string) error {
 			a.defineSym(a.qualify(label))
 			rest := strings.TrimSpace(ln[len(label):])
 			return a.processLine(rest)
+		}
+	}
+	// Capture the prolog shape so the Windows gocrun loader can register a
+	// per-function unwind table. The prolog is `push rbp; mov rbp, rsp;
+	// push <callee-saves>; sub rsp, N`. We record the pushed registers and the
+	// frame allocation; anything else ends the prolog window.
+	if a.uwCur != nil && !a.uwCur.prologDone {
+		t := strings.TrimSpace(ln)
+		if reg, ok := uwParsePush(t); ok {
+			a.uwCur.pushes = append(a.uwCur.pushes, reg)
+			a.uwCur.hasProlog = true
+		} else if t == "mov rbp, rsp" {
+			// frame-pointer setup; no unwind code needed
+		} else if n, ok := uwParseSubRsp(t); ok {
+			a.uwCur.alloc = n
+			a.uwCur.prologDone = true
+		} else {
+			a.uwCur.prologDone = true
 		}
 	}
 	return a.emitInstr(ln)
@@ -520,6 +708,15 @@ func (a *Assembler) processLine(ln string) error {
 
 func (a *Assembler) parseOperand(tok string) (Operand, error) {
 	tok = strings.TrimSpace(tok)
+	// Segment-override prefix: fs:[...] / gs:[...] (also fs:dword [...]).
+	// Only a memory operand may carry one, so require a '[' after the colon.
+	var memSeg int
+	switch {
+	case strings.HasPrefix(tok, "fs:") && strings.Contains(tok, "["):
+		memSeg, tok = segFS, strings.TrimSpace(tok[3:])
+	case strings.HasPrefix(tok, "gs:") && strings.Contains(tok, "["):
+		memSeg, tok = segGS, strings.TrimSpace(tok[3:])
+	}
 	// Strip NASM-style size prefixes (byte/word/dword/qword) and the
 	// redundant "ptr" keyword. The actual operand size is usually inferred
 	// from the register used (al/bl => 8-bit, rax/rbx => 64-bit), so for
@@ -575,7 +772,7 @@ func (a *Assembler) parseOperand(tok string) (Operand, error) {
 		innerStripped := strings.ReplaceAll(inner, "RIP+", "")
 		innerStripped = strings.ReplaceAll(innerStripped, "rip+", "")
 		if innerStripped != inner {
-			return Operand{kind: K_MEM, memSym: a.qualify(strings.TrimSpace(innerStripped)), isRip: true, memIndex: -1, memWidth: sizeKw}, nil
+			return Operand{kind: K_MEM, memSym: a.qualify(strings.TrimSpace(innerStripped)), isRip: true, memIndex: -1, memWidth: sizeKw, memSeg: memSeg}, nil
 		}
 		// Simple register-indirect: [reg]. Normalize it onto memBase (with
 		// memScale = 1) so planMem sees a well-formed operand -- leaving
@@ -583,10 +780,10 @@ func (a *Assembler) parseOperand(tok string) (Operand, error) {
 		if !strings.ContainsAny(inner, "+-*") {
 			if ri, ok := regIndex(inner); ok {
 				return Operand{kind: K_MEM, memReg: ri, memBase: ri, memHasBase: true,
-					isRip: false, memIndex: -1, memScale: 1, memWidth: sizeKw}, nil
+					isRip: false, memIndex: -1, memScale: 1, memWidth: sizeKw, memSeg: memSeg}, nil
 			}
 			// a bare symbol => RIP-relative data reference ([sym])
-			return Operand{kind: K_MEM, memSym: a.qualify(inner), isRip: true, memIndex: -1, memWidth: sizeKw}, nil
+			return Operand{kind: K_MEM, memSym: a.qualify(inner), isRip: true, memIndex: -1, memWidth: sizeKw, memSeg: memSeg}, nil
 		}
 		// Complex: [base+index*scale+disp], [base+disp], [index*scale], ...
 		o, err := parseMemInner(inner)
@@ -594,6 +791,7 @@ func (a *Assembler) parseOperand(tok string) (Operand, error) {
 			return Operand{}, err
 		}
 		o.memWidth = sizeKw
+		o.memSeg = memSeg
 		return o, nil
 	}
 	// immediate (literal or constant name)
@@ -745,6 +943,10 @@ func (a *Assembler) planMem(regField int, mem Operand) (memEnc, error) {
 
 	// Choose mod (and displacement size).
 	switch {
+	case !hasBase && !hasIdx:
+		// Absolute [disp32]: mod=00 with a SIB whose base=101 supplies the
+		// disp32. (mod=10 here would wrongly decode as [rbp+disp32].)
+		e.modrm = 0x00
 	case !needDisp && disp == 0 && !baseIsBP && !useSIB:
 		e.modrm = 0x00
 	case !needDisp && disp == 0 && !baseIsBP && useSIB:
@@ -789,10 +991,8 @@ func (a *Assembler) planMem(regField int, mem Operand) (memEnc, error) {
 			sib |= byte(base & 7)
 			e.rexB = base >= 8
 		} else {
-			sib |= 0x05 // base = 101 (none) => disp32 required
-			// force a 4-byte displacement
+			sib |= 0x05 // base = 101 (none) => disp32 follows (mod stays 00)
 			e.dispSize = 4
-			e.modrm = (e.modrm & 0x3F) | 0x80
 			e.disp = disp
 		}
 		e.sib = sib
@@ -940,6 +1140,16 @@ func (a *Assembler) emitInstr(ln string) error {
 				return fmt.Errorf("line %q: %v", ln, err)
 			}
 			ops = append(ops, o)
+		}
+	}
+	// Emit any segment-override prefix (FS/GS) as a legacy prefix -- strictly
+	// before REX and opcode. At most one operand can be a memory reference, and
+	// the prefix applies to it. (The syscall-stub path in emitSyscallStubs does
+	// not use memory operands with a segment, so it needs no handling here.)
+	for _, op := range ops {
+		if op.kind == K_MEM && op.memSeg != segNone {
+			a.emitByte(byte(op.memSeg))
+			break
 		}
 	}
 	return a.encode(mnem, ops, ln)
@@ -1207,6 +1417,14 @@ func (a *Assembler) encode(mnem string, ops []Operand, ln string) error {
 		return a.emitDQ(restOf(ln))
 	case "du":
 		return a.emitDU(restOf(ln))
+	case "resb":
+		return a.emitRes(1, restOf(ln))
+	case "resw":
+		return a.emitRes(2, restOf(ln))
+	case "resd":
+		return a.emitRes(4, restOf(ln))
+	case "resq":
+		return a.emitRes(8, restOf(ln))
 	case "push", "pop":
 		return a.encodePushPop(mnem, ops, ln)
 	case "call":
@@ -1388,11 +1606,55 @@ func (a *Assembler) emitDQ(rest string) error {
 	return nil
 }
 
+// emitRes reserves count*unit bytes of uninitialised space (the resb/resw/resd/
+// resq directives). No file bytes are written; only the section's virtual offset
+// advances, so a .bss section shrinks the on-disk image while keeping
+// zero-filled memory at the right address.
+func (a *Assembler) emitRes(unit int, rest string) error {
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return nil
+	}
+	count, err := a.parseCount(rest)
+	if err != nil {
+		return err
+	}
+	if count < 0 {
+		return fmt.Errorf("negative reserve count %q", rest)
+	}
+	a.reserve(unit * int(count))
+	return nil
+}
+
+// parseCount evaluates a small integer expression for the res* directives:
+// integers, named constants (a.consts), and '*' products such as `4*1024`.
+func (a *Assembler) parseCount(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	if v, ok := a.consts[s]; ok {
+		return v, nil
+	}
+	// product of factors separated by '*'
+	if strings.Contains(s, "*") {
+		var total int64 = 1
+		for _, p := range strings.Split(s, "*") {
+			f, err := a.parseCount(strings.TrimSpace(p))
+			if err != nil {
+				return 0, err
+			}
+			total *= f
+		}
+		return total, nil
+	}
+	return strconv.ParseInt(s, 0, 64)
+}
+
 // emitDU defines UTF-16LE data ("du" = define unicode). Accepts string
 // literals and 16-bit numbers, and always appends a NUL terminator so a label
 // on the directive can be handed straight to a Wide-char Win32 API.
-func (a *Assembler) emitDU(rest string) error {
-	rest = strings.TrimSpace(rest)
+func (a *Assembler) emitDU(rest string) error {	rest = strings.TrimSpace(rest)
 	for _, tok := range splitTopLevel(rest, ',') {
 		t := strings.TrimSpace(tok)
 		if t == "" {
@@ -1906,7 +2168,17 @@ func (a *Assembler) encodeMovMemImm(base, disp int, imm int64, width int, ln str
 	if width == 8 || base >= 8 {
 		a.emitByte(rex)
 	}
-	a.emitByte(0xC7) // mov r/m, imm32 (or imm16 under 0x66)
+	if width == 1 {
+		// mov r/m8, imm8 -- the byte-size form uses opcode C6, NOT C7.
+		// C7 is "mov r/m, imm32/imm16" and would zero a whole 4-byte (or
+		// 2-byte under 0x66) word. The store at address N writes bytes
+		// N, N+1, N+2, N+3, so a C7 here clobbers the adjacent higher
+		// stack slot (one byte up) and silently corrupts a neighbour
+		// narrow local -- the #81 _Bool/char zero-init bug.
+		a.emitByte(0xC6)
+	} else {
+		a.emitByte(0xC7) // mov r/m, imm32 (or imm16 under 0x66)
+	}
 	useSIB := base == 4 || base == 12
 	var modrm byte
 	if !useSIB {
@@ -1940,10 +2212,13 @@ func (a *Assembler) encodeMovMemImm(base, disp int, imm int64, width int, ln str
 	default:
 		a.emitInt32(int32(disp))
 	}
-	if width == 2 {
+	switch {
+	case width == 1:
+		a.emitByte(byte(imm)) // imm8 for the C6 byte-store form
+	case width == 2:
 		a.emitByte(byte(int16(imm)))
 		a.emitByte(byte(int16(imm) >> 8))
-	} else {
+	default:
 		a.emitInt32(int32(imm))
 	}
 	return nil

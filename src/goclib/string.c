@@ -116,6 +116,17 @@ void *memset(void *dst, int v, size_t n) {
     return dst;
 }
 
+/* memset_explicit (C23): identical to memset, but the compiler must not optimize
+ * the store away even if the buffer is never read again. goc has no DSE pass
+ * that would elide a dead memset, so a direct byte loop is already compliant. */
+void *memset_explicit(void *dst, int v, size_t n) {
+    volatile unsigned char *p = (volatile unsigned char *)dst;
+    unsigned char b = (unsigned char)v;
+    size_t i;
+    for (i = 0; i < n; i++) p[i] = b;
+    return dst;
+}
+
 void *memcpy(void *dst, const void *src, size_t n) {
     unsigned char *d = (unsigned char *)dst;
     const unsigned char *s = (const unsigned char *)src;
@@ -143,5 +154,79 @@ int memcmp(const void *a, const void *b, size_t n) {
     size_t i;
     for (i = 0; i < n; i++)
         if (x[i] != y[i]) return (int)x[i] - (int)y[i];
+    return 0;
+}
+
+void *memchr(const void *s, int c, size_t n) {
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned char want = (unsigned char)c;
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (p[i] == want) return (void *)(p + i);
+    return 0;
+}
+
+size_t strnlen(const char *s, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++)
+        if (s[i] == '\0') return i;
+    return n;
+}
+
+/* malloc + memcpy. A null argument is passed through as null rather than
+ * being turned into a one-byte allocation, so callers that treat strdup(0)
+ * as "nothing to copy" keep working. */
+char *strdup(const char *s) {
+    size_t n;
+    char *p;
+    if (s == 0) return 0;
+    n = strlen(s) + 1;
+    p = (char *)malloc(n);
+    if (p == 0) return 0;
+    memcpy(p, s, n);
+    return p;
+}
+
+char *stpcpy(char *dest, const char *src) {
+    while ((*dest++ = *src++) != 0)
+        ;
+    return dest - 1;            /* point at the NUL we just wrote */
+}
+
+char *strndup(const char *s, size_t n) {
+    size_t i;
+    char *p;
+    if (s == 0) return 0;
+    for (i = 0; i < n && s[i] != 0; i++)
+        ;
+    p = (char *)malloc(i + 1);
+    if (p == 0) return 0;
+    memcpy(p, s, i);
+    p[i] = 0;
+    return p;
+}
+
+void *memrchr(const void *s, int c, size_t n) {
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned char want = (unsigned char)c;
+    size_t i = n;
+    while (i-- > 0)
+        if (p[i] == want) return (void *)(p + i);
+    return 0;
+}
+
+/* memccpy copies bytes from src to dest, stopping after the first byte equal
+ * to (unsigned char)c. Returns a pointer to the byte in dest just past that
+ * copy (i.e. dest + position_of_c + 1), or NULL if c is not found within the
+ * first n bytes. Unlike memchr/memrchr it writes while it scans. */
+void *memccpy(void *dest, const void *src, int c, size_t n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned char want = (unsigned char)c;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        d[i] = s[i];
+        if (s[i] == want) return (void *)(d + i + 1);
+    }
     return 0;
 }

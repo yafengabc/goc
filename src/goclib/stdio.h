@@ -24,6 +24,11 @@ typedef struct __goclib_FILE FILE;
 #define BUFSIZ 4096
 #define FOPEN_MAX 20
 
+/* buffering modes for setvbuf / setbuf */
+#define _IOFBF 0   /* fully buffered */
+#define _IOLBF 1   /* line buffered */
+#define _IONBF 2   /* unbuffered */
+
 #define stdin  __goclib_stdin()
 #define stdout __goclib_stdout()
 #define stderr __goclib_stderr()
@@ -50,6 +55,10 @@ typedef long fpos_t;
 #define fsetpos(f, p) fseek((f), *(fpos_t *)(p), SEEK_SET)
 
 /* formatted input */
+int scanf(const char *fmt, ...);
+int vscanf(const char *fmt, va_list ap);
+int vfscanf(FILE *stream, const char *fmt, va_list ap);
+int vsscanf(const char *s, const char *fmt, va_list ap);
 int sscanf(const char *s, const char *fmt, ...);
 int fscanf(FILE *stream, const char *fmt, ...);
 
@@ -84,6 +93,12 @@ int remove(const char *path);
 int rename(const char *oldp, const char *newp);
 FILE *tmpfile(void);
 int setvbuf(FILE *stream, char *buf, int mode, long size);
+/* setbuf(stream, buf) is the two-argument form of setvbuf: a null `buf`
+ * requests no buffering, otherwise full buffering is used. */
+void setbuf(FILE *stream, char *buf);
+/* tmpnam writes a unique (not-yet-created) file name into `s`, or into an
+ * internal static buffer when `s` is null, and returns it. */
+char *tmpnam(char *s);
 
 /* internal accessors backing the stdin/stdout/stderr macros */
 FILE *__goclib_stdin(void);

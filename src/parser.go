@@ -1,13 +1,17 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 // typeKeywords are the keywords the parser treats as the start of a type
 // specifier.
 var typeKeywords = map[string]bool{
 	"void": true, "char": true, "int": true, "long": true, "short": true,
 	"unsigned": true, "signed": true, "double": true, "float": true,
-	"struct": true, "union": true, "enum": true, "_Bool": true,
+	"struct": true, "union": true, "enum": true, "_Bool": true, "bool": true, "char8_t": true,
+	"_BitInt": true,
 }
 
 // qualifierKeywords are type qualifiers that decorate a specifier list but
@@ -21,13 +25,29 @@ var qualifierKeywords = map[string]bool{
 // static and extern are accepted and their storage semantics are implemented
 // in codegen (static locals live in .data, extern locals reference globals).
 var storageKeywords = map[string]bool{
-	"typedef": true, "extern": true, "static": true, "register": true, "auto": true,
+	"typedef": true, "extern": true, "static": true, "register": true, "auto": true, "inline": true,
 }
 
 // typedefs maps a typedef name to the type it aliases. Populated during parsing
 // of "typedef" declarations and consulted by isTypeName so later declarations
 // can use the alias as a type name.
 var typedefs = map[string]*Type{}
+
+// varTypes maps a variable/parameter name to its declared type. Populated as
+// declarations and parameter lists are parsed, and consulted by typeof(expr)
+// so "typeof(x)" can resolve x's type at parse time (the common case). Complex
+// expressions are not resolved -- only a single identifier is supported in MVP.
+var varTypes = map[string]*Type{}
+
+// autoDeduceType is the placeholder the parser stamps onto a C23 "auto"
+// declaration (type inferred from the initialiser): "auto x = expr;" parses
+// with Typ.AutoDeduce == true and the checker replaces it with the deduced
+// type before any later phase runs. The flag lives on Type (not on DeclStmt)
+// so it survives being combined with qualifiers: parseDeclarationSpecifiers
+// stamps the "const" of "const auto x = 5;" onto the placeholder it returns.
+var autoDeduceType = IntType()
+
+func init() { autoDeduceType.AutoDeduce = true }
 
 // structs maps a struct/union tag to its (possibly incomplete) type. A forward
 // declaration "struct S;" creates the type; a later definition "struct S {...}"
@@ -39,6 +59,19 @@ var structs = map[string]*Type{}
 // evaluator and the code generator all consult this table as a fallback when a
 // name is not a variable.
 var enumConsts = map[string]int64{}
+
+// isAutoDeduction reports whether the current "auto" keyword opens a C23
+// type-inference declaration ("auto name = init;"): the follower is the
+// declarator name -- an identifier that is not a typedef alias. Any other
+// follower ("auto int x", "auto *p") keeps the classic no-op storage-class
+// reading (or fails specifier parsing, exactly as before).
+func (p *Parser) isAutoDeduction() bool {
+	if p.cur().Kind != TKeyword || p.cur().Text != "auto" {
+		return false
+	}
+	nx := p.peek()
+	return nx.Kind == TIdent && typedefs[nx.Text] == nil
+}
 
 func isTypeName(tok Token) bool {
 	if tok.Kind == TKeyword && typeKeywords[tok.Text] {
@@ -56,6 +89,25 @@ func isQualifier(tok Token) bool {
 
 func isStorageClass(tok Token) bool {
 	return tok.Kind == TKeyword && storageKeywords[tok.Text]
+}
+
+// isDeclarationStart reports whether tok can begin a declaration (as opposed to
+// an expression/other statement). It widens the test used by parseStmt so that
+// the C23 specifier keywords (_Alignas/alignas/thread_local/...) at the start of
+// a block-scoped declaration dispatch to parseDeclaration rather than an
+// expression parse (which would reject them).
+func isDeclarationStart(tok Token) bool {
+	if isTypeName(tok) || isQualifier(tok) || isStorageClass(tok) {
+		return true
+	}
+	if tok.Kind == TIdent || tok.Kind == TKeyword {
+		switch tok.Text {
+		case "_Alignas", "alignas", "typeof", "typeof_unqual",
+			"noreturn", "_Noreturn", "thread_local", "_Thread_local":
+			return true
+		}
+	}
+	return false
 }
 
 // paramDecl is an intermediate result of a declarator: the declared name and
@@ -128,12 +180,26 @@ func Parse(toks []Token) (*Program, error) {
 // declarator followed by ';'). The latter is how #include'd system headers
 // declare printf, malloc, strlen, ... without a body.
 func (p *Parser) parseTopLevel() (*FuncDecl, error) {
+	p.skipAttributes()
+	if p.cur().Kind == TKeyword && (p.cur().Text == "_Static_assert" || p.cur().Text == "static_assert") {
+		if _, err := p.parseStaticAssert(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
 	// Storage-class specifiers: typedef / extern / static. These precede the
 	// type specifier list. "typedef" creates an alias and produces no symbol;
 	// extern/static only affect linkage (ignored by the toy model) and fall
 	// through to the normal declaration logic.
 	storage := ""
-	if p.cur().Kind == TKeyword && (p.cur().Text == "typedef" || p.cur().Text == "extern" || p.cur().Text == "static" || p.cur().Text == "register" || p.cur().Text == "auto") {
+	autoInfer := p.isAutoDeduction()
+	if autoInfer {
+		// C23 type inference: "auto" is the whole type specifier and the
+		// declared type comes from the initialiser (legal at file scope too,
+		// C23 6.7.1/6.7.9). Consume the keyword here; the checker replaces
+		// the autoDeduceType placeholder with the deduced type.
+		p.next()
+	} else if p.cur().Kind == TKeyword && (p.cur().Text == "typedef" || p.cur().Text == "extern" || p.cur().Text == "static" || p.cur().Text == "register" || p.cur().Text == "auto" || p.cur().Text == "inline") {
 		storage = p.next().Text
 	}
 	if storage == "typedef" {
@@ -162,9 +228,15 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 		return nil, nil
 	}
 
-	spec, err := p.parseDeclarationSpecifiers()
-	if err != nil {
-		return nil, err
+	var spec *Type
+	if autoInfer {
+		spec = autoDeduceType
+	} else {
+		s, serr := p.parseDeclarationSpecifiers()
+		if serr != nil {
+			return nil, serr
+		}
+		spec = s
 	}
 	// A bare "struct S {...};" / "union U {...};" / "enum E {...};" type
 	// definition declares no symbol: the tag and any enumerators are registered
@@ -176,6 +248,14 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 	d, err := p.parseDeclarator(spec, true, false)
 	if err != nil {
 		return nil, err
+	}
+	// C23 6.7.9: the direct declarator of an inference declaration must be a
+	// plain identifier ("auto *p", "auto x[3]", "auto f(void)" are all
+	// undefined behaviour / errors). parseDeclarator only preserves the
+	// AutoDeduce placeholder for that plain form; any pointer/array/function
+	// suffix wraps it in a fresh type without the flag.
+	if autoInfer && !d.typ.AutoDeduce {
+		return nil, fmt.Errorf("line %d: auto requires a plain identifier declarator", d.line)
 	}
 	// A function definition: declarator followed by a block.
 	if p.atPunct("{") {
@@ -195,6 +275,20 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 	// A declaration: either a function prototype (no body) or a global
 	// variable (with optional initialiser). Both end at ';'.
 	if d.typ.Kind == KFunc {
+		// An optional ", <dll>" names the import library, mirroring the
+		// assembler's `extern Name, dll`. It belongs to the declaration that
+		// uses the API instead of a central table, so a source file is
+		// self-describing: `extern long MessageBoxA(...), user32;`.
+		// A plain identifier is unambiguous here -- the next declarator of a
+		// comma list would have to be a name followed by '(' or '['.
+		dll := ""
+		if p.atPunct(",") {
+			p.next()
+			if p.cur().Kind != TIdent {
+				return nil, fmt.Errorf("line %d: expected a DLL name after ',' in a prototype", p.cur().Line)
+			}
+			dll = p.next().Text
+		}
 		if !p.atPunct(";") {
 			return nil, fmt.Errorf("line %d: expected ';' after prototype", p.cur().Line)
 		}
@@ -205,6 +299,7 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 			Params:     d.paramNames,
 			ParamTypes: d.typ.Params,
 			Variadic:   d.variadic,
+			DLL:        dll,
 		}, nil
 	}
 	// Global variable declaration with optional initialiser: "T name = expr;".
@@ -226,7 +321,12 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 		return nil, fmt.Errorf("line %d: expected ';' after global declaration", p.cur().Line)
 	}
 	p.next()
-	p.globals = append(p.globals, &DeclStmt{Name: d.name, Typ: declType(d.typ), Init: init, Line: d.line})
+	p.globals = append(p.globals, &DeclStmt{Name: d.name, Typ: declType(d.typ), Init: init, Storage: storage, IsTLS: spec.IsTLS, Line: d.line})
+	// Record the global's type so later file-scope "typeof(name)" can resolve it.
+	// An auto-inferred global has no parse-time type yet, so it is not recorded.
+	if d.name != "" && !autoInfer {
+		varTypes[d.name] = declType(d.typ)
+	}
 	return nil, nil
 }
 
@@ -265,7 +365,10 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	isBool := false
 	isConst := false // a "const" qualifier appeared anywhere in the list
 	seen := false
-	var tdType *Type // a typedef alias, if this specifier list names one
+	align := 0 // a requested alignment from _Alignas(N) / _Alignas(type)
+	isConstExpr := false // a "constexpr" specifier appeared
+	isTLS := false        // a _Thread_local / thread_local specifier appeared
+	var tdType *Type      // a typedef alias, if this specifier list names one
 	for {
 		if isQualifier(p.cur()) {
 			if p.cur().Text == "const" {
@@ -274,7 +377,133 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 			p.next()
 			continue
 		}
+		// _Alignas(N) / _Alignas(type): record a requested alignment; the
+		// value is stamped onto the resulting type's Align field and honoured
+		// by the code generator when it lays out the variable's stack slot.
+		if p.cur().Text == "_Alignas" || p.cur().Text == "alignas" {
+			a, err := p.parseAlignas()
+			if err != nil {
+				return nil, err
+			}
+			if a > align {
+				align = a
+			}
+			continue
+		}
+		// typeof(type) / typeof(expr) / typeof_unqual(...): a type specifier that
+		// yields the type of its operand. The type-operand form (typeof(int))
+		// is full; the expression form is restricted to a single identifier that
+		// the parser has already seen (resolved via varTypes).
+		if p.cur().Text == "typeof" || p.cur().Text == "typeof_unqual" {
+			unqual := p.cur().Text == "typeof_unqual"
+			p.next()
+			if err := p.expect("("); err != nil {
+				return nil, err
+			}
+			var t *Type
+			if isTypeName(p.cur()) || isQualifier(p.cur()) {
+				spec, err := p.parseDeclarationSpecifiers()
+				if err != nil {
+					return nil, err
+				}
+				dt, err := p.parseDeclarator(spec, true, true)
+				if err != nil {
+					return nil, err
+				}
+				t = dt.typ
+			} else {
+				e, err := p.parseAssign()
+				if err != nil {
+					return nil, err
+				}
+				switch v := e.(type) {
+				case *Ident:
+					vt, ok := varTypes[v.Name]
+					if !ok {
+						return nil, fmt.Errorf("line %d: typeof(%s): type not known at parse time", p.cur().Line, v.Name)
+					}
+					t = vt
+				case *NumLit:
+					// typeof(1LL) / typeof(0U) etc.: derive the integer type
+					// directly from the literal's width/ signedness.
+					w := 4
+					if v.Long {
+						w = 8
+					}
+					t = &Type{Kind: KInt, Width: w, Signed: !v.Unsig}
+				default:
+					return nil, fmt.Errorf("line %d: only typeof(type), typeof(var) and typeof(constant) are supported", p.cur().Line)
+				}
+			}
+			if err := p.expect(")"); err != nil {
+				return nil, err
+			}
+			if unqual {
+				t2 := *t
+				t2.Const = false
+				t = &t2
+			}
+			return t, nil
+		}
+		// constexpr: a C23 specifier. The lightweight model accepts it as a
+		// no-op qualifier here (the type is flagged ConstExpr); full
+		// compile-time function evaluation is intentionally not performed, but
+		// the keyword lets modern code parse and compile unchanged.
+		if p.cur().Text == "constexpr" {
+			isConstExpr = true
+			p.next()
+			continue
+		}
+		// C23 type inference when auto follows other specifiers/qualifiers:
+		// "static auto x = 5;" / "const auto c = 'a';". The placeholder keeps
+		// the qualifiers seen so far; the checker deduces the underlying type
+		// from the initialiser. (auto as the FIRST specifier is handled by the
+		// storage-class lookahead in parseDeclaration/parseTopLevel.)
+		if p.cur().Text == "auto" && p.isAutoDeduction() {
+			p.next()
+			t := IntType()
+			t.AutoDeduce = true
+			t.Const = isConst
+			return t, nil
+		}
+		// C23 keyword aliases and forward-compatibility specifiers.
+		switch p.cur().Text {
+		case "noreturn", "_Noreturn":
+			// Function specifier: accepted and ignored (this lightweight model
+			// has no missing-return diagnostic to hook into).
+			p.next()
+			continue
+		case "thread_local", "_Thread_local":
+			// C11/C23 thread-local storage. The variable gets a per-thread
+			// instance, laid out in the .tls section and reached through the
+			// FS (Linux) / GS (Windows) segment. Record the flag on the type
+			// and let the specifier list continue normally.
+			isTLS = true
+			p.next()
+			// C permits _Thread_local to combine with a storage-class
+			// specifier (static/extern) in either order; consume any that
+			// follow so the remaining specifier list parses normally.
+			for isStorageClass(p.cur()) {
+				p.next()
+			}
+			continue
+		case "char8_t":
+			// C23 char8_t is an unsigned char (1 byte) with a distinct type.
+			p.next()
+			width = 1
+			signed = false
+			seen = true
+			continue
+		}
 		if !isTypeName(p.cur()) {
+			// A storage-class keyword (static/extern/...) may follow a
+			// _Alignas/thread_local specifier in either order ("_Alignas static
+			// int" / "static _Alignas int"); skip it so the remaining type
+			// specifiers parse. These are no-ops in this model.
+			if isStorageClass(p.cur()) {
+				p.next()
+				continue
+			}
 			break
 		}
 		if p.cur().Text == "struct" || p.cur().Text == "union" {
@@ -298,11 +527,47 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 			if isConst {
 				t2 := *t
 				t2.Const = true
+				t2.IsTLS = isTLS
 				return &t2, nil
+			}
+			t.IsTLS = isTLS
+			return t, nil
+		}
+		// C23 bit-precise integer: "_BitInt(N)" / "unsigned _BitInt(N)".
+		// N is an integer constant expression in [1, 4096] (the storage cap
+		// this implementation shares with the goclib bitint helpers). The
+		// specifier terminates the list, like struct/enum do, because the
+		// pending signed/unsigned flag must be consumed here.
+		if p.cur().Text == "_BitInt" {
+			p.next()
+			if err := p.expect("("); err != nil {
+				return nil, err
+			}
+			e, err := p.parseAssign()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expect(")"); err != nil {
+				return nil, err
+			}
+			nl, ok := e.(*NumLit)
+			if !ok || nl.Val <= 0 {
+				return nil, fmt.Errorf("line %d: _BitInt width must be a positive integer constant", p.cur().Line)
+			}
+		// Implementation limit: 4194304 bits = 65536 words = 512 KiB per
+		// value. A 100,000-decimal-digit pi needs ~332,200 bits; a
+		// 1,000,000-digit one needs ~3,321,929 bits, so this covers both.
+		if nl.Val > 4194304 {
+			return nil, fmt.Errorf("line %d: _BitInt width %d exceeds the implementation limit of 4194304", p.cur().Line, nl.Val)
+		}
+		words := (int(nl.Val) + 63) / 64
+		t := &Type{Kind: KBitInt, Bits: int(nl.Val), Size: words * 8, Signed: signed, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}
+		if isConst {
+				t.Const = true
 			}
 			return t, nil
 		}
-		if p.cur().Text == "_Bool" {
+		if p.cur().Text == "_Bool" || p.cur().Text == "bool" {
 			p.next()
 			seen = true
 			isBool = true
@@ -348,8 +613,10 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		if isConst {
 			t2 := *fp
 			t2.Const = true
+			t2.IsTLS = isTLS
 			return &t2, nil
 		}
+		fp.IsTLS = isTLS
 		return fp, nil
 	}
 	if isVoid {
@@ -357,18 +624,21 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	}
 	if isBool {
 		if isConst {
-			return &Type{Kind: KBool, Width: 1, Signed: true, Const: true}, nil
+			return &Type{Kind: KBool, Width: 1, Signed: true, Const: true, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}, nil
 		}
-		return &Type{Kind: KBool, Width: 1, Signed: true}, nil
+		return &Type{Kind: KBool, Width: 1, Signed: true, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}, nil
 	}
 	if tdType != nil {
 		// The specifier list was a typedef alias (e.g. va_list, size_t). The
 		// pointer/array suffixes are applied later by parseDeclarator, so just
 		// hand back the alias's underlying type. A const-qualified typedef use
-		// is stamped onto a copy so the alias itself is never polluted.
+		// is stamped onto a copy so the alias itself is never polluted. TLS of a
+		// typedef'd type is rare; stamp a copy when const so the shared alias is
+		// left untouched (non-const typedef TLS is not flagged).
 		if isConst {
 			t2 := *tdType
 			t2.Const = true
+			t2.IsTLS = isTLS
 			return &t2, nil
 		}
 		return tdType, nil
@@ -376,11 +646,45 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	if width == 0 {
 		width = 4 // bare "signed"/"unsigned" means int
 	}
-	t := &Type{Kind: KInt, Width: width, Signed: signed}
+	t := &Type{Kind: KInt, Width: width, Signed: signed, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}
 	if isConst {
 		t.Const = true
 	}
 	return t, nil
+}
+
+// parseAlignas parses a "_Alignas(alignment)" or "_Alignas(type)" specifier and
+// returns the requested alignment in bytes. It is invoked from
+// parseDeclarationSpecifiers when it sees the _Alignas keyword.
+func (p *Parser) parseAlignas() (int, error) {
+	p.next() // consume "_Alignas"
+	if err := p.expect("("); err != nil {
+		return 0, err
+	}
+	var a int
+	if isTypeName(p.cur()) || isQualifier(p.cur()) {
+		// _Alignas(type): the alignment is the type's natural alignment.
+		spec, err := p.parseDeclarationSpecifiers()
+		if err != nil {
+			return 0, err
+		}
+		dt, err := p.parseDeclarator(spec, true, true)
+		if err != nil {
+			return 0, err
+		}
+		a = alignOf(dt.typ)
+	} else {
+		// _Alignas(integer-constant).
+		v, err := p.constExpr()
+		if err != nil {
+			return 0, err
+		}
+		a = v
+	}
+	if err := p.expect(")"); err != nil {
+		return 0, err
+	}
+	return a, nil
 }
 
 // parseStructSpecifier parses a struct or union type specifier:
@@ -445,9 +749,27 @@ func (p *Parser) parseStructSpecifier(isUnion bool) (*Type, error) {
 func (p *Parser) parseStructMembers() ([]*Member, error) {
 	var members []*Member
 	for !p.atPunct("}") {
+		p.skipAttributes()
 		spec, err := p.parseDeclarationSpecifiers()
 		if err != nil {
 			return nil, err
+		}
+		// C11 anonymous struct/union member: a struct/union specifier with a
+		// definition body and no declarator ("struct { int x, y; };"). Its
+		// named sub-members are promoted into this type's member list
+		// (recursively, for nested anonymous members); the anonymous shell
+		// itself is kept for size/offset accounting. computeLayout places
+		// the shell as an ordinary member and rewrites the promoted members'
+		// offsets to absolute positions.
+		if (spec.Kind == KStruct || spec.Kind == KUnion) && p.atPunct(";") {
+			if spec.Align == 0 {
+				return nil, fmt.Errorf("line %d: anonymous struct/union member requires a definition body", p.cur().Line)
+			}
+			shell := &Member{Name: "", Type: spec}
+			members = append(members, shell)
+			promoteAnonMembers(&members, spec, shell)
+			p.next()
+			continue
 		}
 		for {
 			var d declResult
@@ -503,6 +825,26 @@ func (p *Parser) parseStructMembers() ([]*Member, error) {
 	return members, nil
 }
 
+// promoteAnonMembers appends the named sub-members of an anonymous struct or
+// union member to the parent's member list. Nested anonymous members are
+// flattened recursively, so every directly nameable field of the anonymous
+// subtree ends up in the parent list. Each promoted member's Offset holds
+// its position *within* the anonymous member's type (that type's layout was
+// computed when it was parsed); computeLayout adds the shell's absolute
+// offset in a final pass.
+func promoteAnonMembers(dst *[]*Member, t *Type, shell *Member) {
+	for _, sm := range t.Members {
+		if sm.Name == "" && (sm.Type.Kind == KStruct || sm.Type.Kind == KUnion) {
+			promoteAnonMembers(dst, sm.Type, shell)
+			continue
+		}
+		if sm.Name == "" {
+			continue // unnamed padding bit-field: not nameable
+		}
+		*dst = append(*dst, &Member{Name: sm.Name, Type: sm.Type, Offset: sm.Offset, BitWidth: sm.BitWidth, BitOff: sm.BitOff, AnonBase: shell})
+	}
+}
+
 // parseEnumSpecifier parses an enum type specifier:
 //
 //	"enum Tag"        -> reference to (or forward declaration of) an enum type
@@ -520,6 +862,16 @@ func (p *Parser) parseEnumSpecifier() (*Type, error) {
 		// A tag name ("enum Color { ... }" or "enum Color x;"). Consume it and
 		// fall through; every enum is modelled as int.
 		p.next()
+	}
+	// C23 underlying type: "enum Tag : int { ... }" (or even "enum : int { ... }").
+	// goc models every enum as a plain int regardless of the requested
+	// underlying type, so the specifier is parsed and dropped (it only refines
+	// the enumerators' storage width, which goc does not track separately).
+	if p.atPunct(":") {
+		p.next()
+		if _, err := p.parseDeclarationSpecifiers(); err != nil {
+			return nil, err
+		}
 	}
 	if !p.atPunct("{") {
 		// Tag reference (or forward declaration "enum Tag;"). Every enum is
@@ -931,6 +1283,53 @@ func (p *Parser) constPrim() (int, error) {
 		}
 		return v, nil
 	}
+	// nullptr inside a constant expression lowers to the integer 0 (a null
+	// pointer constant), so "static_assert(nullptr == 0, ...)" folds.
+	if p.cur().Text == "nullptr" {
+		p.next()
+		return 0, nil
+	}
+	// _Alignof(Type) inside a constant expression: yields the type's alignment.
+	if p.cur().Text == "_Alignof" {
+		p.next()
+		if p.atPunct("(") && (isTypeName(p.peek()) || isQualifier(p.peek())) {
+			p.next()
+			spec, err := p.parseDeclarationSpecifiers()
+			if err != nil {
+				return 0, err
+			}
+			dt, err := p.parseDeclarator(spec, true, true)
+			if err != nil {
+				return 0, err
+			}
+			if err := p.expect(")"); err != nil {
+				return 0, err
+			}
+			return alignOf(dt.typ), nil
+		}
+		return 0, fmt.Errorf("line %d: only _Alignof(type) is constant-evaluable here", p.cur().Line)
+	}
+	// sizeof(Type) inside a constant expression (the common static_assert use,
+	// e.g. "static_assert(sizeof(int) == 4, ...)").
+	if p.cur().Text == "sizeof" {
+		p.next()
+		if p.atPunct("(") && (isTypeName(p.peek()) || isQualifier(p.peek())) {
+			p.next()
+			spec, err := p.parseDeclarationSpecifiers()
+			if err != nil {
+				return 0, err
+			}
+			dt, err := p.parseDeclarator(spec, true, true)
+			if err != nil {
+				return 0, err
+			}
+			if err := p.expect(")"); err != nil {
+				return 0, err
+			}
+			return sizeOf(dt.typ), nil
+		}
+		return 0, fmt.Errorf("line %d: only sizeof(type) is constant-evaluable here", p.cur().Line)
+	}
 	if p.atPunct("-") {
 		p.next()
 		v, err := p.constPrim()
@@ -977,9 +1376,13 @@ func (p *Parser) constPrim() (int, error) {
 
 // parseParamList parses the (...) of a function declarator. Array parameters
 // decay to pointers, matching C. "void" as the sole parameter means empty.
-// atEllipsis reports whether the cursor is at a "..." token sequence (three
-// consecutive '.' punctuation tokens).
+// atEllipsis reports whether the cursor is at a "..." token -- either the single
+// "..." preprocessing token (the modern goc lexer form, emitted for "..."
+// sequences) or three consecutive '.' punctuation tokens (legacy form).
 func (p *Parser) atEllipsis() bool {
+	if p.cur().Kind == TPunct && p.cur().Text == "..." {
+		return true
+	}
 	return p.cur().Kind == TPunct && p.cur().Text == "." &&
 		p.peek().Kind == TPunct && p.peek().Text == "." &&
 		p.toks[p.pos+2].Kind == TPunct && p.toks[p.pos+2].Text == "."
@@ -987,6 +1390,10 @@ func (p *Parser) atEllipsis() bool {
 
 // consumeEllipsis advances past a "..." token sequence.
 func (p *Parser) consumeEllipsis() {
+	if p.cur().Kind == TPunct && p.cur().Text == "..." {
+		p.next()
+		return
+	}
 	p.next()
 	p.next()
 	p.next()
@@ -1059,6 +1466,9 @@ func (p *Parser) parseParamList() ([]*Type, []string, bool, error) {
 		pd.typ = declType(pd.typ)
 		types = append(types, pd.typ)
 		names = append(names, pd.name)
+		if pd.name != "" {
+			varTypes[pd.name] = pd.typ
+		}
 		if p.atPunct(",") {
 			p.next()
 			if p.atEllipsis() {
@@ -1097,10 +1507,13 @@ func (p *Parser) parseBlock() (*Block, error) {
 }
 
 func (p *Parser) parseStmt() (Stmt, error) {
+	p.skipAttributes()
 	t := p.cur()
 	var err error
 	switch {
-	case isTypeName(t) || isQualifier(t) || isStorageClass(t):
+	case t.Kind == TKeyword && (t.Text == "_Static_assert" || t.Text == "static_assert"):
+		return p.parseStaticAssert()
+	case isDeclarationStart(t):
 		return p.parseDeclaration()
 	case t.Kind == TKeyword && t.Text == "return":
 		p.next()
@@ -1165,7 +1578,7 @@ func (p *Parser) parseStmt() (Stmt, error) {
 		}
 		var init Stmt
 		if !p.atPunct(";") {
-			if isTypeName(p.cur()) {
+			if isTypeName(p.cur()) || p.isAutoDeduction() {
 				init, err = p.parseDeclaration()
 				if err != nil {
 					return nil, err
@@ -1344,7 +1757,13 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 	// the lifetime/linkage of the locals below and are otherwise no-ops in this
 	// non-optimising, single-translation-unit compiler.
 	storage := ""
-	if p.cur().Kind == TKeyword && (p.cur().Text == "typedef" || p.cur().Text == "extern" || p.cur().Text == "static" || p.cur().Text == "register" || p.cur().Text == "auto") {
+	autoInfer := p.isAutoDeduction()
+	if autoInfer {
+		// C23 type inference: "auto name = init;" -- see parseTopLevel. The
+		// checker replaces the autoDeduceType placeholder with the deduced
+		// type; a "static auto" combination keeps its storage class here.
+		p.next()
+	} else if p.cur().Kind == TKeyword && (p.cur().Text == "typedef" || p.cur().Text == "extern" || p.cur().Text == "static" || p.cur().Text == "register" || p.cur().Text == "auto" || p.cur().Text == "inline") {
 		storage = p.next().Text
 	}
 	if storage == "typedef" {
@@ -1369,9 +1788,15 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 		}
 		return &DeclList{}, nil
 	}
-	spec, err := p.parseDeclarationSpecifiers()
-	if err != nil {
-		return nil, err
+	var spec *Type
+	if autoInfer {
+		spec = autoDeduceType
+	} else {
+		s, serr := p.parseDeclarationSpecifiers()
+		if serr != nil {
+			return nil, serr
+		}
+		spec = s
 	}
 	// A bare type definition inside a block ("struct S {...};" / "enum { A };")
 	// declares no variable; the empty DeclList is a harmless no-op statement.
@@ -1382,6 +1807,11 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 	var decls []*DeclStmt
 	for {
 		pd, err := p.parseDeclarator(spec, true, false)
+		// C23 6.7.9: the direct declarator of an inference declaration must be
+		// a plain identifier; "auto *p" / "auto x[3]" are not inferred forms.
+		if autoInfer && !pd.typ.AutoDeduce {
+			return nil, fmt.Errorf("line %d: auto requires a plain identifier declarator", pd.line)
+		}
 		var init Expr
 		if p.atPunct("=") {
 			p.next()
@@ -1396,7 +1826,13 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 				return nil, err
 			}
 		}
-		decls = append(decls, &DeclStmt{Name: pd.name, Typ: declType(pd.typ), Init: init, Storage: storage, Line: pd.line})
+		decls = append(decls, &DeclStmt{Name: pd.name, Typ: declType(pd.typ), Init: init, Storage: storage, IsTLS: spec.IsTLS, Line: pd.line})
+		// Record the declared type so later "typeof(name)" can resolve it.
+		// An auto-inferred variable has no parse-time type yet, so it is not
+		// recorded (typeof(auto-var) stays unsupported).
+		if pd.name != "" && !autoInfer {
+			varTypes[pd.name] = declType(pd.typ)
+		}
 		if p.atPunct(",") {
 			p.next()
 			continue
@@ -1410,6 +1846,82 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 		return decls[0], nil
 	}
 	return &DeclList{Decls: decls}, nil
+}
+
+// parseStaticAssert handles C11 _Static_assert and the C23 static_assert alias:
+//   _Static_assert(constant-expr, "message");
+// The assertion is checked at compile time; a false condition is a hard error
+// that aborts compilation, exactly like a failed #if. A true condition produces
+// no code (an empty DeclList is a harmless no-op statement).
+func (p *Parser) parseStaticAssert() (Stmt, error) {
+	p.next() // consume "_Static_assert" / "static_assert"
+	if err := p.expect("("); err != nil {
+		return nil, err
+	}
+	val, err := p.constExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.atPunct(",") {
+		return nil, fmt.Errorf("line %d: expected ',' after static_assert condition", p.cur().Line)
+	}
+	p.next() // consume ','
+	// The second operand is a string-literal message (mandatory in C11/C23).
+	if p.cur().Kind != TStr {
+		return nil, fmt.Errorf("line %d: static_assert requires a string literal message", p.cur().Line)
+	}
+	msg := string(p.cur().Str)
+	p.next()
+	if err := p.expect(")"); err != nil {
+		return nil, err
+	}
+	if err := p.expect(";"); err != nil {
+		return nil, err
+	}
+	if val == 0 {
+		return nil, fmt.Errorf("static_assert failed: %s", msg)
+	}
+	return &DeclList{}, nil
+}
+
+// skipAttributes consumes C23 attribute specifier lists ("[[...]]", possibly
+// several in a row) at the current cursor. Attributes are largely ignored by
+// goc's toy model; the only visible effect is a compiler warning for
+// "deprecated" and "nodiscard". Any other attribute is silently accepted.
+func (p *Parser) skipAttributes() {
+	for p.atPunct("[") && p.peek().Kind == TPunct && p.peek().Text == "[" {
+		p.next() // consume first '['
+		p.next() // consume second '['
+		for {
+			if p.cur().Kind == TEOF {
+				return
+			}
+			if p.atPunct("]") && p.peek().Kind == TPunct && p.peek().Text == "]" {
+				p.next() // first ']'
+				p.next() // second ']'
+				break
+			}
+			if p.cur().Kind == TIdent {
+				switch p.cur().Text {
+				case "deprecated":
+					fmt.Fprintf(os.Stderr, "line %d: warning: declaration is deprecated\n", p.cur().Line)
+				case "nodiscard":
+					fmt.Fprintf(os.Stderr, "line %d: warning: return value of function should not be discarded\n", p.cur().Line)
+				case "maybe_unused", "fallthrough", "noreturn", "unsequenced", "reproducible", "_Noreturn":
+					// Standard C23 attributes: accepted and ignored by this
+					// lightweight model (no unused/flow diagnostics to drive).
+				default:
+					// Unknown attribute: accept silently to avoid breaking code
+					// that uses vendor attributes (e.g. gnu::...).
+				}
+			}
+			if p.atPunct("]") { // tolerate a single unpaired ']' (malformed input)
+				p.next()
+				break
+			}
+			p.next()
+		}
+	}
 }
 
 func (p *Parser) parseExpr() (Expr, error) { return p.parseComma() }
@@ -1782,6 +2294,102 @@ func (p *Parser) parseUnary() (Expr, error) {
 		}
 		return &SizeofExpr{E: e}, nil
 	}
+	// _Alignof is a unary operator analogous to sizeof, but yields the alignment
+	// (always a compile-time constant) of a type or a simple variable. It
+	// requires parentheses around its operand, exactly like sizeof.
+	if p.cur().Text == "_Alignof" || p.cur().Text == "alignof" {
+		p.next() // consume "_Alignof" / "alignof"
+		if !p.atPunct("(") {
+			return nil, fmt.Errorf("line %d: expected '(' after _Alignof", p.cur().Line)
+		}
+		p.next() // consume '('
+		var t *Type
+		if isTypeName(p.cur()) || isQualifier(p.cur()) {
+			spec, err := p.parseDeclarationSpecifiers()
+			if err != nil {
+				return nil, err
+			}
+			dt, err := p.parseDeclarator(spec, true, true)
+			if err != nil {
+				return nil, err
+			}
+			t = dt.typ
+		} else if p.cur().Kind == TIdent {
+			vt, ok := varTypes[p.cur().Text]
+			if !ok {
+				return nil, fmt.Errorf("line %d: _Alignof(%s): type not known at parse time", p.cur().Line, p.cur().Text)
+			}
+			t = vt
+			p.next() // consume the identifier
+		} else {
+			return nil, fmt.Errorf("line %d: only _Alignof(type) and _Alignof(var) are supported", p.cur().Line)
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+		return &NumLit{Val: int64(alignOf(t)), Kind: TInt}, nil
+	}
+	// _Generic is the C11/C23 compile-time type switch:
+	//   _Generic(control-expr, T1: e1, T2: e2, ..., default: eN)
+	// The controlling expression and every branch are parsed here; picking
+	// the matching association needs full type information, so that happens
+	// in the checker (checkExpr's *GenericExpr case), which stores the
+	// selected branch in Chosen. Unselected branches are never evaluated.
+	if p.cur().Text == "_Generic" {
+		line := p.next().Line // consume "_Generic"
+		if err := p.expect("("); err != nil {
+			return nil, err
+		}
+		ctrl, err := p.parseAssign()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(","); err != nil {
+			return nil, err
+		}
+		var assocs []GenericAssoc
+		for {
+			var a GenericAssoc
+			if p.cur().Kind == TKeyword && p.cur().Text == "default" {
+				p.next()
+				a.IsDefault = true
+			} else {
+				if !isTypeName(p.cur()) && !isQualifier(p.cur()) {
+					return nil, fmt.Errorf("line %d: expected a type name or 'default' in _Generic, got %q", p.cur().Line, p.cur().Text)
+				}
+				spec, err := p.parseDeclarationSpecifiers()
+				if err != nil {
+					return nil, err
+				}
+				dt, err := p.parseDeclarator(spec, true, true)
+				if err != nil {
+					return nil, err
+				}
+				a.Typ = dt.typ
+			}
+			if err := p.expect(":"); err != nil {
+				return nil, err
+			}
+			e, err := p.parseAssign()
+			if err != nil {
+				return nil, err
+			}
+			a.E = e
+			assocs = append(assocs, a)
+			if p.atPunct(",") {
+				p.next()
+				continue
+			}
+			break
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+		if len(assocs) == 0 {
+			return nil, fmt.Errorf("line %d: _Generic requires at least one association", line)
+		}
+		return &GenericExpr{Control: ctrl, Assocs: assocs, ChosenIdx: -1, Line: line}, nil
+	}
 	if p.atPunct("-") || p.atPunct("!") || p.atPunct("~") {
 		op := p.next().Text
 		e, err := p.parseUnary()
@@ -1819,6 +2427,7 @@ func (p *Parser) parseUnary() (Expr, error) {
 	// expression-grouping parenthesis.
 	if p.atPunct("(") && (isTypeName(p.peek()) || isQualifier(p.peek())) {
 		p.next() // consume '('
+		line := p.cur().Line
 		spec, err := p.parseDeclarationSpecifiers()
 		if err != nil {
 			return nil, err
@@ -1829,6 +2438,21 @@ func (p *Parser) parseUnary() (Expr, error) {
 		}
 		if err := p.expect(")"); err != nil {
 			return nil, err
+		}
+		// C99 compound literal: "(T){...}" -- a cast is never followed by a
+		// brace in valid C, so the '{' unambiguously starts the literal.
+		if p.atPunct("{") {
+			bi, err := p.parseBraceInit()
+			if err != nil {
+				return nil, err
+			}
+			b, ok := bi.(*BraceInit)
+			if !ok {
+				return nil, fmt.Errorf("line %d: internal: compound literal initialiser is not a brace list", line)
+			}
+			// A compound literal is a postfix-expression: ".member", "[i]"
+			// and even "(args)" may follow it.
+			return p.parsePostfixFrom(&CompoundLit{Typ: dt.typ, Init: b, Line: line})
 		}
 		e, err := p.parseUnary()
 		if err != nil {
@@ -1844,6 +2468,15 @@ func (p *Parser) parsePostfix() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	return p.parsePostfixFrom(e)
+}
+
+// parsePostfixFrom applies the trailing postfix operators ("(...)", "[...]",
+// ".", "->", "++", "--") to the already-parsed head expression e. Split out
+// of parsePostfix so a compound literal -- which the cast branch of
+// parseUnary builds -- can take postfix operators too, per the C grammar
+// ("(struct P){1, 2}.y" is a valid postfix expression).
+func (p *Parser) parsePostfixFrom(e Expr) (Expr, error) {
 	for {
 		if p.atPunct("(") {
 			// Any expression may be called: a plain identifier takes the
@@ -1947,7 +2580,21 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		if t.IsDbl {
 			return &NumLit{Kind: TDouble, Fval: t.Fval, IsFloat: t.IsFloat}, nil
 		}
-		return &NumLit{Val: t.Num, Kind: TInt}, nil
+		if t.BigWords != nil {
+			var lo int64
+			if len(t.BigWords) > 0 {
+				lo = int64(t.BigWords[0])
+			}
+			return &NumLit{
+				Val:       lo,
+				Kind:      TInt,
+				Unsig:     !t.BigSigned,
+				BigWords:  t.BigWords,
+				BigSigned: t.BigSigned,
+				BigBits:   t.BigBits,
+			}, nil
+		}
+		return &NumLit{Val: t.Num, Kind: TInt, Unsig: t.IsUnsig, Long: t.IsLong}, nil
 	case t.Kind == TStr:
 		// Adjacent string literals concatenate (C translation phase 6), e.g.
 		// "a" "b" becomes "ab". This is what lets a pasting macro like
@@ -1961,6 +2608,19 @@ func (p *Parser) parsePrimary() (Expr, error) {
 			p.next()
 		}
 		return &StrLit{Bytes: b}, nil
+	case t.Kind == TKeyword && (t.Text == "true" || t.Text == "false"):
+		p.next()
+		v := int64(0)
+		if t.Text == "true" {
+			v = 1
+		}
+		return &NumLit{Val: v, Kind: TInt}, nil
+	case t.Kind == TIdent && t.Text == "nullptr":
+		// C23 nullptr: a null pointer constant. goc lowers it to the integer
+		// literal 0, so it is implicitly convertible to any pointer type
+		// (exactly like NULL), while keeping a distinct spelling from "0".
+		p.next()
+		return &NumLit{Val: 0, Kind: TInt}, nil
 	case t.Kind == TIdent:
 		p.next()
 		return &Ident{Name: t.Text, Line: t.Line}, nil

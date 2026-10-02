@@ -1,0 +1,5 @@
+found=1
+copied=[hello w]
+notfound=1
+dupe=goc
+ndup=abc

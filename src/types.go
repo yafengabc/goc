@@ -1,6 +1,9 @@
 package main
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // Type is the structured C type used by the front end (parser + checker).
 //
@@ -20,6 +23,7 @@ const (
 	KFunc
 	KStruct
 	KUnion
+	KBitInt // C23 _BitInt(N): arbitrary-width two's-complement integer
 	KBool // for _Bool type
 )
 
@@ -33,6 +37,12 @@ type Member struct {
 	// are handled later; for now only the data members are materialised.
 	BitWidth int
 	BitOff   int
+	// AnonBase is non-nil for a sub-member promoted out of an anonymous
+	// struct/union member (C11): Offset then holds the offset *within* the
+	// anonymous member's own type, and computeLayout rewrites it to the
+	// absolute position (AnonBase.Offset + Offset) once the anonymous shell
+	// has been placed in the enclosing type.
+	AnonBase *Member
 }
 
 type Type struct {
@@ -45,10 +55,14 @@ type Type struct {
 	Width    int       // KInt: 1=char, 2=short, 4=int, 8=long
 	Signed   bool      // KInt
 	Members  []*Member // KStruct / KUnion: ordered fields
+	Bits     int       // KBitInt: exact bit width N (1..4096)
 	Size     int       // KStruct / KUnion: total size in bytes (aligned)
 	Align    int       // KStruct / KUnion: required alignment (0 = not computed)
 	Tag      string    // KStruct / KUnion: optional struct tag (named structs)
-	Const    bool      // declared with a top-level "const" qualifier
+	Const     bool      // declared with a top-level "const" qualifier
+	ConstExpr bool      // declared with the C23 "constexpr" specifier
+	AutoDeduce bool     // C23 "auto" placeholder: type to be inferred from the initialiser
+	IsTLS     bool      // declared with _Thread_local / thread_local (C11 TLS)
 }
 
 // --- constructors -----------------------------------------------------------
@@ -86,6 +100,11 @@ func alignOf(t *Type) int {
 	if t == nil {
 		return 1
 	}
+	// An explicit alignment (from _Alignas) overrides the natural alignment of
+	// any type, including scalars -- so _Alignof(aligned_var) reports it.
+	if t.Align != 0 {
+		return t.Align
+	}
 	switch t.Kind {
 	case KInt:
 		return t.Width // 1, 2, 4, or 8
@@ -101,6 +120,8 @@ func alignOf(t *Type) int {
 		if t.Align != 0 {
 			return t.Align
 		}
+	case KBitInt:
+		return 8 // word-aligned storage
 	}
 	return 8
 }
@@ -125,6 +146,13 @@ func sizeOf(t *Type) int {
 		if t.Size != 0 {
 			return t.Size
 		}
+	case KBitInt:
+		// Whole 64-bit words: little-endian word array, 8-byte aligned.
+		w := (t.Bits + 63) / 64
+		if w < 1 {
+			w = 1
+		}
+		return w * 8
 	}
 	return 8
 }
@@ -141,6 +169,9 @@ func (t *Type) computeLayout() {
 	if t.Kind == KUnion {
 		maxSize := 0
 		for _, m := range t.Members {
+			if m.AnonBase != nil {
+				continue // promoted sub-member: placed in the final pass below
+			}
 			a := alignOf(m.Type)
 			if a > align {
 				align = a
@@ -168,6 +199,9 @@ func (t *Type) computeLayout() {
 	bitOff := 0
 	unitSize := 0 // byte size of the open bit-field storage unit (0 = none open)
 	for _, m := range t.Members {
+		if m.AnonBase != nil {
+			continue // promoted sub-member: placed in the final pass below
+		}
 		a := alignOf(m.Type)
 		if a > align {
 			align = a
@@ -199,8 +233,10 @@ func (t *Type) computeLayout() {
 		}
 		// A zero-width unnamed bit-field (e.g. "int : 0;") occupies no storage
 		// but forces the following member into a fresh storage unit of its own
-		// base type (MSVC: "beginning of the next allocation unit").
-		if m.BitWidth == 0 && m.Name == "" {
+		// base type (MSVC: "beginning of the next allocation unit"). An
+		// anonymous struct/union shell (Name=="", aggregate type) is NOT this:
+		// it takes the ordinary-member path below.
+		if m.BitWidth == 0 && m.Name == "" && m.Type.Kind != KStruct && m.Type.Kind != KUnion {
 			if bitOff != 0 {
 				off += unitSize
 				bitOff = 0
@@ -236,6 +272,77 @@ func (t *Type) computeLayout() {
 		size += align - (size % align)
 	}
 	t.Size = size
+	// Final pass: promoted sub-members of anonymous struct/union members get
+	// their absolute offset (the anonymous shell's position plus the offset
+	// the sub-member had inside the anonymous type). Runs for both struct and
+	// union parents; for a union parent AnonBase.Offset is 0, so this only
+	// restores the relative offset preserved above.
+	for _, m := range t.Members {
+		if m.AnonBase != nil {
+			m.Offset += m.AnonBase.Offset
+		}
+	}
+}
+
+// bigArithResult computes the result type of an arithmetic / bitwise / shift
+// operation with at least one _BitInt operand (the simplified C23 usual
+// arithmetic conversions): the wider bit-precise type wins, a tie between two
+// bitints of equal width goes to the unsigned one, and an int-class operand
+// converts to the bitint side. Comparisons yield int. The callers must verify
+// that at least one operand is a _BitInt and that the other is an integer
+// class (floating/pointer mixes are reported as errors before this runs).
+func bigArithResult(op string, lt0, rt0 *Type) *Type {
+	// exprType reports nil for numeric literals (no type table); on a
+	// _BitInt operation that missing type is the plain int it actually is.
+	lt, rt := lt0, rt0
+	if lt == nil {
+		lt = IntType()
+	}
+	if rt == nil {
+		rt = IntType()
+	}
+	switch op {
+	case "==", "!=", "<", "<=", ">", ">=":
+		return IntType()
+	case "<<", ">>":
+		if lt.Kind == KBitInt {
+			return lt
+		}
+		return rt
+	}
+	lb, rb := lt.Kind == KBitInt, rt.Kind == KBitInt
+	if lb && rb {
+		if lt.Bits != rt.Bits {
+			if lt.Bits > rt.Bits {
+				return lt
+			}
+			return rt
+		}
+		if !lt.Signed {
+			return lt
+		}
+		return rt
+	}
+	if lb {
+		return lt
+	}
+	return rt
+}
+
+// posMembers returns the members that participate in positional brace
+// initialisation. Anonymous struct/union shells (C11) are skipped: they do
+// not consume an initialiser themselves -- their promoted sub-members are
+// separate entries in the member list and pair with the initialisers
+// directly, exactly as C11's transparent-initialisation rule requires.
+func posMembers(t *Type) []*Member {
+	out := make([]*Member, 0, len(t.Members))
+	for _, m := range t.Members {
+		if m.Name == "" && (m.Type.Kind == KStruct || m.Type.Kind == KUnion) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // --- predicates -------------------------------------------------------------
@@ -289,6 +396,12 @@ func (t *Type) String() string {
 	switch t.Kind {
 	case KVoid:
 		return "void"
+	case KBitInt:
+		s := ""
+		if !t.Signed {
+			s = "unsigned "
+		}
+		return fmt.Sprintf("%s_BitInt(%d)", s, t.Bits)
 	case KBool:
 		return "bool"
 	case KDouble:

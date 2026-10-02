@@ -10,6 +10,8 @@ package main
 // Supported:
 //   - #include "file" / <file>   (local relative + search dirs)
 //   - #define object- and function-like macros, with #, ## and __VA_ARGS__
+//   - #embed "file" / <file>  (C23; limit/prefix/suffix/if_empty params)
+//   - __VA_OPT__(x) (C23 variadic macro operator)
 //   - #undef
 //   - #if / #ifdef / #ifndef / #else / #elif / #endif  (constant expressions,
 //     including the defined() operator)
@@ -336,6 +338,11 @@ func (p *Preprocessor) execDirective(name string, rest []Token, line int, filena
 			return nil, nil
 		}
 		return p.doInclude(rest, filename)
+	case "embed":
+		if !p.active() {
+			return nil, nil
+		}
+		return p.doEmbed(rest, filename)
 	case "define":
 		if p.active() {
 			p.doDefine(rest)
@@ -353,6 +360,10 @@ func (p *Preprocessor) execDirective(name string, rest []Token, line int, filena
 		p.pushCond(!p.macroDefined(rest))
 	case "elif":
 		p.doElif(p.expandTokens(rest, filename, line))
+	case "elifdef":
+		p.doElifBool(p.macroDefined(rest))
+	case "elifndef":
+		p.doElifBool(!p.macroDefined(rest))
 	case "else":
 		p.doElse()
 	case "endif":
@@ -371,7 +382,12 @@ func (p *Preprocessor) execDirective(name string, rest []Token, line int, filena
 			return nil, fmt.Errorf("%s:%d: #line needs a line number", p.logicalFileName(filename), p.logicalLine(line))
 		}
 		return p.doLine(rest[0].Num, rest[1:], line, filename)
-	case "warning", "pragma":
+	case "warning":
+		if p.active() {
+			fmt.Fprintf(os.Stderr, "%s:%d: warning: %s\n",
+				p.logicalFileName(filename), p.logicalLine(line), tokensText(rest))
+		}
+	case "pragma":
 		// Ignored for now.
 	default:
 		if p.active() {
@@ -438,6 +454,24 @@ func (p *Preprocessor) macroDefined(rest []Token) bool {
 	return ok
 }
 
+// tokensText renders a token slice as a single space-separated string, for use
+// in diagnostics such as #warning messages. String literals carry their content
+// in .Str (mirroring doLine), not .Text.
+func tokensText(ts []Token) string {
+	s := ""
+	for i, t := range ts {
+		if i > 0 {
+			s += " "
+		}
+		if t.Kind == TStr {
+			s += string(t.Str)
+		} else {
+			s += t.Text
+		}
+	}
+	return s
+}
+
 func (p *Preprocessor) pushCond(cond bool) {
 	p.condStack = append(p.condStack, condFrame{branchTaken: cond, active: cond})
 }
@@ -469,6 +503,25 @@ func (p *Preprocessor) doElif(rest []Token) {
 	// frame INACTIVE -- including the case where an earlier #if/#elif fired,
 	// which left the frame active: without the explicit deactivation the
 	// #elif body would be emitted in addition to the taken branch.
+	if !f.branchTaken && cond {
+		f.active = true
+	} else {
+		f.active = false
+	}
+	f.branchTaken = f.branchTaken || cond
+	p.condStack[len(p.condStack)-1] = f
+}
+
+// doElifBool is like doElif but takes the already-resolved condition, so that
+// #elifdef / #elifndef can reuse the chain logic with a defined() test.
+func (p *Preprocessor) doElifBool(cond bool) {
+	if len(p.condStack) == 0 {
+		return
+	}
+	f := p.condStack[len(p.condStack)-1]
+	if f.seenElse {
+		return
+	}
 	if !f.branchTaken && cond {
 		f.active = true
 	} else {
@@ -550,6 +603,9 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 		// include from an on-disk file must still resolve when the compiler
 		// runs outside the source tree. An unavailable <file> is skipped
 		// rather than fatal.
+		// goclib ships one flat header directory, so a path with a POSIX
+		// prefix such as <sys/stat.h> matches on its basename (goclib/stat.h).
+		// That keeps the standard spelling working without a goclib/sys tree.
 		if src, rerr := goclibHeaders.ReadFile("goclib/" + path); rerr == nil {
 			inc, perr := p.process(string(src), "<builtin:"+path+">")
 			if perr != nil {
@@ -559,6 +615,18 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 				inc = inc[:len(inc)-1]
 			}
 			return inc, nil
+		}
+		if base := filepath.Base(path); base != path {
+			if src, rerr := goclibHeaders.ReadFile("goclib/" + base); rerr == nil {
+				inc, perr := p.process(string(src), "<builtin:"+path+">")
+				if perr != nil {
+					return nil, perr
+				}
+				if len(inc) > 0 && inc[len(inc)-1].Kind == TEOF {
+					inc = inc[:len(inc)-1]
+				}
+				return inc, nil
+			}
 		}
 		if angled {
 			fmt.Fprintf(os.Stderr, "%s: note: skipping unavailable system header <%s>\n", filename, path)
@@ -582,6 +650,163 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 	return inc, nil
 }
 
+// doEmbed handles the C23 #embed directive. "#embed <file>" / "#embed "file""
+// expands to a comma-separated list of integer constants -- the file's bytes
+// (0..255) -- optionally restricted by limit(N) and surrounded by prefix(...)/suffix(...)
+// embed parameters, or replaced by if_empty(...) when the file is empty. The
+// produced tokens are spliced into the stream wherever an initializer list is
+// expected.
+func (p *Preprocessor) doEmbed(rest []Token, filename string) ([]Token, error) {
+	if len(rest) == 0 {
+		return nil, fmt.Errorf("%s: #embed needs a filename", filename)
+	}
+	t := rest[0]
+	var path string
+	angled := false
+	start := 1
+	if t.Kind == TStr {
+		path = string(t.Str)
+	} else if t.Text == "<" {
+		var sb strings.Builder
+		for i := 1; i < len(rest) && rest[i].Text != ">"; i++ {
+			sb.WriteString(rest[i].Text)
+		}
+		path = sb.String()
+		angled = true
+		start = 1
+		for start < len(rest) && rest[start].Text != ">" {
+			start++
+		}
+		if start < len(rest) {
+			start++ // consume '>'
+		}
+	} else {
+		return nil, fmt.Errorf("%s: malformed #embed", filename)
+	}
+
+	// Embed parameters: limit(N), prefix(...), suffix(...), if_empty(...).
+	limit := -1
+	var prefixToks, suffixToks, ifEmptyToks []Token
+	j := start
+	for j < len(rest) {
+		par := rest[j]
+		if par.Kind == TIdent {
+			switch par.Text {
+			case "limit":
+				if j+3 < len(rest) && rest[j+1].Text == "(" &&
+					rest[j+3].Text == ")" && rest[j+2].Kind == TNum {
+					limit = int(rest[j+2].Num)
+					j += 4
+					continue
+				}
+			case "prefix":
+				if toks, nj, ok := parseParenList(rest, j); ok {
+					prefixToks = toks
+					j = nj
+					continue
+				}
+			case "suffix":
+				if toks, nj, ok := parseParenList(rest, j); ok {
+					suffixToks = toks
+					j = nj
+					continue
+				}
+			case "if_empty":
+				if toks, nj, ok := parseParenList(rest, j); ok {
+					ifEmptyToks = toks
+					j = nj
+					continue
+				}
+			}
+		}
+		j++
+	}
+
+	full, err := p.resolveInclude(path, filename, angled)
+	if err != nil {
+		return nil, fmt.Errorf("%s: #embed cannot find %s: %v", filename, path, err)
+	}
+	data, err := os.ReadFile(full)
+	if err != nil {
+		return nil, fmt.Errorf("%s: #embed cannot read %s: %v", filename, path, err)
+	}
+	if limit >= 0 && len(data) > limit {
+		data = data[:limit]
+	}
+	if len(data) == 0 && len(ifEmptyToks) > 0 {
+		return stripEndCommas(ifEmptyToks), nil
+	}
+
+	// The prefix/suffix lists are comma-separated token lists written by the
+	// user; trim any stray leading/trailing comma so groups join with a single
+	// separator. The byte list is joined by commas between elements only.
+	prefixToks = stripEndCommas(prefixToks)
+	suffixToks = stripEndCommas(suffixToks)
+
+	var out []Token
+	sep := false
+	if len(prefixToks) > 0 {
+		out = append(out, prefixToks...)
+		sep = true
+	}
+	for _, b := range data {
+		if sep {
+			out = append(out, Token{Kind: TPunct, Text: ",", Line: t.Line})
+		} else {
+			sep = true
+		}
+		out = append(out, Token{Kind: TNum, Num: int64(b), Text: strconv.Itoa(int(b)), Line: t.Line})
+	}
+	if len(suffixToks) > 0 {
+		if sep {
+			out = append(out, Token{Kind: TPunct, Text: ",", Line: t.Line})
+		}
+		out = append(out, suffixToks...)
+	}
+	return out, nil
+}
+
+// stripEndCommas removes any leading/trailing ',' tokens from a #embed prefix/
+// suffix list so the groups join with a single separator.
+func stripEndCommas(toks []Token) []Token {
+	for len(toks) > 0 && toks[0].Kind == TPunct && toks[0].Text == "," {
+		toks = toks[1:]
+	}
+	for len(toks) > 0 && toks[len(toks)-1].Kind == TPunct && toks[len(toks)-1].Text == "," {
+		toks = toks[:len(toks)-1]
+	}
+	return toks
+}
+
+// parseParenList parses a parameter of the form name(...) beginning at rest[j],
+// returning the inner tokens (excluding the parentheses) and the index just past
+// the closing ')'. Used by #embed's prefix/suffix/if_empty parameters.
+func parseParenList(rest []Token, j int) ([]Token, int, bool) {
+	if j+1 >= len(rest) || rest[j+1].Text != "(" {
+		return nil, j + 1, false
+	}
+	depth := 0
+	var inner []Token
+	k := j + 1 // at '('
+	for k+1 < len(rest) {
+		k++
+		tk := rest[k]
+		if tk.Text == "(" {
+			depth++
+			inner = append(inner, tk)
+		} else if tk.Text == ")" {
+			if depth == 0 {
+				return inner, k + 1, true
+			}
+			depth--
+			inner = append(inner, tk)
+		} else {
+			inner = append(inner, tk)
+		}
+	}
+	return nil, k, false
+}
+
 func (p *Preprocessor) resolveInclude(path, fromFile string, angled bool) (string, error) {
 	var candidates []string
 	if !angled {
@@ -596,6 +821,25 @@ func (p *Preprocessor) resolveInclude(path, fromFile string, angled bool) (strin
 		}
 	}
 	return "", fmt.Errorf("include file not found: %s", path)
+}
+
+// headerExists reports whether a #include-style path would resolve, mirroring
+// the resolution used by doInclude: disk candidates (via resolveInclude) plus
+// the embedded goclib/ headers, matched on the basename for <sys/x.h> spellings.
+// It backs the __has_include(x) preprocessor operator.
+func (p *Preprocessor) headerExists(path string) bool {
+	if _, err := p.resolveInclude(path, filepath.Join(p.baseDir, "_"), false); err == nil {
+		return true
+	}
+	if _, err := goclibHeaders.ReadFile("goclib/" + path); err == nil {
+		return true
+	}
+	if base := filepath.Base(path); base != path {
+		if _, err := goclibHeaders.ReadFile("goclib/" + base); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // expandAt expands the token at index i (handling macros and predefined
@@ -721,40 +965,79 @@ func (p *Preprocessor) readArgs(raw []Token, openIdx int) ([][]Token, int, error
 func (p *Preprocessor) expandFunc(m *Macro, args [][]Token, filename string, line int) []Token {
 	if m.IsVariadic {
 		np := len(m.Params) // includes "__VA_ARGS__"
-		if len(args) >= np {
+		vaIdx := np - 1
+		// Pad up to np so __VA_ARGS__ is always addressable, even when the
+		// macro is invoked with no variadic arguments (it then becomes empty).
+		for len(args) < np {
+			args = append(args, []Token{})
+		}
+		if len(args) > np {
 			merged := []Token{}
-			for k := np - 1; k < len(args); k++ {
-				if k > np-1 {
+			for k := vaIdx; k < len(args); k++ {
+				if k > vaIdx {
 					merged = append(merged, Token{Kind: TPunct, Text: ","})
 				}
 				merged = append(merged, args[k]...)
 			}
-			args = append(args[:np-1], merged)
+			args = append(args[:vaIdx], merged)
 		}
 	}
 
+	// __VA_ARGS__ is empty (a placemarker) when no variadic argument was given.
+	vaNonEmpty := false
+	if m.IsVariadic {
+		vaNonEmpty = len(args[len(args)-1]) > 0
+	}
+
+	out := p.substTokens(m.Body, m, args, filename, line, vaNonEmpty)
+	return p.expandTokens(out, filename, line)
+}
+
+// substTokens performs argument substitution, '#' stringisation and '##' pasting
+// for a slice of body tokens, returning the substituted tokens WITHOUT the final
+// re-expansion (the caller does that). It is used both for the whole macro body
+// and for the contents of a __VA_OPT__(...) construct.
+func (p *Preprocessor) substTokens(body []Token, m *Macro, args [][]Token, filename string, line int, vaNonEmpty bool) []Token {
 	var out []Token
 	i := 0
-	for i < len(m.Body) {
-		bt := m.Body[i]
+	n := len(body)
+	for i < n {
+		bt := body[i]
 		// Stringisation: # param
-		if bt.Kind == TPunct && bt.Text == "#" && i+1 < len(m.Body) && isParam(m.Body[i+1], m) {
-			idx := paramIndex(m.Body[i+1].Text, m)
+		if bt.Kind == TPunct && bt.Text == "#" && i+1 < n && isParam(body[i+1], m) {
+			idx := paramIndex(body[i+1].Text, m)
 			out = append(out, stringize(args[idx], bt.Line)...)
 			i += 2
 			continue
 		}
-		// Pasting: a ## b
+		// Pasting: a ## b  (b may be a __VA_OPT__ operand)
 		if bt.Kind == TPunct && bt.Text == "##" {
 			if len(out) == 0 {
 				i++
 				continue
 			}
 			i++
-			if i >= len(m.Body) {
+			if i >= n {
 				break
 			}
-			nxt := m.Body[i]
+			nxt := body[i]
+			if m.IsVariadic && isVAOpt(nxt) && i+1 < n && body[i+1].Text == "(" {
+				content, next, ok := parseVAOpt(body, i)
+				if ok {
+					if vaNonEmpty {
+						sub := p.substTokens(content, m, args, filename, line, vaNonEmpty)
+						if len(sub) > 0 {
+							merged := lexOne(out[len(out)-1].Text + tokenSpelling(sub[0]))
+							out[len(out)-1] = merged
+							out = append(out, sub[1:]...)
+						}
+						// Empty substitution keeps out[len-1] unchanged
+						// (placemarker semantics of __VA_OPT__).
+					}
+					i = next
+					continue
+				}
+			}
 			var nxtToks []Token
 			if isParam(nxt, m) {
 				nxtToks = args[paramIndex(nxt.Text, m)]
@@ -769,10 +1052,25 @@ func (p *Preprocessor) expandFunc(m *Macro, args [][]Token, filename string, lin
 			i++
 			continue
 		}
+		// __VA_OPT__(x): when __VA_ARGS__ is non-empty, expand x (with full
+		// substitution); otherwise expand to a placemarker (no tokens).
+		if m.IsVariadic && isVAOpt(bt) && i+1 < n && body[i+1].Text == "(" {
+			content, next, ok := parseVAOpt(body, i)
+			if ok {
+				if vaNonEmpty {
+					out = append(out, p.substTokens(content, m, args, filename, line, vaNonEmpty)...)
+				}
+				i = next
+				continue
+			}
+			out = append(out, bt)
+			i++
+			continue
+		}
 		if isParam(bt, m) {
 			idx := paramIndex(bt.Text, m)
 			// An argument used as a '##' operand is not pre-expanded.
-			if i+1 < len(m.Body) && m.Body[i+1].Kind == TPunct && m.Body[i+1].Text == "##" {
+			if i+1 < n && body[i+1].Kind == TPunct && body[i+1].Text == "##" {
 				out = append(out, args[idx]...)
 			} else {
 				out = append(out, p.expandTokens(args[idx], filename, line)...)
@@ -783,7 +1081,42 @@ func (p *Preprocessor) expandFunc(m *Macro, args [][]Token, filename string, lin
 		out = append(out, bt)
 		i++
 	}
-	return p.expandTokens(out, filename, line)
+	return out
+}
+
+// isVAOpt reports whether a token is the __VA_OPT__ preprocessing operator.
+func isVAOpt(t Token) bool {
+	return (t.Kind == TIdent || t.Kind == TKeyword) && t.Text == "__VA_OPT__"
+}
+
+// parseVAOpt parses a __VA_OPT__(...) construct beginning at body[i]
+// (body[i].Text == "__VA_OPT__"). It returns the inner tokens (excluding the
+// parentheses), the index just past the closing ')', and whether parsing
+// succeeded.
+func parseVAOpt(body []Token, i int) (content []Token, nextIdx int, ok bool) {
+	if i+1 >= len(body) || body[i+1].Text != "(" {
+		return nil, i + 1, false
+	}
+	depth := 0
+	j := i + 1 // index of '('
+	k := j + 1
+	for k < len(body) {
+		t := body[k]
+		if t.Text == "(" {
+			depth++
+			content = append(content, t)
+		} else if t.Text == ")" {
+			if depth == 0 {
+				return content, k + 1, true
+			}
+			depth--
+			content = append(content, t)
+		} else {
+			content = append(content, t)
+		}
+		k++
+	}
+	return nil, k, false
 }
 
 func isParam(t Token, m *Macro) bool {
@@ -1029,6 +1362,62 @@ func (p *Preprocessor) cePrimary(toks []Token, i int) (int64, int) {
 			return 1, i
 		}
 		return 0, i
+	case t.Text == "__has_include":
+		// __has_include(<h>) / __has_include("h"): 1 if the header resolves, else 0.
+		i++
+		var path string
+		if i < len(toks) && toks[i].Text == "(" {
+			i++
+			if i < len(toks) && toks[i].Kind == TStr {
+				path = string(toks[i].Str)
+				i++
+			} else if i < len(toks) && toks[i].Text == "<" {
+				i++
+				var sb strings.Builder
+				for i < len(toks) && toks[i].Text != ">" {
+					sb.WriteString(toks[i].Text)
+					i++
+				}
+				path = sb.String()
+				i++ // consume '>'
+			}
+			if i < len(toks) && toks[i].Text == ")" {
+				i++
+			}
+		}
+		if p.headerExists(path) {
+			return 1, i
+		}
+		return 0, i
+	case t.Text == "__has_c_attribute":
+		// __has_c_attribute(name): 202311 if supported, else 0.
+		i++
+		var name string
+		if i < len(toks) && toks[i].Text == "(" {
+			i++
+			if i < len(toks) && toks[i].Text != ")" {
+				name = toks[i].Text
+				i++
+				if i < len(toks) && toks[i].Text == "::" {
+					i++
+					if i < len(toks) && toks[i].Text != ")" {
+						name = toks[i].Text
+						i++
+					}
+				}
+			}
+			if i < len(toks) && toks[i].Text == ")" {
+				i++
+			}
+		}
+		switch name {
+		case "deprecated", "nodiscard", "maybe_unused", "fallthrough",
+			"noreturn", "unsequenced", "reproducible", "_Noreturn",
+			"alignas", "alignof", "thread_local", "char8_t":
+			return 202311, i
+		default:
+			return 0, i
+		}
 	case t.Kind == TIdent:
 		return 0, i + 1
 	case t.Text == "(":

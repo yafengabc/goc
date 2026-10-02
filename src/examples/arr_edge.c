@@ -1,7 +1,8 @@
 // Array print/method edge cases:
-//   - float/double array precision: %g prints six fractional digits then
-//     strips trailing zeros, so 0.9999999 -> 1, 1e-7 -> 0, 1e10 stays
-//     fixed-point (no exponent).
+//   - float/double array precision: %g prints six SIGNIFICANT digits (C's
+//     rule, not six fractional ones) and strips trailing zeros, so
+//     0.9999999 -> 1, 1e-7 -> 1e-07, and 1e10 switches to the exponential
+//     form because its exponent is past the precision.
 //   - a user T_array_print printer and T_array_* UFCS methods coexist on
 //     the same struct array: print(pts) reaches the printer, pts.sum()
 //     the method.

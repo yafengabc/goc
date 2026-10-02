@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 )
 
 // ---------------------------------------------------------------------------
@@ -41,7 +42,9 @@ const (
 
 	shtNull     = 0
 	shtProgBits = 1
+	shtSymTab   = 2
 	shtStrTab   = 3
+	shtNoBits   = 8 // SHT_NOBITS: .bss -- no file bytes, zero-filled at load
 
 	shfWrite     = 0x1
 	shfAlloc     = 0x2
@@ -64,13 +67,21 @@ func (a *Assembler) BuildELF(outPath string) error {
 		s    *Section
 		off  int
 		flag uint64
+		sz   int // virtual size: len(s.Data) normally, s.cur for .bss
 	}
 	var placed2 []placed
 
 	cur := elfTextFileOff
-	for _, name := range []string{".text", ".rdata", ".data"} {
+	var bssSecs []*Section
+	for _, name := range []string{".text", ".rdata", ".data", ".tls", ".bss"} {
 		s := a.sectionByName(name)
 		if s == nil {
+			continue
+		}
+		if s.Bss {
+			// .bss holds uninitialised globals: virtual space after the loadable
+			// image but no file bytes. Reserved until the file end is known.
+			bssSecs = append(bssSecs, s)
 			continue
 		}
 		cur = align(cur, 16)
@@ -87,10 +98,21 @@ func (a *Assembler) BuildELF(outPath string) error {
 		default:
 			flag = shfAlloc | shfWrite
 		}
-		placed2 = append(placed2, placed{s: s, off: cur, flag: flag})
+		placed2 = append(placed2, placed{s: s, off: cur, flag: flag, sz: len(s.Data)})
 		cur += len(s.Data)
 	}
 	loadEnd := align(cur, 16)
+	// .bss sections live right after the loaded file data (virtual only); the
+	// loader zero-fills them. memEnd tracks the full virtual extent.
+	memEnd := loadEnd
+	for _, s := range bssSecs {
+		if s.cur == 0 {
+			continue
+		}
+		secOff[s] = loadEnd
+		placed2 = append(placed2, placed{s: s, off: loadEnd, flag: shfAlloc | shfWrite, sz: s.cur})
+		memEnd += align(s.cur, 16)
+	}
 
 	// Resolve every symbol to a virtual address.
 	symVA := map[string]int{}
@@ -120,13 +142,47 @@ func (a *Assembler) BuildELF(outPath string) error {
 		return fmt.Errorf("entry symbol %q not defined", a.entry)
 	}
 
-	// Section headers live after the loadable image; .shstrtab holds their
-	// names. Not loaded, but it keeps objdump/readelf useful.
-	numSh := 2 + len(placed2) // null + sections + .shstrtab
-	shOff := align(loadEnd, 8)
-	shstrOff := shOff + numSh*elfShEntSize
-	shStrIdx := numSh - 1
+	// ---- symbol table (.symtab + .strtab) ----
+	// A standard symbol table keeps the ELF inspectable (objdump/readelf) and
+	// lets a non-Linux loader locate chokepoint symbols such as __goc_syscall
+	// by name instead of scanning code. It is not part of the loadable segment.
+	secIdx := make(map[*Section]int, len(placed2))
+	for i, p := range placed2 {
+		secIdx[p.s] = i + 1
+	}
+	symtab, strtab := a.buildSymtab(symVA, secIdx)
 
+	// ---- guest unwind metadata (.gocuw) ----
+	// One fixed-layout record per function (see gocrun's parser for the exact
+	// byte format). The Windows gocrun loader reads this and registers a
+	// RtlAddFunctionTable so the x64 unwinder can walk guest frames during a
+	// Win32 syscall's internal exception dispatch. Non-alloc, so it lives
+	// outside the loadable segment (read from the file, not mapped at runtime).
+	var uwData []byte
+	putU32 := func(v uint32) {
+		uwData = append(uwData, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+	}
+	for _, fn := range a.uwRecs {
+		so, ok1 := secOff[a.sections[fn.sect]]
+		eo, ok2 := secOff[a.sections[fn.sect]]
+		if !ok1 || !ok2 {
+			continue
+		}
+		putU32(uint32(so + fn.start)) // RVA of function start (vaddr - elfBase)
+		putU32(uint32(eo + fn.end))   // RVA of function end
+		uwData = append(uwData, byte(len(fn.pushes)))
+		for _, r := range fn.pushes {
+			uwData = append(uwData, byte(r))
+		}
+		putU32(uint32(fn.alloc)) // sub rsp, N frame allocation
+	}
+
+	// Section headers live after the loadable image and the symbol table;
+	// .shstrtab holds their names. Not loaded, but keeps objdump/readelf useful.
+	// non-loaded metadata sections placed after the loadable image: .gocuw
+	// (guest unwind table, if any), .symtab, .strtab, .shstrtab.
+	// Declare the .shstrtab builder (shstr/addName) first so the posts slice
+	// below can reference shstr directly.
 	shstr := []byte{0}
 	nameOff := map[string]int{}
 	addName := func(n string) int {
@@ -139,6 +195,32 @@ func (a *Assembler) BuildELF(outPath string) error {
 		nameOff[n] = o
 		return o
 	}
+
+	type postSec struct {
+		name string
+		data []byte
+	}
+	posts := []postSec{}
+	if len(uwData) > 0 {
+		posts = append(posts, postSec{".gocuw", uwData})
+	}
+	posts = append(posts, postSec{".symtab", symtab}, postSec{".strtab", strtab})
+	// .shstrtab is NOT appended here: building the posts slice captures the
+	// (still empty) shstr slice, but addName is only called later (placed loop
+	// and below), so the captured shstr would be stale. We emit .shstrtab last
+	// from the final shstr instead. The trailing NULL must NOT be counted in
+	// numSh or e_shstrndx would point past the real .shstrtab.
+	numSh := 1 + len(placed2) + len(posts) + 1 // +1 for .shstrtab
+	off := align(loadEnd, 8)
+	postOff := make([]int, len(posts))
+	for i := range posts {
+		postOff[i] = off
+		off += len(posts[i].data)
+		off = align(off, 8)
+	}
+	shOff := off
+	shstrOff := shOff + numSh*elfShEntSize
+	shStrIdx := numSh - 1
 
 	img := make([]byte, loadEnd)
 
@@ -170,7 +252,7 @@ func (a *Assembler) BuildELF(outPath string) error {
 	putU64at(img, 80, elfBase)          // p_vaddr
 	putU64at(img, 88, elfBase)          // p_paddr (unused on Linux)
 	putU64at(img, 96, uint64(loadEnd))  // p_filesz
-	putU64at(img, 104, uint64(loadEnd)) // p_memsz
+	putU64at(img, 104, uint64(memEnd))  // p_memsz (includes zero-filled .bss)
 	putU64at(img, 112, 0x1000)          // p_align
 
 	// Section contents.
@@ -195,15 +277,104 @@ func (a *Assembler) BuildELF(outPath string) error {
 	}
 	putSection(0, 0, shtNull, 0, 0, 0, 0, 0)
 	for i, p := range placed2 {
-		putSection(i+1, addName(p.s.Name), shtProgBits, p.flag,
-			uint64(elfBase+p.off), uint64(p.off), uint64(len(p.s.Data)), 16)
+		var typ uint32 = shtProgBits
+		if p.s.Bss {
+			typ = shtNoBits
+		}
+		putSection(i+1, addName(p.s.Name), typ, p.flag,
+			uint64(elfBase+p.off), uint64(p.off), uint64(p.sz), 16)
 	}
-	putSection(shStrIdx, addName(".shstrtab"), shtStrTab, 0, 0, uint64(shstrOff), uint64(len(shstr)), 1)
+	// Post-load (non-alloc) sections: .gocuw + symbol tables.
+	base := 1 + len(placed2)
+	for i, ps := range posts {
+		idx := base + i
+		var typ uint32 = shtProgBits
+		if ps.name == ".symtab" {
+			typ = shtSymTab
+		} else if ps.name == ".strtab" || ps.name == ".shstrtab" {
+			typ = shtStrTab
+		}
+		putSection(idx, addName(ps.name), typ, 0, 0, uint64(postOff[i]), uint64(len(ps.data)), 1)
+	}
+	// .shstrtab section header: point at the real shstr, written last in the
+	// file (after the section header table, at shstrOff). addName(".shstrtab")
+	// is safe here because every other section name has already been registered.
+	putSection(numSh-1, addName(".shstrtab"), shtStrTab, 0, 0, uint64(shstrOff), uint64(len(shstr)), 1)
+	// .symtab links to .strtab; sh_info is one past the last local symbol
+	// (all our symbols are global, so the first global is index 1).
+	for i, ps := range posts {
+		if ps.name == ".symtab" {
+			symIdx := base + i
+			strIdx := base + i + 1
+			putU32at(sh, symIdx*elfShEntSize+40, uint32(strIdx))
+			putU32at(sh, symIdx*elfShEntSize+44, 1)
+		}
+	}
 
 	out := make([]byte, 0, shstrOff+len(shstr))
 	out = append(out, img...)
+	for i := range posts {
+		for len(out) < postOff[i] {
+			out = append(out, 0)
+		}
+		out = append(out, posts[i].data...)
+	}
+	for len(out) < shOff {
+		out = append(out, 0)
+	}
 	out = append(out, sh...)
 	out = append(out, shstr...)
 
 	return os.WriteFile(outPath, out, 0o755)
+}
+
+// buildSymtab emits a standard ELF64 symbol table (.symtab) paired with its
+// string table (.strtab). Every symbol goc defines (function/label) becomes a
+// global STT_FUNC entry so external tools -- and the Windows gocrun loader --
+// can resolve names such as __goc_syscall by address.
+func (a *Assembler) buildSymtab(symVA map[string]int, secIdx map[*Section]int) ([]byte, []byte) {
+	type ent struct {
+		name    string
+		nameOff int
+		info    uint8
+		shndx   uint16
+		value   uint64
+	}
+	ents := []ent{{}} // leading null symbol (all-zero)
+	names := make([]string, 0, len(a.syms))
+	for n := range a.syms {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		loc := a.syms[n]
+		s := a.sections[loc.sect]
+		shndx := 0
+		if idx, ok := secIdx[s]; ok {
+			shndx = idx
+		}
+		// STB_GLOBAL<<4 | STT_FUNC
+		ents = append(ents, ent{name: n, info: 1<<4 | 2, shndx: uint16(shndx), value: uint64(symVA[n])})
+	}
+
+	var strtab []byte
+	strtab = append(strtab, 0) // leading NUL
+	for i := 1; i < len(ents); i++ {
+		ents[i].nameOff = len(strtab)
+		strtab = append(strtab, []byte(ents[i].name)...)
+		strtab = append(strtab, 0)
+	}
+
+	var symtab []byte
+	for _, e := range ents {
+		var b [24]byte
+		putU32at(b[:], 0, uint32(e.nameOff))
+		b[4] = e.info
+		b[5] = 0 // st_other
+		putU16at(b[:], 6, e.shndx)
+		putU64at(b[:], 8, e.value)
+		putU64at(b[:], 16, 0) // st_size
+		symtab = append(symtab, b[:]...)
+	}
+	return symtab, strtab
 }

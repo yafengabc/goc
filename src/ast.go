@@ -36,6 +36,11 @@ type FuncDecl struct {
 	ParamTypes []*Type
 	Variadic   bool
 	Body       *Block
+	// DLL is the import library named on a prototype: "extern long
+	// MessageBoxA(...), user32;" -- the same `extern Name, dll` shape the
+	// assembler takes. Empty means the symbol resolves to a goclib C function
+	// (compiled in) or, on Linux, a syscall stub -- not a Windows DLL import.
+	DLL string
 }
 
 type Block struct {
@@ -59,7 +64,11 @@ type DeclStmt struct {
 	// single-translation-unit compiler, so register/auto are accepted as no-ops
 	// and extern/static only matter for the static-local lifetime rule.
 	Storage string
-	Line    int
+	// IsTLS is true when the declaration carried _Thread_local / thread_local:
+	// the variable lives in thread-local storage and each thread gets its own
+	// instance (accessed via the FS/GS segment on x86-64).
+	IsTLS bool
+	Line   int
 }
 
 type AssignStmt struct {
@@ -183,7 +192,15 @@ type NumLit struct {
 	Val     int64
 	Kind    CType
 	Fval    float64
-	IsFloat bool // a "1.5f" literal: type float rather than double
+	IsFloat bool   // a "1.5f" literal: type float rather than double
+	Unsig   bool   // u/U suffix: the constant's type is unsigned
+	Long    bool   // l/L suffix: the constant is at least 64 bits wide
+	// C23 bit-precise literal (wb/uwb suffix): BigWords holds the value as
+	// little-endian 64-bit words and BigBits its declared _BitInt width.
+	// Non-nil BigWords switches the literal's type to _BitInt(BigBits).
+	BigWords  []uint64
+	BigSigned bool
+	BigBits   int
 }
 
 type StrLit struct {
@@ -302,4 +319,37 @@ type MemberExpr struct {
 type SizeofExpr struct {
 	Typ *Type // non-nil when the operand is a type name
 	E   Expr  // non-nil when the operand is an expression
+}
+
+// CompoundLit is the C99 compound literal "(T){...}": an unnamed object of
+// type T, initialised from the brace list. It is an lvalue (its address can
+// be taken) and each evaluation re-initialises the object. The checker
+// validates the initialiser against Typ (filling an incomplete array's
+// length) and codegen gives each occurrence a persistent frame slot.
+type CompoundLit struct {
+	Typ  *Type
+	Init *BraceInit
+	Line int
+}
+
+// GenericAssoc is one association of a _Generic selection: either
+// "TypeName : expr" or the catch-all "default : expr". Exactly one of
+// IsDefault / Typ is meaningful.
+type GenericAssoc struct {
+	Typ       *Type // the associated type (nil for default)
+	IsDefault bool
+	E         Expr
+}
+
+// GenericExpr is the C11/C23 generic selection "_Generic(ctrl, T1: e1, ...)".
+// The controlling expression is never evaluated; the type checker computes its
+// type (after lvalue conversion: decay + qualifier drop), picks the matching
+// association -- or the default -- and records it in Chosen/ChosenIdx. Only
+// Chosen is type-checked and emitted; the other branches are syntax only.
+type GenericExpr struct {
+	Control Expr
+	Assocs  []GenericAssoc
+	Chosen  Expr // set by the checker; codegen emits only this
+	ChosenIdx int
+	Line    int
 }

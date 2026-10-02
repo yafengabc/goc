@@ -5,7 +5,8 @@
 
 /* goc wingdi.h -- gdi32 API surface: stock objects, device contexts,
  * raster ops and the bitmap info struct. Included by <windows.h>.
- * Functions import from gdi32.dll (see goclib/win32.def).
+ * Every function is a gdi32 import declared inline, e.g.
+ *     extern HDC GetDC(HWND), gdi32;
  */
 
 /* ------------------------------------------------------------------ */
@@ -133,44 +134,44 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 /* gdi32 functions                                                     */
 /* ------------------------------------------------------------------ */
-HGDIOBJ GetStockObject(int obj);
-HGDIOBJ SelectObject(HDC dc, HGDIOBJ obj);
-BOOL    DeleteObject(HGDIOBJ obj);
+extern HGDIOBJ GetStockObject(int obj), gdi32;
+extern HGDIOBJ SelectObject(HDC dc, HGDIOBJ obj), gdi32;
+extern BOOL    DeleteObject(HGDIOBJ obj), gdi32;
 
-HDC     CreateCompatibleDC(HDC dc);
-HBITMAP CreateCompatibleBitmap(HDC dc, int w, int h);
-BOOL    DeleteDC(HDC dc);
-HDC     CreateDC(LPCSTR driver, LPCSTR device, LPCSTR output, LPVOID init);
-int     GetDeviceCaps(HDC dc, int index);
+extern HDC     CreateCompatibleDC(HDC dc), gdi32;
+extern HBITMAP CreateCompatibleBitmap(HDC dc, int w, int h), gdi32;
+extern BOOL    DeleteDC(HDC dc), gdi32;
+extern HDC     CreateDC(LPCSTR driver, LPCSTR device, LPCSTR output, LPVOID init), gdi32;
+extern int     GetDeviceCaps(HDC dc, int index), gdi32;
 
-BOOL    SetBkColor(HDC dc, COLORREF color);
-COLORREF GetBkColor(HDC dc);
-BOOL    SetTextColor(HDC dc, COLORREF color);
-COLORREF GetTextColor(HDC dc);
-int     SetBkMode(HDC dc, int mode);
-int     GetBkMode(HDC dc);
-int     SetROP2(HDC dc, int rop);
-int     GetROP2(HDC dc);
+extern BOOL    SetBkColor(HDC dc, COLORREF color), gdi32;
+extern COLORREF GetBkColor(HDC dc), gdi32;
+extern BOOL    SetTextColor(HDC dc, COLORREF color), gdi32;
+extern COLORREF GetTextColor(HDC dc), gdi32;
+extern int     SetBkMode(HDC dc, int mode), gdi32;
+extern int     GetBkMode(HDC dc), gdi32;
+extern int     SetROP2(HDC dc, int rop), gdi32;
+extern int     GetROP2(HDC dc), gdi32;
 
-BOOL    TextOutA(HDC dc, int x, int y, LPCSTR text, int len);
-BOOL    LineTo(HDC dc, int x, int y);
-BOOL    MoveToEx(HDC dc, int x, int y, LPPOINT old);
-BOOL    Rectangle(HDC dc, int l, int t, int r, int b);
-BOOL    Ellipse(HDC dc, int l, int t, int r, int b);
-BOOL    PatBlt(HDC dc, int x, int y, int w, int h, DWORD rop);
-BOOL    BitBlt(HDC dst, int x, int y, int w, int h, HDC src,
-               int sx, int sy, DWORD rop);
-BOOL    StretchBlt(HDC dst, int x, int y, int w, int h, HDC src,
-                   int sx, int sy, int sw, int sh, DWORD rop);
-BOOL    SetPixel(HDC dc, int x, int y, COLORREF color);
-COLORREF GetPixel(HDC dc, int x, int y);
-BOOL    RoundRect(HDC dc, int l, int t, int r, int b, int w, int h);
-BOOL    Polygon(HDC dc, LPPOINT pts, int count);
-BOOL    Polyline(HDC dc, LPPOINT pts, int count);
-BOOL    Arc(HDC dc, int l, int t, int r, int b, int x1, int y1, int x2, int y2);
-BOOL    Pie(HDC dc, int l, int t, int r, int b, int x1, int y1, int x2, int y2);
-BOOL    ExtTextOutA(HDC dc, int x, int y, UINT opts, LPRECT rc,
-                    LPCSTR text, UINT len, LPVOID gaps);
-BOOL    TextOutW(HDC dc, int x, int y, LPCWSTR text, int len);
+extern BOOL    TextOutA(HDC dc, int x, int y, LPCSTR text, int len), gdi32;
+extern BOOL    LineTo(HDC dc, int x, int y), gdi32;
+extern BOOL    MoveToEx(HDC dc, int x, int y, LPPOINT old), gdi32;
+extern BOOL    Rectangle(HDC dc, int l, int t, int r, int b), gdi32;
+extern BOOL    Ellipse(HDC dc, int l, int t, int r, int b), gdi32;
+extern BOOL    PatBlt(HDC dc, int x, int y, int w, int h, DWORD rop), gdi32;
+extern BOOL    BitBlt(HDC dst, int x, int y, int w, int h, HDC src,
+               int sx, int sy, DWORD rop), gdi32;
+extern BOOL    StretchBlt(HDC dst, int x, int y, int w, int h, HDC src,
+                   int sx, int sy, int sw, int sh, DWORD rop), gdi32;
+extern BOOL    SetPixel(HDC dc, int x, int y, COLORREF color), gdi32;
+extern COLORREF GetPixel(HDC dc, int x, int y), gdi32;
+extern BOOL    RoundRect(HDC dc, int l, int t, int r, int b, int w, int h), gdi32;
+extern BOOL    Polygon(HDC dc, LPPOINT pts, int count), gdi32;
+extern BOOL    Polyline(HDC dc, LPPOINT pts, int count), gdi32;
+extern BOOL    Arc(HDC dc, int l, int t, int r, int b, int x1, int y1, int x2, int y2), gdi32;
+extern BOOL    Pie(HDC dc, int l, int t, int r, int b, int x1, int y1, int x2, int y2), gdi32;
+extern BOOL    ExtTextOutA(HDC dc, int x, int y, UINT opts, LPRECT rc,
+                    LPCSTR text, UINT len, LPVOID gaps), gdi32;
+extern BOOL    TextOutW(HDC dc, int x, int y, LPCWSTR text, int len), gdi32;
 
 #endif /* GOC_WINGDI_H */

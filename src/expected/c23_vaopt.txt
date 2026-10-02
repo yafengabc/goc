@@ -1,0 +1,5 @@
+hello
+sum=3
+foo(1)
+bar(1,7)
+baz(5,99)

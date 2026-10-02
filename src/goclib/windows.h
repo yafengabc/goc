@@ -16,12 +16,13 @@
  *   <winuser.h>   user32: messages, windows, classes, cursors, DCs
  *   <wingdi.h>    gdi32: stock objects, DCs, bitmap info, raster ops
  *
- * Each DLL's functions import through the goa PE import directory; the
- * "which DLL" table is goclib/win32.def, the single source of truth. A
- * prototype may exist here without a def entry (it just fails to link), but
- * every name in win32.def should have a prototype somewhere under these
- * headers. Struct layouts follow LLP64 and MSVC x64 packing, so they match
- * what the OS writes.
+ * Each DLL's functions import through the goa PE import directory. The import
+ * DLL for every function is named inline on its prototype, e.g.
+ *     extern BOOL CloseHandle(HANDLE h), kernel32;
+ * so the headers are self-describing and there is no central ownership table. A
+ * prototype that names its DLL resolves through dllOf; one that does not is a
+ * goclib C function (compiled in) or, on Linux, a syscall stub. Struct layouts
+ * follow LLP64 and MSVC x64 packing, so they match what the OS writes.
  *
  * Calling convention: Win64 has a single flat convention, so WINAPI and
  * CALLBACK expand to nothing.

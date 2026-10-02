@@ -1,0 +1,4 @@
+null==0=1
+sizeof=8
+qnull=1
+rnonnull=1

@@ -143,7 +143,7 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 		}
 		return "", errors.New(b.String())
 	}
-	asm, err := Gen(prog, cfg.linux, cfg.opt)
+	asm, err := Gen(prog, cfg.linux, cfg.opt, cfg.winGUI)
 	if err != nil {
 		return "", fmt.Errorf("codegen error: %w", err)
 	}
@@ -288,7 +288,8 @@ func runCmd(args []string) {
 type buildCfg struct {
 	mode    string // run | compile | asm | preprocess
 	linux   bool
-	opt     int // optimisation level from -O<level> (0 = none)
+	winGUI  bool // -mwindows: PE subsystem 2 (GUI), no console window
+	opt     int  // optimisation level from -O<level> (0 = none)
 	outFile string
 	defines []string
 	incDirs []string
@@ -368,6 +369,13 @@ func parseArgs(args []string) (buildCfg, bool) {
 		// Attached-value single-letter forms: -ofile -Dname -Ipath -lfoo -Ldir,
 		// plus whole families we accept-and-ignore: -W -m -f -g -s. (-O is
 		// parsed for real: see optFromSuffix.)
+		// -mwindows is the one machine flag goc honours: it switches the PE
+		// subsystem to 2 (windows GUI) so no console window is allocated.
+		// Every other -m* stays accepted-and-ignored below.
+		if arg == "-mwindows" {
+			cfg.winGUI = true
+			continue
+		}
 		if len(arg) > 2 {
 			switch arg[1] {
 			case 'o':
@@ -529,6 +537,8 @@ Options:
   -D<name>[=val]  predefine a macro (val defaults to 1)
   -I<dir>         add a header search directory
   -target linux   emit a Linux ELF64 instead of a Windows PE32+
+  -mwindows       PE subsystem 2 (windows GUI): no console window is
+                  allocated; hInstance comes from GetModuleHandleA(NULL)
   -O* -Wall -W* -std -m* -g -static -pthread -f* -s -l -L -Wl,*
                   accepted and ignored (goc is a single-pass compiler)
   --version       show version
