@@ -1,10 +1,13 @@
 /* ============================================================
    c99_stdint.c - stdint.h / inttypes.h fixed-width types (C99 7.18)
    Standard   : ISO/IEC 9899:1999 (C99) 7.18
-   Strategy   : gcc side: int8..int64/uint64/intptr_t, INT64_C/UINT64_C,
-                PRId64/PRIu64 format macros. goc side: headers skipped,
-                all types undeclared (real gap, goc has no stdint.h).
-   Status     : FAIL (verified 2026-10-02, goc vs gcc -std=c99)
+   Strategy   : int8..int64/uint64/intptr_t, INT64_C/UINT64_C,
+                PRId64/PRIu64/PRIdPTR format macros. The intptr_t demo prints
+                a fixed constant: raw addresses differ between runtimes (goc
+                loads low, the LLP64 gcc loads high) and cannot be compared
+                byte for byte; intptr_t is still exercised as a pointer type
+                through the boolean check on (intptr_t)&i8.
+   Status     : PASS (fixed 2026-10-02, goc LP64 vs gcc LLP64 -std=c99)
    ============================================================ */
 #include <stdio.h>
 #include <stdint.h>
@@ -18,6 +21,7 @@ int main(void) {
     intptr_t ip = (intptr_t)&i8;
     printf("case1: %" PRId8 " %" PRId16 "\n", i8, i16);
     printf("case2: %" PRId32 " %" PRId64 "\n", i32, i64);
-    printf("case3: %" PRIu64 " %" PRIdPTR "\n", u64, (intptr_t)ip);
+    printf("case3: %" PRIu64 " %" PRIdPTR "\n", u64, (intptr_t)0x1234567890LL);
+    if (ip == 0) printf("bad intptr\n");
     return 0;
 }

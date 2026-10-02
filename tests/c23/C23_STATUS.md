@@ -126,7 +126,7 @@
 | 二进制字面量 0b/0B | **PASS** | 11 | 值/后缀（u/UL）/与 0xFF 对照/混算/`#if 0b1100==12` 全一致 | 一致 | 放心用（含 #if 中） |
 | 数字分隔符（合法位置） | **PASS** | 12 | 1'000'000/0xFF'FF/0b1010'1010/1.2'34e5/.12/.1'2/1'000e3/3.14'15f/1'000UL/4'2L 全一致（SUMMARY 12/12）。`.12`/`.1'2` 前导点子用例已加回（2026-10-02 lexer 前导点修复）；`0x1p10'0`（hex 浮点指数内分隔符）仍 `preprocess error: unterminated character literal`，归 P2.13 | 一致 | 合法位置放心用；前导点 `.12` 亦支持；仅 `0x1p10'0` 指数内分隔符避开 |
 | 非法数字分隔符（负向） | **FAIL（goc 过宽）** | 6 构造 | goc **静默删 `'` 照常解析**（`1''000`/`0x'FFFF'`/`1'.2`/`1.'5`/`0x1'p0`/`123'` 全部接受并运行，exit 66661，无诊断） | gcc 全部拒绝（adjacent/after base/adjacent to point/exponent 各报错） | 别指望 goc 揪出分隔符笔误，写法自检 |
-| 十六进制浮点 | **PASS** | 10 | 0x1.8p3/0x.8p1/0x1p-2/f/L 后缀/== 比较与 gcc 一致。**%a 不支持**（打印字面 'a'）；**无指数形式 0x1.8 goc 接受（=1.5）但本 gcc 拒**（`require an exponent`，C23 新特性 gcc 16.2 未实现） | 一致（用 %.3f/== 对拍） | 带 p 指数放心用；别用 %a；0x1.8 是 goc 私有扩展，移植 gcc 不过 |
+| 十六进制浮点 | **PASS** | 10 | 0x1.8p3/0x.8p1/0x1p-2/f/L 后缀/== 比较与 gcc 一致。**%a 已支持**（P0.7, 2026-10-02，与 gcc 逐字节一致）；**无指数形式 0x1.8 goc 接受（=1.5）但本 gcc 拒**（`require an exponent`，C23 新特性 gcc 16.2 未实现） | 一致（用 %.3f/==/%a 对拍） | 带 p 指数放心用；%a 放心用；0x1.8 是 goc 私有扩展，移植 gcc 不过 |
 | u8 字符串/字符值语义 | **PASS** | 8 | sizeof(u8"abc")=4、拼接 u8"ab""cd"、u8'x'=120、尾部 NUL 全一致 | 一致 | 值/大小/拼接/单字节字符放心用（原始串与多字节字符本 gcc c2x 也不接受，未纳入） |
 | 字符串字面量直接下标 | **PASS** | 4 | "hello"[0]='h'(104)、[1]='e'(101)、与 const char* 控制组一致、0xE4 字节按有符号 char 得 -28（SUMMARY 4/4） | 一致（104/101/104/-28） | 放心用；字符串字面量可直接下标（P0.8 修复 2026-10-02，原垃圾值） |
 | 空 {} 初始化 | **PASS（附两坑）** | 9 | int/指针/double/数组/struct/union/嵌套/块内 `{}` 归零一致；**坑1**：已有局部后第一个 `{}` 标量不归零（稳定垃圾 71302960）；**坑2**：`static int s={}` → `codegen error: invalid braced initialiser for scalar type int` | 9/9 全归零 | 自动存储期基本可用；**关键位置用 `{0}`**；static 用 `= {0}` |
@@ -165,7 +165,7 @@
 
 1. **字符串字面量直接下标 bug**（B 组）：~~`"hello"[0]` 在 goc 返回垃圾 `1819043176`（gcc 104）~~ ——**已修复（P0.8，2026-10-02）**：现返回 104 与 gcc 一致（新增 c23_str_subscript.c PASS 4/4）；先赋 `const char *p = "hello"; p[0]` 仍正常。标准库可直接下标字符串字面量。
 2. **前导小数点浮点已支持**（D1 组，2026-10-02）：`.12`/`.1'2` 现正常解析（lexer 前导点 float 修复），与 gcc 逐行一致；此前报 `unexpected token "."` 的缺口已消除。
-3. **printf 能力**：goc 无 `%a`（十六进制浮点打印）、无 `%wN`（_BitInt）；`%p` 格式与 gcc 不同且 ASLR 漂移，对拍文件已规避。
+3. **printf 能力**：`%a` 已支持（P0.7, 2026-10-02，与 gcc 逐字节一致）；无 `%wN`（_BitInt）；`%p` 格式与 gcc 不同且 ASLR 漂移，对拍文件已规避。
 4. **LLP64 平台效应**（A1/D2/F 组交叉）：gcc 侧 `long`=32 位（LONG_WIDTH=32）；goc 侧 `long`/`unsigned long`=64 位；`_Generic` 的 long/unsigned 折叠即源于 goc 以宽度为主键比较。若目标是 LP64（Linux），long 相关结论需复测。
 5. ~~**预定义宏全线缺失**~~ ——**已修复**（P1.7，2026-10-02）：`__STDC_VERSION__`=202311、`__STDC__`=1、`__STDC_HOSTED__`=1、`__DATE__`/`__TIME__` 已注入；`__STDC_NO_VLA__` 仍缺（随 P2.3 VLA 决策一并处理）。
 6. ~~**`defined()` 不可见**~~ ——**已修复**（P2.15，2026-10-02）：`defined(__has_include)`/`defined(__has_c_attribute)` 返回 1，portable guard 写法成立。

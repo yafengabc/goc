@@ -5,7 +5,7 @@
 - 被测对象：`D:\projects\goc\bin\goc.exe`（单模式：接受但忽略 `-std`，所有用例同一语义）
 - 验证日期：2026-10-02；重跑：`powershell -ExecutionPolicy Bypass -File tests\cstd\run_cstd_tests.ps1`（当前结果 0 MISMATCH，退出码 0）
 - 判定四类：**PASS** = goc 与 gcc 输出+退出码一致；**FAIL** = gcc 过而 goc 编译/运行错误（真实缺口，报错原文照录）；**UNSUPPORTED** = goc 明确设计取舍/后置；**PARTIAL** = 部分子用例通过
-- 汇总：**PASS=56 PARTIAL=3 FAIL=3 UNSUPPORTED=7 MISMATCH=0**（2026-10-02：批次E c89_pp_elif/c89_pp_obj 转 PASS；批次D c99_compound 转 PASS）
+- 汇总：**PASS=59 PARTIAL=3 FAIL=0 UNSUPPORTED=7 MISMATCH=0**（2026-10-02：批次E c89_pp_elif/c89_pp_obj 转 PASS；批次D c99_compound 转 PASS；批次F c99_stdint/c99_funcname/c99_vacopy 转 PASS）
 
 ---
 
@@ -59,7 +59,7 @@
 
 ---
 
-## C99（21 文件：14 PASS / 0 PARTIAL / 3 FAIL / 4 UNSUPPORTED）
+## C99（21 文件：17 PASS / 0 PARTIAL / 0 FAIL / 4 UNSUPPORTED）
 
 | 文件 | 特性 | 状态 | 子用例 | goc 证据 / gcc 对拍 | 写标准库建议 |
 |---|---|---|---|---|---|
@@ -67,7 +67,7 @@
 | c99_longlong.c | `long long`/LL/ULL/`%lld%llu%llx`/回绕 | PASS | 5 | 一致（`LLONG_MAX+1` 回绕到 `LLONG_MIN`） | 放心用 |
 | c99_bool.c | `_Bool`/stdbool.h | PASS | 4 | 一致；goc 打印 `note: skipping unavailable system header <stdbool.h>` 但 `bool/true/false/_Bool` 是内建，无需 include | 放心用，无需 include |
 | c99_variadic_macro.c | `__VA_ARGS__`/宏转发 | PASS | 4 | 一致（标准变参宏，至少 1 个变参） | 放心用；勿写空尾变参 `##__VA_ARGS__`（GNU 扩展 goc 拒） |
-| c99_stdint.c | stdint.h/inttypes.h | **FAIL** | 3 | `note: skipping unavailable system header <stdint.h>` + `<inttypes.h>`；`parse error: line 13: expected ";", got "i8"`；gcc 完全通过 | **避开**（goc 无 stdint.h/inttypes.h，intN_t/INT64_C/PRId64 全不可用） |
+| c99_stdint.c | stdint.h/inttypes.h | PASS | 3 | 原头缺失+`expected ";", got "i8"` 已修（P1.3, 2026-10-02）：goclib 现提供 LP64 版 stdint.h/inttypes.h（int64_t=long、PRId64="ld"）；intptr_t 对拍用固定常量——裸地址运行时相关（goc 低地址加载、LLP64 gcc 高地址），无法逐字节比 | 放心用（intN_t/INT64_C/UINT64_C/PRId64/PRIu64/PRIdPTR） |
 | c99_restrict.c | restrict 指针 | PASS | 2 | 一致（行为等价） | 放心用 |
 | c99_inline.c | inline 函数（C99 语义） | PASS | 2 | 输出一致；goc 把 inline 一律降级为普通外部函数（gcc 需 `extern` 重声明才链接） | 注意：goc 总是外提符号，别依赖 C99 inline 仅本 TU 内联 |
 | c99_compound.c | 块作用域复合字面量 | PASS | 8 | case1-8 全部与 gcc 一致；**case8 `sizeof((int[]){1,2,3})`=12（P0.5 已修复 2026-10-02，原恒 0）** | 放心用（含 sizeof 复合字面量） |
@@ -75,13 +75,13 @@
 | c99_designated.c | 指定初始化器 `[i]=`/`.field=` | PASS | 4 | 一致（乱序/嵌套/重复指示符后者生效）；位置+指示符混用 goc 报 `cannot mix positional and designated ("[i] =") initialisers` | 放心用纯指示符；勿混用 |
 | c99_vla.c | 变长数组 | UNSUPPORTED | 3 | `parse error: line 11: expected ";", got "n"`；gcc 全过 | 避开 VLA |
 | c99_mixdecl.c | 声明与语句混排/`for(int i=)` | PASS | 4 | 一致 | 放心用 |
-| c99_hexfloat.c | 十六进制浮点常量 `0x1.8p3` | PASS | 2 | 常量解析正确（`%.6f` 与 gcc 一致） | 放心用常量；**勿用 `%a` 打印**（goc 退化成字面 `a a`） |
+| c99_hexfloat.c | 十六进制浮点常量 `0x1.8p3` + `%a` 打印 | PASS | 6 | 常量解析正确；`%a/%A` 已修（P0.7, 2026-10-02）：精确位型、显式精度舍入、`%#a`、inf/极端值逐字节同 gcc（-0.0/NaN 常量因 goc 常量折叠丢符号位而避开） | 放心用常量与 `%a` 打印 |
 | c99_complex.c | `<complex.h>`/`_Complex` | UNSUPPORTED | 1 | `note: skipping unavailable system header <complex.h>`；`parse error: line 12: expected ";", got "z"`；gcc(+lm) 通过 | 避开复数 |
-| c99_funcname.c | `__func__` 预定义标识符 | **FAIL** | 3 | `line 9: undeclared identifier "__func__"`（三处）；gcc 打印函数名 | 避开 `__func__` |
+| c99_funcname.c | `__func__` 预定义标识符 | PASS | 3 | 原三处 undeclared 已修（P1.4, 2026-10-02）：每函数体首注入 `static const char __func__[]`，三函数均打印自身名，与 gcc 一致 | 放心用 `__func__` |
 | c99_pragma.c | `_Pragma()` 运算符 | UNSUPPORTED | 1 | `parse error: line 9: expected type specifier, got "_Pragma"`；gcc 编译期 message 正常 | 避开 `_Pragma` |
 | c99_ucn.c | 通用字符名 `\uXXXX` | PASS | 1 | 字符串内一致：`e-acute é 5`（UTF-8 解码；原吞反斜杠静默错译已修 2026-10-02）；标识符内 UCN 仍未支持（另一独立缺口） | 字符串/字符字面量 UCN 放心用；标识符内 UCN 仍避开 |
 | c99_trailing.c | 枚举/初始化列表尾随逗号 | PASS | 3 | 一致 | 放心用 |
-| c99_vacopy.c | `va_copy`（stdarg.h） | **FAIL** | 1 | `codegen error: unknown function "va_copy": not in goclib (...)`；gcc 两路独立推进=60 60 | 避开 va_copy |
+| c99_vacopy.c | `va_copy`（stdarg.h） | PASS | 1 | 原 codegen unknown function 已修（P1.5, 2026-10-02）：stdarg.h 补 `#define va_copy(d,s) ((d)=(s))`（va_list=char*），两路独立推进=60 60 与 gcc 一致 | 放心用 va_copy |
 | c99_math.c | C99 math 宏/函数 | PASS | 7 | 一致（round/trunc/floor/ceil/fabs/pow/sqrt/hypot/fmod、isnan/isinf/isfinite/signbit/fpclassify、nan()） | 放心用；**HUGE_VAL 未定义**（math.h 无），不要引用 |
 | c99_implicit.c | C99 应拒绝的构造（隐式 int、隐式函数声明） | PASS（拒绝类） | 3 | goc 硬拒：`parse error: line 9: expected type specifier, got "x"`；gcc 16.2 在纯 `-std=c99` 下把这两类升级为**硬错误**，对拍需 `-Wno-error=implicit-int -Wno-error=implicit-function-declaration -fcommon` | goc 行为正确（拒绝），放心 |
 
@@ -124,15 +124,15 @@ goc 是 **LP64**（`sizeof(long)=8`、指针 8、size_t 8），本机 Windows gc
 | ~~八进制字面量~~ **已修复(2026-10-02)** | 原 `010` 按十进制解析得 10；现正确为 8 | c89_lit_octal.c |
 | ~~字符串内 UCN~~ **已修复(2026-10-02)** | 原 `"\u00e9"` 吞反斜杠输出字面 `u00e9`；现正确解码 UTF-8 | c99_ucn.c |
 | ~~`sizeof(复合字面量)`~~ **已修复(2026-10-02, P0.5)** | 原 `sizeof((int[]){1,2,3})` 恒为 0；现正确为 12 | c99_compound.c case8 |
-| `%a` 十六进制浮点打印 | `printf("%a %a",...)` 退化成字面打印 `a a` | c99_hexfloat.c 对拍记录 |
+| ~~`%a` 十六进制浮点打印~~ **已修复(2026-10-02, P0.7)** | 原 `printf("%a %a",...)` 退化成字面打印 `a a`；现精确位型十六进制浮点，与 gcc 逐字节一致 | c99_hexfloat.c 对拍记录 |
 
 ### 硬错误缺口（gcc 过、goc 编译失败，报错原文）
 - ~~`\ooo`/`\xhh` 转义~~ **已修复(2026-10-02)**：原 `preprocess error: ... unterminated character literal`，现正确解码
 - ~~`.5` 前导点浮点~~ **已修复(2026-10-02)**：原 `parse error: unexpected token "."`，现正确解析
 - ~~多 `#elif` 链~~ **已修复(2026-10-02, P0.6)**：`#if/#elif` 条件求值期间宏展开不再受分支活性影响，真分支正确命中
-- stdint.h/inttypes.h 缺失：`note: skipping unavailable system header` + `expected ";", got "i8"`
-- `__func__`：`line 9: undeclared identifier "__func__"`
-- `va_copy`：`codegen error: unknown function "va_copy": not in goclib`
+- ~~stdint.h/inttypes.h 缺失~~ **已修复(2026-10-02, P1.3)**：原 `note: skipping unavailable system header` + `expected ";", got "i8"`，现 goclib 提供两头
+- ~~`__func__`~~ **已修复(2026-10-02, P1.4)**：原 `line 9: undeclared identifier "__func__"`，现函数体内注入预定义标识符
+- ~~`va_copy`~~ **已修复(2026-10-02, P1.5)**：原 `codegen error: unknown function "va_copy": not in goclib`，现 stdarg.h 宏展开
 - K&R 旧式定义：`parse error: line 1: expected type specifier, got "a"`
 - 顶层变量 extern 重声明：`type error(s): line 2: redefinition of "x" in the same scope`（extern 只对函数声明工作）
 - 标准 `offsetof(type,member)`：`unexpected token "struct"`（用 `(char*)&p.b-(char*)&p` 替代）
@@ -152,7 +152,7 @@ goc 是 **LP64**（`sizeof(long)=8`、指针 8、size_t 8），本机 Windows gc
 - `#include 宏路径`：`malformed #include`；孤立 `#`：`unknown preprocessing directive`；`#line` 行号差 1
 
 ### 与 gcc 行为一致的高价值点（可放心依赖）
-atexit LIFO、qsort/bsearch、memmove 自重叠、strncpy 补零、`%e/%g` 浮点格式、char 有符号（0xFF→-1）、算术右移、枚举尾随逗号（双方都当扩展接受）、零宽位域必须无名（`int:0;`）、复合赋值全家、函数宏 `#`/`##` 与空实参、嵌套 `#if/#else`、`__FILE__/__LINE__`、stdio/string/ctype 全函数、C99 math 宏函数、`_Generic`/`_Static_assert`/`_Alignas`/匿名成员/thread_local 行为。
+atexit LIFO、qsort/bsearch、memmove 自重叠、strncpy 补零、`%e/%g/%a` 浮点格式、char 有符号（0xFF→-1）、算术右移、枚举尾随逗号（双方都当扩展接受）、零宽位域必须无名（`int:0;`）、复合赋值全家、函数宏 `#`/`##` 与空实参、嵌套 `#if/#else`、`__FILE__/__LINE__`、stdio/string/ctype 全函数、C99 math 宏函数、`_Generic`/`_Static_assert`/`_Alignas`/匿名成员/thread_local 行为。
 
 ### 记录类
 - 多字符常量 `'AB'`：goc `preprocess error: unterminated character literal`（gcc 得 0x4142=16706）
@@ -185,12 +185,12 @@ atexit LIFO、qsort/bsearch、memmove 自重叠、strncpy 补零、`%e/%g` 浮�
 |---|---|---|
 | ✅ 可用（无 note） | assert ctype errno float limits math stdarg stddef stdio stdlib string tgmath time **stdckdint** | 头内标识符/函数可正常使用 |
 | ⚠️ 被跳过但关键字内建 | stdbool（bool/true/false/_Bool 内建）、stdalign（alignas/alignof 内建）、stdnoreturn（noreturn 内建） | include 打 `note: skipping unavailable system header` 但不影响使用 |
-| ❌ 缺失（note 后所有标识符未定义） | complex fenv inttypes iso646 locale setjmp signal **stdatomic stdint threads uchar** wchar wctype | include 不报错但头内一切未定义，等同没有 |
-| 📌 特例 | stddef.h **不提供 max_align_t**（`_Alignof(max_align_t): type not known at parse time`）；stdlib.h 无 `RAND_MAX`；math.h 无 `HUGE_VAL`；stdint.h/inttypes.h 缺失（intN_t/INT64_C/PRId64 全不可用） | 写库时自造或避开 |
+| ❌ 缺失（note 后所有标识符未定义） | complex fenv iso646 locale setjmp signal **stdatomic threads uchar** wchar wctype | include 不报错但头内一切未定义，等同没有（stdint/inttypes 已于批次F提供） |
+| 📌 特例 | stddef.h **不提供 max_align_t**（`_Alignof(max_align_t): type not known at parse time`）；stdlib.h 无 `RAND_MAX`；math.h 无 `HUGE_VAL` | 写库时自造或避开 |
 
 ### 类型模型快照
 int=4、long=8（LP64）、long long=8、指针=8、float=4、double=8、long double=8（降级 double，标 `__goc_long_double_is_double`）、wchar_t=8、size_t=8；char 有符号；sizeof(enum)=4（int 宽）；plain int 位域有符号。
 
 ### 给标准库作者的最终建议（放心用 / 避开速查）
 - **放心用**：对象/函数宏（含 `#` `##`）、嵌套 `#if/#else`、`//` 注释、long long、`_Bool`、restrict、声明混排、十六进制浮点常量、尾随逗号、stdint 之外的全套 stdio/string/ctype/stdlib/math（含 C99 math 宏）、`_Generic`、`_Static_assert`、alignas/alignof、thread_local（静态/文件作用域）、`_Noreturn`、匿名 struct/union、stdckdint.h、`__FILE__/__LINE__`
-- **避开**：`__func__`、`%a` 打印、VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、va_copy、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）、stdint.h/inttypes.h（多 `#elif` 链、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`sizeof(复合字面量)`（P0.5）、字符串字面量直接下标（P0.8）均已于 2026-10-02 修复，移出避开清单）
+- **避开**：VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）（多 `#elif` 链、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`sizeof(复合字面量)`（P0.5）、字符串字面量直接下标（P0.8）、`__func__`（P1.4）、`%a` 打印（P0.7）、va_copy（P1.5）、stdint.h/inttypes.h（P1.3）均已于 2026-10-02 修复，移出避开清单）

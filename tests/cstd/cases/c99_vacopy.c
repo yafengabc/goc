@@ -1,9 +1,10 @@
 /* ============================================================
    c99_vacopy.c - va_copy for independent va_list (C99 7.15)
    Standard   : ISO/IEC 9899:1999 (C99) 7.15.2
-   Strategy   : gcc side: va_copy then two independent passes.
-                goc side: va_copy not in goclib (codegen error, real gap).
-   Status     : FAIL (verified 2026-10-02, goc vs gcc -std=c99)
+   Strategy   : va_copy then two independent passes. On goc va_list is a
+                char* cursor, so goclib stdarg.h defines va_copy as a plain
+                pointer assignment (C99 7.15.2.2).
+   Status     : PASS (fixed 2026-10-02, goc vs gcc -std=c99)
    ============================================================ */
 #include <stdio.h>
 #include <stdarg.h>

@@ -9,6 +9,11 @@
  * __builtin_va_list. goc wires up va_list itself, so no typedef is emitted
  * here; this header exists so that "#include <stdarg.h>" resolves and
  * documents the contract.
+ *
+ * va_copy (C99 7.15.2.2) copies a cursor. On goc va_list is a plain char*
+ * cursor, so the copy is a simple pointer assignment -- no builtin needed.
  */
+
+#define va_copy(dest, src) ((dest) = (src))
 
 #endif /* GOC_STDARG_H */

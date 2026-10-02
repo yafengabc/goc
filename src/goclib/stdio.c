@@ -8,6 +8,8 @@
  * stopping after `limit` characters (limit < 0 means "no limit", used by
  * sprintf). Returns the number of characters written.
  */
+int __goclib_double_to_hex(char *buf, double x, int prec, int hasPrec, int upper, int alt);
+
 static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
     long n = 0;
     const char *p = fmt;
@@ -25,12 +27,13 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             p++;
             continue;
         }
-        /* flags: '-' left-justify, '0' zero-pad (numbers only); the others
-         * are parsed and ignored for compatibility. */
-        int left = 0, zero = 0;
+        /* flags: '-' left-justify, '0' zero-pad (numbers only), '#' forces
+         * the decimal point for %a/%A (and is otherwise ignored). */
+        int left = 0, zero = 0, alt = 0;
         while (*p == '-' || *p == '0' || *p == '+' || *p == ' ' || *p == '#') {
             if (*p == '-') left = 1;
             else if (*p == '0') zero = 1;
+            else if (*p == '#') alt = 1;
             p++;
         }
         /* field width: a run of digits, or '*' to read it from the args. */
@@ -38,9 +41,13 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
         if (*p == '*') { width = va_arg(ap, int); p++; }
         else { while (*p >= '0' && *p <= '9') { width = width * 10 + (*p - '0'); p++; } }
         /* optional precision: ".NN" digits, or a bare "." for zero.
-         * Only %f consumes it (fractional digit count); default 6. */
+         * Only %f consumes it (fractional digit count); default 6. %a uses
+         * the distinction between "no precision" (exact value) and "explicit
+         * .N" (rounded fraction), so hasPrec records whether '.' was seen. */
         int prec = 6;
+        int hasPrec = 0;
         if (*p == '.') {
+            hasPrec = 1;
             p++;
             prec = 0;
             while (*p >= '0' && *p <= '9') { prec = prec * 10 + (*p - '0'); p++; }
@@ -91,6 +98,12 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             else tmp[t++] = (char)((spec == 'X' ? 'A' : 'a') + (d - 10));
         }
         while (t-- > 0) field[fl++] = tmp[t];
+    } else if (spec == 'a' || spec == 'A') {
+            /* %a/%A: hexadecimal floating point, "0x1.9p+3" (C99 7.19.6.1).
+             * Default precision = exact value (trailing zeros stripped);
+             * explicit .N rounds the fraction to N hex digits. */
+            double x = va_arg(ap, double);
+            fl = __goclib_double_to_hex(field, x, prec, hasPrec, spec == 'A', alt);
     } else if (spec == 'f' || spec == 'F' || spec == 'e' || spec == 'E' ||
                    spec == 'g' || spec == 'G') {
             /* %f: <prec> fractional digits, rounded half to even, no
@@ -137,7 +150,8 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             int numeric = (spec == 'd' || spec == 'i' || spec == 'u' ||
                            spec == 'o' || spec == 'x' || spec == 'X' ||
                            spec == 'f' || spec == 'F' || spec == 'e' ||
-                           spec == 'E' || spec == 'g' || spec == 'G');
+                           spec == 'E' || spec == 'g' || spec == 'G' ||
+                           spec == 'a' || spec == 'A');
             int clen = (spec == 's') ? (int)strlen(s) : fl;
             if (clen >= width || width <= 0) {
                 if (spec == 's') { while (*s) { if (limit<0||n<limit) out[n]=*s; n++; s++; } }
@@ -407,6 +421,93 @@ int __goclib_double_g(char *buf, double x) {
     int e10 = fmt_g_exp(x);
     if (e10 < -4 || e10 >= 6) return __goclib_double_to_exp(buf, x, 5, 0, 1);
     return __goclib_double_strip_g(buf, __goclib_double_to_buf(buf, x, 5 - e10));
+}
+
+/* __goclib_double_to_hex -- C99 %a/%A conversion ("0x1.9p+3").
+ *
+ * Reads the IEEE-754 bit pattern directly, so the digits are exact and match
+ * gcc (ucrt) byte for byte: a missing precision prints all 13 hex fraction
+ * digits (trailing zeros included); an explicit .N rounds the fraction to N
+ * hex digits (round half to even, carry propagates into the leading digit,
+ * and N beyond 13 pads with zeros). Zero prints "0x0.0000000000000p+0";
+ * subnormals print as "0x0.HHH...p-1022"; inf as "inf"/"INF"; NaN as
+ * "nan(ind)"/"NAN(IND)" with its sign. Returns the length written to buf. */
+int __goclib_double_to_hex(char *buf, double x, int prec, int hasPrec, int upper, int alt) {
+    union { double d; unsigned long long u; } cv;
+    cv.d = x;
+    unsigned long long bits = cv.u;
+    int neg = (int)((bits >> 63) & 1);
+    int ebits = (int)((bits >> 52) & 0x7ff);
+    unsigned long long frac = bits & 0xfffffffffffffULL;
+    int n = 0;
+    int k;
+    if (ebits == 0x7ff) {
+        if (frac != 0) { /* NaN: the ucrt spelling is "nan(ind)" */
+            if (neg) buf[n++] = '-';
+            if (upper) { buf[n++]='N'; buf[n++]='A'; buf[n++]='N'; buf[n++]='(';
+                         buf[n++]='I'; buf[n++]='N'; buf[n++]='D'; buf[n++]=')'; }
+            else       { buf[n++]='n'; buf[n++]='a'; buf[n++]='n'; buf[n++]='(';
+                         buf[n++]='i'; buf[n++]='n'; buf[n++]='d'; buf[n++]=')'; }
+            return n;
+        }
+        if (neg) buf[n++] = '-';
+        if (upper) { buf[n++]='I'; buf[n++]='N'; buf[n++]='F'; }
+        else       { buf[n++]='i'; buf[n++]='n'; buf[n++]='f'; }
+        return n;
+    }
+    if (neg) buf[n++] = '-';
+    int e2, H;
+    if (frac == 0 && ebits == 0) { e2 = 0; H = 0; }   /* +-0.0: "p+0" */
+    else if (ebits == 0) { e2 = -1022; H = 0; }       /* subnormal */
+    else { e2 = ebits - 1023; H = 1; }                /* normal */
+    /* 13 hex digits of the fraction (bits 51..0), most significant first */
+    char d[13];
+    for (k = 0; k < 13; k++) d[k] = (char)((frac >> (48 - 4*k)) & 0xf);
+    int nd = hasPrec ? prec : 13;
+    if (hasPrec && prec < 13) {
+        /* round at digit prec: half to even */
+        int drop = d[prec];
+        int up = 0;
+        if (drop > 8) up = 1;
+        else if (drop == 8) {
+            int any = 0;
+            for (k = prec + 1; k < 13; k++) if (d[k] != 0) { any = 1; break; }
+            if (any) up = 1;
+            else if (prec > 0 && (d[prec-1] & 1) != 0) up = 1;
+            else if (prec == 0 && (H & 1) != 0) up = 1; /* tie -> even */
+        }
+        if (up) {
+            for (k = prec - 1; k >= 0; k--) {
+                d[k]++;
+                if (d[k] < 16) break;
+                d[k] = 0;
+            }
+            if (k < 0) H++;      /* carry out of the fraction */
+        }
+    }
+    buf[n++] = '0';
+    buf[n++] = upper ? 'X' : 'x';
+    buf[n++] = (char)('0' + H);
+    if (nd > 0) {
+        buf[n++] = '.';
+        for (k = 0; k < nd && k < 13; k++) buf[n++] = (char)(d[k] < 10 ? '0' + d[k] : (upper ? 'A' : 'a') + d[k] - 10);
+        for (; k < nd; k++) buf[n++] = '0';   /* precision beyond 13 digits */
+    } else if (alt) {
+        buf[n++] = '.';   /* %#a forces the point even when the fraction is empty */
+    }
+    buf[n++] = upper ? 'P' : 'p';
+    /* signed decimal exponent */
+    char et[16];
+    int etn = 0;
+    int ev = e2;
+    if (ev < 0) { et[etn++] = '-'; ev = -ev; }
+    else et[etn++] = '+';
+    char ed[12]; int edn = 0;
+    if (ev == 0) ed[edn++] = '0';
+    while (ev > 0) { ed[edn++] = (char)('0' + (ev % 10)); ev /= 10; }
+    while (edn > 0) et[etn++] = ed[--edn];
+    for (k = 0; k < etn; k++) buf[n++] = et[k];
+    return n;
 }
 
 int sprintf(char *buf, const char *fmt, ...) {

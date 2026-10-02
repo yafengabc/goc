@@ -968,3 +968,59 @@ func TestStringLiteralSubscript(t *testing.T) {
 		t.Errorf(`"hello"[1] did not stride by 1: %q`, asm)
 	}
 }
+
+
+// TestStdintTypes proves <stdint.h>/<inttypes.h> now resolve and the
+// INT*_C / PRI* macros expand (P1.3). Before the fix the headers were
+// skipped and int64_t etc. were undeclared, so this failed at preprocess
+// or parse time with "expected ; got i8".
+func TestStdintTypes(t *testing.T) {
+	asm := genAsm(t, `#include <stdint.h>
+#include <inttypes.h>
+int main(){
+  int64_t x = INT64_C(1234567890123);
+  uint64_t u = UINT64_C(7);
+  intptr_t ip = (intptr_t)&x;
+  printf("%" PRId64 " %" PRIu64 " %" PRIdPTR "\n", x, u, ip);
+  return (int)(x + u);
+}`)
+	if !strings.Contains(asm, "1234567890123") {
+		t.Errorf("stdint INT64_C literal missing from generated code: %q", asm)
+	}
+}
+
+// TestVaCopy proves va_copy expands away at preprocess time (P1.5): goc's
+// va_list is a char* cursor, so goclib stdarg.h defines it as a plain
+// pointer assignment. Before the fix the call reached codegen as an
+// "unknown function va_copy" error, which failed this test.
+func TestVaCopy(t *testing.T) {
+	asm := genAsm(t, `#include <stdarg.h>
+void f(int n, ...){
+  va_list a, b;
+  va_start(a, n);
+  va_copy(b, a);
+  va_arg(a, int);
+  va_arg(b, int);
+  va_end(a);
+  va_end(b);
+}
+int main(){ return 0; }`)
+	if strings.Contains(asm, "va_copy") {
+		t.Errorf("va_copy should expand away at preprocess time: %q", asm)
+	}
+}
+
+// TestFuncNameIdentifier proves __func__ is injected into every function
+// body as a static const char[] holding the function name (P1.4, C99
+// 6.4.2.2). Before the fix it was an undeclared identifier, which failed
+// the type check.
+func TestFuncNameIdentifier(t *testing.T) {
+	asm := genAsm(t, `void fa(void){ printf("%s", __func__); }
+int main(){ return __func__[0]; }`)
+	if !strings.Contains(asm, "db \"fa\", 0") {
+		t.Errorf(`__func__ image missing the function name bytes: %q`, asm)
+	}
+	if !strings.Contains(asm, "db \"main\", 0") {
+		t.Errorf(`__func__ image missing the main name bytes: %q`, asm)
+	}
+}

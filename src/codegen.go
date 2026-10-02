@@ -2769,10 +2769,11 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 			// generated for _Thread_local reads it to locate the thread's TLS
 			// block via gs:0x58. Zero is the right starting value (and is also
 			// what the loader overwrites). It lives in a real .data slot (not
-			// .bss) so the loader's write has a backing virtual address.
-			if !needData {
-				out.WriteString("\nsection .data\n")
-			}
+			// .bss) so the loader's write has a backing virtual address. The
+			// section is reopened unconditionally: if the .bss block above ran
+			// (needBss), the current section would otherwise be .bss and the
+			// slot would land there, invisible to the loader's TLS write.
+			out.WriteString("\nsection .data\n")
 			out.WriteString("G_goc_tls_index dq 0\n")
 		}
 	}

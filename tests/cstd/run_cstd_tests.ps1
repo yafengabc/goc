@@ -80,7 +80,7 @@ $expected = @{
     'c99_longlong.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_bool.c'        = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_variadic_macro.c' = @{ status = 'PASS';     gocFails = $false; extra = '' }
-    'c99_stdint.c'      = @{ status = 'FAIL';        gocFails = $true;  extra = '' }
+    'c99_stdint.c'      = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_restrict.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_inline.c'      = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_compound.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
@@ -90,11 +90,11 @@ $expected = @{
     'c99_mixdecl.c'     = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_hexfloat.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_complex.c'     = @{ status = 'UNSUPPORTED'; gocFails = $true;  extra = '' }
-    'c99_funcname.c'    = @{ status = 'FAIL';        gocFails = $true;  extra = '' }
+    'c99_funcname.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_pragma.c'      = @{ status = 'UNSUPPORTED'; gocFails = $true;  extra = '' }
     'c99_ucn.c'         = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_trailing.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
-    'c99_vacopy.c'      = @{ status = 'FAIL';        gocFails = $true;  extra = '' }
+    'c99_vacopy.c'      = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_math.c'        = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_implicit.c'    = @{ status = 'PASS';        gocFails = $true;  extra = '-Wno-error=implicit-int -Wno-error=implicit-function-declaration -fcommon' }
     # ---------- C11 ----------

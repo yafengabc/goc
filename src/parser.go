@@ -267,6 +267,24 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 		if err != nil {
 			return nil, err
 		}
+		// C99 6.4.2.2: __func__ is implicitly declared at the start of every
+		// function as "static const char __func__[] = \"function-name\";".
+		// Inject that declaration as the body's first statement so the checker
+		// and codegen treat it exactly like user-written code (the static-local
+		// machinery is per-function, so the name never collides).
+		{
+			fnElem := *CharType()
+			fnElem.Const = true
+			body.Stmts = append([]Stmt{
+				&DeclStmt{
+					Name:    "__func__",
+					Typ:     &Type{Kind: KArr, Elem: &fnElem, Len: 0},
+					Init:    &StrLit{Bytes: []byte(d.name)},
+					Storage: "static",
+					Line:    d.line,
+				},
+			}, body.Stmts...)
+		}
 		return &FuncDecl{
 			Name:       d.name,
 			Ret:        d.typ.Ret,
