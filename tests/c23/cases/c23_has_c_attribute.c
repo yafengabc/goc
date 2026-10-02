@@ -5,10 +5,9 @@
  *             standard attributes (deprecated, nodiscard, noreturn, maybe_unused,
  *             fallthrough, likely, unlikely). Each guarded result is expanded into an
  *             integer macro. The `passed` counter is graded against the CONFORMING
- *             (gcc) guarded values; goc is expected to report the guard inactive (it
- *             does not expose __has_c_attribute to defined()), so the guarded probes
- *             fall to 0, producing a DIFF. See status doc for the unguarded nuance.
- * Status:     PENDING
+ *             (gcc) guarded values.
+ * Status:     PASS (verified 2026-10-02; P2.15 fixed - defined(__has_c_attribute)
+ *             now yields 1, so the portable guard activates like gcc)
  * EXPECT: PASS
  */
 #include <stdio.h>

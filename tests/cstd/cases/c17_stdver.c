@@ -2,9 +2,10 @@
    c17_stdver.c - record __STDC_VERSION__ and friends (C17)
    Standard   : ISO/IEC 9899:2017 (C17) 6.10.8.1
    Strategy   : record-only file. gcc -std=c17 sets __STDC_VERSION__=201710L;
-               goc leaves all of __STDC_VERSION__/__STDC__/__STDC_HOSTED__
-               undefined, so stdout intentionally differs (record, not match).
-   Status     : RECORD (OUTPUT_DIFF by design) (verified 2026-10-02, goc vs gcc -std=c17)
+               goc (single-mode C23, P1.7) sets __STDC_VERSION__=202311L and
+               __STDC__/__STDC_HOSTED__=1, so case1 differs by design
+               (record, not match); cases 2-5 now agree.
+   Status     : PARTIAL (OUTPUT_DIFF by design: version value) (verified 2026-10-02, goc vs gcc -std=c17)
    ============================================================ */
 #include <stdio.h>
 

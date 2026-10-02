@@ -222,3 +222,103 @@ func TestLineDirectiveDoesNotLeakIntoIncludes(t *testing.T) {
 		t.Fatalf("#line leaked out of the include: %q", got)
 	}
 }
+// TestElifChainWithMacro regression (P0.6): a #elif whose condition contains
+// macro expansion must still expand macros even though the preceding #if was
+// false -- the enclosing frame is inactive while the #elif condition is
+// evaluated. Before the fix, X stayed unexpanded, the condition evaluated to
+// 0, and the chain fell through to #else.
+func TestElifChainWithMacro(t *testing.T) {
+	got := pptext(t, "#define X 5\n#if X == 1\nint a;\n#elif X == 5\nint b;\n#elif X == 9\nint c;\n#else\nint d;\n#endif\n")
+	want := "int b ;"
+	if got != want {
+		t.Fatalf("elif chain with macro cond:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestElifPlainConstant: bare constant in a #elif (control case, no macro).
+func TestElifPlainConstant(t *testing.T) {
+	got := pptext(t, "#if 0\nint a;\n#elif 1\nint b;\n#else\nint c;\n#endif\n")
+	want := "int b ;"
+	if got != want {
+		t.Fatalf("elif plain constant:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestElifDefined: #elif defined(NAME) after a false #if picks the branch.
+func TestElifDefined(t *testing.T) {
+	got := pptext(t, "#define X 5\n#if defined(UNDEF)\nint a;\n#elif defined(X)\nint b;\n#else\nint c;\n#endif\n")
+	want := "int b ;"
+	if got != want {
+		t.Fatalf("elif defined:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestElifAfterTaken: once an earlier branch fired, a later #elif with a true
+// condition must not emit a second body.
+func TestElifAfterTaken(t *testing.T) {
+	got := pptext(t, "#define X 5\n#if X == 5\nint b;\n#elif X == 5\nint dup;\n#else\nint c;\n#endif\n")
+	want := "int b ;"
+	if got != want {
+		t.Fatalf("elif after taken:\n got %q\nwant %q", got, want)
+	}
+}
+// TestStandardPredefinedMacros (P1.7): __STDC__/__STDC_HOSTED__/__STDC_VERSION__
+// are predefined object-like macros; __STDC_VERSION__ must be 202311 (C23).
+func TestStandardPredefinedMacros(t *testing.T) {
+	got := pptext(t, "__STDC__ __STDC_HOSTED__ __STDC_VERSION__\n")
+	if got != "1 1 202311" {
+		t.Fatalf("standard predefined macros:\n got %q\nwant %q", got, "1 1 202311")
+	}
+}
+
+// TestDateTimeMacros (P1.7): __DATE__ expands to a C-standard "Mmm dd yyyy"
+// string and __TIME__ to "hh:mm:ss"; both must survive #if defined() tests.
+func TestDateTimeMacros(t *testing.T) {
+	got := pptext(t, "__DATE__ __TIME__\n")
+	// Both expand to quoted string tokens, e.g. "Oct  2 2026" "18:04:17".
+	// __DATE__ itself contains spaces, so parse by quote boundaries, not by
+	// whitespace splitting.
+	if len(got) < 24 || got[0] != '"' {
+		t.Fatalf("date/time macros: got %q", got)
+	}
+	endDate := strings.IndexByte(got[1:], '"') // closing quote of __DATE__
+	if endDate < 0 {
+		t.Fatalf("date/time macros: missing closing quote: %q", got)
+	}
+	date := got[1 : 1+endDate]
+	tm := got[endDate+3:]
+	if len(date) != 11 || date[3] != ' ' || date[6] != ' ' {
+		t.Fatalf("__DATE__ not in \"Mmm dd yyyy\" form: %q", date)
+	}
+	if len(tm) != 10 || tm[0] != '"' || tm[3] != ':' || tm[6] != ':' {
+		t.Fatalf("__TIME__ not in \"hh:mm:ss\" form: %q", tm)
+	}
+	// defined() must see them as defined macros.
+	got2 := pptext(t, "#if defined(__DATE__) && defined(__TIME__)\nint ok;\n#else\nint bad;\n#endif\n")
+	if got2 != "int ok ;" {
+		t.Fatalf("defined(__DATE__/__TIME__): got %q", got2)
+	}
+}
+// TestDefinedHasOperators (P2.15): defined(__has_c_attribute) and
+// defined(__has_include) must evaluate to 1 (C23 6.10.10), so the portable
+// guard "#if defined(__has_c_attribute) && __has_c_attribute(x)" activates.
+func TestDefinedHasOperators(t *testing.T) {
+	got := pptext(t, "#if defined(__has_c_attribute)\nint a;\n#else\nint b;\n#endif\n#if defined(__has_include)\nint c;\n#else\nint d;\n#endif\n")
+	want := "int a ; int c ;"
+	if got != want {
+		t.Fatalf("defined(__has_*):\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestHasCAttributeGuard: the full C23 guard must select the branch when the
+// attribute is supported and reject it when not.
+func TestHasCAttributeGuard(t *testing.T) {
+	got := pptext(t, "#if defined(__has_c_attribute) && __has_c_attribute(deprecated)\nint a;\n#else\nint b;\n#endif\n#if defined(__has_c_attribute) && __has_c_attribute(likely)\nint c;\n#else\nint d;\n#endif\n")
+	want := "int a ; int d ;"
+	if got != want {
+		t.Fatalf("__has_c_attribute guard:\n got %q\nwant %q", got, want)
+	}
+}
+
+
+

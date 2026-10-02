@@ -32,6 +32,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Macro is a single #define'd entity.
@@ -69,6 +70,12 @@ type Preprocessor struct {
 	// handlers check this flag and abort with a real diagnostic instead of
 	// silently treating the expression as 0.
 	ceErr bool
+	// condEval is set only while a #if/#elif condition expression is being
+	// expanded and evaluated. During that window macro expansion must ignore
+	// the enclosing branch-activity state: a "#elif X" following a false
+	// "#if" still expands X normally (C 6.10.1), otherwise the condition is
+	// evaluated against unexpanded identifiers and always comes out false.
+	condEval bool
 }
 // Preprocess runs the full preprocessing pipeline on src (already read from
 // filename) and returns the expanded token stream. The target platform
@@ -98,6 +105,17 @@ func PreprocessTarget(src, filename string, linux bool, incDirs ...string) ([]To
 		p.macros["_WIN32"] = &Macro{Name: "_WIN32", Body: []Token{tokNum(1, 0)}}
 		p.macros["_WIN64"] = &Macro{Name: "_WIN64", Body: []Token{tokNum(1, 0)}}
 	}
+	// Standard predefined macros (C99 6.10.8 / C23 6.11). goc is a single-mode
+	// compiler that accepts C89 through C23 source; __STDC_VERSION__ reports the
+	// highest standard whose core features are implemented (C23) and also drives
+	// visibility of C23-only declarations in goclib headers. __DATE__/__TIME__
+	// are snapshotted once per compilation, mirroring real compilers.
+	now := time.Now()
+	p.macros["__STDC__"] = &Macro{Name: "__STDC__", Body: []Token{tokNum(1, 0)}}
+	p.macros["__STDC_HOSTED__"] = &Macro{Name: "__STDC_HOSTED__", Body: []Token{tokNum(1, 0)}}
+	p.macros["__STDC_VERSION__"] = &Macro{Name: "__STDC_VERSION__", Body: []Token{tokNum(202311, 0)}}
+	p.macros["__DATE__"] = &Macro{Name: "__DATE__", Body: []Token{tokStr(now.Format("Jan _2 2006"), 0)}}
+	p.macros["__TIME__"] = &Macro{Name: "__TIME__", Body: []Token{tokStr(now.Format("15:04:05"), 0)}}
 	// Vendor extension keywords that real-world headers use but that carry no
 	// meaning for goc's code generator. They are predefined as macros that
 	// expand to nothing, so a declaration such as
@@ -363,8 +381,10 @@ func (p *Preprocessor) execDirective(name string, rest []Token, line int, filena
 			delete(p.macros, rest[0].Text)
 		}
 	case "if":
+		p.condEval = true
 		expanded := p.expandTokens(rest, filename, line)
 		cond := p.constExpr(expanded)
+		p.condEval = false
 		if p.ceErr {
 			return nil, fmt.Errorf("%s:%d: division by zero in #if expression", p.logicalFileName(filename), p.logicalLine(line))
 		}
@@ -374,8 +394,10 @@ func (p *Preprocessor) execDirective(name string, rest []Token, line int, filena
 	case "ifndef":
 		p.pushCond(!p.macroDefined(rest))
 	case "elif":
+		p.condEval = true
 		expanded := p.expandTokens(rest, filename, line)
 		cond := p.constExpr(expanded)
+		p.condEval = false
 		if p.ceErr {
 			return nil, fmt.Errorf("%s:%d: division by zero in #elif expression", p.logicalFileName(filename), p.logicalLine(line))
 		}
@@ -904,7 +926,7 @@ func (p *Preprocessor) expandAt(raw []Token, i int, filename string, line int) (
 			}
 			return out, i
 		}
-		if m, ok := p.macros[t.Text]; ok && !p.inExpand[t.Text] && p.active() {
+		if m, ok := p.macros[t.Text]; ok && !p.inExpand[t.Text] && (p.condEval || p.active()) {
 			if !m.IsFunc {
 				p.inExpand[t.Text] = true
 				e := p.expandTokens(m.Body, filename, line)
@@ -1389,6 +1411,15 @@ func (p *Preprocessor) cePrimary(toks []Token, i int) (int64, int) {
 			i++
 		}
 		if _, ok := p.macros[name]; ok {
+			return 1, i
+		}
+		// __has_* operators are lexer keywords handled directly in cePrimary,
+		// not macros. The standard requires defined(__has_c_attribute) and
+		// defined(__has_include) to yield 1 (C23 6.10.10; gcc/clang agree),
+		// otherwise the portable guard "#if defined(__has_c_attribute) && ..."
+		// always falls through to the #else branch.
+		switch name {
+		case "__has_c_attribute", "__has_include":
 			return 1, i
 		}
 		return 0, i

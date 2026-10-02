@@ -4,9 +4,9 @@
    Strategy   : case1 #if 0 / #elif 1 / #else; case2 multi #elif with first true
                 (#if X==1 / #elif X==5 / #elif X==9 / #else); case3 #elif defined(X);
                 case4 #if 1 with no #elif (sanity that plain if/else still works).
-                gcc selects the true #elif branch; goc falls through to #else even
-                when the #elif condition is true (chain broken).
-   Status     : FAIL (verified 2026-10-02, goc vs gcc -std=c89)
+   Status     : PASS (verified 2026-10-02, goc vs gcc -std=c89; P0.6 fixed - a
+                #if/#elif condition now expands macros even while the enclosing
+                branch is inactive)
    ============================================================ */
 #include <stdio.h>
 

@@ -2,7 +2,8 @@
  * Clause:     C23 6.11 "Predefined macro names"; __STDC_VERSION__ shall be 202311L
  * Strategy:   print the macro values; verify __STDC_VERSION__ == 202311L and the
  *             presence/values of __STDC__ and __STDC_HOSTED__.
- * Status:     PASS (expected; cross-checked with gcc -std=c2x)
+ * Status:     PASS (verified 2026-10-02; P1.7 fixed - __STDC_VERSION__=202311,
+ *             __STDC__=1, __STDC_HOSTED__=1, cross-checked with gcc -std=c2x)
  * EXPECT: PASS
  */
 #include <stdio.h>

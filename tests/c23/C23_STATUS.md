@@ -38,7 +38,7 @@
 | 值错误 | **`[[gnu::aligned(N)]]`** | 解析但不生效（_Alignof 仍自然对齐 4）；未知/vendor 属性静默忽略 |
 | 语义偏差 | **`[[fallthrough]]` switch 外** | goc 静默接受（gcc 硬错误） |
 | 语义偏差 | **非法数字分隔符** | goc 静默删 `'` 照常解析（`1''000`/`0x'FFFF'` 等 6 种全不报错）；十六进制浮点指数内分隔符报 "unterminated character literal"（`0x1p10'0`，归 P2.13）；前导小数点 `.12`/`.1'2` 已支持（2026-10-02 lexer 前导点修复） |
-| 语义偏差 | **`__has_c_attribute` guard** | `defined(__has_c_attribute)` 恒为假，标准 portable guard 恒走 else（直接调用返回正确值） |
+| 语义偏差（已修） | **`__has_c_attribute` guard** | **已修复（P2.15，2026-10-02）**：`defined(__has_c_attribute)`/`defined(__has_include)` 现返回 1，标准 portable guard 正常激活（与 gcc 一致） |
 | 语义偏差 | **nullptr_t 类型模型** | goc `typedef void* nullptr_t`、`typeof(nullptr)` 为 4 字节 int（gcc 为独立 8 字节类型）；gcc 侧 mingw 的 <stddef.h> 也不暴露 nullptr_t 类型名 |
 | 缺失头/宏 | **<stdbit.h>**、**<uchar.h>**（char16/32、mbrtoc16 系）、**<stdatomic.h>**、**<threads.h>**、**<stdnoreturn.h>**、**<stdbool.h>** | goc 全部缺失（"note: skipping unavailable system header"），mingw 侧 <stdbit.h> 也无 |
 | 缺失宏 | **limits.h/float.h 全部 C23 宏** | CHAR_WIDTH…ULLONG_WIDTH、BOOL_WIDTH、BITINT_MAXWIDTH、FLT_NORM_MAX、FLT_IS_IEC_60559 等 goc 一个都没有；LLONG_MAX 也没有 |
@@ -52,8 +52,8 @@
 3. ~~块作用域非 static `thread_local` 触发编译器 panic~~ ——**已修复**（2026-10-02：src\check.go 语义层拒绝块作用域 + 非 static/extern 的 `_Thread_local` 组合，codegen panic 路径不可达；负向用例 c23_thread_local_bad.c 双方拒绝）
 4. 空 `{}` 初始化：首个标量不归零（codegen bug）、static 存储期被拒——P1
 5. `_Generic` 在 LLP64 把 long/unsigned 折叠为 int（genericTypeMatch 宽度相等时丢符号/类型）——P2
-6. 不定义 `__STDC_VERSION__`/`__STDC__`/`__STDC_NO_VLA__` 等任何预定义宏——P1（C23 条件编译完全失效）
-7. `__has_c_attribute`/`__has_include` 对 `defined()` 不可见（guard 写法失效）——P2
+6. ~~不定义 `__STDC_VERSION__`/`__STDC__`/`__STDC_NO_VLA__` 等任何预定义宏~~ ——**已修复**（P1.7，2026-10-02：注入 `__STDC__`=1、`__STDC_HOSTED__`=1、`__STDC_VERSION__`=202311、`__DATE__`=`"Mmm dd yyyy"`、`__TIME__`=`"hh:mm:ss"`；`__STDC_NO_VLA__` 仍缺，随 P2.3 VLA 决策一并处理）
+7. ~~`__has_c_attribute`/`__has_include` 对 `defined()` 不可见~~ ——**已修复**（P2.15，2026-10-02：cePrimary defined 分支对 `__has_*` 特判返回 1）
 8. alignas 不作用于结构体成员/数组——P2
 9. 字符串字面量直接下标返回垃圾值——P2
 10. long double 降级已生效，但 `__goc_long_double_is_double` 标记宏未定义（与 roadmap 不符）——P3
@@ -83,7 +83,7 @@
 | _BitInt 边界用例（edge） | **PASS** | 7 | 裸字面量比较（S8/U64）、文件作用域/static 非零初始化（含嵌套 cast、负值全宽扩展）、全局算术、嵌套同宽 cast 的声明/赋值/传参/返回、窄化 6 参 conv 全部与 gcc 一致（`cases\c23_bitint_edge.c`，2026-10-02 新增） | 7/7 逐行一致 | 覆盖本次 P0 修复的全部触发点，写标准库回归必跑 |
 | u8 字面量类型身份（char8_t） | **PARTIAL（DIFF）** | 5 | u8 字符串按 `char*` 衰减（C11 模型）；`sizeof(u8'A')=8`（异常，应 1）；goc 内建 char8_t 类型名（无需 uchar.h） | gcc：u8"abc"=unsigned char*、u8'A'=unsigned char、sizeof=1；不 include <uchar.h> 时不暴露 char8_t 名 | 别按 char8_t 类型身份判断；u8 字符串当普通 char* 用 |
 | 无参 f() == f(void) | **PASS** | 5 | 声明等价/重声明兼容/函数指针类型同一，全对 | 5/5 逐行一致 | 放心用 |
-| __STDC_VERSION__ 等预定义宏 | **FAIL** | 5 | **goc 不定义**：`type error(s): line 14: undeclared identifier "__STDC_VERSION__"`（__STDC__/__STDC_HOSTED__ 同样未定义） | `__STDC_VERSION__=202311`、`__STDC__=1`、`__STDC_HOSTED__=1` | **条件编译失效**：不能 `#if __STDC_VERSION__ >= 202311L`；写标准库用自身 feature 宏替代 |
+| __STDC_VERSION__ 等预定义宏 | **PASS** | 5 | 2026-10-02 P1.7 修复：`__STDC_VERSION__`=202311、`__STDC__`=1、`__STDC_HOSTED__`=1，与 gcc -std=c23 逐行一致（SUMMARY 3/3）；`__DATE__`=`"Oct  2 2026"`、`__TIME__`=`"hh:mm:ss"` | 一致 | **条件编译恢复**：可 `#if __STDC_VERSION__ >= 202311L` 判断 C23；`__DATE__`/`__TIME__` 可用 |
 | _Atomic / <stdatomic.h>（探针） | **UNSUPPORTED** | 1 | `note: skipping unavailable system header <stdatomic.h>`；`parse error: line 15: expected ";", got "int"`（`_Atomic int` 连语法都不解析——roadmap #129 "语法接受"**不成立**） | gcc 干净编译运行 | 原子类型/操作完全不可用，需绕开 |
 
 ## B. 预处理
@@ -95,8 +95,8 @@
 | #embed prefix/suffix/if_empty/__has_embed | **PARTIAL** | 5 | prefix/suffix/if_empty 与 gcc 一致（roadmap "后置未确认"**不准确，实际已支持**）；`__has_embed` 未提供（`avail=0`） | 5/5 | prefix/suffix/if_empty 放心用；**__has_embed 不能用**（guard 必走 else） |
 | #elifdef / #elifndef | **PASS** | 5 | 链式/混用/嵌套/#else 回退全一致 | 一致 | 放心用 |
 | #warning | **PASS** | 1 | 仅警告不阻断：`c23_warning.c:11: warning: c23_warning probe: ...` | gcc：`warning: #warning "..." [-Wcpp]` | 放心用（goc 警告格式更简） |
-| __has_include | **PASS** | 6 | 直接调用正确反映有无该头（stdio/string=1、缺失/threads=0，与 gcc 一致）。**注意**：`defined(__has_include)` 为假（组织者探针证实 guard 写法恒走 else——与 __has_c_attribute 同类问题） | 6/6 | 直接 `#if __has_include(<x>)` 可用；**勿用 `defined(__has_include) &&` guard** |
-| __has_c_attribute | **FAIL** | 7 | `defined(__has_c_attribute)`=0 → 标准 guard 恒 else，SUMMARY 2/7；绕开 guard 直接调用返回正确逐属性值（deprecated/nodiscard/noreturn/maybe_unused/fallthrough=1，likely/unlikely=0） | guard_active=1，7/7 | 标准 portable guard 会静默关闭属性探测；**直接 `#if __has_c_attribute(x)`**；建议上报 goc 注册为 defined() 可见宏 |
+| __has_include | **PASS** | 6 | 直接调用正确反映有无该头（stdio/string=1、缺失/threads=0，与 gcc 一致）；`defined(__has_include)` 2026-10-02 P2.15 修复后返回 1 | 6/6 | 直接 `#if __has_include(<x>)` 可用；portable guard 写法亦可用 |
+| __has_c_attribute | **PASS** | 7 | 2026-10-02 P2.15 修复：`defined(__has_c_attribute)`=1，portable guard 激活；SUMMARY 7/7 与 gcc 逐行一致（deprecated/nodiscard/noreturn/maybe_unused/fallthrough=1，likely/unlikely=0） | guard_active=1，7/7 | 标准 portable guard 放心用 |
 | __VA_OPT__ | **PASS** | 5 | 空变参逗号省略/非空保留/多参/嵌套转发/与 ## 组合全一致 | 一致 | 放心用 |
 | #define F() 空参宏 / F(...) | **PASS** | 5 | 空参空展开/有体零参/变参空调用全一致 | 一致 | 放心用（避免空展开后 `= +常量` 写法） |
 | 宏展开嵌套/递归边界 | **PASS** | 6 | 自引用不递归（#if 折叠 0）/30 层嵌套/# 串化/## 空操作数边界全一致 | 一致 | 放心用 |
@@ -166,8 +166,8 @@
 2. **前导小数点浮点已支持**（D1 组，2026-10-02）：`.12`/`.1'2` 现正常解析（lexer 前导点 float 修复），与 gcc 逐行一致；此前报 `unexpected token "."` 的缺口已消除。
 3. **printf 能力**：goc 无 `%a`（十六进制浮点打印）、无 `%wN`（_BitInt）；`%p` 格式与 gcc 不同且 ASLR 漂移，对拍文件已规避。
 4. **LLP64 平台效应**（A1/D2/F 组交叉）：gcc 侧 `long`=32 位（LONG_WIDTH=32）；goc 侧 `long`/`unsigned long`=64 位；`_Generic` 的 long/unsigned 折叠即源于 goc 以宽度为主键比较。若目标是 LP64（Linux），long 相关结论需复测。
-5. **预定义宏全线缺失**（A 组 + 各负向探针）：goc 不定义 `__STDC_VERSION__`/`__STDC__`/`__STDC_HOSTED__`/`__STDC_NO_VLA__`，标准条件编译（版本判断、VLA 探测）全部失效。
-6. **`defined()` 不可见**（B 组 + 组织者探针）：`defined(__has_include)`/`defined(__has_c_attribute)` 在 goc 恒为假；直接调用可用。契约里推荐的 portable guard 写法对 goc 不成立。
+5. ~~**预定义宏全线缺失**~~ ——**已修复**（P1.7，2026-10-02）：`__STDC_VERSION__`=202311、`__STDC__`=1、`__STDC_HOSTED__`=1、`__DATE__`/`__TIME__` 已注入；`__STDC_NO_VLA__` 仍缺（随 P2.3 VLA 决策一并处理）。
+6. ~~**`defined()` 不可见**~~ ——**已修复**（P2.15，2026-10-02）：`defined(__has_include)`/`defined(__has_c_attribute)` 返回 1，portable guard 写法成立。
 7. **编译器健壮性**（A2 组）：块作用域非 static `thread_local` 原触发 goc 编译期 Go panic（nil 解引用，exit 2）——**已于 2026-10-02 P0.2 修复**（语义层干净拒绝，codegen panic 路径不可达）；_BitInt 与裸字面量比较的同类 panic 亦已于 2026-10-02 修复。
 8. **roadmap 修正汇总**：#129 _Atomic"语法接受+lock 前缀"不成立（parse 拒绝）；#131 _BitInt 窄宽度掩码缺失（π 对拍只覆盖宽宽度）——**已于 2026-10-02 修复**；<stdbit.h>/<uchar.h> 后置成立；long double 降级成立但标记宏未定义；#embed prefix/suffix/if_empty 已支持（"后置未确认"不准确）；stdckdint "已支持"仅 32 位成立；stddef.h 的 offsetof/max_align_t 缺失未记录。
 

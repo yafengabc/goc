@@ -55,7 +55,7 @@ $expected = @{
     'c89_control.c'     = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_func.c'        = @{ status = 'PASS';        gocFails = $false; extra = '' }
     # ---------- C89 pp + literals + library ----------
-    'c89_pp_obj.c'      = @{ status = 'PARTIAL';     gocFails = $false; extra = '' }
+    'c89_pp_obj.c'      = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_pp_func.c'     = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_pp_cond.c'     = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_pp_include.c'  = @{ status = 'PASS';        gocFails = $false; extra = '' }
@@ -72,7 +72,7 @@ $expected = @{
     'c89_lib_varargs.c' = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_trigraph.c'    = @{ status = 'UNSUPPORTED'; gocFails = $true;  extra = '-trigraphs' }
     'c89_lit_octal.c'   = @{ status = 'PASS';        gocFails = $false; extra = '' }
-    'c89_pp_elif.c'     = @{ status = 'FAIL';        gocFails = $false; extra = '' }
+    'c89_pp_elif.c'     = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_lit_esc.c'     = @{ status = 'PASS';        gocFails = $false;  extra = '' }
     'c89_lit_dotfloat.c'= @{ status = 'PASS';        gocFails = $false;  extra = '' }
     # ---------- C99 ----------

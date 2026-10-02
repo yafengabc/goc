@@ -5,7 +5,8 @@
                 case4 identical redefinition (gcc accepts); case5 self reference is non recursive;
                 case6 __FILE__/__LINE__; case7 definedness probes of __STDC__/__DATE__/__TIME__
                 each case printf distinct, gcc -std=c89 diff
-   Status     : PARTIAL: case1-6 match gcc; case7 goc has no __STDC__/__DATE__/__TIME__ (verified 2026-10-02)
+   Status     : PASS (verified 2026-10-02; P1.7 fixed - __STDC__/__DATE__/__TIME__ now defined,
+                all 7 cases match gcc -std=c89)
    ============================================================ */
 #include <stdio.h>
 

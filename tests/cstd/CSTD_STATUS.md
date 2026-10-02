@@ -36,9 +36,9 @@
 
 | 文件 | 特性 | 状态 | 子用例 | goc 证据 / gcc 对拍 | 写标准库建议 |
 |---|---|---|---|---|---|
-| c89_pp_obj.c | 对象宏/undef/空体/重定义/自引用/预定义宏 | PARTIAL | 7 | case1-6 一致；case7 `__STDC__/__DATE__/__TIME__` goc 全 NOT-defined（gcc 全 defined） | 避开 `__STDC__/__DATE__/__TIME__`；对象宏放心用 |
+| c89_pp_obj.c | 对象宏/undef/空体/重定义/自引用/预定义宏 | PASS | 7 | 一致（case7 `__STDC__/__DATE__/__TIME__` 2026-10-02 P1.7 修复后全 defined） | 对象宏放心用；`__STDC__/__DATE__/__TIME__` 可用 |
 | c89_pp_func.c | 函数宏/`#`/`##`/预扫描/嵌套 | PASS | 8 | 一致（含空实参 `GLUE(,tail)`、`STR(A)` 不预扫描） | 放心用；勿在函数宏体内再嵌函数宏调用（见交叉发现） |
-| c89_pp_cond.c | `#if`/`#ifdef`/defined/常量表达式/嵌套 | PASS | 6 | 一致 | 用嵌套 `#if/#else` 代替多 `#elif` 链（见 c89_pp_elif） |
+| c89_pp_cond.c | `#if`/`#ifdef`/defined/常量表达式/嵌套 | PASS | 6 | 一致 | 放心用；多 `#elif` 链已修复（见 c89_pp_elif） |
 | c89_pp_include.c | `<>`/`""`/guard/嵌套（+c89_pp_include_inc.h） | PASS | 4 | 一致 | 放心用；勿 `#include 宏路径` |
 | c89_pp_misc.c | 块内宏/undef 后作标识符等 | PASS | 3 | 一致 | 避开 `#line`（行号差 1）与孤立 `#` |
 | c89_lit_int.c | 十/十六进制、U/L/UL、`%d%u%o%x%ld%lu` | PASS | 8 | 一致 | 八进制字面量放心用（已修复 2026-10-02） |
@@ -53,7 +53,7 @@
 | c89_lib_varargs.c | va_list int/double/混合、ptrdiff_t、offsetof | PASS | 4 | 一致（offsetof 用指针算术实现） | 标准 `offsetof(type,member)` 宏别用（见交叉发现） |
 | c89_trigraph.c | trigraph 探测 | UNSUPPORTED | — | goc：`parse error: line 13: expected ";", got "?"`；gcc 需 `-trigraphs` 才能编译 | 不要写 trigraph |
 | c89_lit_octal.c | 八进制字面量 `010`/`0777` 等 | PASS | 4 | 一致（`010=8 0777=511 010U=8 010L=8 010+010=16`；原静默按十进制解析已修 2026-10-02） | 八进制放心用；`0` 后接 8/9 会干净报错 |
-| c89_pp_elif.c | 多 `#elif` 链 | **FAIL** | 4 | case2 两段 `#elif` 链真分支被跳过、落 `#else`（输出 `else`，gcc 输出 `branch-5`）；单 `#elif` 与 `#elif defined` 反而正确 | 用嵌套 `#if/#else` 代替多 `#elif` 链 |
+| c89_pp_elif.c | 多 `#elif` 链 | **PASS** | 4 | 一致（2026-10-02 P0.6 修复：`#if/#elif` 条件求值期间宏展开不再受分支活性影响，case2 多链真分支正确命中） | 多 `#elif` 链放心用 |
 | c89_lit_esc.c | `\ooo` 八进制与 `\xhh` 十六进制转义 | PASS | 4 | 一致（`'\101'=65 '\x41'=65 '\377'=-1 '\x7f'=127`；原 preprocess 拒绝已修 2026-10-02） | `\ooo`/`\xhh` 放心用（char 有符号，`'\377'`=-1） |
 | c89_lit_dotfloat.c | 前导点浮点 `.5`/`.5f`/`.5e2`/`.5L` | PASS | 4 | 一致（`.5=0.5 .5f=0.5 .5e2=50.0 .5L=0.5`；原 parse error 已修 2026-10-02） | 前导点 `.5` 放心用 |
 
@@ -108,7 +108,7 @@
 
 | 文件 | 特性 | 状态 | 子用例 | goc 证据 / gcc 对拍 | 写标准库建议 |
 |---|---|---|---|---|---|
-| c17_stdver.c | 版本宏记录 | PARTIAL（设计性 OUTPUT_DIFF） | 5 | goc：`STDC_VERSION=undefined / STDC=undefined / HOSTED=undefined / NO_ATOMICS=not-defined / NO_THREADS=not-defined`；gcc `-std=c17`：`201710 / 1 / 1 / not-defined / not-defined` | 注意：goc 三个 STDC 宏全未定义，**条件编译依赖 `__STDC_VERSION__` 的代码会落 `#else` 分支** |
+| c17_stdver.c | 版本宏记录 | PARTIAL（设计性 OUTPUT_DIFF） | 5 | goc：`STDC_VERSION=202311 / STDC=1 / HOSTED=1 / NO_ATOMICS=not-defined / NO_THREADS=not-defined`；gcc `-std=c17`：`201710 / 1 / 1 / not-defined / not-defined`（P1.7 后 STDC 宏已定义；版本值差异为设计性记录，goc 单模式报 C23） | 条件编译依赖 `__STDC_VERSION__` 的代码现可工作（goc 报 202311） |
 | c17_smoke.c | C17 冒烟回归（_Generic/_Static_assert/_Alignas/匿名成员/thread_local 抽查） | PASS | 5 | 与 gcc 一致（C11 特性集在 goc 行为稳定） | 放心用 |
 
 ---
@@ -129,7 +129,7 @@ goc 是 **LP64**（`sizeof(long)=8`、指针 8、size_t 8），本机 Windows gc
 ### 硬错误缺口（gcc 过、goc 编译失败，报错原文）
 - ~~`\ooo`/`\xhh` 转义~~ **已修复(2026-10-02)**：原 `preprocess error: ... unterminated character literal`，现正确解码
 - ~~`.5` 前导点浮点~~ **已修复(2026-10-02)**：原 `parse error: unexpected token "."`，现正确解析
-- 多 `#elif` 链（真分支落 #else）；单 `#elif` 正确
+- ~~多 `#elif` 链~~ **已修复(2026-10-02, P0.6)**：`#if/#elif` 条件求值期间宏展开不再受分支活性影响，真分支正确命中
 - stdint.h/inttypes.h 缺失：`note: skipping unavailable system header` + `expected ";", got "i8"`
 - `__func__`：`line 9: undeclared identifier "__func__"`
 - `va_copy`：`codegen error: unknown function "va_copy": not in goclib`
@@ -149,7 +149,7 @@ goc 是 **LP64**（`sizeof(long)=8`、指针 8、size_t 8），本机 Windows gc
 - `<uchar.h>`：`expected type specifier, got "char16_t"`；`u""`/`U""`/`L""` 前缀被 lexer 吞空：`expected ";", got ""`
 - `<stdatomic.h>`/`_Atomic`：`expected ";", got "a"`；裸 `_Atomic` 非关键字
 - `<threads.h>`：被跳过；本机 gcc 亦无（用例走 `__has_include` 兜底）
-- `#include 宏路径`：`malformed #include`；孤立 `#`：`unknown preprocessing directive`；`#line` 行号差 1；`__has_include` 未实现（落 #else 分支）
+- `#include 宏路径`：`malformed #include`；孤立 `#`：`unknown preprocessing directive`；`#line` 行号差 1
 
 ### 与 gcc 行为一致的高价值点（可放心依赖）
 atexit LIFO、qsort/bsearch、memmove 自重叠、strncpy 补零、`%e/%g` 浮点格式、char 有符号（0xFF→-1）、算术右移、枚举尾随逗号（双方都当扩展接受）、零宽位域必须无名（`int:0;`）、复合赋值全家、函数宏 `#`/`##` 与空实参、嵌套 `#if/#else`、`__FILE__/__LINE__`、stdio/string/ctype 全函数、C99 math 宏函数、`_Generic`/`_Static_assert`/`_Alignas`/匿名成员/thread_local 行为。
@@ -171,12 +171,12 @@ atexit LIFO、qsort/bsearch、memmove 自重叠、strncpy 补零、`%e/%g` 浮�
 ### 预定义宏/标识符
 | 宏 | goc | gcc -std=c17 |
 |---|---|---|
-| `__STDC_VERSION__` | **未定义** | 201710L（c89/c99/c11 分别为未定义/199901L/201112L） |
-| `__STDC__` | 未定义 | 1 |
-| `__STDC_HOSTED__` | 未定义 | 1 |
+| `__STDC_VERSION__` | **202311**（2026-10-02 P1.7 修复；单模式报 C23） | 201710L（c89/c99/c11 分别为未定义/199901L/201112L） |
+| `__STDC__` | 1（2026-10-02 P1.7 修复） | 1 |
+| `__STDC_HOSTED__` | 1（2026-10-02 P1.7 修复） | 1 |
 | `__STDC_NO_ATOMICS__` | 未定义 | 未定义（gcc 有原子） |
 | `__STDC_NO_THREADS__` | 未定义 | 未定义 |
-| `__DATE__` / `__TIME__` | 未定义 | defined |
+| `__DATE__` / `__TIME__` | defined（2026-10-02 P1.7 修复：`"Mmm dd yyyy"`/`"hh:mm:ss"`） | defined |
 | `__FILE__` / `__LINE__` | **可用** | defined |
 | `__func__` | 未实现（undeclared identifier） | defined |
 
@@ -193,4 +193,4 @@ int=4、long=8（LP64）、long long=8、指针=8、float=4、double=8、long do
 
 ### 给标准库作者的最终建议（放心用 / 避开速查）
 - **放心用**：对象/函数宏（含 `#` `##`）、嵌套 `#if/#else`、`//` 注释、long long、`_Bool`、restrict、声明混排、十六进制浮点常量、尾随逗号、stdint 之外的全套 stdio/string/ctype/stdlib/math（含 C99 math 宏）、`_Generic`、`_Static_assert`、alignas/alignof、thread_local（静态/文件作用域）、`_Noreturn`、匿名 struct/union、stdckdint.h、`__FILE__/__LINE__`
-- **避开**：多 `#elif` 链、`__func__`、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`%a` 打印、`sizeof(复合字面量)`、VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、va_copy、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）、stdint.h/inttypes.h
+- **避开**：`__func__`、`%a` 打印、`sizeof(复合字面量)`、VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、va_copy、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）、stdint.h/inttypes.h（多 `#elif` 链与 `__STDC_VERSION__/__STDC__/__DATE__/__TIME__` 已于 2026-10-02 修复，移出避开清单）
