@@ -653,8 +653,8 @@ func (c *CG) extendInt(width int, signed bool) {
 		}
 	case 4: // int
 		if signed {
-			c.emit("shl rax, 32")
-			c.emit("sar rax, 32")
+			c.emitWrap("shl rax, 32")
+			c.emitWrap("sar rax, 32")
 		}
 		// case 8 for long/pointer is no-op, fall through
 	}
@@ -668,8 +668,8 @@ func (c *CG) extendInt(width int, signed bool) {
 // wrongly truncated). Callers gate it on resW == 4.
 func (c *CG) canonInt(signed bool) {
 	if signed {
-		c.emit("shl rax, 32")
-		c.emit("sar rax, 32")
+		c.emitWrap("shl rax, 32")
+		c.emitWrap("sar rax, 32")
 	} else {
 		c.emit("shl rax, 32")
 		c.emit("shr rax, 32")
@@ -746,6 +746,11 @@ const (
 type Inst struct {
 	Kind instKind
 	Text string
+	// IntWrap marks the two instructions of a compiler-emitted int
+	// canonicalisation pair (shl r,32; sar r,32 from canonInt/extendInt).
+	// A peephole may only treat a shift pair as an int wrap when both halves
+	// carry the flag -- a user's own shifts never do.
+	IntWrap bool
 }
 
 // printASM renders the instruction stream as goa-ready assembly text. Every
@@ -765,6 +770,12 @@ func printASM(insts []Inst) string {
 // emit appends one indented instruction line to the body stream.
 func (c *CG) emit(format string, a ...any) {
 	c.insts = append(c.insts, Inst{Kind: instInstr, Text: "\t" + fmt.Sprintf(format, a...)})
+}
+
+// emitWrap is emit for one half of an int canonicalisation pair: the IntWrap
+// marker lets elimRedundantExt recognise (and possibly drop) the pair.
+func (c *CG) emitWrap(format string, a ...any) {
+	c.insts = append(c.insts, Inst{Kind: instInstr, Text: "\t" + fmt.Sprintf(format, a...), IntWrap: true})
 }
 
 // line appends a verbatim body line that is not an instruction: a label, an
@@ -2546,6 +2557,9 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 			c.insts = inlineCalls(c.insts)
 		}
 		c.insts = constProp(c.insts)
+		if !elimRedundantExtSkip {
+			c.insts = elimRedundantExt(c.insts)
+		}
 		c.insts = peepholeIR(c.insts)
 		c.insts = deadStores(c.insts)
 		c.insts = livenessDSE(c.insts)
@@ -3202,7 +3216,7 @@ func expandInline(tmpl *inlineCand, base int, suffix, cont string) []Inst {
 				n, _ := strconv.Atoi(rbpSlotRe.FindStringSubmatch(m)[1])
 				return fmt.Sprintf("[rbp-%d]", n-8+base)
 			})
-			out = append(out, Inst{Kind: instInstr, Text: txt})
+			out = append(out, Inst{Kind: instInstr, Text: txt, IntWrap: in.IntWrap})
 		default:
 			out = append(out, in)
 		}

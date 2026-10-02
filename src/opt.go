@@ -1,0 +1,334 @@
+// Package main: optimisation passes that are kept out of codegen.go
+// (which is already very large). T1.6 / T1.4 live here, each with an
+// independent switch and unit tests.
+package main
+
+import (
+	"strconv"
+	"strings"
+)
+
+// elimRedundantExtSkip bypasses the pass in Gen() -- the independent switch
+// the plan requires for every new pass. Tests exercise it to compare
+// with/without behaviour.
+var elimRedundantExtSkip bool
+
+// elimRedundantExt removes redundant int sign-extension pairs.
+//
+// goc models "int" as 32-bit and re-canonicalises it inside a 64-bit
+// register after every int operation and int load by emitting a marked
+// pair `shl rax, 32; sar rax, 32` (canonInt / extendInt). Sign-extension
+// is idempotent: applying the pair to a value that is already sign-extended
+// from 32 bits is a no-op. This pass tracks, over a linear window, which
+// registers and which exact stack/global slots hold sign-canonical values,
+// and drops a marked pair whose input register is already sign-canonical.
+//
+// Correctness discipline (mirrors peepholeIR / constProp):
+//   - only compiler-marked pairs (Inst.IntWrap) are ever touched; a user's
+//     own `x << 32 >> 32` never is;
+//   - flags: the pair writes flags (shl/sar set SF/ZF/CF/OF), so a pair is
+//     deleted only when no flag-reading instruction appears between it and
+//     the next flag-writing instruction (or a window break);
+//   - windows break at labels, inline __asm, calls, branches, returns and
+//     indirect memory writes: all knowledge is discarded;
+//   - exact slots ([rbp-N], [rip+lab]) are distinct, so a watched store to
+//     one never perturbs another; sized/partial stores and non-"mov" stores
+//     (movsd, fstp, ...) clobber the slot's canonicality;
+//   - movsxd of a 32-bit source is sign-canonical by construction.
+func elimRedundantExt(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	signCanon := make(map[string]bool) // reg -> holds a sign-canonical int
+	slotSign := make(map[string]bool)   // "[rbp-N]"/"[rip+lab]" -> holds one
+	var prevWrap map[string]bool       // regs whose kept pair is output-adjacent
+	clearAll := func() {
+		signCanon = make(map[string]bool)
+		slotSign = make(map[string]bool)
+		prevWrap = nil
+	}
+	clearSlots := func() { slotSign = make(map[string]bool) }
+
+	skip := 0 // 1 while the sar half of a dropped pair is being skipped
+	for i := 0; i < len(insts); i++ {
+		if skip > 0 {
+			skip--
+			continue
+		}
+		in := insts[i]
+		if in.Kind != instInstr {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+
+	// A marked sign-wrap pair: `shl r, 32; sar r, 32` with IntWrap on both
+	// halves. Drop the whole pair when r already holds a sign-canonical
+	// value. Two flag arguments make a drop safe: (a) the immediately
+	// preceding emitted instruction was the sar of a kept marked pair on the
+	// same register -- then shl/sar is idempotent, the value and every flag
+	// (SF/ZF/PF/CF/OF) after the pair are identical with or without it; or
+	// (b) no flag-reading instruction appears between the pair and the next
+	// flag-writing instruction (extDeletable). Otherwise keep the pair and
+	// record that r now holds a sign-canonical value.
+	if in.IntWrap && pl.op == "shl" && len(pl.operands) == 2 &&
+		pl.operands[1] == "32" && i+1 < len(insts) {
+		r := pl.operands[0]
+		nxt := insts[i+1]
+		if np, ok2 := parseBodyLine(nxt.Text); ok2 && nxt.IntWrap &&
+			np.op == "sar" && len(np.operands) == 2 &&
+			np.operands[0] == r && np.operands[1] == "32" {
+			if signCanon[r] && (prevWrap[r] || extDeletable(insts, i+2)) {
+				skip = 1 // drop both halves; the output tail keeps the same flags
+				continue
+			}
+			signCanon[r] = true
+			prevWrap = map[string]bool{r: true}
+			out = append(out, in, nxt)
+			i++
+			continue
+		}
+	}
+	// Any other instruction breaks the adjacency that makes a preceding kept
+	// pair flag-equivalent, so prevWrap no longer applies.
+	prevWrap = nil
+
+		// Memory writes of any kind: an exact slot stays canonical only when
+		// this is a plain full-width `mov [slot], src` of a canonical source;
+		// a sized/partial store or a non-mov store (movsd, fstp, ...) clobbers
+		// the slot; any indirect or non-slot write clobbers every slot.
+		if len(pl.operands) > 0 && isMemOperand(pl.operands[0]) {
+			sz, bare := splitSizedMem(pl.operands[0])
+			switch {
+			case !isSlotOperand(bare):
+				clearSlots()
+			case pl.op != "mov" || sz != "" || len(pl.operands) != 2:
+				slotSign[bare] = false
+			default:
+				slotSign[bare] = sourceSignCanon(pl.operands[1], signCanon)
+			}
+		}
+
+		switch pl.op {
+		case "mov":
+			if len(pl.operands) != 2 {
+				break
+			}
+			dst, src := pl.operands[0], pl.operands[1]
+			// Memory-ness must be judged on the size-prefix-stripped operand:
+			// "dword [r10]" and "byte [rbp-3]" are memory operands too, and a
+			// store to either must stay in the output.
+			if _, dbare := splitSizedMem(dst); isMemOperand(dbare) {
+				break // store (sized or not): slot bookkeeping done above
+			}
+			if _, sbare := splitSizedMem(src); isMemOperand(sbare) {
+				// Load into dst. A full 8-byte load from an exact slot
+				// inherits the slot's canonicality; a sized load or any other
+				// source is unknown. A 32-bit destination zero-extends and
+				// therefore also destroys the wide register's canonicality.
+				sz, bare := splitSizedMem(src)
+				if !gp64Regs[dst] {
+					signCanon[reg64Name(dst)] = false
+					break
+				}
+				if sz != "" || !isSlotOperand(bare) {
+					signCanon[dst] = false
+				} else {
+					signCanon[dst] = slotSign[bare]
+				}
+				break
+			}
+			// Register / immediate move. A 32-bit destination (mov eax, imm)
+			// zero-extends into the wide register and clears canonicality.
+			if !gp64Regs[dst] {
+				signCanon[reg64Name(dst)] = false
+				break
+			}
+			if gp64Regs[src] {
+				signCanon[dst] = signCanon[src]
+			} else if v, ok := immValue(src); ok {
+				signCanon[dst] = int32Fit(v)
+			} else {
+				signCanon[dst] = false
+			}
+		case "movsxd", "movslq":
+			// Sign-extension of a 32-bit source is sign-canonical.
+			if len(pl.operands) == 2 && gp64Regs[pl.operands[0]] {
+				signCanon[pl.operands[0]] = true
+			}
+		case "lea":
+			if len(pl.operands) > 0 && gp64Regs[pl.operands[0]] {
+				signCanon[pl.operands[0]] = false
+			}
+		case "cqo", "cdq":
+			signCanon["rax"] = false
+			signCanon["rdx"] = false
+		case "call", "ret", "push", "pop", "leave":
+			clearAll()
+			out = append(out, in)
+			continue
+		case "jmp", "loop":
+			clearAll()
+			out = append(out, in)
+			continue
+		case "neg", "not", "inc", "dec", "shl", "shr", "sar", "sal",
+			"rol", "ror", "and", "or", "xor", "add", "sub", "adc", "sbb":
+			// Two/one-operand ALU and shifts write operand[0]. A 32-bit
+			// destination (xor eax, eax, add eax, ebx, ...) zero-extends into
+			// the wide register and clears its canonicality too.
+			if len(pl.operands) > 0 {
+				if gp64Regs[pl.operands[0]] {
+					signCanon[pl.operands[0]] = false
+				} else if !isMemOperand(pl.operands[0]) {
+					signCanon[reg64Name(pl.operands[0])] = false
+				}
+			}
+		case "imul", "mul", "div", "idiv":
+			// Two-operand imul writes operand[0]; one-operand forms write
+			// rax/rdx. Clear the widest safe set.
+			if len(pl.operands) == 1 {
+				signCanon["rax"] = false
+				signCanon["rdx"] = false
+			} else if len(pl.operands) > 0 {
+				if gp64Regs[pl.operands[0]] {
+					signCanon[pl.operands[0]] = false
+				} else if !isMemOperand(pl.operands[0]) {
+					signCanon[reg64Name(pl.operands[0])] = false
+				}
+			}
+		case "cmp", "test":
+			// Flag-only: reads values, writes flags, changes no register.
+		default:
+			// jcc readers and set/cmov families are flag readers; any other
+			// instruction that writes a GP register invalidates it.
+			if strings.HasPrefix(pl.op, "j") || strings.HasPrefix(pl.op, "set") ||
+				strings.HasPrefix(pl.op, "cmov") {
+				// branch: full window break below
+				if strings.HasPrefix(pl.op, "j") {
+					clearAll()
+					out = append(out, in)
+					continue
+				}
+				// set*/cmov* write their operand[0].
+				if len(pl.operands) > 0 {
+					if gp64Regs[pl.operands[0]] {
+						signCanon[pl.operands[0]] = false
+					} else if !isMemOperand(pl.operands[0]) {
+						signCanon[reg64Name(pl.operands[0])] = false
+					}
+				}
+				break
+			}
+			if len(pl.operands) > 0 {
+				if gp64Regs[pl.operands[0]] {
+					signCanon[pl.operands[0]] = false
+				} else if !isMemOperand(pl.operands[0]) {
+					signCanon[reg64Name(pl.operands[0])] = false
+				}
+			}
+		}
+		out = append(out, in)
+	}
+	return out
+}
+
+// extDeletable reports whether deleting a marked wrap pair whose instructions
+// occupy from-2/from-1 cannot change any later flag read: the scan stops at
+// the next flag-writing instruction, and no flag-reading instruction (and no
+// window break) may appear before it.
+func extDeletable(insts []Inst, from int) bool {
+	for j := from; j < len(insts); j++ {
+		in := insts[j]
+		if in.Kind != instInstr {
+			return false
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			return false
+		}
+		switch {
+		case isFlagReadOp(pl.op):
+			return false
+		case isFlagWriteOp(pl.op):
+			return true
+		case pl.op == "call" || pl.op == "ret" || pl.op == "jmp" ||
+			strings.HasPrefix(pl.op, "j"):
+			return false
+		}
+	}
+	return false
+}
+
+// isFlagReadOp lists the spellings whose result depends on the flags: the
+// conditional jumps, setcc and cmov families.
+func isFlagReadOp(op string) bool {
+	if strings.HasPrefix(op, "set") || strings.HasPrefix(op, "cmov") {
+		return true
+	}
+	return strings.HasPrefix(op, "j") && op != "jmp"
+}
+
+// isFlagWriteOp lists the spellings that overwrite the flags, so a flag read
+// after them is insulated from anything earlier. "not" is deliberately
+// absent: it does not write flags.
+func isFlagWriteOp(op string) bool {
+	switch op {
+	case "cmp", "test", "add", "sub", "adc", "sbb", "and", "or", "xor",
+		"inc", "dec", "neg", "shl", "shr", "sar", "sal", "rol", "ror",
+		"imul", "mul", "div", "idiv":
+		return true
+	}
+	return false
+}
+
+// sourceSignCanon reports whether a store source operand carries a
+// sign-canonical value: a full 64-bit register whose tracked value is
+// canonical, or a constant that fits in a signed 32-bit int.
+func sourceSignCanon(src string, signCanon map[string]bool) bool {
+	if gp64Regs[src] {
+		return signCanon[src]
+	}
+	if v, ok := immValue(src); ok {
+		return int32Fit(v)
+	}
+	return false
+}
+
+// immValue parses the constant of a mov immediate operand: decimal, 0x hex,
+// and 0b/0o (ParseInt base 0). The 64-bit pattern is reinterpreted as int64
+// so that 0xffffffffffffffff reads as -1.
+func immValue(s string) (int64, bool) {
+	s = strings.TrimPrefix(s, "#")
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		if v, err := strconv.ParseUint(s[2:], 16, 64); err == nil {
+			return int64(v), true
+		}
+		return 0, false
+	}
+	if v, err := strconv.ParseInt(s, 0, 64); err == nil {
+		return v, true
+	}
+	return 0, false
+}
+
+// int32Fit reports whether v, as a 64-bit constant, is already the
+// sign-extension of a 32-bit int.
+func int32Fit(v int64) bool {
+	return v >= -(1<<31) && v < (1<<31)
+}
+
+// splitSizedMem separates a size-prefixed memory operand ("dword [rbp-8]",
+// "byte [rip+lab]") into the prefix and the bare slot text. Unsized operands
+// return an empty prefix and the operand unchanged.
+func splitSizedMem(m string) (sz, bare string) {
+	for _, p := range []string{"qword ", "dword ", "word ", "byte "} {
+		if strings.HasPrefix(m, p) {
+			return p[:len(p)-1], m[len(p):]
+		}
+	}
+	return "", m
+}
