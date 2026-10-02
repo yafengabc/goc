@@ -970,11 +970,27 @@ func (c *CG) loadVar(vi varInfo) {
 // storeVar emits code that stores the value currently in rax (int) or xmm0
 // (double) into variable vi's slot or home register.
 func (c *CG) storeVar(vi varInfo) {
+	// T1.6 (N17): a materialized signed int (resW==4, low 32 valid, high 32=0)
+	// stored into a genuinely 64-bit variable (long / unsigned long / pointer)
+	// must be sign-extended first, or a negative int reads back as a huge
+	// positive when the slot is later consumed as a 64-bit signed value (e.g.
+	// `long l = -7` printing as 4294967289, and bi_conv's `fill = -1` filling
+	// 64-bit limbs with 0x00000000FFFFFFFF). Int (width-4) variables keep
+	// their 8-byte slots in the materialized high-0 form (design invariant),
+	// and narrow homes (char/short) get hardware truncation, so neither needs
+	// this extension here.
+	narrow := vi.typ != nil && !vi.typ.IsFloating() && vi.typ.Kind != KBool &&
+		c.slotWidth(vi.typ) == 8 &&
+		(vi.typ.Kind != KInt || vi.typ.Width == 8) &&
+		c.resW == 4 && c.resSigned
 	if vi.reg != "" {
 		// Register-cached int local: keep it in the callee-save (which
 		// survives function calls, so no spill is needed).
 		if vi.typ != nil && vi.typ.Kind == KBool {
 			c.normalizeBool()
+		}
+		if narrow {
+			c.emit("movsxd rax, eax")
 		}
 		c.emit("mov %s, rax", vi.reg)
 		return
@@ -1001,6 +1017,9 @@ func (c *CG) storeVar(vi varInfo) {
 	default:
 		// int (8-byte slot) and pointers store the full 64-bit value so a
 		// 64-bit address survives in an int-typed variable.
+		if narrow {
+			c.emit("movsxd rax, eax")
+		}
 		c.emit("mov [rbp%+d], rax", vi.off)
 	}
 }
@@ -1031,6 +1050,13 @@ func (c *CG) ensureType(want CType) error {
 		c.emit("cvttsd2si rax, xmm0")
 		c.resTyp = TInt
 	case c.resTyp == TInt && want == TDouble:
+		// T1.6 (N22): a signed materialized int (low 32 valid, high 32 = 0)
+		// must be sign-extended before cvtsi2sd, or -5 converts to
+		// 4294967291.0. An unsigned int is already zero-extended (correct); a
+		// long (resW==8) is a full 64-bit value.
+		if c.resW == 4 && c.resSigned {
+			c.emit("movsxd rax, eax")
+		}
 		c.emit("cvtsi2sd xmm0, rax")
 		c.resTyp = TDouble
 	default:
@@ -1209,6 +1235,12 @@ func (c *CG) bigOperand(e Expr, want *Type) (int, int, int, error) {
 	sg := int64(0)
 	if want.Signed {
 		sg = 1
+	}
+	// N17: a materialized signed int operand consumed as a 64-bit signed
+	// value by bi_from_i64 must be sign-extended first. `(S8)a == -56`
+	// would otherwise compare against the zero-extended +4294967240.
+	if c.resW == 4 && c.resSigned && want.Signed {
+		c.emit("movsxd rax, eax")
 	}
 	c.callBigLib("__goclib_bi_from_i64", []bigArg{
 		{addrOff: off}, {reg: "rax"}, {imm: int64(w)}, {imm: sg},
@@ -1989,6 +2021,9 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 				if err := c.ensureType(TInt); err != nil {
 					return lt.Class(), err
 				}
+				// Capture the RHS's own width/sign now: genLValue below may
+				// clobber c.resW while computing the destination address.
+				rw, rs := c.resW, c.resSigned
 				// Park the RHS value in a frame temporary: genLValue on the
 				// left side is free to clobber r11 (element addressing uses
 				// it as its scratch), and the parked value is the argument.
@@ -2002,6 +2037,13 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 				}
 				c.emit("mov r11, [rbp%+d]", valSlot)
 				c.tmpDepth--
+				// N17: a materialized signed int RHS is consumed as a 64-bit
+				// signed value by bi_from_i64_trunc; sign-extend before the
+				// call (a signed _BitInt lvalue assigned -12345 would
+				// otherwise hold +4294954951).
+				if rw == 4 && rs && lt.Signed {
+					c.emit("movsxd r11, r11d")
+				}
 				sg := int64(0)
 				if lt.Signed {
 					sg = 1
@@ -2083,6 +2125,9 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		if err != nil {
 			return rt, err
 		}
+		// Capture the value's own width/signedness NOW: the genLValue below may
+		// clobber c.resW/c.resSigned while computing the destination address.
+		rw, rs := c.resW, c.resSigned
 		c.tmpDepth++
 		rslot := c.tmpSlot(c.tmpDepth)
 		if rt == TDouble {
@@ -2109,7 +2154,11 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 			if lt := c.exprType(n.Lhs); lt != nil && lt.Kind == KBool {
 				c.normalizeBool()
 			}
-			c.genStoreElem("r10", width, class)
+			// T1.6 (N17): the movsxd for a materialized signed int stored into
+			// an 8-byte slot lives inside genStoreElem (single source of truth;
+			// this call site must NOT re-emit it). rw/rs were captured right
+			// after the value was evaluated, before genLValue clobbered them.
+			c.genStoreElem("r10", width, class, rw, rs)
 		}
 		c.tmpDepth--
 		return rt, nil
@@ -2228,7 +2277,10 @@ func (c *CG) genCompoundAssign(n *AssignExpr) (CType, error) {
 		if lt != nil && lt.Kind == KBool {
 			c.normalizeBool()
 		}
-		c.genStoreElem("r10", width, class)
+		// T1.6 (N17): the movsxd for a materialized signed int stored into an
+		// 8-byte slot lives inside genStoreElem (single source of truth; this
+		// call site must NOT re-emit it).
+		c.genStoreElem("r10", width, class, c.resW, c.resSigned)
 	}
 	return rt, nil
 }
@@ -5135,7 +5187,16 @@ func (c *CG) genStmt(s Stmt) error {
 					if err := c.ensureType(TInt); err != nil {
 						return err
 					}
-					c.emit("mov r11, rax")
+					// N17: a materialized signed int initialiser consumed as a
+					// 64-bit signed value by bi_from_i64_trunc must be
+					// sign-extended first (`S64 x = -12345` would otherwise
+					// land as +4294954951). Unsigned destinations are already
+					// zero-extended and need nothing.
+					if c.resW == 4 && c.resSigned && vi.typ.Signed {
+						c.emit("movsxd r11, eax")
+					} else {
+						c.emit("mov r11, rax")
+					}
 					c.emit("lea r10, [rbp%+d]", vi.off)
 					sg := int64(0)
 					if vi.typ.Signed {
@@ -5229,6 +5290,10 @@ func (c *CG) genStmt(s Stmt) error {
 		if err != nil {
 			return err
 		}
+		// Capture the value's own width/signedness before genLValue clobbers
+		// the expression state (atexit crash class: a pointer truncated by a
+		// stale int index's resW).
+		rw, rs := c.resW, c.resSigned
 		// Spill the right-hand side into a frame temporary so computing the
 		// lvalue address (which may itself call functions) cannot clobber it.
 		c.tmpDepth++
@@ -5250,7 +5315,7 @@ func (c *CG) genStmt(s Stmt) error {
 		} else {
 			c.emit("mov rax, [rbp%+d]", rslot)
 		}
-		c.genStoreElem("r10", c.lvalueWidth(n.Lhs), ec)
+		c.genStoreElem("r10", c.lvalueWidth(n.Lhs), ec, rw, rs)
 		c.tmpDepth--
 		return nil
 	case *ExprStmt:
@@ -5276,7 +5341,13 @@ func (c *CG) genStmt(s Stmt) error {
 				if err := c.ensureType(TInt); err != nil {
 					return err
 				}
-				c.emit("mov r11, rax")
+				// N17: same materialized-int-to-signed-big widening as the
+				// local-initialiser path above.
+				if c.resW == 4 && c.resSigned && c.curRet.Signed {
+					c.emit("movsxd r11, eax")
+				} else {
+					c.emit("mov r11, rax")
+				}
 				c.emit("mov r10, [rbp%+d]", c.sretSlot)
 				sg := int64(0)
 				if c.curRet.Signed {
@@ -5329,6 +5400,15 @@ func (c *CG) genStmt(s Stmt) error {
 			// A _Bool return must be exactly 0 or 1 (C semantics).
 			if c.curRet != nil && c.curRet.Kind == KBool {
 				c.normalizeBool()
+			}
+			// N17: a materialized signed int (resW==4, signed, high 32 = 0)
+			// returned from a signed 8-byte function must be sign-extended.
+			// `return -1;` in a long-returning goclib helper compiles the neg
+			// as `neg eax` (0x00000000FFFFFFFF under C1); the caller's 64-bit
+			// signed consumption (`cmp rax,0; setl` in bi_cmp users) would see
+			// a huge positive and flip the comparison.
+			if c.curRet != nil && c.curRet.Kind == KInt && c.curRet.Signed && c.curRet.Width == 8 && c.resW == 4 && c.resSigned {
+				c.emit("movsxd rax, eax")
 			}
 		} else {
 			c.emit("mov rax, 0")
@@ -5880,33 +5960,39 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 			c.emit("subsd xmm1, xmm0")
 			c.emit("movsd xmm0, xmm1")
 		} else {
-			c.emit("neg rax")
 			// Integer promotion: a narrow operand (char/short) negates as a
 			// signed int; an int keeps its own signedness; an 8-byte value
 			// (long/unsigned long) keeps the full 64-bit result.
-			w, s := c.resW, c.resSigned
+			w := c.resW
 			if w < 4 {
-				w, s = 4, true
+				w = 4
 			}
 			c.resW = w
 			if w == 4 {
-				c.canonInt(s)
+				// T1.6: negate the low 32 bits only -- a 32-bit `neg eax`
+				// wraps at 32 and zero-extends to rax, which is exactly the
+				// materialized-int invariant (low 32 valid, high 32 = 0).
+				// `neg rax` would set the high 32 to FFFF and corrupt it.
+				c.emit("neg eax")
+			} else {
+				c.emit("neg rax")
 			}
 		}
 		return t, nil
 	}
 	// "~" -- one's complement. The operand has already been checked to be an
-	// integer; `not` flips all 64 bits of rax, so a narrow operand is
-	// promoted to int afterwards exactly like unary '-' does.
+	// integer; `not` flips the low 32 bits for an int (32-bit form zero-extends
+	// to rax) and all 64 bits for an 8-byte value.
 	if n.Op == "~" {
-		c.emit("not rax")
-		w, s := c.resW, c.resSigned
+		w := c.resW
 		if w < 4 {
-			w, s = 4, true
+			w = 4
 		}
 		c.resW = w
 		if w == 4 {
-			c.canonInt(s)
+			c.emit("not eax")
+		} else {
+			c.emit("not rax")
 		}
 		c.resTyp = TInt
 		return TInt, nil
@@ -6730,8 +6816,11 @@ func (c *CG) genLoadElem(reg string, width int, class CType, signed bool) {
 		c.extendInt(2, signed)
 		c.resW = 2
 	case 4:
+		// T1.6: a dword load already zero-extends to rax, which IS the
+		// materialized int (low 32 valid, high 32 = 0). No shl/sar sign
+		// extension here any more; consumers that need the signed 64-bit
+		// value (double, (long), int-vs-long compare, printf slot) movsxd.
 		c.emit("mov eax, [%s]", reg)
-		c.extendInt(4, signed)
 		c.resW = 4
 	default:
 		c.emit("mov rax, [%s]", reg)
@@ -6743,7 +6832,10 @@ func (c *CG) genLoadElem(reg string, width int, class CType, signed bool) {
 
 // genStoreElem emits code that stores the value currently in rax (int-class) or
 // xmm0 (double) into the address held in reg, honouring the element width.
-func (c *CG) genStoreElem(reg string, width int, class CType) {
+// valW/valSigned are the VALUE's own width/signedness captured when it was
+// evaluated -- NOT c.resW/c.resSigned at the store point, which the intervening
+// lvalue-address computation (array indexing etc.) may have clobbered.
+func (c *CG) genStoreElem(reg string, width int, class CType, valW int, valSigned bool) {
 	if class == TDouble {
 		if width == 4 {
 			// Float destination: round the double in xmm0 to a single and
@@ -6754,6 +6846,19 @@ func (c *CG) genStoreElem(reg string, width int, class CType) {
 			c.emit("movsd [%s], xmm0", reg)
 		}
 		return
+	}
+	// T1.6 (N17): a materialized signed int (resW==4, low 32 valid, high 32=0)
+	// being stored into an 8-byte (long/pointer) slot must be sign-extended
+	// first, or a negative int lands as a huge positive when the slot is later
+	// read back as a 64-bit signed value. This covers array initialisers and any
+	// other path that lowers an int into a wider slot. Unsigned ints are already
+	// zero-extended (high 32 = 0), and width-4 int slots keep the materialised
+	// form, so only the signed widening case needs this. A pointer value has
+	// valW==8 and must NEVER be narrowed (the atexit crash: a function pointer
+	// truncated to 32 bits when the stale c.resW of an index expression was
+	// consulted instead of the value's own width).
+	if width == 8 && valW == 4 && valSigned {
+		c.emit("movsxd rax, eax")
 	}
 	switch width {
 	case 1:
@@ -6828,7 +6933,7 @@ func (c *CG) genStoreBitfield(unitW, bitOff, bitW int, signed bool) {
 	}
 	c.emit("or rax, r11")
 	c.emit("or rax, rdx")
-	c.genStoreElem("r10", unitW, TInt)
+	c.genStoreElem("r10", unitW, TInt, 8, false)
 	// Leave the truncated field value in rax; sign-extend a signed field so
 	// the rvalue matches a fresh load of it.
 	c.emit("shr rdx, %d", bitOff)
@@ -6958,7 +7063,13 @@ func (c *CG) genBraceInitLocal(t *Type, bi *BraceInit, off int) error {
 			if err := c.ensureType(TInt); err != nil {
 				return err
 			}
-			c.emit("mov r11, rax")
+			// N17: materialized signed int initialiser consumed by
+			// bi_from_i64 must be sign-extended first.
+			if c.resW == 4 && c.resSigned && t.Signed {
+				c.emit("movsxd r11, eax")
+			} else {
+				c.emit("mov r11, rax")
+			}
 			c.emit("lea r10, [rbp%+d]", off)
 			sg := int64(0)
 			if t.Signed {
@@ -7102,7 +7213,7 @@ func (c *CG) braceElemLocal(t *Type, e Expr, off int) error {
 		c.normalizeBool()
 	}
 	c.emit("lea r10, [rbp%+d]", off)
-	c.genStoreElem("r10", w, t.Class())
+	c.genStoreElem("r10", w, t.Class(), c.resW, c.resSigned)
 	return nil
 }
 
@@ -7964,7 +8075,7 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 		} else {
 			c.emit("subsd xmm0, xmm1")
 		}
-		c.genStoreElem("r10", width, TDouble)
+		c.genStoreElem("r10", width, TDouble, 0, false)
 		if !n.Prefix {
 			c.emit("movsd xmm0, xmm1")
 		}
@@ -8029,7 +8140,7 @@ func (c *CG) genIncDec(n *IncDecExpr) (CType, error) {
 	if et != nil && et.Kind == KBool {
 		c.normalizeBool()
 	}
-	c.genStoreElem("r10", width, TInt)
+	c.genStoreElem("r10", width, TInt, c.resW, c.resSigned)
 	if saved {
 		c.emit("mov rax, [rbp%+d]", os)
 		c.tmpDepth--
@@ -8192,6 +8303,11 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 			c.emit("movsd xmm0, [rbp%+d]", off)
 		} else {
 			c.emit("mov rax, [rbp%+d]", off)
+			// T1.6 (N22): sign-extend a signed materialized int left operand
+			// (low 32 valid, high 32 = 0) before cvtsi2sd.
+			if leftW == 4 && leftSigned {
+				c.emit("movsxd rax, eax")
+			}
 			c.emit("cvtsi2sd xmm0, rax")
 		}
 	}
@@ -8222,6 +8338,22 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		// 8-byte result (long/unsigned long) keeps its full 64-bit value.
 		w, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
 		c.emit("mov r10, [rbp%+d]", off) // left -> r10, right -> rax
+		// T1.6 (N17 at consumption): a 64-bit operation must see TRUE 64-bit
+		// signed operands. A materialized signed int (resW==4, resSigned, high
+		// 32 = 0) would read as a huge positive -- `mp + (mp<10 ? 3 : -9)` in
+		// goclib's time.c degraded -9 (neg eax) to 0x00000000FFFFFFF7 and gmtime
+		// came out one year early. movsxd restores the sign; unsigned ints are
+		// already zero-extended and need nothing; pointer (8-byte) sides are
+		// full width. This single site covers the + - * / arithmetic AND the
+		// pointer-arithmetic branch below (which returns before the switch).
+		if w == 8 {
+			if rightW == 4 && rightSigned {
+				c.emit("movsxd rax, eax")
+			}
+			if leftW == 4 && leftSigned {
+				c.emit("movsxd r10, r10d")
+			}
+		}
 		// ---- pointer arithmetic ----
 		// A pointer value is carried as an 8-byte integer in rax/r10. When an
 		// operand has pointer type we stride the integer side by the pointed-to
@@ -8283,34 +8415,54 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		}
 		switch n.Op {
 		case "+":
-			c.emit("add rax, r10")
-		case "-":
-			c.emit("sub r10, rax")
-			c.emit("mov rax, r10")
-		case "*":
-			c.emit("imul rax, r10")
-		case "/":
-			c.emit("mov r11, rax") // divisor
-			c.emit("mov rax, r10") // dividend
-			if resSign {
-				if w == 4 {
-					c.canonInt(true)
-				}
-				c.emit("cqo")
-				c.emit("idiv r11")
+			if w == 4 {
+				c.emit("add eax, r10d") // 32-bit wrap + zero-extend (materialized)
 			} else {
-				if w == 4 {
-					c.canonInt(false)
+				c.emit("add rax, r10")
+			}
+		case "-":
+			if w == 4 {
+				c.emit("sub r10d, eax")
+				c.emit("mov eax, r10d")
+			} else {
+				c.emit("sub r10, rax")
+				c.emit("mov rax, r10")
+			}
+		case "*":
+			if w == 4 {
+				c.emit("imul eax, r10d")
+			} else {
+				c.emit("imul rax, r10")
+			}
+		case "/":
+			if w == 4 {
+				// T1.6: 32-bit division. The materialized dividend/divisor
+				// carry their value in the low 32 bits (zero-extended). cdq
+				// sign-extends eax into edx:eax, idiv r11d reads r11d as a
+				// signed divisor, quotient lands in eax (zero-extended).
+				c.emit("mov r11d, eax") // divisor low 32
+				c.emit("mov eax, r10d") // dividend low 32
+				if resSign {
+					c.emit("cdq")
+					c.emit("idiv r11d")
+				} else {
+					c.emit("xor edx, edx")
+					c.emit("div r11d")
 				}
-				c.emit("xor rdx, rdx")
-				c.emit("div r11")
+			} else {
+				c.emit("mov r11, rax") // divisor
+				c.emit("mov rax, r10") // dividend
+				if resSign {
+					c.emit("cqo")
+					c.emit("idiv r11")
+				} else {
+					c.emit("xor rdx, rdx")
+					c.emit("div r11")
+				}
 			}
 		}
 		c.resSigned = resSign
 		c.resW = w
-		if w == 4 {
-			c.canonInt(resSign)
-		}
 		c.resTyp = TInt
 		return TInt, nil
 	case "%":
@@ -8318,28 +8470,40 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 			return TInt, fmt.Errorf("%% requires integer operands")
 		}
 		w, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
-		c.emit("mov r10, [rbp%+d]", off)
-		c.emit("mov r11, rax") // divisor
-		c.emit("mov rax, r10") // dividend
-		if resSign {
-			if w == 4 {
-				c.canonInt(true)
+		c.emit("mov r10, [rbp%+d]", off) // left -> r10, right stays in rax
+		if w == 4 {
+			c.emit("mov r11d, eax") // divisor low 32
+			c.emit("mov eax, r10d") // dividend low 32
+			if resSign {
+				c.emit("cdq")
+				c.emit("idiv r11d")
+			} else {
+				c.emit("xor edx, edx")
+				c.emit("div r11d")
 			}
-			c.emit("cqo")
-			c.emit("idiv r11")
+			c.emit("mov eax, edx") // remainder low 32 (zero-extended)
 		} else {
-			if w == 4 {
-				c.canonInt(false)
+			// T1.6 (N17): narrow materialized signed int operands before the
+			// 64-bit idiv -- see the + - * / site above.
+			if rightW == 4 && rightSigned {
+				c.emit("movsxd rax, eax")
 			}
-			c.emit("xor rdx, rdx")
-			c.emit("div r11")
+			c.emit("mov r11, rax") // divisor
+			if leftW == 4 && leftSigned {
+				c.emit("movsxd r10, r10d")
+			}
+			c.emit("mov rax, r10") // dividend
+			if resSign {
+				c.emit("cqo")
+				c.emit("idiv r11")
+			} else {
+				c.emit("xor rdx, rdx")
+				c.emit("div r11")
+			}
+			c.emit("mov rax, rdx")
 		}
-		c.emit("mov rax, rdx")
 		c.resSigned = resSign
 		c.resW = w
-		if w == 4 {
-			c.canonInt(resSign)
-		}
 		c.resTyp = TInt
 		return TInt, nil
 	case "<<", ">>":
@@ -8354,28 +8518,69 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		if lw < 4 {
 			lw, ls = 4, true
 		}
+		// T1.6: constant int shifts fold at compile time. A 32-bit `shl eax,
+		// cl` masks the count to 5 bits, so a constant count in [32,63] would
+		// shift by (count & 31) instead of losing all bits; folding with
+		// 64-bit shift + wrap-to-32 semantics reproduces both the pre-C1
+		// output and gcc's constant fold (lllit: `1 << 32` is 0, not 1).
+		// Counts outside [0,63] (UB) and non-constant operands stay on the
+		// runtime path, which still applies x86 count masking as before.
+		// Long (w==8) shifts are not folded: foldConstInit's Go shift of a
+		// negative-encoded unsigned long literal would be an arithmetic shift,
+		// and the runtime 64-bit path already matches there.
+		if lw == 4 {
+			if lv, ok1 := foldConstInit(n.L); ok1 {
+				if cv, ok2 := foldConstInit(n.R); ok2 && cv >= 0 && cv <= 63 {
+					var folded int64
+					switch n.Op {
+					case "<<":
+						folded = lv << uint(cv)
+					case ">>":
+						if ls {
+							folded = lv >> uint(cv)
+						} else {
+							folded = int64(uint32(lv) >> uint(cv))
+						}
+					}
+					c.emit("mov eax, %d", int32(folded))
+					c.resSigned = ls
+					c.resW = 4
+					c.resTyp = TInt
+					return TInt, nil
+				}
+			}
+		}
 		// Shift count must live in cl (low 8 bits of rcx); the left operand
 		// rides in a frame temporary.
-		c.emit("mov rcx, rax")           // count
-		c.emit("mov rax, [rbp%+d]", off) // left
 		if lw == 4 {
-			c.canonInt(ls)
-		}
-		switch n.Op {
-		case "<<":
-			c.emit("shl rax, cl")
-		case ">>":
-			if ls {
-				c.emit("sar rax, cl") // arithmetic (sign-extending) shift
-			} else {
-				c.emit("shr rax, cl") // logical shift
+			c.emit("mov ecx, eax")           // count low 8 (zero-extends rcx)
+			c.emit("mov eax, [rbp%+d]", off) // left low 32
+			switch n.Op {
+			case "<<":
+				c.emit("shl eax, cl") // 32-bit shift wraps at 32
+			case ">>":
+				if ls {
+					c.emit("sar eax, cl") // arithmetic shift reads bit 31
+				} else {
+					c.emit("shr eax, cl") // logical shift
+				}
+			}
+		} else {
+			c.emit("mov rcx, rax")           // count
+			c.emit("mov rax, [rbp%+d]", off) // left
+			switch n.Op {
+			case "<<":
+				c.emit("shl rax, cl")
+			case ">>":
+				if ls {
+					c.emit("sar rax, cl")
+				} else {
+					c.emit("shr rax, cl")
+				}
 			}
 		}
 		c.resSigned = ls
 		c.resW = lw
-		if lw == 4 {
-			c.canonInt(ls)
-		}
 		c.resTyp = TInt
 		return TInt, nil
 	case "&", "|", "^":
@@ -8384,19 +8589,36 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 		}
 		w, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
 		c.emit("mov r11, [rbp%+d]", off) // left
-		switch n.Op {
-		case "&":
-			c.emit("and rax, r11")
-		case "|":
-			c.emit("or rax, r11")
-		case "^":
-			c.emit("xor rax, r11")
+		if w == 4 {
+			switch n.Op {
+			case "&":
+				c.emit("and eax, r11d")
+			case "|":
+				c.emit("or eax, r11d")
+			case "^":
+				c.emit("xor eax, r11d")
+			}
+		} else {
+			// T1.6 (N17): narrow materialized signed int operands before the
+			// 64-bit and/or/xor -- see the + - * / site above. rax = right,
+			// r11 = left (reloaded from the spill slot).
+			if rightW == 4 && rightSigned {
+				c.emit("movsxd rax, eax")
+			}
+			if leftW == 4 && leftSigned {
+				c.emit("movsxd r11, r11d")
+			}
+			switch n.Op {
+			case "&":
+				c.emit("and rax, r11")
+			case "|":
+				c.emit("or rax, r11")
+			case "^":
+				c.emit("xor rax, r11")
+			}
 		}
 		c.resSigned = resSign
 		c.resW = w
-		if w == 4 {
-			c.canonInt(resSign)
-		}
 		c.resTyp = TInt
 		return TInt, nil
 	case "<", ">", "<=", ">=", "==", "!=":
@@ -8433,9 +8655,28 @@ func (c *CG) genBinary(n *Binary) (CType, error) {
 			c.resW = 4 // a comparison yields a (signed) int
 			return TInt, nil
 		} else {
-			_, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
+			w, resSign := promotedArith(leftW, leftSigned, rightW, rightSigned)
 			c.emit("mov r10, [rbp%+d]", off)
-			c.emit("cmp r10, rax")
+			if w == 4 {
+				// T1.6: both sides are materialized ints (low 32 valid, high
+				// 32 = 0). A 32-bit `cmp r10d, eax` sets SF/OF (signed) and
+				// CF (unsigned) on the low 32 bits -- exactly what jl/jg/jb/ja
+				// need. No sign extension required.
+				c.emit("cmp r10d, eax")
+			} else {
+				// w == 8: a 64-bit compare. A signed int-width side (resW==4)
+				// is a materialized value whose high 32 is zero, so it must
+				// be sign-extended before the 64-bit compare or a negative int
+				// would read as a huge positive. Width 1/2 sides are already
+				// sign/zero-extended by loadVar; long sides are full width.
+				if leftW == 4 && leftSigned {
+					c.emit("movsxd r10, r10d")
+				}
+				if rightW == 4 && rightSigned {
+					c.emit("movsxd rax, eax")
+				}
+				c.emit("cmp r10, rax")
+			}
 			// Signedness selects the condition codes: signed uses jl/jg/...,
 			// unsigned uses jb/ja/... so that negative values compare right.
 			// The promoted common type decides which -- a negative int
@@ -8840,6 +9081,11 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 			if err := c.ensureType(TInt); err != nil {
 				return TInt, err
 			}
+			// N17: materialized signed int argument consumed by bi_from_i64
+			// must be sign-extended first (signed _BitInt parameter).
+			if c.resW == 4 && c.resSigned && pt.Signed {
+				c.emit("movsxd rax, eax")
+			}
 			k, off := c.claimBig(pw)
 			s := int64(0)
 			if pt.Signed {
@@ -8903,6 +9149,11 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 			if pt.IsFloating() {
 				f32 = pt.Kind == KFloat
 				if t == TInt {
+					// T1.6 (N22): sign-extend a signed materialized int
+					// argument before cvtsi2sd (negative int -> double).
+					if c.resW == 4 && c.resSigned {
+						c.emit("movsxd rax, eax")
+					}
 					c.emit("cvtsi2sd xmm0, rax")
 					t = TDouble
 					c.resTyp = TDouble
@@ -8915,6 +9166,26 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 		} else {
 			if t == TDouble { // varargs: double bits ride in a GP slot
 				c.emit("movq rax, xmm0")
+			} else if varargs && t == TInt && c.resW == 4 && c.resSigned {
+				// T1.6 (N13, printf %d): vfmt reads a vararg int as a full
+				// 8-byte signed long (va_arg(ap, long)) and negates on the
+				// sign bit. A materialized signed int only has the low 32 bits
+				// valid (high 32 = 0), so it must be sign-extended into the
+				// 8-byte slot or a negative int prints as a huge positive.
+				c.emit("movsxd rax, eax")
+			} else if !varargs && t == TInt && c.resW == 4 && c.resSigned &&
+				i < len(paramTypes) && paramTypes[i] != nil &&
+				paramTypes[i].Kind == KInt && paramTypes[i].Signed &&
+				paramTypes[i].Width >= 4 {
+				// T1.6 (N13): an int argument passed to a signed int/long
+				// parameter must be sign-extended into the 8-byte argument
+				// slot. The callee loads a param's full 8 bytes; a materialized
+				// negative int (high 32 = 0) would otherwise read as a huge
+				// positive (intprint: int_print(-2147483647-1) printed
+				// +2147483648; libmisc: labs(-7) printed 4294967289). Unsigned
+				// params read the materialized (zero-extended) form, which is
+				// exactly the C conversion.
+				c.emit("movsxd rax, eax")
 			}
 			c.emit("mov [rbp%+d], rax", c.tmpSlot(c.tmpDepth))
 		}

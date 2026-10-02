@@ -1169,6 +1169,47 @@ func (a *Assembler) rexW(regIdx, rmIdx int) {
 	a.emitByte(v)
 }
 
+// emitArithRex emits the REX prefix for a 16/32/64-bit arithmetic op whose
+// width comes from its register operands. W is set only for 64-bit operands: a
+// 32-bit form must NOT get REX.W, or the CPU silently promotes it to 64-bit
+// (e.g. `cmp r10d, eax` becomes `cmp r10, rax`). Under the int carry model a
+// materialized int has high 32 bits = 0, so a 64-bit signed compare of
+// 0x00000000FFFFFFFF (int -1) against 1 sees 4294967295 >= 1 and loops
+// forever; and `sub r10d, eax` as a 64-bit sub pollutes the high bits that the
+// zero-extension invariant depends on. 0x66 (16-bit) precedes REX like always.
+func (a *Assembler) emitArithRex(width int, regIdx, rmIdx int) {
+	if width == 2 {
+		a.emitByte(0x66)
+	}
+	v := byte(0x40)
+	if width == 8 {
+		v |= 0x08
+	}
+	if regIdx >= 8 {
+		v |= 0x04
+	}
+	if rmIdx >= 8 {
+		v |= 0x01
+	}
+	if v != 0x40 {
+		a.emitByte(v)
+	}
+}
+
+// arithWidth returns the operation width in bytes for a reg-reg arithmetic op:
+// either operand being 32-bit (eax/r10d) makes the whole op 32-bit, either
+// being 16-bit makes it 16-bit, otherwise it is 64-bit. Valid code pairs
+// same-width operands; the rule mirrors encodeMov's.
+func arithWidth(dst, src Operand) int {
+	if dst.is32 || src.is32 {
+		return 4
+	}
+	if dst.is16 || src.is16 {
+		return 2
+	}
+	return 8
+}
+
 // modrmRegReg builds mod=11 (register-direct) ModRM: reg field = r, rm field = m.
 func modrmRegReg(r, m int) byte {
 	return byte(0xC0 | ((r & 7) << 3) | (m & 7))
@@ -1951,6 +1992,31 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 
 	// mov reg, imm64
 	if dst.kind == K_REG && src.kind == K_IMM {
+		// Width-aware mov reg, imm: `mov eax, -2147483648` must emit the 32-bit
+		// B8+rd imm32 form (zero-extending rax to the materialized-int pattern),
+		// NOT REX.W + imm64, which would sign-extend into 0xFFFFFFFF80000000
+		// and corrupt the materialized invariant. The same rule applies to a
+		// 0x66-prefixed imm16. Only a full-width (64-bit) destination takes the
+		// REX.W + imm64 form.
+		if dst.is16 {
+			a.emitByte(0x66)
+			if dst.reg >= 8 {
+				a.emitByte(0x41) // REX.B for r8w-r15w
+			}
+			a.emitByte(byte(0xB8 | (dst.reg & 7)))
+			v := int16(src.imm)
+			a.emitByte(byte(v))
+			a.emitByte(byte(v >> 8))
+			return nil
+		}
+		if dst.is32 {
+			if dst.reg >= 8 {
+				a.emitByte(0x41) // REX.B for r8d-r15d
+			}
+			a.emitByte(byte(0xB8 | (dst.reg & 7)))
+			a.emitInt32(int32(src.imm))
+			return nil
+		}
 		if dst.reg >= 8 {
 			a.emitByte(0x48 | 0x01)
 		} else {
@@ -2262,7 +2328,9 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 	if src.kind == K_REG {
 		// opcode is "op r/m64, r64": modrm reg field = src, rm field = dst.
 		// REX.R extends the reg field (src), REX.B extends the rm field (dst).
-		a.rexW(src.reg, dst.reg)
+		// Width comes from the operands: `cmp r10d, eax` must encode as a
+		// 32-bit cmp (REX.W=0), not the 64-bit form rexW used to force.
+		a.emitArithRex(arithWidth(dst, src), src.reg, dst.reg)
 		a.emitByte(c.reg)
 		a.emitByte(modrmRegReg(src.reg, dst.reg)) // reg field = src, rm = dst
 		return nil
@@ -2274,12 +2342,12 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 		// "test eax, 1" into "add eax, 1" -- silently corrupting the
 		// register and the flags it was supposed to probe.
 		if src.imm >= -128 && src.imm <= 127 {
-			a.rexW(0, dst.reg)
+			a.emitArithRex(regWidth(dst), 0, dst.reg)
 			a.emitByte(0xF6)
 			a.emitByte(modrmRegReg(0, dst.reg))
 			a.emitByte(byte(int8(src.imm)))
 		} else {
-			a.rexW(0, dst.reg)
+			a.emitArithRex(regWidth(dst), 0, dst.reg)
 			a.emitByte(0xF7)
 			a.emitByte(modrmRegReg(0, dst.reg))
 			a.emitInt32(int32(src.imm))
@@ -2288,12 +2356,12 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 	}
 	if src.kind == K_IMM {
 		if src.imm >= -128 && src.imm <= 127 {
-			a.rexW(0, dst.reg)
+			a.emitArithRex(regWidth(dst), 0, dst.reg)
 			a.emitByte(0x83)
 			a.emitByte(modrmRegReg(int(c.dig), dst.reg))
 			a.emitByte(byte(int8(src.imm)))
 		} else {
-			a.rexW(0, dst.reg)
+			a.emitArithRex(regWidth(dst), 0, dst.reg)
 			a.emitByte(0x81)
 			a.emitByte(modrmRegReg(int(c.dig), dst.reg))
 			a.emitInt32(int32(src.imm))
@@ -2419,26 +2487,28 @@ func (a *Assembler) encodeImul(ops []Operand, ln string) error {
 	}
 	dst := ops[0]
 	if ops[1].kind == K_REG {
-		// imul r64, r64 : 0F AF /r  (reg=dst, rm=src)
-		a.rexW(dst.reg, ops[1].reg)
+		// imul r32, r/m32 : 0F AF /r  (reg=dst, rm=src). Width-aware: imul
+		// eax, r10d must not get REX.W (would multiply full 64-bit rax).
+		a.emitArithRex(arithWidth(dst, ops[1]), dst.reg, ops[1].reg)
 		a.emitByte(0x0F)
 		a.emitByte(0xAF)
 		a.emitByte(modrmRegReg(dst.reg, ops[1].reg))
 		return nil
 	}
 	if ops[1].kind == K_IMM {
-		// imul r64, imm : 6B /r ib (sign-extended imm8) or 69 /r id (imm32).
+		// imul r32, imm : 6B /r ib (sign-extended imm8) or 69 /r id (imm32).
 		// The destination register occupies BOTH the reg and rm fields of the
 		// ModRM, so when dst.reg >= 8 we must set REX.R (reg field) AND REX.B
-		// (rm field) — rexW(dst, dst) does exactly that.
+		// (rm field) — rexW(dst, dst) did that but always forced 64-bit; the
+		// 32-bit form (imul r11d, 4) must stay REX.W=0.
 		imm := ops[1].imm
 		if imm >= -128 && imm <= 127 {
-			a.rexW(dst.reg, dst.reg)
+			a.emitArithRex(regWidth(dst), dst.reg, dst.reg)
 			a.emitByte(0x6B)
 			a.emitByte(modrmRegReg(dst.reg, dst.reg))
 			a.emitByte(byte(int8(imm)))
 		} else {
-			a.rexW(dst.reg, dst.reg)
+			a.emitArithRex(regWidth(dst), dst.reg, dst.reg)
 			a.emitByte(0x69)
 			a.emitByte(modrmRegReg(dst.reg, dst.reg))
 			a.emitInt32(int32(imm))
@@ -2479,23 +2549,37 @@ func (a *Assembler) encodeShift(mnem string, ops []Operand, ln string) error {
 			return fmt.Errorf("%s count %d out of range [0,63]: %q", mnem, c, ln)
 		}
 		if c == 1 {
-			a.rexW(0, dst.reg)
+			a.emitShiftRex(dst, int(dig))
 			a.emitByte(0xD1)
 			a.emitByte(modrmRegReg(int(dig), dst.reg))
 		} else {
-			a.rexW(0, dst.reg)
+			a.emitShiftRex(dst, int(dig))
 			a.emitByte(0xC1)
 			a.emitByte(modrmRegReg(int(dig), dst.reg))
 			a.emitByte(byte(c))
 		}
 	case ops[1].kind == K_REG && ops[1].isByte && ops[1].reg == 1: // cl
-		a.rexW(0, dst.reg)
+		a.emitShiftRex(dst, int(dig))
 		a.emitByte(0xD3)
 		a.emitByte(modrmRegReg(int(dig), dst.reg))
 	default:
 		return fmt.Errorf("%s: unsupported shift count: %q", mnem, ln)
 	}
 	return nil
+}
+
+// emitShiftRex emits the REX prefix for a shift whose destination is dst and
+// whose ModRM reg field carries the shift group digit dig. Width-aware: a
+// 32-bit destination must NOT get REX.W, or `sar eax, cl` silently operates on
+// 64-bit rax (sign bit = bit 63). For a materialized int in eax the high 32
+// bits are 0, so such a 64-bit arithmetic shift degenerates into a logical one
+// (negative `a >> n` came out as a huge positive). The old 64-bit shifts
+// (shl/sar rax, ...) keep REX.W=1 unchanged.
+func (a *Assembler) emitShiftRex(dst Operand, dig int) {
+	rex, must := rexByte(regWidth(dst), dig, dst.reg, false, false, dst.reg >= 8)
+	if must {
+		a.emitByte(rex)
+	}
 }
 
 // ---- SSE2 (scalar double / quadword moves) --------------------------------

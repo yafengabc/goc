@@ -253,11 +253,13 @@ int main(){ return h(3); }`
 	if strings.Count(body, "shl rax, 32") > 1 {
 		t.Fatalf("expected exactly one shl pair in h, got:\n%s", body)
 	}
-	// And a user shift of the same shape stays untouched.
+	// And a user shift of the same shape stays untouched. Under T1.6 an int
+	// shift emits the 32-bit form (shl eax, cl), which is NOT an IntWrap pair,
+	// so elimRedundantExt must leave it alone.
 	src2 := `int u(int a){ return (a << 32 >> 32) + 1; }
 int main(){ return u(3); }`
 	asm2 := genAsmOpt(t, src2, 2)
-	if strings.Count(asm2, "shl rax, 32") < 2 {
+	if strings.Count(asm2, "shl eax, cl") < 1 {
 		t.Fatalf("user shift must survive, got:\n%s", asm2)
 	}
 }
