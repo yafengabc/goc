@@ -3,7 +3,7 @@
 > 测试套件：`D:\projects\goc\tests\c23\`（cases 66 个用例文件 + 一键重跑脚本 `run_c23_tests.ps1` + 对拍引擎 `_tools\check_case.ps1`）
 > 对拍基线：`D:\projects\goc\bin\goc.exe`（2026-10-02 版本）vs `D:\msys\ucrt64\bin\gcc.exe -std=c2x -Wall -Wextra`（GCC 16.2.0，MSYS2 UCRT64，Windows LLP64）
 > 判定四类：**PASS**（goc 与 gcc 行为一致）/ **FAIL**（gcc 通过而 goc 错误 = 真实缺口，附报错原文）/ **UNSUPPORTED**（goc 明确设计取舍）/ **PARTIAL**（部分子用例通过，含两侧输出不同但都能跑的 DIFF 情形）
-> 全量机械判定：45 PASS / 7 PARTIAL / 7 FAIL / 5 DIFF / 2 UNSUPPORTED（详见下方分组表；机械判定与语义判定差异处已注明）
+> 全量机械判定：47 PASS / 6 PARTIAL / 6 FAIL / 5 DIFF / 2 UNSUPPORTED（2026-10-02 批次E：c23_version/c23_has_c_attribute 转 PASS；详见下方分组表；机械判定与语义判定差异处已注明）
 > 所有用例均在 gcc -std=c2x 下编译运行通过（负向用例为双方拒绝），源代码 LF/UTF-8 无 BOM/纯 ASCII。
 > 2026-10-02 更新：P0 _BitInt 修复落地（src\codegen.go、src\goclib\bitint.c/h），`c23_bitint.c` 由 PARTIAL(12/15) 转 **PASS(15/15)**，新增 `c23_bitint_edge.c`（PASS 7/7，覆盖裸字面量比较/全局与 static 非零初始化/嵌套同宽 cast/6 参 conv 栈通道）；go test 全绿，C89-C17 套件 0 MISMATCH。
 > 2026-10-02 更新：P0.2 块作用域非 static `_Thread_local` panic 修复落地（src\check.go 存储类约束：块作用域 + 非 static/extern 直接干净拒绝），新增 `c23_thread_local_bad.c`（EXPECT: REJECT，双方拒机械 PASS）；原 codegen.go:4785 IsArray nil panic 路径不可达。

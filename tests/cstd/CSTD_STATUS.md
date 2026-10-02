@@ -5,11 +5,11 @@
 - 被测对象：`D:\projects\goc\bin\goc.exe`（单模式：接受但忽略 `-std`，所有用例同一语义）
 - 验证日期：2026-10-02；重跑：`powershell -ExecutionPolicy Bypass -File tests\cstd\run_cstd_tests.ps1`（当前结果 0 MISMATCH，退出码 0）
 - 判定四类：**PASS** = goc 与 gcc 输出+退出码一致；**FAIL** = gcc 过而 goc 编译/运行错误（真实缺口，报错原文照录）；**UNSUPPORTED** = goc 明确设计取舍/后置；**PARTIAL** = 部分子用例通过
-- 汇总：**PASS=53 PARTIAL=5 FAIL=4 UNSUPPORTED=7 MISMATCH=0**
+- 汇总：**PASS=55 PARTIAL=4 FAIL=3 UNSUPPORTED=7 MISMATCH=0**（2026-10-02 批次E：c89_pp_elif/c89_pp_obj 转 PASS）
 
 ---
 
-## C89（36 文件：31 PASS / 3 PARTIAL / 1 FAIL / 1 UNSUPPORTED）
+## C89（36 文件：33 PASS / 2 PARTIAL / 0 FAIL / 1 UNSUPPORTED）
 
 ### 核心语言（16 文件，全 PASS）
 
