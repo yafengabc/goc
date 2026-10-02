@@ -1,11 +1,12 @@
 # C23 特性就绪度状态矩阵（goc tests\c23）
 
-> 测试套件：`D:\projects\goc\tests\c23\`（cases 65 个用例文件 + 一键重跑脚本 `run_c23_tests.ps1` + 对拍引擎 `_tools\check_case.ps1`）
+> 测试套件：`D:\projects\goc\tests\c23\`（cases 66 个用例文件 + 一键重跑脚本 `run_c23_tests.ps1` + 对拍引擎 `_tools\check_case.ps1`）
 > 对拍基线：`D:\projects\goc\bin\goc.exe`（2026-10-02 版本）vs `D:\msys\ucrt64\bin\gcc.exe -std=c2x -Wall -Wextra`（GCC 16.2.0，MSYS2 UCRT64，Windows LLP64）
 > 判定四类：**PASS**（goc 与 gcc 行为一致）/ **FAIL**（gcc 通过而 goc 错误 = 真实缺口，附报错原文）/ **UNSUPPORTED**（goc 明确设计取舍）/ **PARTIAL**（部分子用例通过，含两侧输出不同但都能跑的 DIFF 情形）
-> 全量机械判定：44 PASS / 7 PARTIAL / 7 FAIL / 5 DIFF / 2 UNSUPPORTED（详见下方分组表；机械判定与语义判定差异处已注明）
+> 全量机械判定：45 PASS / 7 PARTIAL / 7 FAIL / 5 DIFF / 2 UNSUPPORTED（详见下方分组表；机械判定与语义判定差异处已注明）
 > 所有用例均在 gcc -std=c2x 下编译运行通过（负向用例为双方拒绝），源代码 LF/UTF-8 无 BOM/纯 ASCII。
 > 2026-10-02 更新：P0 _BitInt 修复落地（src\codegen.go、src\goclib\bitint.c/h），`c23_bitint.c` 由 PARTIAL(12/15) 转 **PASS(15/15)**，新增 `c23_bitint_edge.c`（PASS 7/7，覆盖裸字面量比较/全局与 static 非零初始化/嵌套同宽 cast/6 参 conv 栈通道）；go test 全绿，C89-C17 套件 0 MISMATCH。
+> 2026-10-02 更新：P0.2 块作用域非 static `_Thread_local` panic 修复落地（src\check.go 存储类约束：块作用域 + 非 static/extern 直接干净拒绝），新增 `c23_thread_local_bad.c`（EXPECT: REJECT，双方拒机械 PASS）；原 codegen.go:4785 IsArray nil panic 路径不可达。
 
 ## 0. 对写标准库的核心结论（先看这个）
 
@@ -43,12 +44,12 @@
 | 缺失宏 | **limits.h/float.h 全部 C23 宏** | CHAR_WIDTH…ULLONG_WIDTH、BOOL_WIDTH、BITINT_MAXWIDTH、FLT_NORM_MAX、FLT_IS_IEC_60559 等 goc 一个都没有；LLONG_MAX 也没有 |
 | 缺失设施 | **offsetof / max_align_t** | goc stddef.h 明写 "deliberately not provided" |
 | 平台细节 | **printf %a / %wN / `"hello"[0]` 直接下标** | goc 无 %a（打印字面 'a'）、无 %wN；字符串字面量直接下标返回垃圾值 1819043176（先赋 `const char*` 再下标） |
-| 编译器崩溃 | **块作用域非 static thread_local** | goc 编译期 Go panic（nil 解引用，exit 2）——非法 C（gcc 拒绝），合法形式须 `static thread_local` |
+| 编译器崩溃（已修） | **块作用域非 static thread_local** | **已修复（P0.2，2026-10-02）**：现干净拒绝 `_Thread_local variable "x" at block scope must be static or extern`（exit 非 0），不再 Go panic；gcc 同样拒绝；合法形式须 `static thread_local` |
 
 ### 需要上报 goc 的缺陷清单（按优先级）
 1. ~~`_BitInt` ≤64 位不做宽度掩码（赋值/运算不回绕）~~ ——**已修复**（2026-10-02：8 处转换落点改 `from_i64_trunc`/`conv` 按目标宽度回绕 + 算术/复合赋值就地回绕）
 2. ~~`_BitInt` 与无类型整数字面量比较触发编译器 panic~~ ——**已修复**（比较分支 nil 类型兜底 `IntType()`）；另修复：全局/static 非零初始化被静默丢弃（bigInitWords 剥 cast 链+回绕+负值全宽扩展）、goa dq 拒 16 位十六进制、callBigLib 5+ 参栈通道、同宽 big->big cast 缺失 copyBytes、返回 _BitInt 的函数调用误判 struct
-3. 块作用域非 static `thread_local` 触发编译器 panic——P1
+3. ~~块作用域非 static `thread_local` 触发编译器 panic~~ ——**已修复**（2026-10-02：src\check.go 语义层拒绝块作用域 + 非 static/extern 的 `_Thread_local` 组合，codegen panic 路径不可达；负向用例 c23_thread_local_bad.c 双方拒绝）
 4. 空 `{}` 初始化：首个标量不归零（codegen bug）、static 存储期被拒——P1
 5. `_Generic` 在 LLP64 把 long/unsigned 折叠为 int（genericTypeMatch 宽度相等时丢符号/类型）——P2
 6. 不定义 `__STDC_VERSION__`/`__STDC__`/`__STDC_NO_VLA__` 等任何预定义宏——P1（C23 条件编译完全失效）
@@ -69,7 +70,8 @@
 | alignas/alignof | **PARTIAL** | 7 | goc 4/7：标量变量真对齐（alignas(16) 偏移 0）；`alignas(32) char[64]` 全局偏移 **8**、结构体成员偏移 **8**、`alignas(64) char[128]` 局部偏移 **48**——声明了但没真对齐 | 7/7 全对齐 | 标量变量可用；**别用 alignas 对齐成员/数组/SIMD/缓存行** |
 | constexpr 对象（文件作用域） | **PASS（附缺口）** | 8 | 文件作用域标量/指针/数组/`static constexpr` 折叠正确；**拒**块作用域 constexpr（`parse error: expected ";", got "int"`）与 constexpr 数组界（`expected ";", got "N"`） | 8/8 全支持 | 文件作用域放心用；勿在函数内写、勿作数组维 |
 | constexpr 非常量初始化（负向） | **FAIL（偏差）** | 1 | goc **接受** `constexpr int bad = glob;`（exit 0 无诊断） | gcc 拒：`initializer element is not constant` | 别指望 constexpr 做编译期校验（goc 不强制常量） |
-| thread_local / _Thread_local | **PASS** | 7 | 文件作用域 + 函数内 static TLS 读写/sizeof/取址全对（goa 原生 TLS 实证） | 7/7 逐行一致 | 放心用（合法形式）；**块内必须 `static thread_local`**（非 static 会 panic）；单线程局限待 threads.h |
+| thread_local / _Thread_local | **PASS** | 7 | 文件作用域 + 函数内 static TLS 读写/sizeof/取址全对（goa 原生 TLS 实证） | 7/7 逐行一致 | 放心用（合法形式）；**块内必须 `static thread_local`**（非 static 现被干净拒绝，P0.2）；单线程局限待 threads.h |
+| 块作用域非 static thread_local（负向） | **PASS（双方拒）** | 3 构造 | goc 干净拒：`type error(s): line N: _Thread_local variable "x" at block scope must be static or extern`（P0.2） | gcc -std=c2x 拒：`function-scope 'x' implicitly auto and declared '_Thread_local'` | 非法写法；块作用域 TLS 必须 static/extern |
 | typeof / typeof_unqual | **PASS（附缺口）** | 7 | typeof(类型/标量变量/常量) 与 typeof_unqual(const/volatile) 可用；**拒** `__typeof__`（`parse error`）、`typeof(&x)`（`only typeof(type), typeof(var) and typeof(constant) are supported`）、嵌套 typeof；`typeof(2.0)` 得 0.0（bug） | 7/7 全支持 | 放心用，实参限类型名/标量变量；勿用旧拼写/嵌套/地址表达式 |
 | auto 类型推导 | **PASS** | 7 | int/指针/数组衰减/函数指针/const/static/for-init/文件作用域全过 | 7/7（gcc 对 `static auto` 仅警告声明序） | 放心用 |
 | auto 无初始化器（负向） | **PASS（双方拒）** | 1 | `type error(s): line 11: auto declaration of "x" requires an initialiser` | `error: 'auto' requires an initialized data declaration` | 一致拒绝 |
@@ -166,7 +168,7 @@
 4. **LLP64 平台效应**（A1/D2/F 组交叉）：gcc 侧 `long`=32 位（LONG_WIDTH=32）；goc 侧 `long`/`unsigned long`=64 位；`_Generic` 的 long/unsigned 折叠即源于 goc 以宽度为主键比较。若目标是 LP64（Linux），long 相关结论需复测。
 5. **预定义宏全线缺失**（A 组 + 各负向探针）：goc 不定义 `__STDC_VERSION__`/`__STDC__`/`__STDC_HOSTED__`/`__STDC_NO_VLA__`，标准条件编译（版本判断、VLA 探测）全部失效。
 6. **`defined()` 不可见**（B 组 + 组织者探针）：`defined(__has_include)`/`defined(__has_c_attribute)` 在 goc 恒为假；直接调用可用。契约里推荐的 portable guard 写法对 goc 不成立。
-7. **编译器健壮性**（A2 组）：块作用域非 static `thread_local` 会触发 goc 编译期 Go panic（nil 解引用，exit 2）——非法写法直接让 goc 崩溃而非报错；_BitInt 与裸字面量比较的同类 panic 已于 2026-10-02 修复。
+7. **编译器健壮性**（A2 组）：块作用域非 static `thread_local` 原触发 goc 编译期 Go panic（nil 解引用，exit 2）——**已于 2026-10-02 P0.2 修复**（语义层干净拒绝，codegen panic 路径不可达）；_BitInt 与裸字面量比较的同类 panic 亦已于 2026-10-02 修复。
 8. **roadmap 修正汇总**：#129 _Atomic"语法接受+lock 前缀"不成立（parse 拒绝）；#131 _BitInt 窄宽度掩码缺失（π 对拍只覆盖宽宽度）——**已于 2026-10-02 修复**；<stdbit.h>/<uchar.h> 后置成立；long double 降级成立但标记宏未定义；#embed prefix/suffix/if_empty 已支持（"后置未确认"不准确）；stdckdint "已支持"仅 32 位成立；stddef.h 的 offsetof/max_align_t 缺失未记录。
 
 ## 附：重跑方法

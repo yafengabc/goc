@@ -102,6 +102,7 @@ $expected = @{
     'c11_static_assert.c' = @{ status = 'PASS';      gocFails = $false; extra = '' }
     'c11_align.c'       = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c11_thread_local.c'= @{ status = 'PASS';        gocFails = $false; extra = '' }
+    'c11_thread_local_bad.c'= @{ status = 'PASS';     gocFails = $true;  extra = '' }
     'c11_noreturn.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c11_anon.c'        = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c11_uchar.c'       = @{ status = 'UNSUPPORTED'; gocFails = $true;  extra = '' }

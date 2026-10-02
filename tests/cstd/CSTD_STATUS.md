@@ -1,11 +1,11 @@
 # CSTD_STATUS.md — goc C89/C99/C11/C17 单元测试就绪度矩阵
 
-- 套件位置：`tests\cstd\cases\`（68 个用例 .c + 1 个配套 .h）
+- 套件位置：`tests\cstd\cases\`（69 个用例 .c + 1 个配套 .h）
 - 对拍基准：gcc 16.2.0（MSYS2 UCRT64，`D:\msys\ucrt64\bin\gcc.exe`），逐版本 `-std=c89/c99/c11/c17`（等号形式）
 - 被测对象：`D:\projects\goc\bin\goc.exe`（单模式：接受但忽略 `-std`，所有用例同一语义）
 - 验证日期：2026-10-02；重跑：`powershell -ExecutionPolicy Bypass -File tests\cstd\run_cstd_tests.ps1`（当前结果 0 MISMATCH，退出码 0）
 - 判定四类：**PASS** = goc 与 gcc 输出+退出码一致；**FAIL** = gcc 过而 goc 编译/运行错误（真实缺口，报错原文照录）；**UNSUPPORTED** = goc 明确设计取舍/后置；**PARTIAL** = 部分子用例通过
-- 汇总：**PASS=48 PARTIAL=5 FAIL=8 UNSUPPORTED=7 MISMATCH=0**
+- 汇总：**PASS=49 PARTIAL=5 FAIL=8 UNSUPPORTED=7 MISMATCH=0**
 
 ---
 
@@ -87,14 +87,15 @@
 
 ---
 
-## C11（9 文件：7 PASS / 2 UNSUPPORTED）
+## C11（10 文件：8 PASS / 2 UNSUPPORTED）
 
 | 文件 | 特性 | 状态 | 子用例 | goc 证据 / gcc 对拍 | 写标准库建议 |
 |---|---|---|---|---|---|
 | c11_generic.c | `_Generic` 类型泛选 | PASS | 6 | 一致（控制表达式不求值、default、char 左值 vs `'a'` 整型提升陷阱、嵌套） | 放心用；**同一关联列表勿同时列 `int:` 与 `const int:`**（goc 报 appears twice） |
 | c11_static_assert.c | `_Static_assert`/static_assert | PASS | 4 | 一致；goc 是关键字（失败用例诊断：`parse error: static_assert failed: this must fail`）；gcc 需 `#include <assert.h>` 取宏 | 放心用（goc 解析期即拒，诊断干净） |
 | c11_align.c | `_Alignas`/`_Alignof`/对齐宏 | PASS | 5 | 一致（内置 alignas/alignof 可用，实测 16）；`_Alignof(struct Tag)` 与标准 `offsetof(type,m)` 为 goc 缺口，用例改用 sizeof/指针减法 | 用内置 alignas/alignof；勿用 `_Alignof(struct Tag)`、标准 offsetof 宏 |
-| c11_thread_local.c | `_Thread_local`/thread_local | PASS | 5 | 一致（goc 原生 TLS：文件作用域、static 函数内、取地址、跨函数读均正常）；**块作用域非 static TLS 触发 panic**（codegen.go:4724） | 放心用；**勿用非 static 块作用域 TLS**；gcc 本机无 threads.h，用例用 `#define thread_local _Thread_local` 兜底 |
+| c11_thread_local.c | `_Thread_local`/thread_local | PASS | 5 | 一致（goc 原生 TLS：文件作用域、static 函数内、取地址、跨函数读均正常）；块作用域非 static TLS 现被干净拒绝（P0.2），不再 panic | 放心用；块作用域须 `static _Thread_local`；gcc 本机无 threads.h，用例用 `#define thread_local _Thread_local` 兜底 |
+| c11_thread_local_bad.c | 块作用域非 static `_Thread_local`（负向） | PASS（拒绝类） | 3 | goc 干净拒：`type error(s): line N: _Thread_local variable "x" at block scope must be static or extern`（P0.2，原 codegen.go:4785 IsArray nil panic 已消除）；gcc -std=c11 同样拒（`function-scope 'x' implicitly auto and declared '_Thread_local'`） | 双方一致拒绝；块作用域写 TLS 必须加 static |
 | c11_noreturn.c | `_Noreturn`/noreturn 宏 | PASS | 3 | 一致 | 放心用 |
 | c11_anon.c | 匿名 struct/union 成员 | PASS | 7 | 一致（扁平访问/初始化透明/嵌套/union 重叠） | 放心用 |
 | c11_uchar.c | `<uchar.h>`/char16_t/`u""`/`U""` | UNSUPPORTED | 4 | `note: skipping unavailable system header <uchar.h>`；`parse error: line 11: expected type specifier, got "char16_t"`；gcc 编译通过 | 避开 |
@@ -137,7 +138,7 @@ goc 是 **LP64**（`sizeof(long)=8`、指针 8、size_t 8），本机 Windows gc
 - 标准 `offsetof(type,member)`：`unexpected token "struct"`（用 `(char*)&p.b-(char*)&p` 替代）
 - `_Alignof(struct Tag)`：parse error（`_Alignof(标量/数组)` 正常）
 - gets：`codegen error: unknown function "gets": not in goclib (...)`（符合 C11 移除，goc 同样无）
-- 块作用域非 static `_Thread_local`：**panic**（`IsArray` nil，codegen.go:4724）——唯一会崩溃的触发点，写库时绝对避开
+- 块作用域非 static `_Thread_local`：**已修复（P0.2，2026-10-02）**——现被语义层干净拒绝（`_Thread_local variable "x" at block scope must be static or extern`，exit 非 0），原 codegen.go:4785 IsArray nil panic 路径不可达；gcc 同样拒绝
 
 ### UNSUPPORTED（设计取舍/后置，报错原文）
 - trigraph：`parse error: line 13: expected ";", got "?"`（gcc 需 `-trigraphs`）
@@ -192,4 +193,4 @@ int=4、long=8（LP64）、long long=8、指针=8、float=4、double=8、long do
 
 ### 给标准库作者的最终建议（放心用 / 避开速查）
 - **放心用**：对象/函数宏（含 `#` `##`）、嵌套 `#if/#else`、`//` 注释、long long、`_Bool`、restrict、声明混排、十六进制浮点常量、尾随逗号、stdint 之外的全套 stdio/string/ctype/stdlib/math（含 C99 math 宏）、`_Generic`、`_Static_assert`、alignas/alignof、thread_local（静态/文件作用域）、`_Noreturn`、匿名 struct/union、stdckdint.h、`__FILE__/__LINE__`
-- **避开**：八进制字面量、`\ooo`/`\xhh`、`.5` 写法、多 `#elif` 链、UCN、`__func__`、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`%a` 打印、`sizeof(复合字面量)`、VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、va_copy、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（panic）、stdint.h/inttypes.h
+- **避开**：八进制字面量、`\ooo`/`\xhh`、`.5` 写法、多 `#elif` 链、UCN、`__func__`、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`%a` 打印、`sizeof(复合字面量)`、VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、va_copy、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）、stdint.h/inttypes.h

@@ -111,7 +111,15 @@ func (c *checker) checkBlock(b *Block, fn *FuncDecl) {
 func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 	switch n := st.(type) {
 	case *DeclStmt:
-		// C23 type inference: the parser stamped the autoDeduceType placeholder
+		// C11/C23 6.7.1 constraint: _Thread_local at block scope must also carry
+		// static or extern. A plain "_Thread_local int x;" inside a function is
+		// ill-formed (gcc rejects it: 'function-scope ... implicitly auto'). Without
+		// this check the variable is laid out neither on the frame nor in the TLS
+		// section, so codegen later nil-derefs vi.typ (IsArray panic at codegen.go
+		// ~4785). Reject here with a clean diagnostic instead of crashing.
+		if n.IsTLS && fn != nil && n.Storage != "static" && n.Storage != "extern" {
+			c.errf(n.Line, "_Thread_local variable %q at block scope must be static or extern", n.Name)
+		}
 		// ("auto x = expr;"). The declared type is the type of the initialiser
 		// after lvalue/array-to-pointer/function-to-pointer decay -- exactly
 		// what checkExpr returns -- or the type of the single element of the
