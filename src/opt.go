@@ -500,6 +500,128 @@ func slotCache(insts []Inst) []Inst {
 	return out
 }
 
+// algebraicIdentSkip bypasses the algebraic-identity pass in Gen().
+var algebraicIdentSkip bool
+
+// algebraicIdent folds a small set of algebraic identities that goc emits
+// literally (T1.3). The headline case is comparison-to-zero:
+//
+//   - truthiness of if/while/for/do-while/&&/|| conditions, and the generic
+//     `x == 0` / `x != 0` / `x < 0` / ... all end up as `cmp <r>, 0` (an
+//     immediate zero) or `cmp <r2>, <r>` where r was materialised as zero by
+//     `xor r, r` / `mov r, 0`;
+//   - `test <r>, <r>` is byte-identical in effect for the ZF-based and signed
+//     condition codes (je/jne/jg/jl/jge/jle and the setcc equivalents), at a
+//     smaller encoding and one fewer uop than `cmp`.
+//
+// `test` clears CF to 0 whereas `cmp r, 0` sets CF = (r <u 0); the unsigned
+// reads (ja/jb/jae/jbe and seta/setb/setae/setbe) therefore must NOT be
+// rewritten. The pass only rewrites when the immediately following
+// instruction is a flag read in the SAFE set, so an unsigned branch after a
+// `cmp r, 0` is left untouched.
+//
+// Correctness discipline (mirrors the other passes): a label, inline __asm, a
+// call, a return or any unparseable line clears all knowledge; a write to a
+// tracked register clears its zero fact; mul/div/idiv/cqo/cdq write rax/rdx.
+func algebraicIdent(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	zeroReg := map[string]bool{} // register (64-bit name) -> holds the constant 0
+	clearAll := func() { zeroReg = map[string]bool{} }
+	// safeCmpZeroRead reports whether a flag-read instruction makes
+	// `cmp r, 0` ≡ `test r, r`. ZF-based (je/jne) and signed (jg/jl/jge/jle,
+	// setg/setl/setge/setle) comparisons are identical; unsigned (ja/jb/jae/
+	// jbe, seta/setb/setae/setbe) are not, because `test` clears CF.
+	safeCmpZeroRead := func(op string) bool {
+		switch op {
+		case "je", "jne", "jz", "jnz", "jg", "jl", "jge", "jle",
+			"sete", "setne", "setg", "setl", "setge", "setle":
+			return true
+		}
+		return false
+	}
+	for i := 0; i < len(insts); i++ {
+		in := insts[i]
+		if in.Kind != instInstr {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+		// A call or return clobbers every register we track (rax plus the
+		// caller-save set), so discard all zero facts.
+		if pl.op == "call" || pl.op == "ret" {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+		// Attempt a comparison-to-zero rewrite on the original instruction.
+		if pl.op == "cmp" && len(pl.operands) == 2 {
+			dst := pl.operands[0]
+			if gp64Regs[dst] || gpRegs[dst] {
+				zero := false
+				if v, ok := immValue(pl.operands[1]); ok && v == 0 {
+					zero = true
+				} else if gp64Regs[pl.operands[1]] && zeroReg[pl.operands[1]] {
+					zero = true
+				}
+				if zero && i+1 < len(insts) {
+					if np, ok := parseBodyLine(insts[i+1].Text); ok && safeCmpZeroRead(np.op) {
+						in = Inst{Kind: instInstr, Text: "\ttest " + dst + ", " + dst}
+					}
+				}
+			}
+		}
+		// Update zeroReg knowledge from the ORIGINAL instruction (a rewrite to
+		// `test` neither creates nor destroys a zero fact, so it is ignored).
+		switch pl.op {
+		case "cmp", "test":
+			// flag-only: no register is written
+		case "xor", "sub":
+			if len(pl.operands) == 2 {
+				dst := pl.operands[0]
+				if gp64Regs[dst] || gpRegs[dst] {
+					if pl.operands[0] == pl.operands[1] {
+						zeroReg[reg64Name(dst)] = true
+					} else {
+						zeroReg[reg64Name(dst)] = false
+					}
+				}
+			}
+		case "mov":
+			if len(pl.operands) == 2 {
+				dst := pl.operands[0]
+				if gp64Regs[dst] || gpRegs[dst] {
+					if v, ok := immValue(pl.operands[1]); ok && v == 0 {
+						zeroReg[reg64Name(dst)] = true
+					} else {
+						zeroReg[reg64Name(dst)] = false
+					}
+				}
+			}
+		case "mul", "div", "idiv", "cqo", "cdq":
+			// these write rax/rdx (cqo/cdq also derive rdx from rax); the
+			// safe conservative choice is to forget both.
+			zeroReg["rax"] = false
+			zeroReg["rdx"] = false
+		default:
+			// any other GP-register write clears its zero fact
+			if len(pl.operands) > 0 {
+				dst := pl.operands[0]
+				if gp64Regs[dst] || gpRegs[dst] {
+					zeroReg[reg64Name(dst)] = false
+				}
+			}
+		}
+		out = append(out, in)
+	}
+	return out
+}
+
 // immValue parses the constant of a mov immediate operand: decimal, 0x hex,
 // and 0b/0o (ParseInt base 0). The 64-bit pattern is reinterpreted as int64
 // so that 0xffffffffffffffff reads as -1.

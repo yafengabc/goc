@@ -2564,6 +2564,9 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 			c.insts = slotCache(c.insts)
 		}
 		c.insts = peepholeIR(c.insts)
+		if !algebraicIdentSkip {
+			c.insts = algebraicIdent(c.insts)
+		}
 		c.insts = deadStores(c.insts)
 		c.insts = livenessDSE(c.insts)
 	}

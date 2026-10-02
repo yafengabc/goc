@@ -481,3 +481,140 @@ int main(){ return fib(10); }`
 		t.Fatalf("branch-guarded reloads must survive as memory loads, got:\n%s", asm)
 	}
 }
+
+// ---------- T1.3 algebraic-identity unit tests (comparison-to-zero) ----------
+
+// runAlg runs algebraicIdent over the fixture and returns the surviving
+// instruction texts.
+func runAlg(insts []Inst) []string {
+	out := algebraicIdent(insts)
+	texts := make([]string, 0, len(out))
+	for _, in := range out {
+		texts = append(texts, strings.TrimSpace(in.Text))
+	}
+	return texts
+}
+
+// TestAlgImmZeroJe: cmp rax, 0 followed by a ZF read (je) rewrites to
+// `test rax, rax`.
+func TestAlgImmZeroJe(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tcmp rax, 0"},
+		{Kind: instInstr, Text: "\tje .Lx"},
+	}
+	got := runAlg(in)
+	if countText(got, "test rax, rax") != 1 {
+		t.Fatalf("cmp rax,0 ; je must become test rax,rax, got %v", got)
+	}
+	if countText(got, "cmp rax, 0") != 0 {
+		t.Fatalf("cmp rax,0 must be gone, got %v", got)
+	}
+}
+
+// TestAlgRegZeroJne: cmp r10, rax where rax is known-zero (xor eax,eax), then
+// jne, rewrites to `test r10, r10` -- the second operand is a tracked zero reg.
+func TestAlgRegZeroJne(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\txor eax, eax"},
+		{Kind: instInstr, Text: "\tcmp r10, rax"},
+		{Kind: instInstr, Text: "\tjne .Ly"},
+	}
+	got := runAlg(in)
+	if countText(got, "test r10, r10") != 1 {
+		t.Fatalf("cmp r10,rax(zero) ; jne must become test r10,r10, got %v", got)
+	}
+}
+
+// TestAlgUnsignedKept: cmp rax, 0 followed by an unsigned read (ja) must NOT
+// rewrite -- `test` clears CF, so the unsigned branch would misread it.
+func TestAlgUnsignedKept(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tcmp rax, 0"},
+		{Kind: instInstr, Text: "\tja .Lx"},
+	}
+	got := runAlg(in)
+	if countText(got, "cmp rax, 0") != 1 {
+		t.Fatalf("unsigned read must keep cmp, got %v", got)
+	}
+	if countText(got, "test rax, rax") != 0 {
+		t.Fatalf("unsigned read must not become test, got %v", got)
+	}
+}
+
+// TestAlgOverwrittenRegKept: rax is zeroed, then clobbered by `mov rax,5`,
+// so a later `cmp r10, rax` must NOT be rewritten -- the second operand is no
+// longer a known zero.
+func TestAlgOverwrittenRegKept(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\txor eax, eax"},
+		{Kind: instInstr, Text: "\tmov rax, 5"},
+		{Kind: instInstr, Text: "\tcmp r10, rax"},
+		{Kind: instInstr, Text: "\tje .Lx"},
+	}
+	got := runAlg(in)
+	if countText(got, "cmp r10, rax") != 1 {
+		t.Fatalf("clobbered second operand must keep cmp, got %v", got)
+	}
+	if countText(got, "test r10, r10") != 0 {
+		t.Fatalf("clobbered second operand must not become test, got %v", got)
+	}
+}
+
+// TestAlgNonFlagReadKept: cmp rax,0 not followed by a flag read must stay cmp.
+func TestAlgNonFlagReadKept(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tcmp rax, 0"},
+		{Kind: instInstr, Text: "\tmov rbx, rax"},
+	}
+	got := runAlg(in)
+	if countText(got, "cmp rax, 0") != 1 {
+		t.Fatalf("non-flag-read successor must keep cmp, got %v", got)
+	}
+}
+
+// fnAsmFull extracts a full top-level function body, stopping only at the
+// next NON-internal top-level label (one that does not start with '.'), so the
+// extracted region includes the compiler's internal .L* labels instead of
+// being truncated at the first one (which fnAsm does).
+func fnAsmFull(asm, name string) string {
+	start := strings.Index(asm, name+":")
+	if start < 0 {
+		return asm
+	}
+	rest := asm[start:]
+	lines := strings.Split(rest, "\n")
+	for i := 1; i < len(lines); i++ {
+		ln := lines[i]
+		if ln == "" {
+			continue
+		}
+		if ln[0] == '\t' || ln[0] == ' ' {
+			continue
+		}
+		if strings.HasSuffix(ln, ":") && !strings.HasPrefix(ln, ".") {
+			return strings.Join(lines[:i], "\n")
+		}
+	}
+	return rest
+}
+
+// TestAlgEndToEnd: a small equality-against-zero function must lower its
+// compare-to-zero to `test r,r` at -O1. Here `if (x==0)` emits
+// `cmp r10, rax` (rax materialised as zero) which the pass turns into
+// `test r10, r10`; the immediate form `cmp rax, 0` must not survive either.
+func TestAlgEndToEnd(t *testing.T) {
+	src := `int isz(int x){ if (x == 0) return 1; return 0; }
+int main(){ return isz(0); }`
+	asm := genAsmOpt(t, src, 1)
+	body := fnAsmFull(asm, "isz")
+	if strings.Contains(body, "cmp rax, 0") {
+		t.Fatalf("isz must not contain cmp rax,0, got:\n%s", body)
+	}
+	if strings.Contains(body, "cmp r10, rax") || strings.Contains(body, "cmp rbx, rax") ||
+		strings.Contains(body, "cmp rcx, rax") || strings.Contains(body, "cmp rdx, rax") {
+		t.Fatalf("isz compare-against-zero must lower to test, got:\n%s", body)
+	}
+	if !strings.Contains(body, "test ") {
+		t.Fatalf("isz must contain a test instruction, got:\n%s", body)
+	}
+}
