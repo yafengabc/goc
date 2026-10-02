@@ -83,7 +83,23 @@ type AssignStmt struct {
 // code path.
 type AssignExpr struct {
 	Lhs Expr // must be an lvalue
+	// Op is the compound-assignment operator in its binary spelling ("+", "-",
+	// "*", "/", "%", "&", "|", "^", "<<", ">>"); it is "" for plain "=". The
+	// parser no longer desugars "E1 op= E2" into "E1 = E1 op E2": that
+	// evaluated E1's address twice ("a[i++] += 10" incremented i twice). The
+	// checker and codegen treat Op != "" as "evaluate the lvalue once".
+	Op  string
 	Rhs Expr
+}
+
+// TmpLoad is an internal codegen-only node: it loads the value that a
+// compound-assignment implementation parked in a frame temporary at Slot.
+// The parser never produces it; genCompoundAssign builds it so genBinary's
+// arithmetic (width promotion, float, pointer scaling) is reused verbatim
+// without re-evaluating the lvalue.
+type TmpLoad struct {
+	Slot int
+	Typ  *Type
 }
 
 // CommaExpr is the comma operator a, b, c: each operand is evaluated in turn

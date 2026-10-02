@@ -63,8 +63,13 @@ type Preprocessor struct {
 	// in process, so a #line inside an #include cannot leak into the includer.
 	logicalFile string
 	lineDelta   int
+	// ceErr records a constant-expression evaluation error (division or
+	// modulo by zero) inside #if/#elif. The ce* chain cannot return errors
+	// without threading a signature through every level, so the directive
+	// handlers check this flag and abort with a real diagnostic instead of
+	// silently treating the expression as 0.
+	ceErr bool
 }
-
 // Preprocess runs the full preprocessing pipeline on src (already read from
 // filename) and returns the expanded token stream. The target platform
 // defaults to Windows; PreprocessTarget selects it explicitly.
@@ -205,6 +210,12 @@ func cEscape(b []byte) string {
 // spliceContinuations removes backslash-newline pairs (C translation phase 2),
 // so multi-line macro definitions collapse onto one logical line.
 func spliceContinuations(src string) string {
+	// A UTF-8 BOM (EF BB BF) is permitted at the very start of a source file
+	// (C11 5.1.1.2 translation phase 1); strip it here so it does not surface
+	// as the lexer's "unexpected character 'ï'". spliceContinuations is the
+	// single choke point every file -- the main TU and every #include target
+	// -- passes through, so stripping here covers all of them.
+	src = strings.TrimPrefix(src, "\xEF\xBB\xBF")
 	var b strings.Builder
 	i := 0
 	n := len(src)
@@ -353,13 +364,22 @@ func (p *Preprocessor) execDirective(name string, rest []Token, line int, filena
 		}
 	case "if":
 		expanded := p.expandTokens(rest, filename, line)
-		p.pushCond(p.constExpr(expanded) != 0)
+		cond := p.constExpr(expanded)
+		if p.ceErr {
+			return nil, fmt.Errorf("%s:%d: division by zero in #if expression", p.logicalFileName(filename), p.logicalLine(line))
+		}
+		p.pushCond(cond != 0)
 	case "ifdef":
 		p.pushCond(p.macroDefined(rest))
 	case "ifndef":
 		p.pushCond(!p.macroDefined(rest))
 	case "elif":
-		p.doElif(p.expandTokens(rest, filename, line))
+		expanded := p.expandTokens(rest, filename, line)
+		cond := p.constExpr(expanded)
+		if p.ceErr {
+			return nil, fmt.Errorf("%s:%d: division by zero in #elif expression", p.logicalFileName(filename), p.logicalLine(line))
+		}
+		p.doElif(cond != 0)
 	case "elifdef":
 		p.doElifBool(p.macroDefined(rest))
 	case "elifndef":
@@ -489,7 +509,10 @@ func (p *Preprocessor) doElse() {
 	p.condStack[len(p.condStack)-1] = f
 }
 
-func (p *Preprocessor) doElif(rest []Token) {
+// doElif updates the top conditional frame for a #elif whose condition was
+// already evaluated by the caller (which also checked the division-by-zero
+// flag); cond is the branch's own condition.
+func (p *Preprocessor) doElif(cond bool) {
 	if len(p.condStack) == 0 {
 		return
 	}
@@ -497,7 +520,6 @@ func (p *Preprocessor) doElif(rest []Token) {
 	if f.seenElse {
 		return
 	}
-	cond := p.constExpr(rest) != 0
 	// This #elif branch is selected only when no earlier branch in the chain
 	// fired and its own condition holds. Every other case must leave the
 	// frame INACTIVE -- including the case where an earlier #if/#elif fired,
@@ -1182,6 +1204,7 @@ func (p *Preprocessor) constExpr(toks []Token) int64 {
 	if len(toks) == 0 {
 		return 0
 	}
+	p.ceErr = false // fresh expression: clear any stale error flag
 	v, _ := p.ceOr(toks, 0)
 	return v
 }
@@ -1301,11 +1324,18 @@ func (p *Preprocessor) ceMul(toks []Token, i int) (int64, int) {
 		case "*":
 			left *= right
 		case "/":
-			if right != 0 {
+			if right == 0 {
+				// Division by zero in a #if/#elif constant expression is a
+				// constraint violation (C11 6.6p4 / 6.5.5p5); the caller
+				// reports it via p.ceErr instead of silently skipping.
+				p.ceErr = true
+			} else {
 				left /= right
 			}
 		case "%":
-			if right != 0 {
+			if right == 0 {
+				p.ceErr = true
+			} else {
 				left %= right
 			}
 		}

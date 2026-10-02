@@ -430,17 +430,18 @@ func parseArgs(args []string) (buildCfg, bool) {
 			if lvl := optFromSuffix(val); lvl >= 0 {
 				cfg.opt = lvl
 			}
-		case "-Wall", "-Wextra", "-Werror", "-Wshadow", "-w",
-			"-std", "-m", "-g", "-static", "-shared", "-pthread",
-			"-pipe", "-v", "-pedantic", "-ansi", "-M", "-MM", "-MD", "-MP",
-			"-save-temps", "-ffreestanding", "-fno-builtin", "-fPIC", "-fpic",
-			"-fno-stack-protector", "-nostdlib", "-nodefaultlibs", "-nolibc":
-			// swallow a possible separate value for -MF/-MT/-MQ/-MQ style flags
-			if name == "-MF" || name == "-MT" || name == "-MQ" {
-				if val == "" {
-					i++ // consume the dependency-file argument
-				}
+case "-Wall", "-Wextra", "-Werror", "-Wshadow", "-w",
+		"-std", "-m", "-g", "-static", "-shared", "-pthread",
+		"-pipe", "-v", "-pedantic", "-ansi", "-M", "-MM", "-MD", "-MP",
+		"-MF", "-MT", "-MQ",
+		"-save-temps", "-ffreestanding", "-fno-builtin", "-fPIC", "-fpic",
+		"-fno-stack-protector", "-nostdlib", "-nodefaultlibs", "-nolibc":
+		// swallow a possible separate value for -MF/-MT/-MQ style flags
+		if name == "-MF" || name == "-MT" || name == "-MQ" {
+			if val == "" {
+				i++ // consume the dependency-file argument
 			}
+		}
 		default:
 			// Any other -flag: accept and ignore (covers -Wl,--foo, -fsanitize,
 			// and anything future gcc adds) so foreign build commands don't break.

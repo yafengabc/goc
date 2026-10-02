@@ -1272,7 +1272,15 @@ func (a *Assembler) emitOpRM(width int, prefixes []byte, twoByte bool, op byte, 
 			a.emitByte(modrmRip(regField))
 			off := a.curOff()
 			a.emitInt32(0)
-			a.fixup(off, rm.memSym)
+			if tail != nil {
+				// The trailer (e.g. the imm8 of "bt [rip+sym], imm8")
+				// follows the disp32, so the true RIP is off+4+trailer
+				// bytes. Without ripAdj the rel32 was 1 byte short and the
+				// fixup pointed the CPU at the immediate's own byte.
+				a.fixups = append(a.fixups, Fixup{sect: a.cur, off: off, sym: rm.memSym, ripAdj: 1})
+			} else {
+				a.fixup(off, rm.memSym)
+			}
 			if tail != nil {
 				tail()
 			}
@@ -2102,7 +2110,7 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 		if width == 0 {
 			width = 8
 		}
-		return a.encodeMovMemImm(dst.memBase, dst.memDisp, src.imm, width, ln)
+		return a.encodeMovMemImm(dst, src.imm, width, ln)
 	}
 
 	// mov reg, [mem]   (load; width from `dword`/`word`/`byte` prefix, or
@@ -2154,18 +2162,34 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 // encodeMovMemImm emits: mov [base+disp], imm (imm16 under a 0x66 prefix for
 // width==2, imm32 -- sign-extended to 64 bits by REX.W -- for width==8, plain
 // imm32 for width==4).
-func (a *Assembler) encodeMovMemImm(base, disp int, imm int64, width int, ln string) error {
+// encodeMovMemImm emits: mov [base+idx*scale+disp], imm (imm16 under a 0x66
+// prefix for width==2, imm32 -- sign-extended to 64 bits by REX.W -- for
+// width==8, plain imm32 for width==4). The full memory operand is passed so
+// an index register and scale survive encoding -- the previous base+disp
+// signature dropped the index, so "mov [rax+rbx*4], 10" was silently encoded
+// as "mov [rax], 10".
+func (a *Assembler) encodeMovMemImm(mem Operand, imm int64, width int, ln string) error {
 	if width == 2 {
 		a.emitByte(0x66) // operand-size prefix => 16-bit immediate
+	}
+	// planMem computes ModRM/SIB/displacement for the memory operand and the
+	// REX.X/B bits for its index/base registers. The ModRM.reg field is /0
+	// for both the C6 (imm8) and C7 (imm32/imm16) forms.
+	enc, err := a.planMem(0, mem)
+	if err != nil {
+		return err
 	}
 	rex := byte(0x40)
 	if width == 8 {
 		rex = 0x48
 	}
-	if base >= 8 {
+	if enc.rexX {
+		rex |= 0x02
+	}
+	if enc.rexB {
 		rex |= 0x01
 	}
-	if width == 8 || base >= 8 {
+	if width == 8 || enc.rexX || enc.rexB {
 		a.emitByte(rex)
 	}
 	if width == 1 {
@@ -2179,38 +2203,17 @@ func (a *Assembler) encodeMovMemImm(base, disp int, imm int64, width int, ln str
 	} else {
 		a.emitByte(0xC7) // mov r/m, imm32 (or imm16 under 0x66)
 	}
-	useSIB := base == 4 || base == 12
-	var modrm byte
-	if !useSIB {
-		switch {
-		case disp == 0:
-			modrm = byte(0x00 | (base & 7))
-		case disp >= -128 && disp <= 127:
-			modrm = byte(0x40 | (base & 7))
-		default:
-			modrm = byte(0x80 | (base & 7))
-		}
-	} else {
-		switch {
-		case disp == 0:
-			modrm = 0x04
-		case disp >= -128 && disp <= 127:
-			modrm = 0x44
-		default:
-			modrm = 0x84
-		}
-	}
-	a.emitByte(modrm)
-	if useSIB {
-		a.emitByte(0x24) // scale 0, no index, base = rsp/r12
+	a.emitByte(enc.modrm)
+	if enc.hasSIB {
+		a.emitByte(enc.sib)
 	}
 	switch {
-	case disp == 0:
+	case enc.dispSize == 0:
 		// no displacement
-	case disp >= -128 && disp <= 127:
-		a.emitByte(byte(int8(disp)))
+	case enc.dispSize == 1:
+		a.emitByte(byte(int8(enc.disp)))
 	default:
-		a.emitInt32(int32(disp))
+		a.emitInt32(int32(enc.disp))
 	}
 	switch {
 	case width == 1:
@@ -2262,6 +2265,25 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 		a.rexW(src.reg, dst.reg)
 		a.emitByte(c.reg)
 		a.emitByte(modrmRegReg(src.reg, dst.reg)) // reg field = src, rm = dst
+		return nil
+	}
+	if src.kind == K_IMM && mnem == "test" {
+		// test r/m, imm has its own opcodes: F6 /0 for imm8 and F7 /0 for
+		// imm32 (imm16 under 0x66). The 83/81 group the other arithmetic
+		// ops share decodes /0 as ADD, so the old code turned
+		// "test eax, 1" into "add eax, 1" -- silently corrupting the
+		// register and the flags it was supposed to probe.
+		if src.imm >= -128 && src.imm <= 127 {
+			a.rexW(0, dst.reg)
+			a.emitByte(0xF6)
+			a.emitByte(modrmRegReg(0, dst.reg))
+			a.emitByte(byte(int8(src.imm)))
+		} else {
+			a.rexW(0, dst.reg)
+			a.emitByte(0xF7)
+			a.emitByte(modrmRegReg(0, dst.reg))
+			a.emitInt32(int32(src.imm))
+		}
 		return nil
 	}
 	if src.kind == K_IMM {

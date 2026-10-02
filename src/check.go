@@ -811,52 +811,71 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		return IntType()
 	case *SizeofExpr:
 		return IntType()
-	case *AssignExpr:
-		// Assignment "a = b" (statement-level or in expression position) must
-		// have a modifiable lvalue on the left. Statement-level assignments are
-		// parsed as ExprStmt{AssignExpr}, so the lvalue check must live here,
-		// not in checkStmt (whose *AssignStmt branch is never produced by the
-		// parser).
-		lt, ok := c.checkLValue(n.Lhs, fn)
-		if !ok {
-			return IntType()
-		}
-		rt := c.checkExpr(n.Rhs, fn)
-		// Writing through a void* yields a void location; any value may be
-		// stored there (the checker models it as "we do not know the element
-		// type"), so skip the assignability check for that case.
-		if !lt.IsVoid() && !assignable(lt, rt) {
-			c.errf(0, "cannot assign %s to %s", rt, lt)
-		}
-		return rt
-	case *VaArgExpr:
-		ap := c.checkExpr(n.Ap, fn)
-		if !ap.IsPtr() {
-			c.errf(0, "va_arg first argument must be a va_list, got %s", ap)
-		}
-		return n.Typ
+case *AssignExpr:
+	// Assignment "a = b" (statement-level or in expression position) must
+	// have a modifiable lvalue on the left. Statement-level assignments are
+	// parsed as ExprStmt{AssignExpr}, so the lvalue check must live here,
+	// not in checkStmt (whose *AssignStmt branch is never produced by the
+	// parser).
+	lt, ok := c.checkLValue(n.Lhs, fn)
+	if !ok {
+		return IntType()
 	}
-	return IntType()
+	if n.Op != "" {
+		// Compound assignment "E1 op= E2" (C11 6.5.16.2) types as "E1 =
+		// E1 op E2" but evaluates E1 exactly once. The result type is the
+		// arithmetic result, which must be assignable back to the lvalue.
+		rt := c.checkExpr(n.Rhs, fn)
+		res := c.binaryResultType(n.Op, lt, rt)
+		if !lt.IsVoid() && !assignable(lt, res) {
+			c.errf(0, "cannot assign %s to %s", res, lt)
+		}
+		return res
+	}
+	rt := c.checkExpr(n.Rhs, fn)
+	// Writing through a void* yields a void location; any value may be
+	// stored there (the checker models it as "we do not know the element
+	// type"), so skip the assignability check for that case.
+	if !lt.IsVoid() && !assignable(lt, rt) {
+		c.errf(0, "cannot assign %s to %s", rt, lt)
+	}
+	return rt
+case *VaArgExpr:
+	ap := c.checkExpr(n.Ap, fn)
+	if !ap.IsPtr() {
+		c.errf(0, "va_arg first argument must be a va_list, got %s", ap)
+	}
+	return n.Typ
 }
-
+return IntType()
+}
 func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 	lt := c.checkExpr(n.L, fn)
 	rt := c.checkExpr(n.R, fn)
-	switch n.Op {
+	return c.binaryResultType(n.Op, lt, rt)
+}
+
+// binaryResultType computes the result type of "lt op rt" (C11 6.5.5-6.5.12)
+// and reports errors for invalid operand combinations, without re-checking
+// the operands. checkBinary evaluates both operands and delegates here;
+// compound assignment ("E1 op= E2") uses it directly so the lvalue is checked
+// exactly once and the arithmetic validity rules are shared verbatim.
+func (c *checker) binaryResultType(op string, lt, rt *Type) *Type {
+	switch op {
 	case "+", "-", "*", "/", "%":
-		if n.Op == "%" && !(lt.IsIntClass() && rt.IsIntClass()) && !isBig(lt) && !isBig(rt) {
+		if op == "%" && !(lt.IsIntClass() && rt.IsIntClass()) && !isBig(lt) && !isBig(rt) {
 			c.errf(0, "operator '%%' requires integer operands, got %s and %s", lt, rt)
 		}
 		// Pointer arithmetic: ptr +/- int, ptr - ptr.
 		if lt.IsPtr() || rt.IsPtr() {
 			switch {
-			case n.Op == "+" && lt.IsPtr() && rt.IsIntClass():
+			case op == "+" && lt.IsPtr() && rt.IsIntClass():
 				return lt
-			case n.Op == "+" && lt.IsIntClass() && rt.IsPtr():
+			case op == "+" && lt.IsIntClass() && rt.IsPtr():
 				return rt
-			case n.Op == "-" && lt.IsPtr() && rt.IsIntClass():
+			case op == "-" && lt.IsPtr() && rt.IsIntClass():
 				return lt
-			case n.Op == "-" && lt.IsPtr() && rt.IsPtr():
+			case op == "-" && lt.IsPtr() && rt.IsPtr():
 				return IntType() // pointer difference
 			}
 			c.errf(0, "invalid pointer arithmetic on %s and %s", lt, rt)
@@ -871,7 +890,7 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 				c.errf(0, "floating operands with _BitInt are not supported (%s and %s)", lt, rt)
 				return lt
 			}
-			if n.Op == "%" {
+			if op == "%" {
 				c.errf(0, "operator '%%' requires integer operands, got %s and %s", lt, rt)
 			}
 			if lt.Kind == KDouble || rt.Kind == KDouble {
@@ -887,7 +906,7 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 				c.errf(0, "invalid operands with _BitInt: %s and %s", lt, rt)
 				return IntType()
 			}
-			return bigArithResult(n.Op, lt, rt)
+			return bigArithResult(op, lt, rt)
 		}
 		return IntType()
 	case "<", ">", "<=", ">=", "==", "!=":
@@ -902,14 +921,14 @@ func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 		return IntType()
 	case "<<", ">>", "&", "|", "^":
 		if !(lt.IsIntClass() && rt.IsIntClass()) && !isBig(lt) && !isBig(rt) {
-			c.errf(0, "operator %q requires integer operands, got %s and %s", n.Op, lt, rt)
+			c.errf(0, "operator %q requires integer operands, got %s and %s", op, lt, rt)
 		}
 		if isBig(lt) || isBig(rt) {
 			if !(lt.IsIntClass() || isBig(lt)) || !(rt.IsIntClass() || isBig(rt)) {
 				c.errf(0, "invalid operands with _BitInt: %s and %s", lt, rt)
 				return IntType()
 			}
-			return bigArithResult(n.Op, lt, rt)
+			return bigArithResult(op, lt, rt)
 		}
 		return IntType()
 	}

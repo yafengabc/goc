@@ -1907,6 +1907,16 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 	case *IndirectCall:
 		return c.genIndirectCall(n)
 	case *AssignExpr:
+		// Compound assignment "E1 op= E2" (C11 6.5.16.2): the parser no
+		// longer desugars this into "E1 = E1 op E2" (that re-evaluated E1,
+		// so a[i++] += 10 incremented i twice); codegen now evaluates the
+		// lvalue exactly once, combines, and stores back.
+		if n.Op != "" {
+			if isBig(c.exprType(n.Lhs)) || isBig(c.exprType(n.Rhs)) {
+				return c.genBigCompoundAssign(n)
+			}
+			return c.genCompoundAssign(n)
+		}
 		// Whole-struct/union assignment: neither side fits in a register, so
 		// there is no scalar fast path and we never load the value into rax.
 		// The RHS may be an lvalue (copied byte-for-byte) or a call returning
@@ -2042,12 +2052,259 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		}
 		c.tmpDepth--
 		return rt, nil
+	case *TmpLoad:
+		// TmpLoad is an internal node produced only by genCompoundAssign to
+		// re-read a left operand whose address/value was already evaluated
+		// (the lvalue is evaluated exactly once, its old value parked in a
+		// frame temporary, and the arithmetic re-loads it here as a plain
+		// memory read with no side effects). It is never produced by the
+		// parser, so it cannot appear in user code. Slot is the already-
+		// computed frame OFFSET (the value tmpSlot returned when the operand
+		// was parked), not a slot index: re-deriving it through tmpSlot would
+		// read a wildly wrong address.
+		if n.Typ != nil && n.Typ.IsFloating() {
+			c.emit("movsd xmm0, [rbp%+d]", n.Slot)
+			c.resTyp = TDouble
+			c.resSigned = false
+			c.resW = 8
+			return TDouble, nil
+		}
+		c.emit("mov rax, [rbp%+d]", n.Slot)
+		c.resTyp = TInt
+		c.resSigned = n.Typ != nil && n.Typ.Kind == KInt && n.Typ.Signed
+		c.resW = 8
+		if n.Typ != nil {
+			c.resW = c.semWOf(n.Typ)
+		}
+		return TInt, nil
 	case *VaArgExpr:
 		return c.genVaArg(n)
 	}
 	return TInt, fmt.Errorf("unknown expression")
 }
 
+// genCompoundAssign compiles "E1 op= E2" for scalar lvalues (C11 6.5.16.2).
+// The lvalue is evaluated exactly once: its address (or register/stack home)
+// is computed and the old value parked in a frame temporary, then E2 is
+// evaluated and combined via the shared genBinary arithmetic -- which re-reads
+// the parked old value through a TmpLoad, a pure memory read with no side
+// effects -- and the result is stored back to the same address. The parser
+// used to desugar "E1 op= E2" into "E1 = E1 op E2", which duplicated the
+// lvalue: "a[i++] += 10" incremented i twice.
+func (c *CG) genCompoundAssign(n *AssignExpr) (CType, error) {
+	lt := c.exprType(n.Lhs)
+	// Fast path: a simple scalar local/param has no address computation and
+	// no side effects, so loadVar + storeVar suffice.
+	if id, ok := n.Lhs.(*Ident); ok {
+		if vi, ok2 := c.lookupVar(id.Name); ok2 {
+			entry := c.tmpDepth
+			c.loadVar(vi) // old value in rax (int) / xmm0 (double)
+			c.tmpDepth++
+			slot := c.tmpSlot(c.tmpDepth)
+			if vi.typ != nil && vi.typ.IsFloating() {
+				c.emit("movsd [rbp%+d], xmm0", slot)
+			} else {
+				c.emit("mov [rbp%+d], rax", slot)
+			}
+			bin := &Binary{Op: n.Op, L: &TmpLoad{Slot: slot, Typ: lt}, R: n.Rhs}
+			rt, err := c.genBinary(bin)
+			c.tmpDepth = entry
+			if err != nil {
+				return rt, err
+			}
+			if err := c.ensureType(vi.typ.Class()); err != nil {
+				return rt, err
+			}
+			c.storeVar(vi)
+			c.resTyp = vi.typ.Class()
+			c.resSigned = vi.typ.Kind == KInt && vi.typ.Signed
+			c.resW = c.semWOf(vi.typ)
+			return vi.typ.Class(), nil
+		}
+	}
+	// General case (deref / element / member / bit-field lvalues): evaluate
+	// the address once, park it and the old value, evaluate E2 through the
+	// shared binary machinery, then store back to the parked address.
+	entry := c.tmpDepth
+	if err := c.genLValue(n.Lhs); err != nil {
+		return TInt, err
+	}
+	c.tmpDepth++
+	addrSlot := c.tmpSlot(c.tmpDepth)
+	c.emit("mov r11, r10")
+	c.emit("mov [rbp%+d], r11", addrSlot)
+	width := c.lvalueWidth(n.Lhs)
+	class := c.lvalueClass(n.Lhs)
+	if c.lvBitWidth > 0 {
+		c.genLoadBitfield(c.lvBitUnit, c.lvBitOff, c.lvBitWidth, c.lvBitSigned)
+	} else {
+		signed := lt != nil && lt.Kind == KInt && lt.Signed
+		c.genLoadElem("r10", width, class, signed)
+	}
+	c.tmpDepth++
+	valSlot := c.tmpSlot(c.tmpDepth)
+	if class == TDouble {
+		c.emit("movsd [rbp%+d], xmm0", valSlot)
+	} else {
+		c.emit("mov [rbp%+d], rax", valSlot)
+	}
+	bin := &Binary{Op: n.Op, L: &TmpLoad{Slot: valSlot, Typ: lt}, R: n.Rhs}
+	rt, err := c.genBinary(bin)
+	if err != nil {
+		c.tmpDepth = entry
+		return rt, err
+	}
+	c.tmpDepth = entry
+	// genBinary canonicalised the combined value; convert it to the lvalue
+	// class and store back to the parked address.
+	if err := c.ensureType(class); err != nil {
+		return rt, err
+	}
+	c.emit("mov r10, [rbp%+d]", addrSlot)
+	if c.lvBitWidth > 0 {
+		c.genStoreBitfield(c.lvBitUnit, c.lvBitOff, c.lvBitWidth, c.lvBitSigned)
+	} else {
+		if lt != nil && lt.Kind == KBool {
+			c.normalizeBool()
+		}
+		c.genStoreElem("r10", width, class)
+	}
+	return rt, nil
+}
+
+// genBigCompoundAssign compiles "E1 op= E2" when the left operand (or the
+// result of the operation) is a _BitInt. The lvalue is evaluated exactly
+// once: the address is parked, the old value is snapshotted (and widened to
+// the result width when the right operand is wider), the right operand is
+// materialised, the __goclib_bi_* helper runs, and the result is stored back
+// to the same address.
+func (c *CG) genBigCompoundAssign(n *AssignExpr) (CType, error) {
+	lt := c.exprType(n.Lhs)
+	rt := c.exprType(n.Rhs)
+	resT := lt
+	if n.Op != "<<" && n.Op != ">>" {
+		resT = bigArithResult(n.Op, lt, rt)
+	}
+	if !isBig(resT) {
+		return TInt, fmt.Errorf("internal: no result type for %q on %s and %s", n.Op, lt, rt)
+	}
+	w := bigWordsOf(resT)
+	// 1. Evaluate the lvalue address exactly once.
+	if err := c.genLValue(n.Lhs); err != nil {
+		return TInt, err
+	}
+	c.tmpDepth++
+	addrSlot := c.tmpSlot(c.tmpDepth)
+	c.emit("mov r11, r10")
+	c.emit("mov [rbp%+d], r11", addrSlot)
+	// 2. Snapshot the old value (sw source words) and widen it to w words
+	//    when the operation promotes the lvalue (e.g. _BitInt(64) +=
+	//    _BitInt(128) or int += _BitInt).
+	sw := bigWordsOf(lt)
+	_, loff := c.claimBig(w)
+	cp := sw
+	if cp > w {
+		cp = w
+	}
+	for i := 0; i < cp; i++ {
+		c.emit("mov rax, [r10%+d]", i*8)
+		c.emit("mov [rbp%+d], rax", loff+i*8)
+	}
+	if w > sw {
+		c.emit("mov r10, [rbp%+d]", addrSlot)
+		wname := "__goclib_bi_widen_u"
+		if lt != nil && lt.Signed {
+			wname = "__goclib_bi_widen_s"
+		}
+		c.callBigLib(wname, []bigArg{
+			{addrOff: loff}, {reg: "r10"}, {imm: int64(w)}, {imm: int64(sw)},
+		})
+	}
+	// 3. The right operand: an integer count for shifts, otherwise a big
+	//    operand materialised to the result type (evaluated once).
+	if n.Op == "<<" || n.Op == ">>" {
+		if _, err := c.genExprT(n.Rhs); err != nil {
+			return TInt, err
+		}
+		if err := c.ensureType(TInt); err != nil {
+			return TInt, err
+		}
+		rk, resOff := c.claimBig(w)
+		name := "__goclib_bi_shl"
+		if n.Op == ">>" {
+			name = "__goclib_bi_shr_u"
+			if resT.Signed {
+				name = "__goclib_bi_shr_s"
+			}
+		}
+		c.callBigLib(name, []bigArg{
+			{addrOff: resOff}, {addrOff: loff}, {reg: "rax"}, {imm: int64(w)},
+		})
+		// Store the result back to the lvalue (w words, the lvalue width).
+		c.emit("mov r10, [rbp%+d]", addrSlot)
+		c.emit("lea r11, [rbp%+d]", resOff)
+		for i := 0; i < w; i++ {
+			c.emit("mov rax, [r11%+d]", i*8)
+			c.emit("mov [r10%+d], rax", i*8)
+		}
+		c.tmpDepth = rk + w - 1
+		c.markBig(resT, rk, w)
+		return TInt, nil
+	}
+	_, _, roff, err := c.bigOperand(n.Rhs, resT)
+	if err != nil {
+		return TInt, err
+	}
+	// 4. Compute old op rhs into a result block.
+	rk, resOff := c.claimBig(w)
+	var name string
+	switch n.Op {
+	case "+":
+		name = "__goclib_bi_add"
+	case "-":
+		name = "__goclib_bi_sub"
+	case "*":
+		name = "__goclib_bi_mul"
+	case "&":
+		name = "__goclib_bi_and"
+	case "|":
+		name = "__goclib_bi_or"
+	case "^":
+		name = "__goclib_bi_xor"
+	case "/":
+		name = "__goclib_bi_div_u"
+		if resT.Signed {
+			name = "__goclib_bi_div_s"
+		}
+	case "%":
+		name = "__goclib_bi_mod_u"
+		if resT.Signed {
+			name = "__goclib_bi_mod_s"
+		}
+	default:
+		return TInt, fmt.Errorf("internal: no big helper for %q", n.Op)
+	}
+	c.callBigLib(name, []bigArg{
+		{addrOff: resOff}, {addrOff: loff}, {addrOff: roff}, {imm: int64(w)},
+	})
+	// 5. Store back: the result is converted to the lvalue's type, so only
+	//    the lvalue's (sw) low words are written when the result is wider.
+	sw2 := w
+	if sw2 > bigWordsOf(lt) {
+		sw2 = bigWordsOf(lt)
+	}
+	c.emit("mov r10, [rbp%+d]", addrSlot)
+	c.emit("lea r11, [rbp%+d]", resOff)
+	for i := 0; i < sw2; i++ {
+		c.emit("mov rax, [r11%+d]", i*8)
+		c.emit("mov [r10%+d], rax", i*8)
+	}
+	// 6. The assignment expression's value is resT at resOff, flagged like
+	//    genBigBinary leaves it.
+	c.tmpDepth = rk + w - 1
+	c.markBig(resT, rk, w)
+	return TInt, nil
+}
 // genExpr emits an expression and discards its type (for statement context).
 func (c *CG) genExpr(e Expr) error {
 	_, err := c.genExprT(e)
@@ -2685,6 +2942,8 @@ var internalLabelRe = regexp.MustCompile(`^\.`)
 var rbpSlotRe = regexp.MustCompile(`\[rbp-(\d+)\]`)
 
 // calleeSaveWrites lists every spelling of a register whose clobbering would
+
+// calleeSaveWrites lists every spelling of a register whose clobbering would
 // corrupt the caller's state across an inlined body: the callee-save integer
 // registers plus rsp/rbp. goc homes locals in rbx/r12-r14, so a template
 // writing any of these could silently overwrite a caller local.
@@ -2709,6 +2968,23 @@ var calleeSaveWrites = func() map[string]bool {
 	return m
 }()
 
+// isCalleeSaveRestore reports whether text is one of the epilogue's
+// callee-save restores, `mov rX, [rbp-8..32]`, emitted right before
+// mov rsp,rbp. Restores are skipped when building an inline template: the
+// caller's own prologue pushed (and its epilogue will pop) these registers,
+// so reloading them from the caller's frame would only clobber the caller's
+// saved copies with the callee's stale values.
+func isCalleeSaveRestore(text string) bool {
+	pl, ok := parseBodyLine(text)
+	if !ok || pl.op != "mov" || len(pl.operands) != 2 {
+		return false
+	}
+	if !calleeSaveRegs[pl.operands[0]] {
+		return false
+	}
+	return strings.HasPrefix(pl.operands[1], "[rbp-") && strings.HasSuffix(pl.operands[1], "]")
+}
+
 // parseEq reports whether text parses as exactly the given mnemonic and
 // operands.
 func parseEq(text, op string, ops ...string) bool {
@@ -2728,16 +3004,31 @@ func parseEq(text, op string, ops ...string) bool {
 // label) for inlining, or returns nil when any safety rule rejects it.
 func extractInlineCand(insts []Inst, lo, hi int) *inlineCand {
 	body := insts[lo+1 : hi]
-	// Canonical prologue: push rbp / mov rbp, rsp / sub rsp, N. The entry
-	// stub (_start:) and anything else irregular is excluded, which also
-	// guarantees a caller-side rbp frame exists when this body is a caller.
-	if len(body) < 4 {
+	// Canonical prologue: push rbp / mov rbp, rsp / [push <callee-save>]* /
+	// sub rsp, N. The entry stub (_start:) and anything else irregular is
+	// excluded, which also guarantees a caller-side rbp frame exists when
+	// this body is a caller. The prologue pushes rbx/r12/r13/r14
+	// unconditionally between mov rbp,rsp and the frame alloc, so the shape
+	// check must skip them before requiring the `sub rsp` -- otherwise every
+	// candidate would fail and -O1 would inline nothing.
+	if len(body) < 3 {
 		return nil
 	}
 	if !parseEq(body[0].Text, "push", "rbp") || !parseEq(body[1].Text, "mov", "rbp", "rsp") {
 		return nil
 	}
-	if fr, ok := parseBodyLine(body[2].Text); !ok || fr.op != "sub" ||
+	i := 2
+	for i < len(body) {
+		fr, ok := parseBodyLine(body[i].Text)
+		if !ok || fr.op != "push" || len(fr.operands) != 1 || !calleeSaveRegs[fr.operands[0]] {
+			break
+		}
+		i++
+	}
+	if i >= len(body) {
+		return nil
+	}
+	if fr, ok := parseBodyLine(body[i].Text); !ok || fr.op != "sub" ||
 		len(fr.operands) != 2 || fr.operands[0] != "rsp" {
 		return nil
 	}
@@ -2748,22 +3039,27 @@ func extractInlineCand(insts []Inst, lo, hi int) *inlineCand {
 	isRet := func(in Inst) bool { return strings.TrimSpace(in.Text) == "ret" }
 	isMvr := func(in Inst) bool { return parseEq(in.Text, "mov", "rsp", "rbp") }
 	isPop := func(in Inst) bool { return parseEq(in.Text, "pop", "rbp") }
-	for i := 2; i < len(body); i++ {
-		if isRet(body[i]) && !(isMvr(body[i-2]) && isPop(body[i-1])) {
+	for j := 2; j < len(body); j++ {
+		if isRet(body[j]) && !(isMvr(body[j-2]) && isPop(body[j-1])) {
 			return nil
 		}
 	}
-	// Build the template: skip the prologue, replace each epilogue triple
-	// with the placeholder.
+	// Build the template: skip the prologue and the callee-save restores (the
+	// `mov rX, [rbp-8..32]` bookkeeping -- the caller saved those registers
+	// itself), and replace each epilogue triple with the placeholder.
 	tmpl := make([]Inst, 0, len(body))
-	for i := 3; i < len(body); {
-		if i+2 < len(body) && isMvr(body[i]) && isPop(body[i+1]) && isRet(body[i+2]) {
-			tmpl = append(tmpl, Inst{Kind: instInstr, Text: inlineRetPlaceholder})
-			i += 3
+	for j := i + 1; j < len(body); {
+		if isCalleeSaveRestore(body[j].Text) {
+			j++
 			continue
 		}
-		tmpl = append(tmpl, body[i])
-		i++
+		if j+2 < len(body) && isMvr(body[j]) && isPop(body[j+1]) && isRet(body[j+2]) {
+			tmpl = append(tmpl, Inst{Kind: instInstr, Text: inlineRetPlaceholder})
+			j += 3
+			continue
+		}
+		tmpl = append(tmpl, body[j])
+		j++
 	}
 	// Safety screen over the template.
 	cand := &inlineCand{body: tmpl, labels: map[string]bool{}}
@@ -2905,16 +3201,29 @@ func inlineCalls(insts []Inst) []Inst {
 	}
 	for bi := range blocks {
 		b := &blocks[bi]
-		// Canonical prologue: push rbp / mov rbp, rsp / sub rsp, N. Blocks
-		// without it (the _start entry stub) are neither candidates nor
-		// callers -- expanding into them would reference an uninitialised
-		// rbp.
-		b.regular = b.start+3 < b.end &&
+		// Canonical prologue: push rbp / mov rbp, rsp / [push <callee-save>]*
+		// / sub rsp, N. Blocks without it (the _start entry stub) are neither
+		// candidates nor callers -- expanding into them would reference an
+		// uninitialised rbp. The callee-save pushes are skipped; only the
+		// frame alloc is required.
+		b.regular = b.start+2 < b.end &&
 			parseEq(insts[b.start+1].Text, "push", "rbp") &&
 			parseEq(insts[b.start+2].Text, "mov", "rbp", "rsp") &&
 			func() bool {
-				fr, ok := parseBodyLine(insts[b.start+3].Text)
-				return ok && fr.op == "sub" && len(fr.operands) == 2 && fr.operands[0] == "rsp"
+				for j := b.start + 3; j < b.end; j++ {
+					fr, ok := parseBodyLine(insts[j].Text)
+					if !ok {
+						return false
+					}
+					if fr.op == "sub" && len(fr.operands) == 2 && fr.operands[0] == "rsp" {
+						return true
+					}
+					if fr.op == "push" && len(fr.operands) == 1 && calleeSaveRegs[fr.operands[0]] {
+						continue
+					}
+					return false
+				}
+				return false
 			}()
 	}
 	// Templates first (from the untouched stream), then expansion.
@@ -5759,6 +6068,10 @@ func (c *CG) exprType(e Expr) *Type {
 		return c.binaryType(n)
 	case *IncDecExpr:
 		return c.exprType(n.E)
+	case *TmpLoad:
+		// Internal node produced only by genCompoundAssign: the type is the
+		// parked lvalue's static type.
+		return n.Typ
 	case *MemberExpr:
 		return c.memberType(n.Base, n.Name)
 	case *CastExpr:

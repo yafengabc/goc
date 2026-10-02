@@ -44,3 +44,6 @@ buildtmp/
 
 # Python bytecode caches from the QEMU/Unicorn runners.
 __pycache__/
+
+# Scratch dirs from the C89-C17 / C23 test-suite builders (probes, temp exes).
+.tmp/

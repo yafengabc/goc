@@ -42,16 +42,16 @@
 
 ### 待办（剩余缺口）
 
-| 特性                          | 任务号      | 阶段      | 工作量    | 状态                                           |
-| --------------------------- | -------- | ------- | ------ | -------------------------------------------- |
-| **十六进制浮点 `0x1.8p3`**        | **#126** | C99/C23 | M      | ✅ `c99_hexfloat`：p 指数可选（C23）、`0x.8p1`、f/l 后缀 |
-| **匿名 struct/union 成员**      | **#128** | C11     | M      | ✅ `c23_anon`：扁平访问、初始化透明穿透、union 重叠，gcc 对拍一致  |
-| `_Atomic` / `<stdatomic.h>` | #129     | C11     | XL     | ❌ 可选后置（语法接受 + lock 前缀标量原子即可）                 |
-| `<threads.h>` + 线程创建        | #130     | C11     | L      | ❌ 后置（依赖线程基础设施）                               |
-| `long double`（→ double 降级）  | —        | C99     | M（可选）  | ❌ 标 `__goc_long_double_is_double`            |
-| `_BitInt(N)`                | **#131** | C23     | XL     | ✅ `bitint`：goclib 大整数运行时（schoolbook+Karatsuba 乘、Knuth D 除、十进制 str），按需分配 scratch；**10 万位 π（Chudnovsky 二分）100,011 位逐位对拍 Python 大整数通过，15.5s** |
-| `<uchar.h>` / `<stdbit.h>`  | —        | C11/C23 | M（可选）  | ❌                                            |
-| TLS 测试钩子补全（#123）            | #123     | 工具链     | S      | ❌ tls_basic 尚无 golden，regress 中 SKIP         |
+| 特性                          | 任务号      | 阶段      | 工作量   | 状态                                                                                                                                         |
+| --------------------------- | -------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| **十六进制浮点 `0x1.8p3`**        | **#126** | C99/C23 | M     | ✅ `c99_hexfloat`：p 指数可选（C23）、`0x.8p1`、f/l 后缀                                                                                               |
+| **匿名 struct/union 成员**      | **#128** | C11     | M     | ✅ `c23_anon`：扁平访问、初始化透明穿透、union 重叠，gcc 对拍一致                                                                                                |
+| `_Atomic` / `<stdatomic.h>` | #129     | C11     | XL    | ❌ 可选后置（语法接受 + lock 前缀标量原子即可）                                                                                                               |
+| `<threads.h>` + 线程创建        | #130     | C11     | L     | ❌ 后置（依赖线程基础设施）                                                                                                                             |
+| `long double`（→ double 降级）  | —        | C99     | M（可选） | ❌ 标 `__goc_long_double_is_double`                                                                                                          |
+| `_BitInt(N)`                | **#131** | C23     | XL    | ✅ `bitint`：goclib 大整数运行时（schoolbook+Karatsuba 乘、Knuth D 除、十进制 str），按需分配 scratch；**10 万位 π（Chudnovsky 二分）100,011 位逐位对拍 Python 大整数通过，15.5s** |
+| `<uchar.h>` / `<stdbit.h>`  | —        | C11/C23 | M（可选） | ❌                                                                                                                                          |
+| TLS 测试钩子补全（#123）            | #123     | 工具链     | S     | ❌ tls_basic 尚无 golden，regress 中 SKIP                                                                                                       |
 
 ---
 
@@ -128,4 +128,4 @@
 - 基线 **456 pass / 1 fail**（唯一 fail 为预存 TestOsKeepsCalls）不回退；tls_basic golden 补入后 SKIP 清零。
 - 剩余特性（#126/#128，以及可选的 #129/#130）各配 example + golden。
 - 文档：`README.md` 语言子集章节按本路线图增量更新（原大改计划仍缓行）。
-- 全部完成后 README 可标注「**C23 实用子集 · 完整支持**」（除 long double/完整内存序/_Atomic）。
+- 全部完成后 README 可标注「**C23 实用子集 · 完整支持**」（除 long double/完整内存序/\_Atomic）。

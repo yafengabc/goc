@@ -151,7 +151,11 @@ func Parse(toks []Token) (*Program, error) {
 	for k := range enumConsts {
 		delete(enumConsts, k)
 	}
-	// va_list is the cursor type for <stdarg.h> variadic access. goc implements
+for k := range varTypes {
+	delete(varTypes, k)
+}
+
+// va_list is the cursor type for <stdarg.h> variadic access. goc implements
 	// variadics with a contiguous register/stack save area and walks it with a
 	// plain char* cursor, so va_list is just a pointer typedef.
 	typedefs["va_list"] = PtrType(CharType())
@@ -2018,10 +2022,11 @@ func (p *Parser) parseBraceInit() (Expr, error) {
 	return bi, nil
 }
 
-// parseAssign parses an assignment expression. Simple "=" binds the value of the
-// right side (and yields it), while the compound operators (+= -= *= /= %= &=
-// |= <<= >>=) desugar to "lhs = lhs OP rhs". Assignment is the lowest-precedence
-// expression operator (below the ternary ?:).
+// parseAssign parses an assignment expression. Simple "=" binds the value of
+// the right side (and yields it); compound operators (+= -= *= /= %= &= |=
+// <<= >>=) are kept as AssignExpr{Op} and compiled with evaluate-once lvalue
+// semantics (C11 6.5.16.2). Assignment is the lowest-precedence expression
+// operator (below the ternary ?:).
 func (p *Parser) parseAssign() (Expr, error) {
 	left, err := p.parseCond()
 	if err != nil {
@@ -2041,7 +2046,11 @@ func (p *Parser) parseAssign() (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &AssignExpr{Lhs: left, Rhs: &Binary{Op: op, L: left, R: right}}, nil
+		// "E1 op= E2" is not desugared into "E1 = E1 op E2" (that would
+		// evaluate E1 twice, C11 6.5.16.2 requires exactly once). The operator
+		// rides on AssignExpr; the checker and codegen implement evaluate-once
+		// semantics.
+		return &AssignExpr{Op: op, Lhs: left, Rhs: right}, nil
 	}
 	return left, nil
 }
