@@ -30,7 +30,7 @@ import (
 //
 // Usage (goc convenience front-end):
 //
-//	goc file.c                 compile and run
+//	goc file.c                 compile only (emit file.exe)
 //	goc run file.c [args...]   compile to a temp dir, run with args (go run)
 //	goc -c file.c              compile only (produce file.exe / file)
 //	goc -S file.c              emit assembly only (produce file.asm)
@@ -43,9 +43,9 @@ import (
 //	     -f* -s -pipe -v -DNAME[=val] -I<dir> -L<dir> -l<lib> -o <file>
 //	     -target <win|linux> [-shared -M* -MD -MP]
 //
-// When the binary is named `cc` (or `cc.exe`), it behaves like gcc: the
-// default action is "compile and emit an executable" without auto-running,
-// matching cc's contract.
+// Since 2026-10-02 plain `goc file.c` also compiles without auto-running
+// (use `goc run file.c` to execute), so the `cc`/`cc.exe` personality no
+// longer differs from the default: both just emit the executable.
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "run" {
 		runCmd(os.Args[2:])
@@ -323,14 +323,9 @@ func optFromSuffix(s string) int {
 
 // parseArgs turns os.Args[1:] into a buildCfg, tolerating gcc/clang options.
 func parseArgs(args []string) (buildCfg, bool) {
-	cfg := buildCfg{mode: "run"}
-	// When invoked as `cc`/`cc.exe` mimic gcc: compiling without -c/-S still
-	// just emits an executable and never auto-runs.
+	cfg := buildCfg{mode: "compile"} // plain `goc file.c` never auto-runs
 	self := filepath.Base(os.Args[0])
 	isCC := self == "cc" || self == "cc.exe" || strings.HasPrefix(self, "cc.")
-	if isCC {
-		cfg.mode = "compile"
-	}
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]

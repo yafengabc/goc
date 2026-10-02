@@ -12,9 +12,9 @@ The EXPECT tag is read from the case's header comment:
                           stance (accept/reject) is recorded for reference only
   EXPECT: UNSUPPORTED  -> goc is expected to fail (known design gap), gcc must pass
 
-Note on goc stdout: on a successful compile+run goc prints two "compiled ..." log
-lines and (only for a nonzero program exit) a "(program exited with code N)" line;
-all of those are stripped before comparing with gcc output.
+Note on goc stdout: goc is invoked as `goc run <case>` (compile to a temp dir,
+run the program, pass its exit code through as goc's own exit code). The
+"compiled ..." log lines are stripped before comparing with gcc output.
 
 Mechanical verdicts: PASS / FAIL / UNSUPPORTED / PARTIAL / DIFF / BROKEN_TEST / TIMEOUT.
 The mechanical verdict is a hint; the final semantic verdict (UNSUPPORTED rationale,
@@ -75,12 +75,15 @@ function Normalize([string]$s) {
 $srcText = [IO.File]::ReadAllText($CaseFile, (New-Object System.Text.UTF8Encoding($false, $true)))
 $expect = Get-ExpectTag $srcText
 
-# ---- goc (writes .exe next to the source file) ----
-$gocRes = Run-Native $goc @($CaseFile) $caseDir
+# ---- goc (`goc run`: compile to a temp dir, run, exit code passed through) ----
+$gocRes = Run-Native $goc @('run', $CaseFile) $caseDir
+$gocCompiled = ($gocRes.Stdout -match '(?m)^compiled ')
+# $gocRejected = the file failed to COMPILE (no "compiled" marker). A program
+# that compiled and ran with a non-zero exit is not a rejection: its exit code
+# arrives as goc's own exit code and is used in the output comparison below.
+$gocRejected = ($gocRes.Exit -ne 0 -and -not $gocCompiled)
 $gocProgExit = 0
-$em = [regex]::Match($gocRes.Stdout, '\(program exited with code (\d+)\)')
-if ($em.Success) { $gocProgExit = [int]$em.Groups[1].Value }
-elseif ($gocRes.Exit -ne 0) { $gocProgExit = $gocRes.Exit }
+if ($gocRes.Exit -ne 0) { $gocProgExit = $gocRes.Exit }
 
 # ---- gcc compile + run ----
 $gccExe = Join-Path $BuildDir ($caseName + '_gcc.exe')
@@ -98,12 +101,12 @@ $gccCompileOk = ($gccCompile.Exit -eq 0)
 
 switch ($expect) {
     'GOC-REJECT' {
-        if ($gocRes.Exit -ne 0) { $verdict = 'PASS' }
+        if ($gocRejected) { $verdict = 'PASS' }
         else { $verdict = 'FAIL'; $detail = 'goc accepted a construct that C23 removed (expected rejection)' }
     }
     'REJECT' {
         if (-not $gccCompileOk) {
-            if ($gocRes.Exit -ne 0) { $verdict = 'PASS' }
+            if ($gocRejected) { $verdict = 'PASS' }
             else { $verdict = 'FAIL'; $detail = 'goc accepted code that gcc -std=c2x rejects (C23 requires rejection)' }
         } else {
             $verdict = 'BROKEN_TEST'; $detail = 'gcc -std=c2x compiled it; EXPECT: REJECT tag is wrong'
@@ -112,7 +115,7 @@ switch ($expect) {
     'UNSUPPORTED' {
         if (-not $gccCompileOk) {
             $verdict = 'BROKEN_TEST'; $detail = 'gcc failed to compile: ' + ((($gccCompile.Stderr -split "`r?`n") | Select-Object -First 3) -join ' | ')
-        } elseif ($gocRes.Exit -ne 0) {
+        } elseif ($gocRejected) {
             $verdict = 'UNSUPPORTED'
         } else {
             $same = (Normalize $gocOutClean) -eq (Normalize $gccRun.Stdout)
@@ -123,8 +126,8 @@ switch ($expect) {
     default {
         if (-not $gccCompileOk) {
             $verdict = 'BROKEN_TEST'; $detail = 'gcc failed to compile: ' + ((($gccCompile.Stderr -split "`r?`n") | Select-Object -First 3) -join ' | ')
-        } elseif ($gocRes.Exit -ne 0) {
-            $verdict = 'FAIL'; $detail = 'goc failed to compile/run'
+        } elseif ($gocRejected) {
+            $verdict = 'FAIL'; $detail = 'goc failed to compile: ' + ((($gocRes.Stderr -split "`r?`n") | Select-Object -First 2) -join ' | ')
         } else {
             $same = (Normalize $gocOutClean) -eq (Normalize $gccRun.Stdout)
             if ($same -and $gocProgExit -eq $gccRun.Exit) { $verdict = 'PASS' }

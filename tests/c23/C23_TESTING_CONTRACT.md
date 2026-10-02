@@ -15,9 +15,9 @@
 
 ## 工具链（组织者已实测可用）
 
-- goc：`D:\projects\goc\bin\goc.exe` —— 把 .c 编译为同目录同名 .exe 并自动运行；  
-  编译成功时 stdout 有两行 `compiled ...` 日志（引擎已剥离），程序退出码非 0 时才打印  
-  `(program exited with code N)`；进程退出码成功恒为 0；报错走 stderr（格式如  
+- goc：`D:\projects\goc\bin\goc.exe` —— 引擎经 `goc run <file>` 调用：编译到临时目录并运行，  
+  程序的退出码透传为 goc 进程自身退出码（2026-10-02 起裸 `goc <file>` 只编译不运行）；  
+  编译成功时 stdout 有一行 `compiled ...` 日志（引擎已剥离）；报错走 stderr（格式如  
   `type error(s):` / `parse error: line N: ...` / `note: skipping unavailable system header <X>`），退出码非 0。
 - gcc：`D:\msys\ucrt64\bin\gcc.exe -std=c2x -Wall -Wextra`（16.2.0，MSYS2 UCRT64）。
 - 对拍引擎（每写完一个 .c 就跑一次）：

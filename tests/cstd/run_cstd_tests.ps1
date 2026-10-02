@@ -128,20 +128,24 @@ function FirstDiff($a, $b) {
 }
 
 function Run-Goc($src, $work) {
+    # goc run: compiles to a temp dir, runs the program, and passes its exit
+    # code through as goc's own exit code (no "(program exited...)" line).
     $out = Join-Path $work 'goc_out.txt'
     $err = Join-Path $work 'goc_err.txt'
-    $p = Start-Process -FilePath $goc -ArgumentList ('"' + $src + '"') -NoNewWindow -Wait -PassThru `
+    $p = Start-Process -FilePath $goc -ArgumentList ('run "' + $src + '"') -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput $out -RedirectStandardError $err
     $text = [IO.File]::ReadAllText($out)
     $errText = [IO.File]::ReadAllText($err)
     $prog = ''; $code = $null
-    if ($p.ExitCode -eq 0) {
+    $compiled = ($text -match '(?m)^compiled ')
+    if ($p.ExitCode -eq 0 -or $compiled) {
         foreach ($ln in ($text -split "`r?`n")) {
             if ($ln -match '^compiled ') { continue }
-            if ($ln -match '^\(program exited with code (\d+)\)$') { $code = [uint32]$Matches[1]; continue }
             $prog += $ln + "`n"
         }
-        if ($code -eq $null) { $code = [uint32]0 }
+        # Exit != 0 with a "compiled" line means the program ran and returned
+        # that code; without it the compile failed and $code stays $null.
+        $code = [uint32]$p.ExitCode
         $prog = Norm $prog
     }
     return @{ exit = $p.ExitCode; prog = $prog; code = $code; err = $errText }
