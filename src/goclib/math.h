@@ -191,6 +191,13 @@ int fpclassify(double x);
 /* Complement of the two above; false for NaN. */
 #define isfinite(x) (!isnan(x) && !isinf(x))
 
+/* Positive infinity as a double expression (7.12.4.1). goc does not fold
+ * 1.0/0.0 at compile time; the runtime division yields +inf per IEEE 754
+ * semantics, and %g prints it as "inf", matching the compared gcc. */
+#define HUGE_VAL  (1.0 / 0.0)
+#define HUGE_VALF (1.0f / 0.0f)
+#define HUGE_VALL (1.0L / 0.0L)
+
 #define M_PI     3.14159265358979323846
 #define M_PI_2   1.57079632679489661923
 #define M_PI_4   0.78539816339744830962

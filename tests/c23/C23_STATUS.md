@@ -3,7 +3,7 @@
 > 测试套件：`D:\projects\goc\tests\c23\`（cases 66 个用例文件 + 一键重跑脚本 `run_c23_tests.ps1` + 对拍引擎 `_tools\check_case.ps1`）
 > 对拍基线：`D:\projects\goc\bin\goc.exe`（2026-10-02 版本）vs `D:\msys\ucrt64\bin\gcc.exe -std=c2x -Wall -Wextra`（GCC 16.2.0，MSYS2 UCRT64，Windows LLP64）
 > 判定四类：**PASS**（goc 与 gcc 行为一致）/ **FAIL**（gcc 通过而 goc 错误 = 真实缺口，附报错原文）/ **UNSUPPORTED**（goc 明确设计取舍）/ **PARTIAL**（部分子用例通过，含两侧输出不同但都能跑的 DIFF 情形）
-> 全量机械判定：48 PASS / 6 PARTIAL / 6 FAIL / 5 DIFF / 2 UNSUPPORTED（2026-10-02：批次E c23_version/c23_has_c_attribute 转 PASS；批次D 新增 c23_str_subscript.c PASS；详见下方分组表；机械判定与语义判定差异处已注明）
+> 全量机械判定：49 PASS / 6 PARTIAL / 6 FAIL / 5 DIFF / 1 UNSUPPORTED（2026-10-02：批次E c23_version/c23_has_c_attribute 转 PASS；批次D 新增 c23_str_subscript.c PASS；批次H c23_uchar 转 PASS（uchar.h/uchar.c 落地）；详见下方分组表；机械判定与语义判定差异处已注明）
 > 所有用例均在 gcc -std=c2x 下编译运行通过（负向用例为双方拒绝），源代码 LF/UTF-8 无 BOM/纯 ASCII。
 > 2026-10-02 更新：P0 _BitInt 修复落地（src\codegen.go、src\goclib\bitint.c/h），`c23_bitint.c` 由 PARTIAL(12/15) 转 **PASS(15/15)**，新增 `c23_bitint_edge.c`（PASS 7/7，覆盖裸字面量比较/全局与 static 非零初始化/嵌套同宽 cast/6 参 conv 栈通道）；go test 全绿，C89-C17 套件 0 MISMATCH。
 > 2026-10-02 更新：P0.2 块作用域非 static `_Thread_local` panic 修复落地（src\check.go 存储类约束：块作用域 + 非 static/extern 直接干净拒绝），新增 `c23_thread_local_bad.c`（EXPECT: REJECT，双方拒机械 PASS）；原 codegen.go:4785 IsArray nil panic 路径不可达。
@@ -40,9 +40,9 @@
 | 语义偏差 | **非法数字分隔符** | goc 静默删 `'` 照常解析（`1''000`/`0x'FFFF'` 等 6 种全不报错）；十六进制浮点指数内分隔符报 "unterminated character literal"（`0x1p10'0`，归 P2.13）；前导小数点 `.12`/`.1'2` 已支持（2026-10-02 lexer 前导点修复） |
 | 语义偏差（已修） | **`__has_c_attribute` guard** | **已修复（P2.15，2026-10-02）**：`defined(__has_c_attribute)`/`defined(__has_include)` 现返回 1，标准 portable guard 正常激活（与 gcc 一致） |
 | 语义偏差 | **nullptr_t 类型模型** | goc `typedef void* nullptr_t`、`typeof(nullptr)` 为 4 字节 int（gcc 为独立 8 字节类型）；gcc 侧 mingw 的 <stddef.h> 也不暴露 nullptr_t 类型名 |
-| 缺失头/宏 | **<stdbit.h>**、**<uchar.h>**（char16/32、mbrtoc16 系）、**<stdatomic.h>**、**<threads.h>**、**<stdnoreturn.h>**、**<stdbool.h>** | goc 全部缺失（"note: skipping unavailable system header"），mingw 侧 <stdbit.h> 也无 |
-| 缺失宏 | **limits.h/float.h 全部 C23 宏** | CHAR_WIDTH…ULLONG_WIDTH、BOOL_WIDTH、BITINT_MAXWIDTH、FLT_NORM_MAX、FLT_IS_IEC_60559 等 goc 一个都没有；LLONG_MAX 也没有 |
-| 缺失设施 | **offsetof / max_align_t** | goc stddef.h 明写 "deliberately not provided" |
+| 缺失头/宏 | **<stdbit.h>**、**<stdatomic.h>** | goc 无此二头（"note: skipping unavailable system header"），mingw 侧 <stdbit.h> 也无；<uchar.h>/<threads.h>/<stdnoreturn.h>/<stdbool.h> 已于批次H提供 |
+| 缺失宏 | （批次H 已提供） | limits.h/float.h C23 宽度/归一化宏全套已落地（CHAR_WIDTH…ULLONG_WIDTH/BOOL_WIDTH/BITINT_MAXWIDTH/FLT_NORM_MAX/*_IS_IEC_60559/EXP 系）；LONG_WIDTH=64 为 goc LP64 语义（gcc LLP64 报 32），LDBL_* 按 long double=double 降级值 |
+| 缺失设施 | （批次H 已提供） | stddef.h 现提供标准 offsetof 宏与 max_align_t（goc 8 字节对齐 vs gcc 16——long double 模型差异） |
 | 平台细节 | **printf %a / %wN** | goc 无 %a（打印字面 'a'）、无 %wN；`"hello"[0]` 直接下标已修复（P0.8，2026-10-02，见 c23_str_subscript.c PASS 4/4） |
 | 编译器崩溃（已修） | **块作用域非 static thread_local** | **已修复（P0.2，2026-10-02）**：现干净拒绝 `_Thread_local variable "x" at block scope must be static or extern`（exit 非 0），不再 Go panic；gcc 同样拒绝；合法形式须 `static thread_local` |
 
@@ -153,11 +153,11 @@
 |---|---|---|---|---|---|
 | <stdckdint.h> ckd_add/sub/mul | **PARTIAL** | 12 | goc 9/12：int/uint/混合 32 位目标溢出检测全对；**64 位目标（long long/unsigned long long）溢出标志恒报 0**（goclib 头自证：`__ckd_oflow((long long)(a)+(long long)(b), sizeof(*(r)), r)` 且 `(W)>=8 ? 0 : ...`——"64-bit overflow cannot be detected without 128-bit math"）；回绕结果值两侧一致 | 12/12 | **32 位放心用**；**64 位溢出检查避开**（自实现 128 位或区间判断） |
 | <stdbit.h> | **UNSUPPORTED** | 3 | 双侧均无此头，守卫探针输出一致 `unavailable`；本地 shim（stdc_bit_width/count_ones）两侧 3/3 一致 | gcc 也无此头 | 避开；位运算手写（shim 已验证语义可行） |
-| <uchar.h> char16/char32/mbrtoc16 系 | **UNSUPPORTED** | 4 | `note: skipping unavailable system header <uchar.h>`（<wchar.h> 一并 skip）；`parse error: line 26: expected ";", got "h"`（char16_t 未定义） | gcc 4/4：sizeof=2/4，mbrtoc16/c16rtomb/mbrtoc32/c32rtomb ASCII 往返全对（mingw 无 mbrtoc8/char8_t） | 完全不可用（宽字符转换需自建） |
-| <stddef.h> nullptr_t/unreachable/NULL/offsetof | **PASS（附 3 信息分叉）** | 7 | 功能核心（NULL/size_t=8/ptrdiff_t/`if(0){unreachable();}`/nullptr 赋值）7/7；分叉：`typeof(nullptr)`=4 字节 int（gcc 8 字节独立类型）、`_Generic(nullptr)` 命中 int、**offsetof/max_align_t 未提供**（头注释 "deliberately not provided"） | gcc：mingw 无 unreachable() 宏（用 __builtin_unreachable），有 offsetof=4、max_align_t=32 | NULL/size_t/unreachable(死分支) 放心用；**offsetof/max_align_t 要自实现**；勿依赖 nullptr 的指针类型语义 |
+| <uchar.h> char16/char32/mbrtoc16 系 | **PASS** | 4 | 批次H：src\goclib\uchar.h/uchar.c（go:embed 内嵌）实现 C11 7.28 四函数（含 mbstate_t 代理半字状态机，非 BMP 走 -3/-1 协议），4/4 与 gcc 逐字节一致；char8_t/mbrtoc8 双方均缺（mingw 无） | gcc 4/4：sizeof=2/4，mbrtoc16/c16rtomb/mbrtoc32/c32rtomb ASCII 往返全对 | char16_t/char32_t 与 UTF-16/32 往返放心用；u""/U"" 字面量仍避开 |
+| <stddef.h> nullptr_t/unreachable/NULL/offsetof | **PASS（附 2 信息分叉）** | 7 | 功能核心 7/7；批次H 提供 offsetof（=4 与 gcc 一致）与 max_align_t（goc 8/8 vs gcc 16/32，long double 模型差异）；剩余分叉：`typeof(nullptr)`=4 字节 int（gcc 8 字节独立类型）、`_Generic(nullptr)` 命中 int | gcc：mingw 无 unreachable() 宏（用 __builtin_unreachable），有 offsetof=4、max_align_t=32 | NULL/size_t/unreachable(死分支)/offsetof/max_align_t 放心用；勿依赖 nullptr 的指针类型语义 |
 | <string.h> strdup/strndup | **PASS** | 5 | 正常/空串/strndup n<len/n>len/n=0/free 全对；goclib 声明在 string.h（stdlib.h 未重复，符合 C23） | 5/5 一致（一条无害 -Wstringop-overread） | 放心用（从 <string.h> 取） |
 | <string.h> memccpy + <stdlib.h> qsort/bsearch const 签名 | **PASS** | 6 | memccpy 找到/未找到/c='\0'/n 过短全对；goclib qsort/bsearch 已用 C23 `int (*)(const void*, const void*)` 签名，排序/查找正确 | 6/6 一致 | 放心用 |
-| limits.h/float.h C23 宏 + long double | **PASS（探针）+ 逐宏 DIFF** | 21 宏+3 项 | goc **全部 C23 宏 undef**（CHAR_WIDTH…ULLONG_WIDTH/BOOL_WIDTH/BITINT_MAXWIDTH/FLT_NORM_MAX/*_IS_IEC_60559）；goclib limits.h 连 ULLONG_MAX 也无；long double 降级 double 生效（sizeof=8、LDBL_MANT_DIG=53、运算正常）**但 `__goc_long_double_is_double` 标记宏未定义**、LDBL_MAX_EXP undef | gcc 全宏齐全（LONG_WIDTH=32 是 Windows LLP64 ABI，非缺陷）；LDBL_MANT_DIG=64、sizeof=16 | 别写依赖任何 C23 宽度/归一化宏的代码；long double 当 double 用可运算，勿依赖降级标记宏 |
+| limits.h/float.h C23 宏 + long double | **PASS（探针）+ 逐宏 DIFF** | 21 宏+3 项 | 批次H：全部 C23 宽度/归一化宏落地（CHAR_WIDTH…ULLONG_WIDTH、BOOL_WIDTH=1、BITINT_MAXWIDTH=65535、FLT/DBL/LDBL_NORM_MAX、FLT/DBL/LDBL_IS_IEC_60559=1、FLT_RADIX/ROUNDS/EXP 全套），`__goc_long_double_is_double` 标记已补；剩余 DIFF 全为模型差异：LONG_WIDTH/ULONG_WIDTH=64（goc LP64 vs gcc 32）、LDBL_MANT_DIG=53/LDBL_MAX_EXP=1024/sizeof=8（long double 降级 double，gcc 64/16384/16）、标记宏 goc defined vs gcc undef | gcc 全宏齐全（LONG_WIDTH=32 是 Windows LLP64 ABI，非缺陷）；LDBL_MANT_DIG=64、sizeof=16 | 宽度/归一化宏可引用（long 相关值按 goc LP64 语义）；long double 当 double 用；跨 ABI 比对 long 值先确认 |
 
 ---
 

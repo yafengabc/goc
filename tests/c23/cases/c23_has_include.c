@@ -1,14 +1,14 @@
 /* C23 feature: __has_include
  * Clause:     C23 6.10.2 "Source file inclusion" (feature-test macro)
  * Strategy:   probe __has_include only for headers where the two compilers agree
- *             on availability (goc ships stdio/stdlib/string/math; neither ships
- *             threads.h), plus a guaranteed-missing header, the quoted form, and a
- *             boolean-logic combination. __has_include may only appear inside a
- *             preprocessing directive, so each result is expanded into an integer
- *             macro. NOTE: measured on this build goc reports 1 for the headers it
- *             actually has and 0 for the ones it lacks (wchar/complex/stdatomic/
- *             iso646), so it tracks goc's real header inventory -- see status doc.
- * Status:     PENDING
+ *             on availability, plus a guaranteed-missing header, the quoted form,
+ *             and a boolean-logic combination. Batch H gave goc stdbool/stdnoreturn/
+ *             uchar/threads headers that this mingw gcc lacks, so those are NOT
+ *             probed (goc's inventory is now strictly richer; see C23_STATUS).
+ *             <stdbit.h> is absent on both and stands in as the "missing" probe.
+ *             __has_include may only appear inside a preprocessing directive, so
+ *             each result is expanded into an integer macro.
+ * Status:     PASS (batch H, 2026-10-02: goc vs gcc -std=c2x 6/6 identical)
  * EXPECT: PASS
  */
 #include <stdio.h>
@@ -31,10 +31,10 @@
 #  define HI_MISSING 0
 #endif
 
-#if __has_include(<threads.h>)
-#  define HI_THREADS 1
+#if __has_include(<stdbit.h>)
+#  define HI_STDBIT 1
 #else
-#  define HI_THREADS 0
+#  define HI_STDBIT 0
 #endif
 
 #if __has_include("stdio.h")
@@ -65,8 +65,8 @@ int main(void) {
     if (HI_MISSING == 0) passed++;
 
     ++total;
-    printf("case%d: __has_include(<threads.h>) = %d (want 0)\n", total, HI_THREADS);
-    if (HI_THREADS == 0) passed++;
+    printf("case%d: __has_include(<stdbit.h>) = %d (want 0)\n", total, HI_STDBIT);
+    if (HI_STDBIT == 0) passed++;
 
     ++total;
     printf("case%d: __has_include(\"stdio.h\") = %d (want 1)\n", total, HI_QSTDIO);

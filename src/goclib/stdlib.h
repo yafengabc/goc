@@ -61,6 +61,9 @@ int   rand(void);
 void  srand(unsigned int seed);
 void  exit(int code);
 
+/* Largest value rand() can return (7.22.2.1). Matches the compared gcc. */
+#define RAND_MAX 32767
+
 /* ---- C11 additions ----------------------------------------------------- */
 /* aligned_alloc: size bytes aligned to `alignment` (a power of two). goc's
  * heap is already 16-byte aligned, so alignment <= 16 is exact; larger

@@ -33,4 +33,26 @@
 #define LDBL_MAX      DBL_MAX
 #define LDBL_EPSILON  DBL_EPSILON
 
+/* ---- exponent range / radix (classic C89 macros, completed) ------------ */
+#define FLT_RADIX     2
+#define FLT_ROUNDS    1
+#define FLT_MIN_EXP   (-125)
+#define FLT_MAX_EXP   128
+#define DBL_MIN_EXP   (-1021)
+#define DBL_MAX_EXP   1024
+#define LDBL_MIN_EXP  DBL_MIN_EXP
+#define LDBL_MAX_EXP  DBL_MAX_EXP
+
+/* ---- C23 normalization / IEC 60559 macros (7.7.1, 7.7.2) --------------- */
+#define FLT_NORM_MAX FLT_MAX
+#define DBL_NORM_MAX DBL_MAX
+#define LDBL_NORM_MAX LDBL_MAX
+#define FLT_IS_IEC_60559 1
+#define DBL_IS_IEC_60559 1
+#define LDBL_IS_IEC_60559 1
+
+/* goc long double is binary64 in disguise; the marker lets portable code
+ * detect the downgrade (P3.5). */
+#define __goc_long_double_is_double 1
+
 #endif /* GOC_FLOAT_H */

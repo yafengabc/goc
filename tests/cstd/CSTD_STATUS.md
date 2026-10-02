@@ -5,11 +5,11 @@
 - 被测对象：`D:\projects\goc\bin\goc.exe`（单模式：接受但忽略 `-std`，所有用例同一语义）
 - 验证日期：2026-10-02；重跑：`powershell -ExecutionPolicy Bypass -File tests\cstd\run_cstd_tests.ps1`（当前结果 0 MISMATCH，退出码 0）
 - 判定四类：**PASS** = goc 与 gcc 输出+退出码一致；**FAIL** = gcc 过而 goc 编译/运行错误（真实缺口，报错原文照录）；**UNSUPPORTED** = goc 明确设计取舍/后置；**PARTIAL** = 部分子用例通过
-- 汇总：**PASS=59 PARTIAL=3 FAIL=0 UNSUPPORTED=7 MISMATCH=0**（2026-10-02：批次E c89_pp_elif/c89_pp_obj 转 PASS；批次D c99_compound 转 PASS；批次F c99_stdint/c99_funcname/c99_vacopy 转 PASS）
+- 汇总：**PASS=60 PARTIAL=2 FAIL=0 UNSUPPORTED=7 MISMATCH=0**（2026-10-02：批次E c89_pp_elif/c89_pp_obj 转 PASS；批次D c99_compound 转 PASS；批次F c99_stdint/c99_funcname/c99_vacopy 转 PASS；批次H c89_lib_stdlib 转 PASS（RAND_MAX 落地），stdbool/threads/uchar 等头补全后维持 PASS）
 
 ---
 
-## C89（36 文件：33 PASS / 2 PARTIAL / 0 FAIL / 1 UNSUPPORTED）
+## C89（36 文件：34 PASS / 1 PARTIAL / 0 FAIL / 1 UNSUPPORTED）
 
 ### 核心语言（16 文件，全 PASS）
 
@@ -47,10 +47,10 @@
 | c89_lit_str.c | 拼接/转义/空串/sizeof/下标/数组 vs 指针 | PASS | 6 | 一致 | 放心用 |
 | c89_lib_stdio.c | printf 全家/sprintf/sscanf/文件 I/O 全链路 | PASS | 7 | 一致（临时文件自删） | 放心用 |
 | c89_lib_string.c | 19 个字符串函数（含 memmove 自重叠、strncpy 补零） | PASS | 10 | 一致 | 放心用 |
-| c89_lib_stdlib.c | atoi/strtol/div/qsort/bsearch/atexit/rand | PARTIAL | 8 | case5 `RAND_MAX=not-defined`；其余一致（atexit LIFO 一致） | 不要引用 RAND_MAX；其余放心用 |
+| c89_lib_stdlib.c | atoi/strtol/div/qsort/bsearch/atexit/rand | PASS | 8 | 批次H：stdlib.h 补 RAND_MAX=32767，case5 与 gcc 一致；atexit LIFO 一致 | 放心用（rand/srand/exit/atexit/RAND_MAX） |
 | c89_lib_ctype.c | 12 个 is* + tolower/toupper/EOF | PASS | 3 | 一致 | 放心用 |
 | c89_lib_limits.c | limits.h + float.h + sizeof 汇总 | PARTIAL | 7 | LONG_MIN/MAX、ULONG_MAX、sizeof(long) 不同：goc long=8（LP64）vs gcc long=4（Windows LLP64）；float.h 全一致 | 勿按 long=4 假设；跨编译比对 long 值前先确认 ABI |
-| c89_lib_varargs.c | va_list int/double/混合、ptrdiff_t、offsetof | PASS | 4 | 一致（offsetof 用指针算术实现） | 标准 `offsetof(type,member)` 宏别用（见交叉发现） |
+| c89_lib_varargs.c | va_list int/double/混合、ptrdiff_t、offsetof | PASS | 4 | 一致（批次H：标准 offsetof 宏落地 stddef.h，与指针算术路径同结果） | 放心用 |
 | c89_trigraph.c | trigraph 探测 | UNSUPPORTED | — | goc：`parse error: line 13: expected ";", got "?"`；gcc 需 `-trigraphs` 才能编译 | 不要写 trigraph |
 | c89_lit_octal.c | 八进制字面量 `010`/`0777` 等 | PASS | 4 | 一致（`010=8 0777=511 010U=8 010L=8 010+010=16`；原静默按十进制解析已修 2026-10-02） | 八进制放心用；`0` 后接 8/9 会干净报错 |
 | c89_pp_elif.c | 多 `#elif` 链 | **PASS** | 4 | 一致（2026-10-02 P0.6 修复：`#if/#elif` 条件求值期间宏展开不再受分支活性影响，case2 多链真分支正确命中） | 多 `#elif` 链放心用 |
@@ -65,7 +65,7 @@
 |---|---|---|---|---|---|
 | c99_comment.c | `//` 行注释 | PASS | 5 | 一致（含字符串内 `//` 不生效） | 放心用 |
 | c99_longlong.c | `long long`/LL/ULL/`%lld%llu%llx`/回绕 | PASS | 5 | 一致（`LLONG_MAX+1` 回绕到 `LLONG_MIN`） | 放心用 |
-| c99_bool.c | `_Bool`/stdbool.h | PASS | 4 | 一致；goc 打印 `note: skipping unavailable system header <stdbool.h>` 但 `bool/true/false/_Bool` 是内建，无需 include | 放心用，无需 include |
+| c99_bool.c | `_Bool`/stdbool.h | PASS | 4 | 一致（批次H：stdbool.h 落地，include 不再 skip；bool/true/false/_Bool 内建） | 放心用 |
 | c99_variadic_macro.c | `__VA_ARGS__`/宏转发 | PASS | 4 | 一致（标准变参宏，至少 1 个变参） | 放心用；勿写空尾变参 `##__VA_ARGS__`（GNU 扩展 goc 拒） |
 | c99_stdint.c | stdint.h/inttypes.h | PASS | 3 | 原头缺失+`expected ";", got "i8"` 已修（P1.3, 2026-10-02）：goclib 现提供 LP64 版 stdint.h/inttypes.h（int64_t=long、PRId64="ld"）；intptr_t 对拍用固定常量——裸地址运行时相关（goc 低地址加载、LLP64 gcc 高地址），无法逐字节比 | 放心用（intN_t/INT64_C/UINT64_C/PRId64/PRIu64/PRIdPTR） |
 | c99_restrict.c | restrict 指针 | PASS | 2 | 一致（行为等价） | 放心用 |
@@ -82,7 +82,7 @@
 | c99_ucn.c | 通用字符名 `\uXXXX` | PASS | 1 | 字符串内一致：`e-acute é 5`（UTF-8 解码；原吞反斜杠静默错译已修 2026-10-02）；标识符内 UCN 仍未支持（另一独立缺口） | 字符串/字符字面量 UCN 放心用；标识符内 UCN 仍避开 |
 | c99_trailing.c | 枚举/初始化列表尾随逗号 | PASS | 3 | 一致 | 放心用 |
 | c99_vacopy.c | `va_copy`（stdarg.h） | PASS | 1 | 原 codegen unknown function 已修（P1.5, 2026-10-02）：stdarg.h 补 `#define va_copy(d,s) ((d)=(s))`（va_list=char*），两路独立推进=60 60 与 gcc 一致 | 放心用 va_copy |
-| c99_math.c | C99 math 宏/函数 | PASS | 7 | 一致（round/trunc/floor/ceil/fabs/pow/sqrt/hypot/fmod、isnan/isinf/isfinite/signbit/fpclassify、nan()） | 放心用；**HUGE_VAL 未定义**（math.h 无），不要引用 |
+| c99_math.c | C99 math 宏/函数 | PASS | 7 | 一致（round/trunc/floor/ceil/fabs/pow/sqrt/hypot/fmod、isnan/isinf/isfinite/signbit/fpclassify、nan()） | 放心用；HUGE_VAL/HUGE_VALF/HUGE_VALL 已提供（批次H，1.0/0.0 运行时 IEEE 除零得 inf） |
 | c99_implicit.c | C99 应拒绝的构造（隐式 int、隐式函数声明） | PASS（拒绝类） | 3 | goc 硬拒：`parse error: line 9: expected type specifier, got "x"`；gcc 16.2 在纯 `-std=c99` 下把这两类升级为**硬错误**，对拍需 `-Wno-error=implicit-int -Wno-error=implicit-function-declaration -fcommon` | goc 行为正确（拒绝），放心 |
 
 ---
@@ -93,14 +93,14 @@
 |---|---|---|---|---|---|
 | c11_generic.c | `_Generic` 类型泛选 | PASS | 6 | 一致（控制表达式不求值、default、char 左值 vs `'a'` 整型提升陷阱、嵌套） | 放心用；**同一关联列表勿同时列 `int:` 与 `const int:`**（goc 报 appears twice） |
 | c11_static_assert.c | `_Static_assert`/static_assert | PASS | 4 | 一致；goc 是关键字（失败用例诊断：`parse error: static_assert failed: this must fail`）；gcc 需 `#include <assert.h>` 取宏 | 放心用（goc 解析期即拒，诊断干净） |
-| c11_align.c | `_Alignas`/`_Alignof`/对齐宏 | PASS | 5 | 一致（内置 alignas/alignof 可用，实测 16）；`_Alignof(struct Tag)` 与标准 `offsetof(type,m)` 为 goc 缺口，用例改用 sizeof/指针减法 | 用内置 alignas/alignof；勿用 `_Alignof(struct Tag)`、标准 offsetof 宏 |
+| c11_align.c | `_Alignas`/`_Alignof`/对齐宏 | PASS | 5 | 一致（内置 alignas/alignof 可用，实测 16）；`_Alignof(struct Tag)` 仍为缺口（用例改用 sizeof/指针减法）；标准 offsetof 宏批次H 已提供 | 用内置 alignas/alignof；勿用 `_Alignof(struct Tag)` |
 | c11_thread_local.c | `_Thread_local`/thread_local | PASS | 5 | 一致（goc 原生 TLS：文件作用域、static 函数内、取地址、跨函数读均正常）；块作用域非 static TLS 现被干净拒绝（P0.2），不再 panic | 放心用；块作用域须 `static _Thread_local`；gcc 本机无 threads.h，用例用 `#define thread_local _Thread_local` 兜底 |
 | c11_thread_local_bad.c | 块作用域非 static `_Thread_local`（负向） | PASS（拒绝类） | 3 | goc 干净拒：`type error(s): line N: _Thread_local variable "x" at block scope must be static or extern`（P0.2，原 codegen.go:4785 IsArray nil panic 已消除）；gcc -std=c11 同样拒（`function-scope 'x' implicitly auto and declared '_Thread_local'`） | 双方一致拒绝；块作用域写 TLS 必须加 static |
 | c11_noreturn.c | `_Noreturn`/noreturn 宏 | PASS | 3 | 一致 | 放心用 |
 | c11_anon.c | 匿名 struct/union 成员 | PASS | 7 | 一致（扁平访问/初始化透明/嵌套/union 重叠） | 放心用 |
-| c11_uchar.c | `<uchar.h>`/char16_t/`u""`/`U""` | UNSUPPORTED | 4 | `note: skipping unavailable system header <uchar.h>`；`parse error: line 11: expected type specifier, got "char16_t"`；gcc 编译通过 | 避开 |
+| c11_uchar.c | `<uchar.h>`/char16_t/`u""`/`U""` | UNSUPPORTED | 4 | 批次H：<uchar.h> 已提供，char16_t/char32_t 与转换函数可用；仍拒 `u""`/`U""`/u 前缀宽字面量（`parse error: line 11: expected ';' after global declaration`）；gcc 编译通过 | 宽字面量避开；类型/转换函数放心用 |
 | c11_atomic.c | `<stdatomic.h>`/atomic_int | UNSUPPORTED | 1 | `note: skipping unavailable system header <stdatomic.h>`；`parse error: line 13: expected ";", got "a"`；裸 `_Atomic int x;`（不 include）`parse error: line 1: expected ";", got "int"` —— **`_Atomic` 不是 goc 关键字** | 避开（roadmap 后置项，语法也未接受） |
-| c11_threads.c | `<threads.h>`/thrd_t 等 | PASS（兜底） | 1 | 经 `__has_include` 落到 opaque typedef，sizeof 与 gcc 一致（本机 gcc 也无 threads.h） | 避开原生 threads 库；类型可用自造 opaque 替身 |
+| c11_threads.c | `<threads.h>`/thrd_t 等 | PASS（兜底） | 1 | 批次H：goc 提供 threads.h（同构 opaque 类型，sizeof 与兜底一致）；调用 thrd_*/mtx_* 函数仍为 clean unknown-function（goc 单线程）；本机 gcc 无此头 | 类型声明可用；勿调用 threads 函数 |
 
 ---
 
@@ -135,7 +135,7 @@ goc 是 **LP64**（`sizeof(long)=8`、指针 8、size_t 8），本机 Windows gc
 - ~~`va_copy`~~ **已修复(2026-10-02, P1.5)**：原 `codegen error: unknown function "va_copy": not in goclib`，现 stdarg.h 宏展开
 - K&R 旧式定义：`parse error: line 1: expected type specifier, got "a"`
 - 顶层变量 extern 重声明：`type error(s): line 2: redefinition of "x" in the same scope`（extern 只对函数声明工作）
-- 标准 `offsetof(type,member)`：`unexpected token "struct"`（用 `(char*)&p.b-(char*)&p` 替代）
+- 标准 `offsetof(type,member)`：批次H 已修复（stddef.h 落地 `((size_t)&(((type*)0)->member))`，对拍与 gcc 一致）
 - `_Alignof(struct Tag)`：parse error（`_Alignof(标量/数组)` 正常）
 - gets：`codegen error: unknown function "gets": not in goclib (...)`（符合 C11 移除，goc 同样无）
 - 块作用域非 static `_Thread_local`：**已修复（P0.2，2026-10-02）**——现被语义层干净拒绝（`_Thread_local variable "x" at block scope must be static or extern`，exit 非 0），原 codegen.go:4785 IsArray nil panic 路径不可达；gcc 同样拒绝
@@ -183,14 +183,14 @@ atexit LIFO、qsort/bsearch、memmove 自重叠、strncpy 补零、`%e/%g/%a` �
 ### 库头可用性（goc 自带）
 | 类别 | 头文件 | 说明 |
 |---|---|---|
-| ✅ 可用（无 note） | assert ctype errno float limits math stdarg stddef stdio stdlib string tgmath time **stdckdint** | 头内标识符/函数可正常使用 |
-| ⚠️ 被跳过但关键字内建 | stdbool（bool/true/false/_Bool 内建）、stdalign（alignas/alignof 内建）、stdnoreturn（noreturn 内建） | include 打 `note: skipping unavailable system header` 但不影响使用 |
-| ❌ 缺失（note 后所有标识符未定义） | complex fenv iso646 locale setjmp signal **stdatomic threads uchar** wchar wctype | include 不报错但头内一切未定义，等同没有（stdint/inttypes 已于批次F提供） |
-| 📌 特例 | stddef.h **不提供 max_align_t**（`_Alignof(max_align_t): type not known at parse time`）；stdlib.h 无 `RAND_MAX`；math.h 无 `HUGE_VAL` | 写库时自造或避开 |
+| ✅ 可用（无 note） | assert ctype errno float limits math stdarg stddef stdio stdlib string tgmath time **stdckdint stdbool stdnoreturn stdint inttypes uchar threads** | 头内标识符/函数可正常使用（stdbool/stdnoreturn/uchar/threads 为批次H 新提供） |
+| ⚠️ 被跳过但关键字内建 | stdalign（alignas/alignof 内建） | include 打 `note: skipping unavailable system header` 但不影响使用 |
+| ❌ 缺失（note 后所有标识符未定义） | complex fenv iso646 locale setjmp signal **stdatomic** wchar wctype | include 不报错但头内一切未定义，等同没有（stdint/inttypes 于批次F、threads/uchar 于批次H 提供） |
+| 📌 特例 | （批次H 已清空：stddef.h 提供 offsetof/max_align_t，stdlib.h 提供 RAND_MAX，math.h 提供 HUGE_VAL 系） | 原三项缺口均已落地，直接使用 |
 
 ### 类型模型快照
 int=4、long=8（LP64）、long long=8、指针=8、float=4、double=8、long double=8（降级 double，标 `__goc_long_double_is_double`）、wchar_t=8、size_t=8；char 有符号；sizeof(enum)=4（int 宽）；plain int 位域有符号。
 
 ### 给标准库作者的最终建议（放心用 / 避开速查）
-- **放心用**：对象/函数宏（含 `#` `##`）、嵌套 `#if/#else`、`//` 注释、long long、`_Bool`、restrict、声明混排、十六进制浮点常量、尾随逗号、stdint 之外的全套 stdio/string/ctype/stdlib/math（含 C99 math 宏）、`_Generic`、`_Static_assert`、alignas/alignof、thread_local（静态/文件作用域）、`_Noreturn`、匿名 struct/union、stdckdint.h、`__FILE__/__LINE__`
-- **避开**：VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）（多 `#elif` 链、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`sizeof(复合字面量)`（P0.5）、字符串字面量直接下标（P0.8）、`__func__`（P1.4）、`%a` 打印（P0.7）、va_copy（P1.5）、stdint.h/inttypes.h（P1.3）均已于 2026-10-02 修复，移出避开清单）
+- **放心用**：对象/函数宏（含 `#` `##`）、嵌套 `#if/#else`、`//` 注释、long long、`_Bool`、restrict、声明混排、十六进制浮点常量、尾随逗号、全套 stdio/string/ctype/stdlib/math（含 C99 math 宏/RAND_MAX/HUGE_VAL）、stdint/inttypes、stdbool/stdnoreturn/uchar/threads 类型、offsetof、max_align_t、`_Generic`、`_Static_assert`、alignas/alignof、thread_local（静态/文件作用域）、`_Noreturn`、匿名 struct/union、stdckdint.h、`__FILE__/__LINE__`
+- **避开**：VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、gets、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`、`u""`/`U""` 宽字面量、threads 函数调用（thrd_*/mtx_*）、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）（多 `#elif` 链、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`sizeof(复合字面量)`（P0.5）、字符串字面量直接下标（P0.8）、`__func__`（P1.4）、`%a` 打印（P0.7）、va_copy（P1.5）、stdint.h/inttypes.h（P1.3）、`offsetof(type,m)`、RAND_MAX、HUGE_VAL 均已于 2026-10-02 修复，移出避开清单）

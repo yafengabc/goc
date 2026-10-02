@@ -1024,3 +1024,74 @@ int main(){ return __func__[0]; }`)
 		t.Errorf(`__func__ image missing the main name bytes: %q`, asm)
 	}
 }
+
+// TestOffsetofMacro proves the standard offsetof(type, member) macro from
+// goclib stddef.h expands to a null-pointer member address and folds to the
+// member's byte offset (P3.4). Before batch H, stddef.h said "deliberately
+// not provided" and offsetof(struct S, b) died at parse time.
+func TestOffsetofMacro(t *testing.T) {
+	asm := genAsm(t, `#include <stddef.h>
+struct S { char a; int b; };
+int main(){ return (int)offsetof(struct S, b); }`)
+	if !strings.Contains(asm, "add r10, 4") {
+		t.Errorf("offsetof(struct S, b) did not fold to 4: %q", asm)
+	}
+}
+
+// TestWidthMacros proves the C23 width / normalization macros (P3.2) resolve
+// at preprocess time with the documented values: LP64 long widths on goc,
+// BITINT_MAXWIDTH mirroring UINT_MAX's bound, and the IEC 60559 normalization
+// markers all defined. Any mismatch trips a #error, which fails the test.
+func TestWidthMacros(t *testing.T) {
+	asm := genAsm(t, `#include <limits.h>
+#include <float.h>
+#if CHAR_WIDTH != 8 || SCHAR_WIDTH != 8 || UCHAR_WIDTH != 8
+#error CHAR_WIDTH
+#endif
+#if SHRT_WIDTH != 16 || USHRT_WIDTH != 16
+#error SHRT_WIDTH
+#endif
+#if INT_WIDTH != 32 || UINT_WIDTH != 32
+#error INT_WIDTH
+#endif
+#if LONG_WIDTH != 64 || ULONG_WIDTH != 64
+#error LONG_WIDTH
+#endif
+#if LLONG_WIDTH != 64 || ULLONG_WIDTH != 64
+#error LLONG_WIDTH
+#endif
+#if BOOL_WIDTH != 1
+#error BOOL_WIDTH
+#endif
+#if BITINT_MAXWIDTH != 65535
+#error BITINT_MAXWIDTH
+#endif
+#if !defined(FLT_NORM_MAX) || !defined(DBL_NORM_MAX) || !defined(LDBL_NORM_MAX)
+#error NORM_MAX
+#endif
+#if FLT_IS_IEC_60559 != 1 || DBL_IS_IEC_60559 != 1 || LDBL_IS_IEC_60559 != 1
+#error IS_IEC_60559
+#endif
+#if !defined(__goc_long_double_is_double)
+#error long-double marker
+#endif
+int main(){ return 0; }`)
+	if strings.Contains(asm, "#error") {
+		t.Errorf("a C23 width/NORM macro check tripped: %q", asm)
+	}
+}
+
+// TestLibMacrosRandHuge proves stdlib.h RAND_MAX and math.h HUGE_VAL are now
+// defined and usable (P3.3/P3.5): RAND_MAX materialises as 32767, and
+// HUGE_VAL (1.0/0.0) evaluates to +inf via a runtime IEEE division.
+func TestLibMacrosRandHuge(t *testing.T) {
+	asm := genAsm(t, `#include <stdlib.h>
+#include <math.h>
+int main(){ printf("%d %g\n", RAND_MAX, (double)HUGE_VAL); return 0; }`)
+	if !strings.Contains(asm, "mov rax, 32767") {
+		t.Errorf("RAND_MAX did not expand to 32767: %q", asm)
+	}
+	if !strings.Contains(asm, "divsd") {
+		t.Errorf("HUGE_VAL 1.0/0.0 should emit a runtime division producing inf: %q", asm)
+	}
+}

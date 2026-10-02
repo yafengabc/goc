@@ -66,7 +66,7 @@ $expected = @{
     'c89_lit_str.c'     = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_lib_stdio.c'   = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_lib_string.c'  = @{ status = 'PASS';        gocFails = $false; extra = '' }
-    'c89_lib_stdlib.c'  = @{ status = 'PARTIAL';     gocFails = $false; extra = '' }
+    'c89_lib_stdlib.c'  = @{ status = 'PASS';         gocFails = $false; extra = '' }
     'c89_lib_ctype.c'   = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_lib_limits.c'  = @{ status = 'PARTIAL';     gocFails = $false; extra = '' }
     'c89_lib_varargs.c' = @{ status = 'PASS';        gocFails = $false; extra = '' }

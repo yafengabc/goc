@@ -43,4 +43,24 @@
 #define LLONG_MIN (-9223372036854775807LL - 1)
 #define LLONG_MAX 9223372036854775807LL
 
+/* ---- C23 width macros (7.10.1) -----------------------------------------
+ * Width = value bits. goc is LP64, so LONG_WIDTH/ULONG_WIDTH are 64 here
+ * (the LLP64 gcc they are compared against reports 32 -- a documented,
+ * intentional ABI difference). BOOL_WIDTH mirrors the value-bit definition
+ * and BITINT_MAXWIDTH mirrors the standard's UINT_MAX upper bound; goc's
+ * own _BitInt implementation supports up to 1024 bits. */
+#define CHAR_WIDTH   8
+#define SCHAR_WIDTH  8
+#define UCHAR_WIDTH  8
+#define SHRT_WIDTH   16
+#define USHRT_WIDTH  16
+#define INT_WIDTH    32
+#define UINT_WIDTH   32
+#define LONG_WIDTH   64
+#define ULONG_WIDTH  64
+#define LLONG_WIDTH  64
+#define ULLONG_WIDTH 64
+#define BOOL_WIDTH   1
+#define BITINT_MAXWIDTH 65535
+
 #endif /* GOC_LIMITS_H */

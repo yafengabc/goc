@@ -4,10 +4,11 @@
  *             mbrtoc16 / c16rtomb / mbrtoc32 / c32rtomb conversion round-trips on an
  *             ASCII input. mingw-w64 UCRT64 ships this header (verified: it declares
  *             char16_t, char32_t, mbrtoc16, c16rtomb, mbrtoc32, c32rtomb; it does NOT
- *             provide char8_t / mbrtoc8, so those are intentionally absent). goc does
- *             not ship <uchar.h>; it should skip the header and then fail on the types.
- * Status:     UNSUPPORTED (goc lacks <uchar.h>)
- * EXPECT: UNSUPPORTED
+ *             provide char8_t / mbrtoc8, so those are intentionally absent). goc
+ *             ships src\goclib\uchar.h/uchar.c (embedded via go:embed) with the
+ *             same semantics; char8_t / mbrtoc8 stay intentionally absent on both.
+ * Status:     PASS (batch H, 2026-10-02: goc vs gcc -std=c2x 4/4 identical)
+ * EXPECT: PASS
  */
 #include <stdio.h>
 #include <string.h>
