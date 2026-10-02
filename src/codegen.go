@@ -1971,6 +1971,18 @@ func (c *CG) genExprT(e Expr) (CType, error) {
 		if t == TInt && n.Typ != nil && n.Typ.Kind == KInt && n.Typ.Width <= 4 {
 			c.canonInt(n.Typ.Signed)
 		}
+		// T1.6 (C3/N17): a widening cast of a signed materialized int to an
+		// 8-byte int target must sign-extend. Pre-C3 the value was canonical
+		// (call sites sign-extended int params), which masked this site; now a
+		// materialized -7 is 0x00000000FFFFFFF9 and "((long)n)*100" would
+		// multiply as a huge positive without the movsxd. Unsigned targets use
+		// the same sign-extension: int -> unsigned long converts modulo 2^64,
+		// which is exactly the movsxd pattern. resW==8 sources and unsigned
+		// int sources (already zero-extended, the correct widening) need none.
+		if t == TInt && n.Typ != nil && n.Typ.Kind == KInt && n.Typ.Width == 8 &&
+			c.resW == 4 && c.resSigned {
+			c.emit("movsxd rax, eax")
+		}
 		if err := c.ensureType(n.Typ.Class()); err != nil {
 			return t, err
 		}
@@ -9219,13 +9231,17 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 			} else if !varargs && t == TInt && c.resW == 4 && c.resSigned &&
 				i < len(paramTypes) && paramTypes[i] != nil &&
 				paramTypes[i].Kind == KInt && paramTypes[i].Signed &&
-				paramTypes[i].Width >= 4 {
-				// T1.6 (N13): an int argument passed to a signed int/long
-				// parameter must be sign-extended into the 8-byte argument
-				// slot. The callee loads a param's full 8 bytes; a materialized
-				// negative int (high 32 = 0) would otherwise read as a huge
-				// positive (intprint: int_print(-2147483647-1) printed
-				// +2147483648; libmisc: labs(-7) printed 4294967289). Unsigned
+				paramTypes[i].Width == 8 {
+				// T1.6 (C3, N13): an int argument passed to a signed LONG
+				// parameter is a C widening conversion and must be sign-extended
+				// into the 8-byte slot (the callee consumes a true 64-bit long;
+				// libmisc: labs(-7) printed 4294967289 without it). An int
+				// argument passed to an INT parameter is NOT widened: per the
+				// unified ABI the value travels materialized (low 32 bits valid,
+				// high 32 = 0) and the callee's int consumption is 32-bit-aware
+				// (32-bit ops, N5b movsxd, N17 stores, N11 index, N21 switch,
+				// N22 double) -- no movsxd, matching the mingw/gcc convention
+				// that a 32-bit argument's upper bits are irrelevant. Unsigned
 				// params read the materialized (zero-extended) form, which is
 				// exactly the C conversion.
 				c.emit("movsxd rax, eax")

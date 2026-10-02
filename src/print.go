@@ -84,6 +84,17 @@ func (c *checker) rewritePrint(n *Call, fn *FuncDecl) *Type {
 		case t == nil:
 			// errored argument: keep going through the printf path so the
 			// %d stand-in reports exactly once.
+		case t.Kind == KInt && litNeedsLong(n.Args[0]):
+			// T1.6 (C3): a plain (possibly negated) integer literal whose
+			// magnitude exceeds 32 bits is typed long by C's literal rules
+			// (int -> long -> long long), but checkExpr types every NumLit as
+			// int regardless of value. The thin print dispatch must widen by
+			// value the same way the code generator does, or
+			// print(-1234567890123456789) lowers to int_print and the callee
+			// reads only the truncated low 32 bits. This sat long latent
+			// because the (long) cast inside int_print used to pass the full
+			// value through unextended; C3's cast widening exposed it.
+			return c.rewritePrintThin(n, "long_print", n.Args, fn)
 		case t.Kind == KBool || (t.Kind == KInt && t.Width <= 4):
 			return c.rewritePrintThin(n, "int_print", n.Args, fn)
 		case t.Kind == KInt && t.Width == 8:
@@ -130,6 +141,26 @@ func (c *checker) rewritePrint(n *Call, fn *FuncDecl) *Type {
 		return c.checkArgs("print", pd.ParamTypes, pd.Variadic, args, fn, pd.Ret)
 	}
 	return IntType() // unreachable: goclib.h always feeds the prototype table
+}
+
+// litNeedsLong reports whether e is an integer literal (possibly wrapped in
+// unary minus) whose magnitude exceeds 32 bits. checkExpr types every NumLit
+// as int, but C types such a literal long (int -> long -> long long), and the
+// code generator widens by value at emission time; the thin print dispatch
+// must follow the value so print(-1234567890123456789) lowers to long_print.
+func litNeedsLong(e Expr) bool {
+	for {
+		if u, ok := e.(*Unary); ok && u.Op == "-" {
+			e = u.E
+			continue
+		}
+		break
+	}
+	lit, ok := e.(*NumLit)
+	if !ok || lit.IsFloat || lit.BigWords != nil {
+		return false
+	}
+	return lit.Val > 2147483647 || lit.Val < -2147483648
 }
 
 // rewritePrintThin renames a print call in place to one of the thin

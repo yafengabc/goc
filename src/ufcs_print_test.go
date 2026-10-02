@@ -187,6 +187,29 @@ func TestPrintLongThin(t *testing.T) {
 	}
 }
 
+// A plain (negated) integer literal whose magnitude exceeds 32 bits is a long
+// literal per C's literal typing, but the checker types every NumLit as int.
+// The thin print dispatch must widen by value (T1.6 C3) or the call lowers to
+// int_print and the callee reads only the truncated low 32 bits.
+func TestPrintLiteralLongThin(t *testing.T) {
+	src := `int main() {
+    print(-1234567890123456789);
+    print(4294967295);
+    print(1234567890123456789);
+    return 0;
+}`
+	asm := genAsmOpt(t, src, 0)
+	if got := strings.Count(asm, "call long_print"); got != 3 {
+		t.Fatalf("out-of-32-bit literals must lower to long_print thrice, got %d:\n%s", got, asm)
+	}
+	if strings.Contains(asm, "call int_print") {
+		t.Fatalf("out-of-32-bit literals must not lower to int_print:\n%s", asm)
+	}
+	if strings.Contains(asm, "call printf") {
+		t.Fatalf("literal long prints must not drag in printf/vfmt:\n%s", asm)
+	}
+}
+
 // A lone double still needs vfmt (%g): it keeps the printf lowering.
 func TestPrintDoubleStillPrintf(t *testing.T) {
 	src := `int main() {

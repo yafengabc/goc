@@ -656,3 +656,38 @@ int main(){ return f(-1); }`
 		t.Fatalf("int switch must compare eax against the case constant, got:\n%s", body3)
 	}
 }
+
+// TestC3ABIMaterialized pins the T1.6 C3 ABI: an int argument passed to an int
+// parameter travels materialized (no movsxd at the call site -- the callee's
+// int consumption is 32-bit-aware), while an int argument passed to a LONG
+// parameter is a C widening conversion and must still sign-extend. A "(long)x"
+// cast of a materialized int must also sign-extend (the pre-C3 call-site
+// canonicalization used to mask that site).
+func TestC3ABIMaterialized(t *testing.T) {
+	// int -> int param: no movsxd when marshalling the argument.
+	src1 := `int g(int x){ return x; }
+int f(int a){ return g(a) + 1; }
+int main(){ return f(-3); }`
+	asm1 := genAsmOpt(t, src1, 2)
+	body1 := fnAsm(asm1, "f")
+	if strings.Contains(body1, "movsxd rax, eax") {
+		t.Fatalf("int arg to int param must not sign-extend, got:\n%s", body1)
+	}
+	// int -> long param: the widening conversion must sign-extend.
+	src2 := `long g(long x){ return x; }
+long f(int a){ return g(a); }
+int main(){ return f(-3); }`
+	asm2 := genAsmOpt(t, src2, 2)
+	body2 := fnAsm(asm2, "f")
+	if !strings.Contains(body2, "movsxd rax, eax") {
+		t.Fatalf("int arg to long param must sign-extend (widening), got:\n%s", body2)
+	}
+	// "(long)x" cast of a materialized signed int must sign-extend.
+	src3 := `long f(int a){ return (long)a * 100; }
+int main(){ return f(-7); }`
+	asm3 := genAsmOpt(t, src3, 2)
+	body3 := fnAsm(asm3, "f")
+	if !strings.Contains(body3, "movsxd rax, eax") {
+		t.Fatalf("(long) cast of materialized int must sign-extend, got:\n%s", body3)
+	}
+}
