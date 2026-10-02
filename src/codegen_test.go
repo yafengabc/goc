@@ -933,3 +933,38 @@ int main(){
 		t.Errorf("(p + 1) - base scaled the difference by an element size: %q", main)
 	}
 }
+
+func TestSizeofCompoundLiteralArray(t *testing.T) {
+	// P0.5: sizeof((int[]){1,2,3}) must fold to 12 (3 * sizeof(int)), not 0.
+	// checkExpr never visited a sizeof's operand, so the compound literal's
+	// incomplete array type kept Len=0 and typeWidth computed 0.
+	asm := genAsm(t, `int main(){ return (int)sizeof((int[]){1,2,3}); }`)
+	if !strings.Contains(asm, "mov rax, 12") {
+		t.Errorf("sizeof((int[]){1,2,3}) did not fold to 12: %q", asm)
+	}
+	// A scalar compound literal operand keeps its own width.
+	asm = genAsm(t, `int main(){ return (int)sizeof((long){7}); }`)
+	if !strings.Contains(asm, "mov rax, 8") {
+		t.Errorf("sizeof((long){7}) did not stay 8: %q", asm)
+	}
+	// The type-name form is untouched.
+	asm = genAsm(t, `int main(){ return (int)sizeof(int[3]); }`)
+	if !strings.Contains(asm, "mov rax, 12") {
+		t.Errorf("sizeof(int[3]) did not stay 12: %q", asm)
+	}
+}
+
+func TestStringLiteralSubscript(t *testing.T) {
+	// P0.8: "hello"[0] must load one byte (char element), not a whole quadword
+	// from the string address. elemWidthOf had no StrLit case and defaulted
+	// the load to 8 bytes of neighbouring memory.
+	asm := genAsm(t, `int main(){ return "hello"[0]; }`)
+	if !strings.Contains(asm, "mov al, [r10]") {
+		t.Errorf(`"hello"[0] did not emit a 1-byte load: %q`, asm)
+	}
+	// "hello"[1] must step 1 byte, not 8.
+	asm = genAsm(t, `int main(){ return "hello"[1]; }`)
+	if !strings.Contains(asm, "imul r11, 1") {
+		t.Errorf(`"hello"[1] did not stride by 1: %q`, asm)
+	}
+}

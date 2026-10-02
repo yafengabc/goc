@@ -83,7 +83,7 @@ $expected = @{
     'c99_stdint.c'      = @{ status = 'FAIL';        gocFails = $true;  extra = '' }
     'c99_restrict.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_inline.c'      = @{ status = 'PASS';        gocFails = $false; extra = '' }
-    'c99_compound.c'    = @{ status = 'PARTIAL';     gocFails = $false; extra = '' }
+    'c99_compound.c'    = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_compound_file.c' = @{ status = 'UNSUPPORTED'; gocFails = $true; extra = '' }
     'c99_designated.c'  = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c99_vla.c'         = @{ status = 'UNSUPPORTED'; gocFails = $true;  extra = '' }

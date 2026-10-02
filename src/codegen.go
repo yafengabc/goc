@@ -6242,6 +6242,12 @@ func (c *CG) binaryType(n *Binary) *Type {
 // stride must be the *element* width, never the 8-byte pointer width.
 func (c *CG) elemWidthOf(e Expr) int {
 	switch n := e.(type) {
+	case *StrLit:
+		// A string literal is a char[N] array: indexing it ("hello"[i]) strides
+		// and loads one byte, not the 8-byte default a bare expression gets.
+		// Without this case "hello"[0] read a whole quadword of neighbouring
+		// memory (P0.8).
+		return 1
 	case *Ident:
 		vi, ok := c.lookupVar(n.Name)
 		if !ok {
@@ -6357,6 +6363,9 @@ func (c *CG) ptrElemWidth(t *Type) int {
 // elemSignedOf returns whether the element referenced by a pointer/array e has
 // a signed integer type (false for unsigned / double / pointer elements).
 func (c *CG) elemSignedOf(e Expr) bool {
+	if _, ok := e.(*StrLit); ok {
+		return true // string literal elements are char; goc's char is signed
+	}
 	t := c.exprType(e)
 	if t == nil {
 		return false

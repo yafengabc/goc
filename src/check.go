@@ -818,6 +818,13 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		}
 		return IntType()
 	case *SizeofExpr:
+		// sizeof(expr) must still type-check its operand: an incomplete-array
+		// compound literal inside ("sizeof((int[]){1,2,3})") borrows its length
+		// from the brace list during checking. Without this visit the Len stayed
+		// 0, so the fold produced 0 instead of 12 (P0.5).
+		if n.E != nil {
+			c.checkExpr(n.E, fn)
+		}
 		return IntType()
 case *AssignExpr:
 	// Assignment "a = b" (statement-level or in expression position) must

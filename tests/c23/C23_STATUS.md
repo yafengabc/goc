@@ -3,7 +3,7 @@
 > 测试套件：`D:\projects\goc\tests\c23\`（cases 66 个用例文件 + 一键重跑脚本 `run_c23_tests.ps1` + 对拍引擎 `_tools\check_case.ps1`）
 > 对拍基线：`D:\projects\goc\bin\goc.exe`（2026-10-02 版本）vs `D:\msys\ucrt64\bin\gcc.exe -std=c2x -Wall -Wextra`（GCC 16.2.0，MSYS2 UCRT64，Windows LLP64）
 > 判定四类：**PASS**（goc 与 gcc 行为一致）/ **FAIL**（gcc 通过而 goc 错误 = 真实缺口，附报错原文）/ **UNSUPPORTED**（goc 明确设计取舍）/ **PARTIAL**（部分子用例通过，含两侧输出不同但都能跑的 DIFF 情形）
-> 全量机械判定：47 PASS / 6 PARTIAL / 6 FAIL / 5 DIFF / 2 UNSUPPORTED（2026-10-02 批次E：c23_version/c23_has_c_attribute 转 PASS；详见下方分组表；机械判定与语义判定差异处已注明）
+> 全量机械判定：48 PASS / 6 PARTIAL / 6 FAIL / 5 DIFF / 2 UNSUPPORTED（2026-10-02：批次E c23_version/c23_has_c_attribute 转 PASS；批次D 新增 c23_str_subscript.c PASS；详见下方分组表；机械判定与语义判定差异处已注明）
 > 所有用例均在 gcc -std=c2x 下编译运行通过（负向用例为双方拒绝），源代码 LF/UTF-8 无 BOM/纯 ASCII。
 > 2026-10-02 更新：P0 _BitInt 修复落地（src\codegen.go、src\goclib\bitint.c/h），`c23_bitint.c` 由 PARTIAL(12/15) 转 **PASS(15/15)**，新增 `c23_bitint_edge.c`（PASS 7/7，覆盖裸字面量比较/全局与 static 非零初始化/嵌套同宽 cast/6 参 conv 栈通道）；go test 全绿，C89-C17 套件 0 MISMATCH。
 > 2026-10-02 更新：P0.2 块作用域非 static `_Thread_local` panic 修复落地（src\check.go 存储类约束：块作用域 + 非 static/extern 直接干净拒绝），新增 `c23_thread_local_bad.c`（EXPECT: REJECT，双方拒机械 PASS）；原 codegen.go:4785 IsArray nil panic 路径不可达。
@@ -43,7 +43,7 @@
 | 缺失头/宏 | **<stdbit.h>**、**<uchar.h>**（char16/32、mbrtoc16 系）、**<stdatomic.h>**、**<threads.h>**、**<stdnoreturn.h>**、**<stdbool.h>** | goc 全部缺失（"note: skipping unavailable system header"），mingw 侧 <stdbit.h> 也无 |
 | 缺失宏 | **limits.h/float.h 全部 C23 宏** | CHAR_WIDTH…ULLONG_WIDTH、BOOL_WIDTH、BITINT_MAXWIDTH、FLT_NORM_MAX、FLT_IS_IEC_60559 等 goc 一个都没有；LLONG_MAX 也没有 |
 | 缺失设施 | **offsetof / max_align_t** | goc stddef.h 明写 "deliberately not provided" |
-| 平台细节 | **printf %a / %wN / `"hello"[0]` 直接下标** | goc 无 %a（打印字面 'a'）、无 %wN；字符串字面量直接下标返回垃圾值 1819043176（先赋 `const char*` 再下标） |
+| 平台细节 | **printf %a / %wN** | goc 无 %a（打印字面 'a'）、无 %wN；`"hello"[0]` 直接下标已修复（P0.8，2026-10-02，见 c23_str_subscript.c PASS 4/4） |
 | 编译器崩溃（已修） | **块作用域非 static thread_local** | **已修复（P0.2，2026-10-02）**：现干净拒绝 `_Thread_local variable "x" at block scope must be static or extern`（exit 非 0），不再 Go panic；gcc 同样拒绝；合法形式须 `static thread_local` |
 
 ### 需要上报 goc 的缺陷清单（按优先级）
@@ -55,7 +55,7 @@
 6. ~~不定义 `__STDC_VERSION__`/`__STDC__`/`__STDC_NO_VLA__` 等任何预定义宏~~ ——**已修复**（P1.7，2026-10-02：注入 `__STDC__`=1、`__STDC_HOSTED__`=1、`__STDC_VERSION__`=202311、`__DATE__`=`"Mmm dd yyyy"`、`__TIME__`=`"hh:mm:ss"`；`__STDC_NO_VLA__` 仍缺，随 P2.3 VLA 决策一并处理）
 7. ~~`__has_c_attribute`/`__has_include` 对 `defined()` 不可见~~ ——**已修复**（P2.15，2026-10-02：cePrimary defined 分支对 `__has_*` 特判返回 1）
 8. alignas 不作用于结构体成员/数组——P2
-9. 字符串字面量直接下标返回垃圾值——P2
+9. ~~字符串字面量直接下标返回垃圾值~~ ——**已修复**（P0.8，2026-10-02：codegen elemWidthOf/elemSignedOf 将字符串字面量按 char[] 处理，`"hello"[0]` 现返回 104 与 gcc 一致；新增 c23_str_subscript.c PASS）
 10. long double 降级已生效，但 `__goc_long_double_is_double` 标记宏未定义（与 roadmap 不符）——P3
 11. `enum E:T` 布局忽略（sizeof 恒 4）、`__goc_long_double_is_double`、`offsetof` 缺失——P2/P3
 
@@ -128,6 +128,7 @@
 | 非法数字分隔符（负向） | **FAIL（goc 过宽）** | 6 构造 | goc **静默删 `'` 照常解析**（`1''000`/`0x'FFFF'`/`1'.2`/`1.'5`/`0x1'p0`/`123'` 全部接受并运行，exit 66661，无诊断） | gcc 全部拒绝（adjacent/after base/adjacent to point/exponent 各报错） | 别指望 goc 揪出分隔符笔误，写法自检 |
 | 十六进制浮点 | **PASS** | 10 | 0x1.8p3/0x.8p1/0x1p-2/f/L 后缀/== 比较与 gcc 一致。**%a 不支持**（打印字面 'a'）；**无指数形式 0x1.8 goc 接受（=1.5）但本 gcc 拒**（`require an exponent`，C23 新特性 gcc 16.2 未实现） | 一致（用 %.3f/== 对拍） | 带 p 指数放心用；别用 %a；0x1.8 是 goc 私有扩展，移植 gcc 不过 |
 | u8 字符串/字符值语义 | **PASS** | 8 | sizeof(u8"abc")=4、拼接 u8"ab""cd"、u8'x'=120、尾部 NUL 全一致 | 一致 | 值/大小/拼接/单字节字符放心用（原始串与多字节字符本 gcc c2x 也不接受，未纳入） |
+| 字符串字面量直接下标 | **PASS** | 4 | "hello"[0]='h'(104)、[1]='e'(101)、与 const char* 控制组一致、0xE4 字节按有符号 char 得 -28（SUMMARY 4/4） | 一致（104/101/104/-28） | 放心用；字符串字面量可直接下标（P0.8 修复 2026-10-02，原垃圾值） |
 | 空 {} 初始化 | **PASS（附两坑）** | 9 | int/指针/double/数组/struct/union/嵌套/块内 `{}` 归零一致；**坑1**：已有局部后第一个 `{}` 标量不归零（稳定垃圾 71302960）；**坑2**：`static int s={}` → `codegen error: invalid braced initialiser for scalar type int` | 9/9 全归零 | 自动存储期基本可用；**关键位置用 `{0}`**；static 用 `= {0}` |
 | 复合字面量（块作用域） | **PASS** | 10 | 取地址/数组退化/循环内每轮重初始化/struct/union/指示符/按值传参全一致。**两个缺口移除**：文件作用域 → `type error: compound literal requires block scope`；`(const int){}` → `type error: compound literal is const-qualified` | 一致 | 块作用域放心用；勿写文件作用域 `&(T){...}`、勿用 const 限定字面量 |
 | _Generic | **PARTIAL** | 10 | goc 5/10：int 匹配/不求值（x++ 不生效）/char 与 short 不提升/default/宏全对；**`1L` 与 `1U` 误配 int 分支**（LLP64 宽度相同即折叠）、typedef 名关联不命中、`const int*` vs `int*` 报 `type int* appears twice`（gcc 可区分） | 10/10 | int/char/short 分支与"不求值"可靠；**别用 _Generic 区分 long/unsigned 与 int** |
@@ -162,7 +163,7 @@
 
 ## 附：跨组交叉发现与平台注意
 
-1. **字符串字面量直接下标 bug**（B 组）：`"hello"[0]` 在 goc 返回垃圾 `1819043176`（gcc 104）；先赋 `const char *p = "hello"; p[0]` 正常。标准库读字符串首字节须走指针变量。
+1. **字符串字面量直接下标 bug**（B 组）：~~`"hello"[0]` 在 goc 返回垃圾 `1819043176`（gcc 104）~~ ——**已修复（P0.8，2026-10-02）**：现返回 104 与 gcc 一致（新增 c23_str_subscript.c PASS 4/4）；先赋 `const char *p = "hello"; p[0]` 仍正常。标准库可直接下标字符串字面量。
 2. **前导小数点浮点已支持**（D1 组，2026-10-02）：`.12`/`.1'2` 现正常解析（lexer 前导点 float 修复），与 gcc 逐行一致；此前报 `unexpected token "."` 的缺口已消除。
 3. **printf 能力**：goc 无 `%a`（十六进制浮点打印）、无 `%wN`（_BitInt）；`%p` 格式与 gcc 不同且 ASLR 漂移，对拍文件已规避。
 4. **LLP64 平台效应**（A1/D2/F 组交叉）：gcc 侧 `long`=32 位（LONG_WIDTH=32）；goc 侧 `long`/`unsigned long`=64 位；`_Generic` 的 long/unsigned 折叠即源于 goc 以宽度为主键比较。若目标是 LP64（Linux），long 相关结论需复测。

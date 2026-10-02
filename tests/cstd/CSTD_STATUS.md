@@ -5,7 +5,7 @@
 - 被测对象：`D:\projects\goc\bin\goc.exe`（单模式：接受但忽略 `-std`，所有用例同一语义）
 - 验证日期：2026-10-02；重跑：`powershell -ExecutionPolicy Bypass -File tests\cstd\run_cstd_tests.ps1`（当前结果 0 MISMATCH，退出码 0）
 - 判定四类：**PASS** = goc 与 gcc 输出+退出码一致；**FAIL** = gcc 过而 goc 编译/运行错误（真实缺口，报错原文照录）；**UNSUPPORTED** = goc 明确设计取舍/后置；**PARTIAL** = 部分子用例通过
-- 汇总：**PASS=55 PARTIAL=4 FAIL=3 UNSUPPORTED=7 MISMATCH=0**（2026-10-02 批次E：c89_pp_elif/c89_pp_obj 转 PASS）
+- 汇总：**PASS=56 PARTIAL=3 FAIL=3 UNSUPPORTED=7 MISMATCH=0**（2026-10-02：批次E c89_pp_elif/c89_pp_obj 转 PASS；批次D c99_compound 转 PASS）
 
 ---
 
@@ -59,7 +59,7 @@
 
 ---
 
-## C99（21 文件：13 PASS / 1 PARTIAL / 3 FAIL / 4 UNSUPPORTED）
+## C99（21 文件：14 PASS / 0 PARTIAL / 3 FAIL / 4 UNSUPPORTED）
 
 | 文件 | 特性 | 状态 | 子用例 | goc 证据 / gcc 对拍 | 写标准库建议 |
 |---|---|---|---|---|---|
@@ -70,7 +70,7 @@
 | c99_stdint.c | stdint.h/inttypes.h | **FAIL** | 3 | `note: skipping unavailable system header <stdint.h>` + `<inttypes.h>`；`parse error: line 13: expected ";", got "i8"`；gcc 完全通过 | **避开**（goc 无 stdint.h/inttypes.h，intN_t/INT64_C/PRId64 全不可用） |
 | c99_restrict.c | restrict 指针 | PASS | 2 | 一致（行为等价） | 放心用 |
 | c99_inline.c | inline 函数（C99 语义） | PASS | 2 | 输出一致；goc 把 inline 一律降级为普通外部函数（gcc 需 `extern` 重声明才链接） | 注意：goc 总是外提符号，别依赖 C99 inline 仅本 TU 内联 |
-| c99_compound.c | 块作用域复合字面量 | PARTIAL | 8 | case1-7 一致；**case8 `sizeof((int[]){1,2,3})` goc=0 vs gcc=12（真实 bug）** | 注意：别对复合字面量取 sizeof |
+| c99_compound.c | 块作用域复合字面量 | PASS | 8 | case1-8 全部与 gcc 一致；**case8 `sizeof((int[]){1,2,3})`=12（P0.5 已修复 2026-10-02，原恒 0）** | 放心用（含 sizeof 复合字面量） |
 | c99_compound_file.c | 文件作用域复合字面量 | UNSUPPORTED | 3 | `type error(s): line 9: compound literal requires block scope (file-scope static literals are not supported)`；gcc 全过 | 避开文件作用域复合字面量 |
 | c99_designated.c | 指定初始化器 `[i]=`/`.field=` | PASS | 4 | 一致（乱序/嵌套/重复指示符后者生效）；位置+指示符混用 goc 报 `cannot mix positional and designated ("[i] =") initialisers` | 放心用纯指示符；勿混用 |
 | c99_vla.c | 变长数组 | UNSUPPORTED | 3 | `parse error: line 11: expected ";", got "n"`；gcc 全过 | 避开 VLA |
@@ -123,7 +123,7 @@ goc 是 **LP64**（`sizeof(long)=8`、指针 8、size_t 8），本机 Windows gc
 |---|---|---|
 | ~~八进制字面量~~ **已修复(2026-10-02)** | 原 `010` 按十进制解析得 10；现正确为 8 | c89_lit_octal.c |
 | ~~字符串内 UCN~~ **已修复(2026-10-02)** | 原 `"\u00e9"` 吞反斜杠输出字面 `u00e9`；现正确解码 UTF-8 | c99_ucn.c |
-| `sizeof(复合字面量)` | `sizeof((int[]){1,2,3})` 恒为 0（应为 12） | c99_compound.c case8 |
+| ~~`sizeof(复合字面量)`~~ **已修复(2026-10-02, P0.5)** | 原 `sizeof((int[]){1,2,3})` 恒为 0；现正确为 12 | c99_compound.c case8 |
 | `%a` 十六进制浮点打印 | `printf("%a %a",...)` 退化成字面打印 `a a` | c99_hexfloat.c 对拍记录 |
 
 ### 硬错误缺口（gcc 过、goc 编译失败，报错原文）
@@ -193,4 +193,4 @@ int=4、long=8（LP64）、long long=8、指针=8、float=4、double=8、long do
 
 ### 给标准库作者的最终建议（放心用 / 避开速查）
 - **放心用**：对象/函数宏（含 `#` `##`）、嵌套 `#if/#else`、`//` 注释、long long、`_Bool`、restrict、声明混排、十六进制浮点常量、尾随逗号、stdint 之外的全套 stdio/string/ctype/stdlib/math（含 C99 math 宏）、`_Generic`、`_Static_assert`、alignas/alignof、thread_local（静态/文件作用域）、`_Noreturn`、匿名 struct/union、stdckdint.h、`__FILE__/__LINE__`
-- **避开**：`__func__`、`%a` 打印、`sizeof(复合字面量)`、VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、va_copy、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）、stdint.h/inttypes.h（多 `#elif` 链与 `__STDC_VERSION__/__STDC__/__DATE__/__TIME__` 已于 2026-10-02 修复，移出避开清单）
+- **避开**：`__func__`、`%a` 打印、VLA、`_Complex`、`_Pragma`、trigraph、K&R 定义、va_copy、gets、`offsetof(type,m)` 宏、`_Alignof(struct Tag)`、`_Atomic`/`<stdatomic.h>`/`<threads.h>`/`<uchar.h>`、`#include 宏路径`、`#line`、块作用域非 static TLS（编译期拒绝，须加 static）、stdint.h/inttypes.h（多 `#elif` 链、`__STDC_VERSION__/__STDC__/__DATE__/__TIME__`、`sizeof(复合字面量)`（P0.5）、字符串字面量直接下标（P0.8）均已于 2026-10-02 修复，移出避开清单）

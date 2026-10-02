@@ -8,7 +8,8 @@
                 literal, sizeof of array literal.
                 NOTE: file-scope compound literals are rejected by
                 goc (see c99_compound_file.c, UNSUPPORTED).
-   Status     : PASS (verified 2026-10-02, goc vs gcc -std=c99)
+   Status     : PASS (verified 2026-10-02, goc vs gcc -std=c99; P0.5: case8
+                sizeof((int[]){1,2,3}) = 12, was 0)
    ============================================================ */
 #include <stdio.h>
 

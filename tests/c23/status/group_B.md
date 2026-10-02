@@ -33,8 +33,9 @@
 
 3. **`#embed` 的 prefix/suffix/if_empty 其实已支持**（roadmap 标注"后置未确认"不准确）。实测 goc 与 gcc 行为一致，且与 gcc 相同的语法要求：选项 token 自带分隔逗号（`prefix(11,)` / `suffix(,22)` / `if_empty(0xEE,)`），gcc 不会在选项 token 与字节流之间自动补逗号。唯一缺口是 `__has_embed` 未提供。
 
-4. **跨组交叉发现（不属于本组，但影响标准库写法）：goc 对"直接下标字符串字面量"有 bug。**
-   实测 `"hello"[0]` 在 goc 返回垃圾值 `1819043176`（gcc 为 104），但 `const char *p="world"; p[0]` 返回正确的 119。
-   → 标准库若需要读字符串字面量首字节，先赋给 `const char*` 再下标。此现象应转交词法/语义组核实。
+4. ~~**跨组交叉发现（不属于本组，但影响标准库写法）：goc 对"直接下标字符串字面量"有 bug。**~~
+   ~~实测 `"hello"[0]` 在 goc 返回垃圾值 `1819043176`（gcc 为 104），但 `const char *p="world"; p[0]` 返回正确的 119。~~
+   ~~→ 标准库若需要读字符串字面量首字节，先赋给 `const char*` 再下标。~~
+   ——**已修复（P0.8，2026-10-02）**：codegen `elemWidthOf`/`elemSignedOf` 缺 `*StrLit` 分支（下标按 8 字节宽加载），现按 char[] 处理，`"hello"[0]` 返回 104 与 gcc 一致；新增 c23_str_subscript.c PASS 4/4。标准库可直接下标字符串字面量。
 
 5. 其他细节：goc 对 `#if` 溢出不像 gcc 那样告警（静默同值）；`#warning` 可正常编译运行，goc 警告格式比 gcc 简短但语义一致；`#if 1/0` goc 与 gcc 都拒绝。
