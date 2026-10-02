@@ -298,6 +298,208 @@ func sourceSignCanon(src string, signCanon map[string]bool) bool {
 	return false
 }
 
+
+// slotCacheSkip bypasses the slot-cache pass in Gen() -- its independent
+// switch.
+var slotCacheSkip bool
+
+// slotVal is the value the slot cache believes a slot holds: a tracked
+// immediate, or a full-width register (with the register's current write
+// version at record time, so a later write to that register invalidates it).
+type slotVal struct {
+	isImm bool
+	imm   int64
+	reg   string
+}
+
+// slotCache removes redundant slot loads and stores (T1.4). A linear scan
+// maintains, per exact stack/global slot ([rbp-N], [rip+lab]), the value last
+// stored into it, and rewrites:
+//
+//  1. load forwarding: `mov rD, [s]` whose cached value is register rS
+//     becomes `mov rD, rS` (or `mov rD, imm` for a cached immediate); when
+//     rD == rS the load is a self-move and is dropped outright;
+//  2. redundant store: `mov [s], rS` (or an immediate) when the slot already
+//     holds exactly that value is dropped.
+//
+// Correctness discipline (mirrors constProp / elimRedundantExt):
+//   - only full-width, unsized 8-byte loads/stores touch the cache; sized or
+//     partial stores, non-mov stores (movsd, fstp) and any store with a
+//     non-GP source clear the slot;
+//   - an indirect or non-slot memory write, a lea of a slot address (address
+//     escape), a call, a branch, a label, inline __asm and a return clear
+//     everything;
+//   - any write to a register invalidates cache entries sourced from it
+//     (32-bit and 8-bit destinations map to the 64-bit name first);
+//   - a rewritten load carries the same 64-bit value and writes no flags, so
+//     no condition-code boundary moves.
+func slotCache(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	cache := map[string]slotVal{}
+	clearAll := func() { cache = map[string]slotVal{} }
+	clearSlot := func(s string) { delete(cache, s) }
+	killReg := func(r string) {
+		r = reg64Name(r)
+		switch r {
+		case "al":
+			r = "rax"
+		case "bl":
+			r = "rbx"
+		case "cl":
+			r = "rcx"
+		case "dl":
+			r = "rdx"
+		case "sil":
+			r = "rsi"
+		case "dil":
+			r = "rdi"
+		}
+		if len(r) == 3 && r[0] == 'r' && r[2] == 'b' { // r8b..r15b
+			r = r[:2]
+		}
+		for k, v := range cache {
+			if !v.isImm && v.reg == r {
+				delete(cache, k)
+			}
+		}
+	}
+
+	for _, in := range insts {
+		if in.Kind != instInstr {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+		// Control flow, calls and stack ops break every window.
+		if pl.op == "call" || pl.op == "ret" || pl.op == "leave" ||
+			pl.op == "push" || pl.op == "pop" || pl.op == "loop" ||
+			strings.HasPrefix(pl.op, "j") {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+		// Memory writes of any kind come first.
+		if len(pl.operands) > 0 {
+			if _, bare := splitSizedMem(pl.operands[0]); isMemOperand(bare) {
+				sz, _ := splitSizedMem(pl.operands[0])
+				if !isSlotOperand(bare) {
+					clearAll()
+					out = append(out, in)
+					continue
+				}
+				if pl.op != "mov" || sz != "" || len(pl.operands) != 2 {
+					clearSlot(bare)
+					out = append(out, in)
+					continue
+				}
+				src := pl.operands[1]
+				if gp64Regs[src] {
+					if v, ok := cache[bare]; ok && !v.isImm && v.reg == src {
+						continue // the slot already holds exactly this value
+					}
+					cache[bare] = slotVal{reg: src}
+					out = append(out, in)
+					continue
+				}
+				if v, ok := immValue(src); ok {
+					if cv, ok := cache[bare]; ok && cv.isImm && cv.imm == v {
+						continue // redundant same-immediate store
+					}
+					cache[bare] = slotVal{isImm: true, imm: v}
+					out = append(out, in)
+					continue
+				}
+				// xmm or other untracked source: value unknown.
+				clearSlot(bare)
+				out = append(out, in)
+				continue
+			}
+		}
+		// lea of a slot address is an address escape: the slot can now be
+		// written through any pointer, so every slot is unknown. Any other
+		// lea just writes its destination register.
+		if pl.op == "lea" && len(pl.operands) == 2 {
+			if _, bare := splitSizedMem(pl.operands[1]); isSlotOperand(bare) {
+				clearAll()
+				out = append(out, in)
+				continue
+			}
+			killReg(pl.operands[0])
+			out = append(out, in)
+			continue
+		}
+		// Plain mov: store handled above; a load forwards the cached value;
+		// anything else is a register write.
+		if pl.op == "mov" && len(pl.operands) == 2 {
+			dst, src := pl.operands[0], pl.operands[1]
+			if _, dbare := splitSizedMem(dst); isMemOperand(dbare) {
+				out = append(out, in) // store (handled above)
+				continue
+			}
+			if _, sbare := splitSizedMem(src); isMemOperand(sbare) {
+				if gp64Regs[dst] {
+					sz, bare := splitSizedMem(src)
+					if v, ok := cache[bare]; ok && sz == "" {
+						if v.reg == dst {
+							continue // reloading what the register already holds
+						}
+						// The rewritten move still writes dst, so cache entries sourced
+						// from it must be invalidated (a forwarded load that skipped this
+						// killed the linux register-arg spills and miscomputed sum7).
+						killReg(dst)
+						if v.isImm {
+							in = Inst{Kind: instInstr,
+								Text: "\tmov " + dst + ", " + strconv.FormatInt(v.imm, 10)}
+							out = append(out, in)
+							continue
+						}
+						in = Inst{Kind: instInstr, Text: "\tmov " + dst + ", " + v.reg}
+						out = append(out, in)
+						continue
+					}
+				}
+				// No forwardable value: the destination register is still
+				// written (killing any cache entry sourced from it).
+				killReg(dst)
+				out = append(out, in)
+				continue
+			}
+			killReg(dst)
+			out = append(out, in)
+			continue
+		}
+		// ALU, shifts, extensions and flag-only ops.
+		switch pl.op {
+		case "cmp", "test":
+			out = append(out, in) // reads only; no register write
+		case "cqo", "cdq":
+			killReg("rax")
+			killReg("rdx")
+			out = append(out, in)
+		case "imul", "mul", "div", "idiv":
+			if len(pl.operands) == 1 {
+				killReg("rax")
+				killReg("rdx")
+			} else if len(pl.operands) > 0 {
+				killReg(pl.operands[0])
+			}
+			out = append(out, in)
+		default:
+			if len(pl.operands) > 0 && !isMemOperand(pl.operands[0]) {
+				killReg(pl.operands[0])
+			}
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
 // immValue parses the constant of a mov immediate operand: decimal, 0x hex,
 // and 0b/0o (ParseInt base 0). The 64-bit pattern is reinterpreted as int64
 // so that 0xffffffffffffffff reads as -1.

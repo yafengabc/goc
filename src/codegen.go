@@ -2560,6 +2560,9 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 		if !elimRedundantExtSkip {
 			c.insts = elimRedundantExt(c.insts)
 		}
+		if !slotCacheSkip {
+			c.insts = slotCache(c.insts)
+		}
 		c.insts = peepholeIR(c.insts)
 		c.insts = deadStores(c.insts)
 		c.insts = livenessDSE(c.insts)

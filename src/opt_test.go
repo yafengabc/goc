@@ -28,6 +28,17 @@ func runExt(insts []Inst) []string {
 	return texts
 }
 
+// runSlot runs slotCache over the fixture and returns the surviving
+// instruction texts.
+func runSlot(insts []Inst) []string {
+	out := slotCache(insts)
+	texts := make([]string, 0, len(out))
+	for _, in := range out {
+		texts = append(texts, strings.TrimSpace(in.Text))
+	}
+	return texts
+}
+
 func countText(texts []string, sub string) int {
 	n := 0
 	for _, t := range texts {
@@ -248,5 +259,225 @@ int main(){ return u(3); }`
 	asm2 := genAsmOpt(t, src2, 2)
 	if strings.Count(asm2, "shl rax, 32") < 2 {
 		t.Fatalf("user shift must survive, got:\n%s", asm2)
+	}
+}
+
+// mkSlot fixtures for T1.4 slotCache.
+func slotStore(reg string) Inst  { return Inst{Kind: instInstr, Text: "\tmov [rbp-8], " + reg} }
+func slotLoad(dst string) Inst   { return Inst{Kind: instInstr, Text: "\tmov " + dst + ", [rbp-8]"} }
+
+// TestSlotForwardReg: a load of a slot known to hold register rS becomes a
+// register move into the load's destination.
+func TestSlotForwardReg(t *testing.T) {
+	in := []Inst{slotStore("rax"), slotLoad("rcx")}
+	got := runSlot(in)
+	if countText(got, "mov rcx, rax") != 1 {
+		t.Fatalf("store/load round trip must forward to mov rcx, rax, got %v", got)
+	}
+	if countText(got, "mov rcx, [rbp-8]") != 0 {
+		t.Fatalf("slot load must be replaced, got %v", got)
+	}
+	if countText(got, "mov [rbp-8], rax") != 1 {
+		t.Fatalf("store must survive, got %v", got)
+	}
+}
+
+// TestSlotForwardSameRegDropped: reloading into the very register the slot
+// holds is a self-move and is dropped entirely.
+func TestSlotForwardSameRegDropped(t *testing.T) {
+	in := []Inst{slotStore("rax"), slotLoad("rax")}
+	got := runSlot(in)
+	if countText(got, "mov rax, [rbp-8]") != 0 {
+		t.Fatalf("same-reg reload must be dropped, got %v", got)
+	}
+	if countText(got, "mov [rbp-8], rax") != 1 {
+		t.Fatalf("store must survive, got %v", got)
+	}
+}
+
+// TestSlotClobberBlocksForward: writing the source register between store and
+// load invalidates the cache; the load must stay a memory load.
+func TestSlotClobberBlocksForward(t *testing.T) {
+	in := []Inst{
+		slotStore("rax"),
+		{Kind: instInstr, Text: "\tmov rax, 5"},
+		slotLoad("rcx"),
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("clobbered source must block forwarding, got %v", got)
+	}
+	// 32-bit write clobbers the wide form too.
+	in2 := []Inst{
+		slotStore("rax"),
+		{Kind: instInstr, Text: "\txor eax, eax"},
+		slotLoad("rcx"),
+	}
+	if got := runSlot(in2); countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("narrow write must block forwarding, got %v", got)
+	}
+}
+
+// TestSlotRedundantStoreDropped: storing the same register's value into a slot
+// that already holds it is a no-op; storing a different value is kept.
+func TestSlotRedundantStoreDropped(t *testing.T) {
+	in := []Inst{slotStore("rax"), slotStore("rax")}
+	got := runSlot(in)
+	if countText(got, "mov [rbp-8], rax") != 1 {
+		t.Fatalf("duplicate same-value store must be dropped, got %v", got)
+	}
+	in2 := []Inst{slotStore("rax"), slotStore("rbx")}
+	got2 := runSlot(in2)
+	if countText(got2, "mov [rbp-8], rax") != 1 || countText(got2, "mov [rbp-8], rbx") != 1 {
+		t.Fatalf("stores of different values must survive, got %v", got2)
+	}
+}
+
+// TestSlotImmForwardAndRedundant: an immediate store forwards to the load as
+// an immediate and a same-immediate re-store is dropped.
+func TestSlotImmForwardAndRedundant(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov [rbp-8], 5"},
+		slotLoad("rcx"),
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, 5") != 1 {
+		t.Fatalf("imm slot load must forward to mov rcx, 5, got %v", got)
+	}
+	in2 := []Inst{
+		{Kind: instInstr, Text: "\tmov [rbp-8], 5"},
+		{Kind: instInstr, Text: "\tmov [rbp-8], 5"},
+	}
+	if got := runSlot(in2); countText(got, "mov [rbp-8], 5") != 1 {
+		t.Fatalf("same-immediate re-store must be dropped, got %v", got)
+	}
+}
+
+// TestSlotIndirectWriteClears: any non-slot memory write kills all slot
+// knowledge (the write may alias any slot).
+func TestSlotIndirectWriteClears(t *testing.T) {
+	in := []Inst{
+		slotStore("rax"),
+		{Kind: instInstr, Text: "\tmov [r10], rbx"},
+		slotLoad("rcx"),
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("indirect write must clear the cache, got %v", got)
+	}
+}
+
+// TestSlotSizedStoreClears: a partial (sized) write to the slot destroys the
+// cached full-width value.
+func TestSlotSizedStoreClears(t *testing.T) {
+	in := []Inst{
+		slotStore("rax"),
+		{Kind: instInstr, Text: "\tmov byte [rbp-8], al"},
+		slotLoad("rcx"),
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("sized store must clear the slot, got %v", got)
+	}
+}
+
+// TestSlotCallClears: calls clobber registers and memory; no forwarding across.
+func TestSlotCallClears(t *testing.T) {
+	in := []Inst{
+		slotStore("rax"),
+		{Kind: instInstr, Text: "\tcall foo"},
+		slotLoad("rcx"),
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("call must clear the cache, got %v", got)
+	}
+}
+
+// TestSlotLeaEscapeClears: taking the slot's address lets any pointer write
+// reach it, so all slot knowledge drops.
+func TestSlotLeaEscapeClears(t *testing.T) {
+	in := []Inst{
+		slotStore("rax"),
+		{Kind: instInstr, Text: "\tlea r10, [rbp-8]"},
+		slotLoad("rcx"),
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("lea of slot must clear the cache, got %v", got)
+	}
+}
+
+// TestSlotForwardKillsDest: a forwarded load still writes its destination
+// register, so cache entries sourced from it must be invalidated. Without
+// this, the linux register-arg spill sequence (`mov [s],rax; mov rax,[t] ->
+// mov rax,rY; mov r10,[s]`) forwarded the second reload through a clobbered
+// rax and miscomputed.
+func TestSlotForwardKillsDest(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov [rbp-8], rax"},  // cache[8] = rax
+		{Kind: instInstr, Text: "\tmov [rbp-16], rbx"}, // cache[16] = rbx
+		{Kind: instInstr, Text: "\tmov rax, [rbp-16]"}, // forward -> mov rax, rbx; must kill rax
+		{Kind: instInstr, Text: "\tmov r10, [rbp-8]"},  // rax clobbered: must NOT forward
+	}
+	got := runSlot(in)
+	if countText(got, "mov r10, [rbp-8]") != 1 {
+		t.Fatalf("reload through clobbered rax must stay a memory load, got %v", got)
+	}
+	if countText(got, "mov rax, rbx") != 1 {
+		t.Fatalf("first forward must still happen, got %v", got)
+	}
+}
+
+// TestSlotLabelClears: a label marks a control-flow merge; values cannot be
+// trusted across it.
+func TestSlotLabelClears(t *testing.T) {
+	in := []Inst{
+		slotStore("rax"),
+		{Kind: instInstr, Text: ".L1:"},
+		slotLoad("rcx"),
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("label must clear the cache, got %v", got)
+	}
+}
+
+// TestSlotNeverGrows: slotCache must never increase the instruction count.
+func TestSlotNeverGrows(t *testing.T) {
+	fixtures := [][]Inst{
+		{slotStore("rax"), slotLoad("rcx")},
+		{slotStore("rax"), slotStore("rax")},
+		{slotStore("rax"), {Kind: instInstr, Text: "\tcall foo"}, slotLoad("rcx")},
+		{slotStore("rax"), {Kind: instInstr, Text: "\tmov [r10], rbx"}, slotLoad("rcx")},
+		{slotStore("rax"), slotStore("rbx"), slotStore("rcx"), slotLoad("rdx")},
+	}
+	for i, in := range fixtures {
+		out := slotCache(in)
+		if len(out) > len(in) {
+			t.Fatalf("fixture %d grew: %d -> %d", i, len(in), len(out))
+		}
+	}
+}
+
+// TestSlotEndToEnd compiles the recursive ternary fib (the bench2 shape) at
+// -O2. Its prologue stores the parameter and reloads it before the setcc
+// dance; slotCache must turn that reload into a register move (the t16d
+// snapshot had `mov rax, [rbp-48]` there, the pass produces `mov rax, rcx`),
+// while the reloads inside the branches -- separated by labels and branches --
+// must survive as memory loads.
+func TestSlotEndToEnd(t *testing.T) {
+	src := `int fib(int n) { return n < 2 ? n : fib(n-1) + fib(n-2); }
+int main(){ return fib(10); }`
+	asm := genAsmOpt(t, src, 2)
+	body := fnAsm(asm, "fib")
+	if !strings.Contains(body, "\tmov [rbp-48], rcx\n\tmov rax, rcx") {
+		t.Fatalf("param reload must be forwarded to a register move, got:\n%s", body)
+	}
+	// fnAsm stops at the first label, so count the branch-guarded reloads on
+	// the whole assembly: they sit after .Lcmp1/.Lelse3 and must survive as
+	// memory loads.
+	if strings.Count(asm, "mov rax, [rbp-48]") < 2 {
+		t.Fatalf("branch-guarded reloads must survive as memory loads, got:\n%s", asm)
 	}
 }
