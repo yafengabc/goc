@@ -1,0 +1,6 @@
+c=A s=hi
+alignof(int)=4
+alignof(double)=8
+alignof(av)=32
+cube(3)=27
+g=7
