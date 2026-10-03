@@ -324,17 +324,35 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 			DLL:        dll,
 		}, nil
 	}
-	// Global variable declaration with optional initialiser: "T name = expr;".
-	var init Expr
-	if p.atPunct("=") {
-		p.next()
-		if p.atPunct("{") {
-			init, err = p.parseBraceInit()
-		} else {
-			// An initialiser is an assignment-expression: the top-level comma
-			// separates declarators ("int a = 1, b = 2;"), not a comma-op.
-			init, err = p.parseAssign()
+	// Global variable declaration(s), optionally comma-separated:
+	//   "T name = expr;", "T a, b = 2, c;" -- each declarator gets its own
+	// initialiser; the top-level comma separates declarators, never a comma-op.
+	for {
+		var init Expr
+		if p.atPunct("=") {
+			p.next()
+			if p.atPunct("{") {
+				init, err = p.parseBraceInit()
+			} else {
+				// An initialiser is an assignment-expression: the top-level comma
+				// separates declarators ("int a = 1, b = 2;"), not a comma-op.
+				init, err = p.parseAssign()
+			}
+			if err != nil {
+				return nil, err
+			}
 		}
+		p.globals = append(p.globals, &DeclStmt{Name: d.name, Typ: declType(d.typ), Init: init, Storage: storage, IsTLS: spec.IsTLS, Line: d.line})
+		// Record the global's type so later file-scope "typeof(name)" can resolve it.
+		// An auto-inferred global has no parse-time type yet, so it is not recorded.
+		if d.name != "" && !autoInfer {
+			varTypes[d.name] = declType(d.typ)
+		}
+		if !p.atPunct(",") {
+			break
+		}
+		p.next() // consume the ',' between declarators
+		d, err = p.parseDeclarator(spec, true, false)
 		if err != nil {
 			return nil, err
 		}
@@ -343,12 +361,6 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 		return nil, fmt.Errorf("line %d: expected ';' after global declaration", p.cur().Line)
 	}
 	p.next()
-	p.globals = append(p.globals, &DeclStmt{Name: d.name, Typ: declType(d.typ), Init: init, Storage: storage, IsTLS: spec.IsTLS, Line: d.line})
-	// Record the global's type so later file-scope "typeof(name)" can resolve it.
-	// An auto-inferred global has no parse-time type yet, so it is not recorded.
-	if d.name != "" && !autoInfer {
-		varTypes[d.name] = declType(d.typ)
-	}
 	return nil, nil
 }
 
