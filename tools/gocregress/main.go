@@ -188,12 +188,27 @@ func runLeg(dirSuffix, label string, targetLinux bool, flags []string, ucrunExe 
 	env := childEnv()
 	goc := filepath.Join(repoRoot, "bin", "goc.exe")
 
+	// One case per example .c, plus one multi-translation-unit build: every
+	// .c in src/examples/multi is compiled together into a single program,
+	// which is how `goc a.c b.c` behaves.
+	type exCase struct {
+		name string
+		srcs []string
+	}
+	var cases []exCase
 	examples, _ := filepath.Glob(filepath.Join(repoRoot, "src", "examples", "*.c"))
 	sort.Strings(examples)
+	for _, src := range examples {
+		cases = append(cases, exCase{strings.TrimSuffix(filepath.Base(src), ".c"), []string{src}})
+	}
+	if multi, _ := filepath.Glob(filepath.Join(repoRoot, "src", "examples", "multi", "*.c")); len(multi) > 0 {
+		sort.Strings(multi)
+		cases = append(cases, exCase{"multi", multi})
+	}
 
 	pass, fail := 0, 0
-	for _, src := range examples {
-		name := strings.TrimSuffix(filepath.Base(src), ".c")
+	for _, ex := range cases {
+		name, srcs := ex.name, ex.srcs
 		exp := filepath.Join(repoRoot, "src", "expected", name+".txt")
 		_, expErr := os.Stat(exp)
 
@@ -205,7 +220,8 @@ func runLeg(dirSuffix, label string, targetLinux bool, flags []string, ucrunExe 
 			if winOnly[name] {
 				// No golden: prove the Win32 imports compile + link.
 				cargs := append([]string{"-c"}, flags...)
-				cargs = append(cargs, "-o", outDir, src)
+				cargs = append(cargs, "-o", outDir)
+				cargs = append(cargs, srcs...)
 				_, cerr, rc, err := runCmd(repoRoot, env, goc, cargs...)
 				if err != nil || rc != 0 {
 					fmt.Fprintf(&sb, "FAIL  %s%s (compile): %s\n", label, name, string(cerr))
@@ -225,7 +241,15 @@ func runLeg(dirSuffix, label string, targetLinux bool, flags []string, ucrunExe 
 		if targetLinux {
 			cargs = append(cargs, "-target", "linux")
 		}
-		cargs = append(cargs, "-o", outDir, src)
+		// A single file picks up its own name from -o <dir>; a multi-file
+		// build has no single source to name itself after, so pass the
+		// explicit output file instead.
+		outArg := outDir
+		if len(srcs) > 1 {
+			outArg = filepath.Join(outDir, name)
+		}
+		cargs = append(cargs, "-o", outArg)
+		cargs = append(cargs, srcs...)
 		_, cerr, rc, err := runCmd(repoRoot, env, goc, cargs...)
 		if err != nil || rc != 0 {
 			fmt.Fprintf(&sb, "FAIL  %s%s (compile): %s\n", label, name, string(cerr))

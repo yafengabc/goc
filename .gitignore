@@ -17,6 +17,12 @@
 # hand-invoked `goc -S`/`goc -c` runs that write next to the source.
 src/examples/*
 !src/examples/*.c
+# ...and the same for sources one level down: the multi-file regression builds
+# from src/examples/multi/{a,b}.c. Negating the files is not enough on its own
+# -- git does not descend into an excluded *directory*, so each such directory
+# has to be re-included before the file rule can match.
+!src/examples/*/
+!src/examples/**/*.c
 
 # Same rule for goa's own examples. src/goa/run_tests.sh assembles each example
 # where it lives: Windows .exe output is already caught by the *.exe rule above,
