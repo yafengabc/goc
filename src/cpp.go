@@ -77,6 +77,7 @@ type Preprocessor struct {
 	// evaluated against unexpanded identifiers and always comes out false.
 	condEval bool
 }
+
 // Preprocess runs the full preprocessing pipeline on src (already read from
 // filename) and returns the expanded token stream. The target platform
 // defaults to Windows; PreprocessTarget selects it explicitly.

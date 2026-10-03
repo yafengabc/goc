@@ -118,13 +118,13 @@ type Assembler struct {
 
 // uwFunc records one function's prolog for unwind-table emission.
 type uwFunc struct {
-	sect      int   // section index the function lives in (.text)
-	start     int   // offset of the function label within the section
-	end       int   // offset of the next label (or section end) within sect
-	pushes      []int // register numbers pushed, in execution order (incl. rbp)
-	alloc       int   // `sub rsp, N` amount (0 if no frame alloc)
-	hasProlog   bool  // saw at least `push rbp`
-	prologDone  bool  // finished capturing the prolog shape
+	sect       int   // section index the function lives in (.text)
+	start      int   // offset of the function label within the section
+	end        int   // offset of the next label (or section end) within sect
+	pushes     []int // register numbers pushed, in execution order (incl. rbp)
+	alloc      int   // `sub rsp, N` amount (0 if no frame alloc)
+	hasProlog  bool  // saw at least `push rbp`
+	prologDone bool  // finished capturing the prolog shape
 }
 
 // uwRegNum maps an x86-64 register name to its unwind-code register number.
@@ -218,41 +218,41 @@ const (
 // `syscall`, so the call site uses the ordinary SysV register arguments
 // (rdi, rsi, rdx, r10, r8, r9) with no libc involved.
 var linuxSyscalls = map[string]int64{
-	"read":          0,
-	"write":         1,
-	"open":          2,
-	"close":         3,
-	"lseek":         8,
-	"mmap":          9,
-	"mprotect":      10,
-	"munmap":        11,
-	"brk":           12,
-	"ioctl":         16,
-	"writev":        20,
-	"nanosleep":     35,
-	"getpid":        39,
-	"exit":          60,
-	"kill":          62,
-	"exit_group":    231,
-	"gettimeofday":  96,
+	"read":                0,
+	"write":               1,
+	"open":                2,
+	"close":               3,
+	"lseek":               8,
+	"mmap":                9,
+	"mprotect":            10,
+	"munmap":              11,
+	"brk":                 12,
+	"ioctl":               16,
+	"writev":              20,
+	"nanosleep":           35,
+	"getpid":              39,
+	"exit":                60,
+	"kill":                62,
+	"exit_group":          231,
+	"gettimeofday":        96,
 	"__goc_clock_gettime": 228,
-	"unlink":        87,
-	"rename":        82,
-	"__goclib_vfork":   58, // used by system() on Linux
-	"__goclib_execve":  59,
-	"__goclib_wait4":   61,
+	"unlink":              87,
+	"rename":              82,
+	"__goclib_vfork":      58, // used by system() on Linux
+	"__goclib_execve":     59,
+	"__goclib_wait4":      61,
 	// Directory and metadata calls used by goclib/dir.c. The __goclib_* aliases
 	// exist for the same reason as __goclib_rename: the wrapper that carries
 	// the C name (stat/mkdir/rmdir) cannot extern that same name, or the stub
 	// call would resolve to the wrapper itself.
-	"__goclib_stat":        4,  // stat
-	"__goclib_mkdir":       83,
-	"__goclib_rmdir":       84,
-	"__goclib_getdents64":  217,
-	"__goclib_getcwd":      79, // getcwd
-	"__goclib_chmod":       90, // chmod
-	"__goclib_access":      21, // access
-	"__goclib_fstat":       5,  // fstat
+	"__goclib_stat":       4, // stat
+	"__goclib_mkdir":      83,
+	"__goclib_rmdir":      84,
+	"__goclib_getdents64": 217,
+	"__goclib_getcwd":     79, // getcwd
+	"__goclib_chmod":      90, // chmod
+	"__goclib_access":     21, // access
+	"__goclib_fstat":      5,  // fstat
 	// __goclib_rename: the alias goclib's rename() wrapper calls for the raw
 	// syscall. The wrapper cannot `extern rename` itself -- the name resolves
 	// to its own definition, an infinite recursion (see goclib/file.c).
@@ -357,6 +357,7 @@ func (a *Assembler) emitInt64(v int64) {
 		a.emitByte(byte(v >> (8 * i)))
 	}
 }
+
 // reserve grows the current section's virtual offset by n bytes without writing
 // any file bytes -- the basis of the BSS resb/resq/resd/resw directives.
 func (a *Assembler) reserve(n int) {
@@ -1703,7 +1704,8 @@ func (a *Assembler) parseCount(s string) (int64, error) {
 // emitDU defines UTF-16LE data ("du" = define unicode). Accepts string
 // literals and 16-bit numbers, and always appends a NUL terminator so a label
 // on the directive can be handed straight to a Wide-char Win32 API.
-func (a *Assembler) emitDU(rest string) error {	rest = strings.TrimSpace(rest)
+func (a *Assembler) emitDU(rest string) error {
+	rest = strings.TrimSpace(rest)
 	for _, tok := range splitTopLevel(rest, ',') {
 		t := strings.TrimSpace(tok)
 		if t == "" {

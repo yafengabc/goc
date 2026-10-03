@@ -248,12 +248,12 @@ func (a *Assembler) BuildELF(outPath string) error {
 	// Program header: one PT_LOAD covering the whole image, RWX.
 	putU32at(img, 64, ptLoad)
 	putU32at(img, 68, pfR|pfW|pfX)
-	putU64at(img, 72, 0)                // p_offset
-	putU64at(img, 80, elfBase)          // p_vaddr
-	putU64at(img, 88, elfBase)          // p_paddr (unused on Linux)
-	putU64at(img, 96, uint64(loadEnd))  // p_filesz
-	putU64at(img, 104, uint64(memEnd))  // p_memsz (includes zero-filled .bss)
-	putU64at(img, 112, 0x1000)          // p_align
+	putU64at(img, 72, 0)               // p_offset
+	putU64at(img, 80, elfBase)         // p_vaddr
+	putU64at(img, 88, elfBase)         // p_paddr (unused on Linux)
+	putU64at(img, 96, uint64(loadEnd)) // p_filesz
+	putU64at(img, 104, uint64(memEnd)) // p_memsz (includes zero-filled .bss)
+	putU64at(img, 112, 0x1000)         // p_align
 
 	// Section contents.
 	for _, p := range placed2 {

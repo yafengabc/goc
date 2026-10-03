@@ -15,9 +15,10 @@
 // (neither via pure syscall nor cgo) and must run as a separate C process.
 //
 // Usage:
-//   go run ./tools/gocregress            (or: go build -o bin/gocregress.exe ./tools/gocregress && ./bin/gocregress.exe)
-//   gocregress -p=false                  sequential
-//   gocregress -j 4                      limit parallelism to 4 jobs
+//
+//	go run ./tools/gocregress            (or: go build -o bin/gocregress.exe ./tools/gocregress && ./bin/gocregress.exe)
+//	gocregress -p=false                  sequential
+//	gocregress -j 4                      limit parallelism to 4 jobs
 package main
 
 import (

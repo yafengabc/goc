@@ -24,7 +24,7 @@ const (
 	KStruct
 	KUnion
 	KBitInt // C23 _BitInt(N): arbitrary-width two's-complement integer
-	KBool // for _Bool type
+	KBool   // for _Bool type
 )
 
 // Member is a single field of a struct or union.
@@ -46,23 +46,23 @@ type Member struct {
 }
 
 type Type struct {
-	Kind     TypeKind
-	Elem     *Type     // KPtr / KArr: element type
-	Len      int       // KArr: number of elements (0 = incomplete)
-	Params   []*Type   // KFunc: parameter types
-	Ret      *Type     // KFunc: return type
-	Variadic bool      // KFunc: declared with a trailing "..."
-	Width    int       // KInt: 1=char, 2=short, 4=int, 8=long
-	Signed   bool      // KInt
-	Members  []*Member // KStruct / KUnion: ordered fields
-	Bits     int       // KBitInt: exact bit width N (1..4096)
-	Size     int       // KStruct / KUnion: total size in bytes (aligned)
-	Align    int       // KStruct / KUnion: required alignment (0 = not computed)
-	Tag      string    // KStruct / KUnion: optional struct tag (named structs)
-	Const     bool      // declared with a top-level "const" qualifier
-	ConstExpr bool      // declared with the C23 "constexpr" specifier
-	AutoDeduce bool     // C23 "auto" placeholder: type to be inferred from the initialiser
-	IsTLS     bool      // declared with _Thread_local / thread_local (C11 TLS)
+	Kind       TypeKind
+	Elem       *Type     // KPtr / KArr: element type
+	Len        int       // KArr: number of elements (0 = incomplete)
+	Params     []*Type   // KFunc: parameter types
+	Ret        *Type     // KFunc: return type
+	Variadic   bool      // KFunc: declared with a trailing "..."
+	Width      int       // KInt: 1=char, 2=short, 4=int, 8=long
+	Signed     bool      // KInt
+	Members    []*Member // KStruct / KUnion: ordered fields
+	Bits       int       // KBitInt: exact bit width N (1..4096)
+	Size       int       // KStruct / KUnion: total size in bytes (aligned)
+	Align      int       // KStruct / KUnion: required alignment (0 = not computed)
+	Tag        string    // KStruct / KUnion: optional struct tag (named structs)
+	Const      bool      // declared with a top-level "const" qualifier
+	ConstExpr  bool      // declared with the C23 "constexpr" specifier
+	AutoDeduce bool      // C23 "auto" placeholder: type to be inferred from the initialiser
+	IsTLS      bool      // declared with _Thread_local / thread_local (C11 TLS)
 }
 
 // --- constructors -----------------------------------------------------------

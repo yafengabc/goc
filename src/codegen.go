@@ -152,10 +152,10 @@ type CG struct {
 	// entryWide that it is the Unicode one -- which also decides whether the
 	// command line is fetched as LPWSTR or LPSTR. A GUI program has no main
 	// at all, so the stub calls the named function and builds its arguments.
-	entryFn        string
-	entryIsGUI     bool
-	entryWide      bool
-	exitSym        string // entry-stub terminator: "exit" (full C exit) or "__goclib_exit" (bare)
+	entryFn    string
+	entryIsGUI bool
+	entryWide  bool
+	exitSym    string // entry-stub terminator: "exit" (full C exit) or "__goclib_exit" (bare)
 	// Built-in C library (clibCStore): needed C functions are emitted through
 	// genFunc (which marks more needs, so Gen iterates to a fixpoint), and the
 	// library's file-scope variables join the .data pool -- but only those the
@@ -3028,11 +3028,11 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 			// defers to the user's ShellExecute "start in" preference.
 			out.WriteString("\txor rcx, rcx\n")
 			out.WriteString("\tcall GetModuleHandleA\n")
-			out.WriteString("\tmov rcx, rax\n")        // hInstance
-			out.WriteString("\txor rdx, rdx\n")        // hPrevInstance = NULL
+			out.WriteString("\tmov rcx, rax\n") // hInstance
+			out.WriteString("\txor rdx, rdx\n") // hPrevInstance = NULL
 			out.WriteString("\tcall " + cmdLineFn + "\n")
-			out.WriteString("\tmov r8, rax\n")         // lpCmdLine
-			out.WriteString("\tmov r9d, 10\n")         // nCmdShow = SW_SHOWDEFAULT
+			out.WriteString("\tmov r8, rax\n") // lpCmdLine
+			out.WriteString("\tmov r9d, 10\n") // nCmdShow = SW_SHOWDEFAULT
 			out.WriteString("\tcall " + c.entryFn + "\n")
 		default:
 			out.WriteString("\tcall " + c.entryFn + "\n")
@@ -5889,27 +5889,27 @@ func (c *CG) genStmt(s Stmt) error {
 			// char array: copy the bytes (plus NUL) into the stack slot and
 			// zero-fill the tail of a larger array. Other array initialisers
 			// were rejected by the checker and never reach codegen.
-		if sl, ok := n.Init.(*StrLit); ok && ((sl.Wide && vi.typ.Elem.Width == 2) || (!sl.Wide && vi.typ.Elem.IsChar())) {
-			size := c.typeWidth(vi.typ)
-			copied := len(sl.Bytes)
-			if sl.Wide {
-				copied += 2 // 2-byte NUL terminator for wchar_t[]
-			} else {
-				copied += 1
-			}
-			if copied > size {
-				copied = size // defensive; the checker rejects oversize
-			}
-			if _, err := c.genExprT(n.Init); err != nil {
-				return err // rax = address of the constant in .rdata
-			}
-			c.emit("mov r11, rax")
-			c.emit("lea r10, [rbp%+d]", vi.off)
-			c.copyBytes("r10", "r11", copied)
-			if size > copied {
-				c.emit("add r10, %d", copied)
-				c.zeroBytes("r10", size-copied)
-			}
+			if sl, ok := n.Init.(*StrLit); ok && ((sl.Wide && vi.typ.Elem.Width == 2) || (!sl.Wide && vi.typ.Elem.IsChar())) {
+				size := c.typeWidth(vi.typ)
+				copied := len(sl.Bytes)
+				if sl.Wide {
+					copied += 2 // 2-byte NUL terminator for wchar_t[]
+				} else {
+					copied += 1
+				}
+				if copied > size {
+					copied = size // defensive; the checker rejects oversize
+				}
+				if _, err := c.genExprT(n.Init); err != nil {
+					return err // rax = address of the constant in .rdata
+				}
+				c.emit("mov r11, rax")
+				c.emit("lea r10, [rbp%+d]", vi.off)
+				c.copyBytes("r10", "r11", copied)
+				if size > copied {
+					c.emit("add r10, %d", copied)
+					c.zeroBytes("r10", size-copied)
+				}
 			}
 			return nil
 		}

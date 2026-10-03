@@ -114,4 +114,3 @@ func TestC4ReassignedFromIntDropsMark(t *testing.T) {
 // still must not clear the mark there -- see the `plain` argument of the
 // AssignExpr rule in ptrcap.go -- but the emitted code is 32-bit either way,
 // so it is deliberately not asserted here.
-

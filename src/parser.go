@@ -151,11 +151,11 @@ func Parse(toks []Token) (*Program, error) {
 	for k := range enumConsts {
 		delete(enumConsts, k)
 	}
-for k := range varTypes {
-	delete(varTypes, k)
-}
+	for k := range varTypes {
+		delete(varTypes, k)
+	}
 
-// va_list is the cursor type for <stdarg.h> variadic access. goc implements
+	// va_list is the cursor type for <stdarg.h> variadic access. goc implements
 	// variadics with a contiguous register/stack save area and walks it with a
 	// plain char* cursor, so va_list is just a pointer typedef.
 	typedefs["va_list"] = PtrType(CharType())
@@ -401,10 +401,10 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	isBool := false
 	isConst := false // a "const" qualifier appeared anywhere in the list
 	seen := false
-	align := 0 // a requested alignment from _Alignas(N) / _Alignas(type)
+	align := 0           // a requested alignment from _Alignas(N) / _Alignas(type)
 	isConstExpr := false // a "constexpr" specifier appeared
-	isTLS := false        // a _Thread_local / thread_local specifier appeared
-	var tdType *Type      // a typedef alias, if this specifier list names one
+	isTLS := false       // a _Thread_local / thread_local specifier appeared
+	var tdType *Type     // a typedef alias, if this specifier list names one
 	for {
 		if isQualifier(p.cur()) {
 			if p.cur().Text == "const" {
@@ -590,15 +590,15 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 			if !ok || nl.Val <= 0 {
 				return nil, fmt.Errorf("line %d: _BitInt width must be a positive integer constant", p.cur().Line)
 			}
-		// Implementation limit: 4194304 bits = 65536 words = 512 KiB per
-		// value. A 100,000-decimal-digit pi needs ~332,200 bits; a
-		// 1,000,000-digit one needs ~3,321,929 bits, so this covers both.
-		if nl.Val > 4194304 {
-			return nil, fmt.Errorf("line %d: _BitInt width %d exceeds the implementation limit of 4194304", p.cur().Line, nl.Val)
-		}
-		words := (int(nl.Val) + 63) / 64
-		t := &Type{Kind: KBitInt, Bits: int(nl.Val), Size: words * 8, Signed: signed, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}
-		if isConst {
+			// Implementation limit: 4194304 bits = 65536 words = 512 KiB per
+			// value. A 100,000-decimal-digit pi needs ~332,200 bits; a
+			// 1,000,000-digit one needs ~3,321,929 bits, so this covers both.
+			if nl.Val > 4194304 {
+				return nil, fmt.Errorf("line %d: _BitInt width %d exceeds the implementation limit of 4194304", p.cur().Line, nl.Val)
+			}
+			words := (int(nl.Val) + 63) / 64
+			t := &Type{Kind: KBitInt, Bits: int(nl.Val), Size: words * 8, Signed: signed, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}
+			if isConst {
 				t.Const = true
 			}
 			return t, nil
@@ -1885,7 +1885,9 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 }
 
 // parseStaticAssert handles C11 _Static_assert and the C23 static_assert alias:
-//   _Static_assert(constant-expr, "message");
+//
+//	_Static_assert(constant-expr, "message");
+//
 // The assertion is checked at compile time; a false condition is a hard error
 // that aborts compilation, exactly like a failed #if. A true condition produces
 // no code (an empty DeclList is a harmless no-op statement).

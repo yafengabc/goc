@@ -222,6 +222,7 @@ func TestLineDirectiveDoesNotLeakIntoIncludes(t *testing.T) {
 		t.Fatalf("#line leaked out of the include: %q", got)
 	}
 }
+
 // TestElifChainWithMacro regression (P0.6): a #elif whose condition contains
 // macro expansion must still expand macros even though the preceding #if was
 // false -- the enclosing frame is inactive while the #elif condition is
@@ -262,6 +263,7 @@ func TestElifAfterTaken(t *testing.T) {
 		t.Fatalf("elif after taken:\n got %q\nwant %q", got, want)
 	}
 }
+
 // TestStandardPredefinedMacros (P1.7): __STDC__/__STDC_HOSTED__/__STDC_VERSION__
 // are predefined object-like macros; __STDC_VERSION__ must be 202311 (C23).
 func TestStandardPredefinedMacros(t *testing.T) {
@@ -299,6 +301,7 @@ func TestDateTimeMacros(t *testing.T) {
 		t.Fatalf("defined(__DATE__/__TIME__): got %q", got2)
 	}
 }
+
 // TestDefinedHasOperators (P2.15): defined(__has_c_attribute) and
 // defined(__has_include) must evaluate to 1 (C23 6.10.10), so the portable
 // guard "#if defined(__has_c_attribute) && __has_c_attribute(x)" activates.
@@ -319,6 +322,3 @@ func TestHasCAttributeGuard(t *testing.T) {
 		t.Fatalf("__has_c_attribute guard:\n got %q\nwant %q", got, want)
 	}
 }
-
-
-

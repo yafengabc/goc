@@ -167,27 +167,27 @@ func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 		// else through the normal expression/assignable path.
 		strInit, braceInit := false, false
 		if n.Typ.IsArray() && n.Init != nil {
-		if sl, ok := n.Init.(*StrLit); ok {
-			if sl.Wide && n.Typ.Elem.Width == 2 {
-				// L"..." initialises a wchar_t[] array (UTF-16 elements).
-				strInit = true
-				need := len(sl.Bytes)/2 + 1
-				if n.Typ.Len == 0 {
-					n.Typ.Len = need
-				} else if n.Typ.Len < need {
-					c.errf(n.Line, "initialiser wide string of %d elements does not fit in wchar_t array %q of %d elements",
-						len(sl.Bytes)/2, n.Name, n.Typ.Len)
+			if sl, ok := n.Init.(*StrLit); ok {
+				if sl.Wide && n.Typ.Elem.Width == 2 {
+					// L"..." initialises a wchar_t[] array (UTF-16 elements).
+					strInit = true
+					need := len(sl.Bytes)/2 + 1
+					if n.Typ.Len == 0 {
+						n.Typ.Len = need
+					} else if n.Typ.Len < need {
+						c.errf(n.Line, "initialiser wide string of %d elements does not fit in wchar_t array %q of %d elements",
+							len(sl.Bytes)/2, n.Name, n.Typ.Len)
+					}
+				} else if !sl.Wide && n.Typ.Elem.IsChar() {
+					strInit = true
+					need := len(sl.Bytes) + 1
+					if n.Typ.Len == 0 {
+						n.Typ.Len = need
+					} else if n.Typ.Len < need {
+						c.errf(n.Line, "initialiser string of length %d does not fit in char array %q of %d bytes",
+							len(sl.Bytes), n.Name, n.Typ.Len)
+					}
 				}
-			} else if !sl.Wide && n.Typ.Elem.IsChar() {
-				strInit = true
-				need := len(sl.Bytes) + 1
-				if n.Typ.Len == 0 {
-					n.Typ.Len = need
-				} else if n.Typ.Len < need {
-					c.errf(n.Line, "initialiser string of length %d does not fit in char array %q of %d bytes",
-						len(sl.Bytes), n.Name, n.Typ.Len)
-				}
-			}
 			} else if _, ok := n.Init.(*BraceInit); ok {
 				braceInit = true
 				c.checkBraceInit(n.Typ, n.Init.(*BraceInit), fn, n.Line)
@@ -603,17 +603,17 @@ func (c *checker) checkLValueAddr(e Expr, fn *FuncDecl, addrOf bool) (*Type, boo
 	case *CompoundLit:
 		// A compound literal is a modifiable lvalue: "(T){...} = ..." is
 		// nonsense but "&(T){...}" and "(T){...}.member" are ordinary C.
-			// A const-qualified compound literal is still addressable, so
-			// "&(const T){...}" is fine; only writing to it is not.
-			c.checkExpr(n, fn)
-			if n.Typ.Const {
-				if addrOf {
-					return n.Typ, true
-				}
-				c.errf(n.Line, "compound literal is const-qualified")
-				return n.Typ, false
+		// A const-qualified compound literal is still addressable, so
+		// "&(const T){...}" is fine; only writing to it is not.
+		c.checkExpr(n, fn)
+		if n.Typ.Const {
+			if addrOf {
+				return n.Typ, true
 			}
-			return n.Typ, true
+			c.errf(n.Line, "compound literal is const-qualified")
+			return n.Typ, false
+		}
+		return n.Typ, true
 	}
 	c.errf(0, "expression is not an lvalue")
 	return IntType(), false
@@ -898,43 +898,43 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			c.checkExpr(n.E, fn)
 		}
 		return IntType()
-case *AssignExpr:
-	// Assignment "a = b" (statement-level or in expression position) must
-	// have a modifiable lvalue on the left. Statement-level assignments are
-	// parsed as ExprStmt{AssignExpr}, so the lvalue check must live here,
-	// not in checkStmt (whose *AssignStmt branch is never produced by the
-	// parser).
-	lt, ok := c.checkLValue(n.Lhs, fn)
-	if !ok {
-		return IntType()
-	}
-	if n.Op != "" {
-		// Compound assignment "E1 op= E2" (C11 6.5.16.2) types as "E1 =
-		// E1 op E2" but evaluates E1 exactly once. The result type is the
-		// arithmetic result, which must be assignable back to the lvalue.
-		rt := c.checkExpr(n.Rhs, fn)
-		res := c.binaryResultType(n.Op, lt, rt)
-		if !lt.IsVoid() && !assignable(lt, res) {
-			c.errf(0, "cannot assign %s to %s", res, lt)
+	case *AssignExpr:
+		// Assignment "a = b" (statement-level or in expression position) must
+		// have a modifiable lvalue on the left. Statement-level assignments are
+		// parsed as ExprStmt{AssignExpr}, so the lvalue check must live here,
+		// not in checkStmt (whose *AssignStmt branch is never produced by the
+		// parser).
+		lt, ok := c.checkLValue(n.Lhs, fn)
+		if !ok {
+			return IntType()
 		}
-		return res
+		if n.Op != "" {
+			// Compound assignment "E1 op= E2" (C11 6.5.16.2) types as "E1 =
+			// E1 op E2" but evaluates E1 exactly once. The result type is the
+			// arithmetic result, which must be assignable back to the lvalue.
+			rt := c.checkExpr(n.Rhs, fn)
+			res := c.binaryResultType(n.Op, lt, rt)
+			if !lt.IsVoid() && !assignable(lt, res) {
+				c.errf(0, "cannot assign %s to %s", res, lt)
+			}
+			return res
+		}
+		rt := c.checkExpr(n.Rhs, fn)
+		// Writing through a void* yields a void location; any value may be
+		// stored there (the checker models it as "we do not know the element
+		// type"), so skip the assignability check for that case.
+		if !lt.IsVoid() && !assignable(lt, rt) {
+			c.errf(0, "cannot assign %s to %s", rt, lt)
+		}
+		return rt
+	case *VaArgExpr:
+		ap := c.checkExpr(n.Ap, fn)
+		if !ap.IsPtr() {
+			c.errf(0, "va_arg first argument must be a va_list, got %s", ap)
+		}
+		return n.Typ
 	}
-	rt := c.checkExpr(n.Rhs, fn)
-	// Writing through a void* yields a void location; any value may be
-	// stored there (the checker models it as "we do not know the element
-	// type"), so skip the assignability check for that case.
-	if !lt.IsVoid() && !assignable(lt, rt) {
-		c.errf(0, "cannot assign %s to %s", rt, lt)
-	}
-	return rt
-case *VaArgExpr:
-	ap := c.checkExpr(n.Ap, fn)
-	if !ap.IsPtr() {
-		c.errf(0, "va_arg first argument must be a va_list, got %s", ap)
-	}
-	return n.Typ
-}
-return IntType()
+	return IntType()
 }
 func (c *checker) checkBinary(n *Binary, fn *FuncDecl) *Type {
 	lt := c.checkExpr(n.L, fn)
@@ -1226,10 +1226,10 @@ func (c *checker) checkBraceInit(t *Type, bi *BraceInit, fn *FuncDecl, line int)
 		}
 		if hasDesig {
 			for _, el := range bi.Elems {
-			if el.DesigIdx < 0 {
-				c.errf(line, "cannot mix positional and designated (\"[i] =\") initialisers")
-				continue
-			}
+				if el.DesigIdx < 0 {
+					c.errf(line, "cannot mix positional and designated (\"[i] =\") initialisers")
+					continue
+				}
 				if el.DesigIdx >= t.Len {
 					c.errf(line, "designator index %d out of range for array of %d element(s)", el.DesigIdx, t.Len)
 					continue

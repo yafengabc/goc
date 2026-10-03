@@ -278,8 +278,8 @@ int main(){ return u(3); }`
 }
 
 // mkSlot fixtures for T1.4 slotCache.
-func slotStore(reg string) Inst  { return Inst{Kind: instInstr, Text: "\tmov [rbp-8], " + reg} }
-func slotLoad(dst string) Inst   { return Inst{Kind: instInstr, Text: "\tmov " + dst + ", [rbp-8]"} }
+func slotStore(reg string) Inst { return Inst{Kind: instInstr, Text: "\tmov [rbp-8], " + reg} }
+func slotLoad(dst string) Inst  { return Inst{Kind: instInstr, Text: "\tmov " + dst + ", [rbp-8]"} }
 
 // TestSlotForwardReg: a load of a slot known to hold register rS becomes a
 // register move into the load's destination.
@@ -517,10 +517,10 @@ func mov64(dst, src string) Inst {
 // reload forwards from r12 instead of doing a real load.
 func TestSlotSnapshotChainForward(t *testing.T) {
 	in := []Inst{
-		mov64("rax", "r12"),    // copyOf[rax] = r12
-		slotStore("rax"),       // cache[8] = {reg: root(rax)=r12}
+		mov64("rax", "r12"),                     // copyOf[rax] = r12
+		slotStore("rax"),                        // cache[8] = {reg: root(rax)=r12}
 		{Kind: instInstr, Text: "\tmov rax, 5"}, // kill rax (not r12)
-		slotLoad("rcx"),        // forward -> mov rcx, r12
+		slotLoad("rcx"),                         // forward -> mov rcx, r12
 	}
 	got := runSlot(in)
 	if countText(got, "mov rcx, r12") != 1 {
@@ -535,10 +535,10 @@ func TestSlotSnapshotChainForward(t *testing.T) {
 // is invalidated and the reload stays a real memory load.
 func TestSlotSnapshotRootKilled(t *testing.T) {
 	in := []Inst{
-		mov64("rax", "r12"),    // copyOf[rax] = r12
-		slotStore("rax"),       // cache[8] = {reg: r12}
+		mov64("rax", "r12"),                     // copyOf[rax] = r12
+		slotStore("rax"),                        // cache[8] = {reg: r12}
 		{Kind: instInstr, Text: "\tmov r12, 5"}, // kill the ROOT
-		slotLoad("rcx"),        // root dead: real load
+		slotLoad("rcx"),                         // root dead: real load
 	}
 	got := runSlot(in)
 	if countText(got, "mov rcx, [rbp-8]") != 1 {
@@ -550,9 +550,9 @@ func TestSlotSnapshotRootKilled(t *testing.T) {
 // Writing that register kills the slot (same as T1.4).
 func TestSlotSnapshotNoChain(t *testing.T) {
 	in := []Inst{
-		slotStore("rax"),       // cache[8] = {reg: rax}
+		slotStore("rax"),                        // cache[8] = {reg: rax}
 		{Kind: instInstr, Text: "\tmov rax, 5"}, // kill rax (root)
-		slotLoad("rcx"),        // root dead: real load
+		slotLoad("rcx"),                         // root dead: real load
 	}
 	got := runSlot(in)
 	if countText(got, "mov rcx, [rbp-8]") != 1 {
@@ -564,11 +564,11 @@ func TestSlotSnapshotNoChain(t *testing.T) {
 // ultimate root. This is one of the three probe field cases.
 func TestSlotSnapshotChainTwoHop(t *testing.T) {
 	in := []Inst{
-		mov64("rbx", "rcx"),    // copyOf[rbx] = rcx
-		mov64("rax", "rbx"),    // copyOf[rax] = root(rbx)=rcx
-		slotStore("rax"),       // cache[8] = {reg: rcx}
+		mov64("rbx", "rcx"),                     // copyOf[rbx] = rcx
+		mov64("rax", "rbx"),                     // copyOf[rax] = root(rbx)=rcx
+		slotStore("rax"),                        // cache[8] = {reg: rcx}
 		{Kind: instInstr, Text: "\tmov rax, 2"}, // kill rax (not rcx)
-		slotLoad("r10"),        // forward -> mov r10, rcx
+		slotLoad("r10"),                         // forward -> mov r10, rcx
 	}
 	got := runSlot(in)
 	if countText(got, "mov r10, rcx") != 1 {
@@ -584,15 +584,15 @@ func TestSlotSnapshotChainTwoHop(t *testing.T) {
 // rooted at the surviving root still forwards.
 func TestSlotSnapshotForwardKillsDst(t *testing.T) {
 	in := []Inst{
-		{Kind: instInstr, Text: "\tmov [rbp-8], r12"},   // cache[8] = {reg: r12}
-		{Kind: instInstr, Text: "\tmov [rbp-16], rax"},  // cache[16] = {reg: rax}
-		mov64("rcx", "r12"),                              // copyOf[rcx] = r12
-		{Kind: instInstr, Text: "\tmov [rbp-24], rcx"},   // cache[24] = {reg: r12}
+		{Kind: instInstr, Text: "\tmov [rbp-8], r12"},  // cache[8] = {reg: r12}
+		{Kind: instInstr, Text: "\tmov [rbp-16], rax"}, // cache[16] = {reg: rax}
+		mov64("rcx", "r12"),                            // copyOf[rcx] = r12
+		{Kind: instInstr, Text: "\tmov [rbp-24], rcx"}, // cache[24] = {reg: r12}
 		// Forward [rbp-8] into rcx: rcx was a copy of r12, but now rcx is
 		// overwritten by the forward. The slot [rbp-24] still roots at r12
 		// (alive), so it should still forward.
-		{Kind: instInstr, Text: "\tmov rcx, [rbp-8]"},   // forward -> mov rcx, r12
-		{Kind: instInstr, Text: "\tmov r10, [rbp-24]"},  // root r12 alive: forward
+		{Kind: instInstr, Text: "\tmov rcx, [rbp-8]"},  // forward -> mov rcx, r12
+		{Kind: instInstr, Text: "\tmov r10, [rbp-24]"}, // root r12 alive: forward
 	}
 	got := runSlot(in)
 	if countText(got, "mov r10, r12") != 1 {
@@ -605,10 +605,10 @@ func TestSlotSnapshotForwardKillsDst(t *testing.T) {
 // forwards.
 func TestSlotSnapshotNarrowWriteBreaksChain(t *testing.T) {
 	in := []Inst{
-		mov64("rax", "r12"),    // copyOf[rax] = r12
-		slotStore("rax"),       // cache[8] = {reg: r12}
+		mov64("rax", "r12"),                       // copyOf[rax] = r12
+		slotStore("rax"),                          // cache[8] = {reg: r12}
 		{Kind: instInstr, Text: "\txor eax, eax"}, // kill rax (32-bit), not r12
-		slotLoad("rcx"),        // root r12 alive: forward -> mov rcx, r12
+		slotLoad("rcx"),                           // root r12 alive: forward -> mov rcx, r12
 	}
 	got := runSlot(in)
 	if countText(got, "mov rcx, r12") != 1 {
@@ -624,9 +624,9 @@ func TestSlotSnapshotNarrowWriteBreaksChain(t *testing.T) {
 func TestSlotSnapshotSizedStoreInvalidates(t *testing.T) {
 	in := []Inst{
 		mov64("rax", "r12"),
-		slotStore("rax"),       // cache[8] = {reg: r12}
+		slotStore("rax"), // cache[8] = {reg: r12}
 		{Kind: instInstr, Text: "\tmov dword [rbp-8], 0"}, // sized store: clobber
-		slotLoad("rcx"),        // slot cleared: real load
+		slotLoad("rcx"), // slot cleared: real load
 	}
 	got := runSlot(in)
 	if countText(got, "mov rcx, [rbp-8]") != 1 {
@@ -669,9 +669,9 @@ func TestSlotSnapshotIndirectWrite(t *testing.T) {
 func TestSlotSnapshotRedundantStoreRoot(t *testing.T) {
 	in := []Inst{
 		mov64("rax", "r12"),
-		slotStore("rax"),       // cache[8] = {reg: r12}
-		mov64("rcx", "r12"),    // copyOf[rcx] = r12
-		slotStore("rcx"),       // root(rcx)=r12 == cache[8].reg: redundant
+		slotStore("rax"),    // cache[8] = {reg: r12}
+		mov64("rcx", "r12"), // copyOf[rcx] = r12
+		slotStore("rcx"),    // root(rcx)=r12 == cache[8].reg: redundant
 	}
 	got := runSlot(in)
 	if countText(got, "mov [rbp-8], ") != 1 {

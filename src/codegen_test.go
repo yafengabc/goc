@@ -372,8 +372,8 @@ func TestConstPropForward(t *testing.T) {
 	// definition alive (rax must still hold 7 at the store).
 	got = lineTexts(constProp([]Inst{
 		peepIns("mov rax, 7"),
-		peepIns("mov rbx, rax"),      // -> mov rbx, 7
-		peepIns("mov [rbp-8], rax"),  // store keeps rax
+		peepIns("mov rbx, rax"),     // -> mov rbx, 7
+		peepIns("mov [rbp-8], rax"), // store keeps rax
 	}))
 	want = []string{
 		"\tmov rax, 7",
@@ -1137,7 +1137,6 @@ func TestStringLiteralSubscript(t *testing.T) {
 		t.Errorf(`"hello"[1] did not stride by 1: %q`, asm)
 	}
 }
-
 
 // TestStdintTypes proves <stdint.h>/<inttypes.h> now resolve and the
 // INT*_C / PRI* macros expand (P1.3). Before the fix the headers were

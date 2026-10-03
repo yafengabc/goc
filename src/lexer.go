@@ -1,10 +1,10 @@
 package main
 
 import (
-	"strings"
 	"fmt"
 	"math/big"
 	"strconv"
+	"strings"
 )
 
 type TokKind int
@@ -36,10 +36,10 @@ var keywords = map[string]bool{
 	"static_assert": true, "_Static_assert": true,
 	"alignas": true, "alignof": true,
 	"noreturn": true, "_Noreturn": true,
-	"_Generic": true,
-	"_BitInt": true,
-	"char8_t": true,
-	"inline": true,
+	"_Generic":     true,
+	"_BitInt":      true,
+	"char8_t":      true,
+	"inline":       true,
 	"thread_local": true, "_Thread_local": true,
 	"__has_include": true, "__has_c_attribute": true,
 	"__VA_OPT__": true,
@@ -60,14 +60,14 @@ type Token struct {
 	BigWords  []uint64
 	BigSigned bool
 	BigBits   int // declared bit width of the literal's own _BitInt type
-	Str     []byte
+	Str       []byte
 	// Wide marks an L"..." literal: Str holds UTF-16LE code units (2 bytes
 	// each) instead of UTF-8 bytes, and the literal's type is wchar_t* rather
 	// than char*. The terminating NUL is added by the code generator, which
 	// knows whether it must be 1 or 2 bytes wide.
-	Wide    bool
-	Line    int
-	Space   bool // true if whitespace preceded this token (separates macro name from '(' etc.)
+	Wide  bool
+	Line  int
+	Space bool // true if whitespace preceded this token (separates macro name from '(' etc.)
 }
 
 // pushBig builds the token for a C23 bit-precise integer literal: the value's
@@ -128,7 +128,7 @@ func parseBigLiteral(text string) ([]uint64, int, error) {
 	for k, b := range bs {
 		// k counts from the most significant byte; its weight from the
 		// bottom of the number is (len-1-k)*8 bits.
-		bitPos := uint((len(bs)-1-k) * 8)
+		bitPos := uint((len(bs) - 1 - k) * 8)
 		words[bitPos/64] |= uint64(b) << (bitPos % 64)
 	}
 	return words, v.BitLen(), nil
@@ -337,123 +337,123 @@ func Lex(src string) ([]Token, error) {
 		case isDigit(c):
 			start := i
 			isDbl := false
-		// Hex literal: 0x[0-9a-fA-F]+. The size suffixes are recorded
-		// rather than dropped: 1LL has to *be* 64 bits wide, because a
-		// 32-bit `1` shifted left by 52 is zero while `1LL << 52` is not.
-		if c == '0' && i+1 < n && (src[i+1] == 'x' || src[i+1] == 'X') {
-			i += 2
-			for i < n && (isDigit(src[i]) ||
-				(src[i] >= 'a' && src[i] <= 'f') ||
-				(src[i] >= 'A' && src[i] <= 'F') || src[i] == 39) {
-				i++
-			}
-			// C23 bit-precise suffix: 0xFFuwb / 0x1Abcwb. Checked before the
-			// float forms because 'w' can never continue a hex number.
-			if isW, u, ni := bigSuffix(src, i, n); isW {
-				words, bitLen, err := parseBigLiteral(strings.ReplaceAll(src[start:i], "'", ""))
-				if err != nil {
-					return nil, fmt.Errorf("line %d: %s", line, err.Error())
-				}
-				pushBig(push, words, bitLen, u, line)
-				i = ni
-				continue
-			}
-			// Hexadecimal floating literal (C99/C23): 0x1.8p3, 0x.8p1,
-			// 0x1p-2. The binary-exponent part (p/P[+-]digits) is optional
-			// since C23, so "0x1.8" is also a valid double. 'p' can never
-			// start an integer continuation -- it is not a hex digit -- so
-			// 0x1e5 (e IS a hex digit) stays an integer and only '.'/'p'
-			// switch to the float path.
-			isHexDbl := false
-			if i < n && src[i] == '.' {
-				isHexDbl = true
-				i++
-				for i < n && ((src[i] >= 'a' && src[i] <= 'f') ||
-					(src[i] >= 'A' && src[i] <= 'F') || isDigit(src[i]) || src[i] == 39) {
+			// Hex literal: 0x[0-9a-fA-F]+. The size suffixes are recorded
+			// rather than dropped: 1LL has to *be* 64 bits wide, because a
+			// 32-bit `1` shifted left by 52 is zero while `1LL << 52` is not.
+			if c == '0' && i+1 < n && (src[i+1] == 'x' || src[i+1] == 'X') {
+				i += 2
+				for i < n && (isDigit(src[i]) ||
+					(src[i] >= 'a' && src[i] <= 'f') ||
+					(src[i] >= 'A' && src[i] <= 'F') || src[i] == 39) {
 					i++
 				}
-			}
-			if i < n && (src[i] == 'p' || src[i] == 'P') {
-				j := i + 1
-				if j < n && (src[j] == '+' || src[j] == '-') {
-					j++
+				// C23 bit-precise suffix: 0xFFuwb / 0x1Abcwb. Checked before the
+				// float forms because 'w' can never continue a hex number.
+				if isW, u, ni := bigSuffix(src, i, n); isW {
+					words, bitLen, err := parseBigLiteral(strings.ReplaceAll(src[start:i], "'", ""))
+					if err != nil {
+						return nil, fmt.Errorf("line %d: %s", line, err.Error())
+					}
+					pushBig(push, words, bitLen, u, line)
+					i = ni
+					continue
 				}
-				if j < n && isDigit(src[j]) {
+				// Hexadecimal floating literal (C99/C23): 0x1.8p3, 0x.8p1,
+				// 0x1p-2. The binary-exponent part (p/P[+-]digits) is optional
+				// since C23, so "0x1.8" is also a valid double. 'p' can never
+				// start an integer continuation -- it is not a hex digit -- so
+				// 0x1e5 (e IS a hex digit) stays an integer and only '.'/'p'
+				// switch to the float path.
+				isHexDbl := false
+				if i < n && src[i] == '.' {
 					isHexDbl = true
-					i = j
-					for i < n && isDigit(src[i]) {
+					i++
+					for i < n && ((src[i] >= 'a' && src[i] <= 'f') ||
+						(src[i] >= 'A' && src[i] <= 'F') || isDigit(src[i]) || src[i] == 39) {
 						i++
 					}
 				}
-			}
-			raw := src[start:i]
-			text := strings.ReplaceAll(raw, "'", "")
-			if isHexDbl {
-				// f/F/l/L suffixes follow the decimal-float convention
-				// (f -> float narrowing, l/L ignored: goc floats are
-				// "effective double" internally).
-				isFloat := false
-				for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
-					if src[i] == 'f' || src[i] == 'F' {
-						isFloat = true
+				if i < n && (src[i] == 'p' || src[i] == 'P') {
+					j := i + 1
+					if j < n && (src[j] == '+' || src[j] == '-') {
+						j++
+					}
+					if j < n && isDigit(src[j]) {
+						isHexDbl = true
+						i = j
+						for i < n && isDigit(src[i]) {
+							i++
+						}
+					}
+				}
+				raw := src[start:i]
+				text := strings.ReplaceAll(raw, "'", "")
+				if isHexDbl {
+					// f/F/l/L suffixes follow the decimal-float convention
+					// (f -> float narrowing, l/L ignored: goc floats are
+					// "effective double" internally).
+					isFloat := false
+					for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
+						if src[i] == 'f' || src[i] == 'F' {
+							isFloat = true
+						}
+						i++
+					}
+					// Go's ParseFloat only accepts hex floats with a binary
+					// exponent; C23 allows its omission, so add a p0 for it.
+					if !strings.ContainsAny(text, "pP") {
+						text += "p0"
+					}
+					f, _ := strconv.ParseFloat(text, 64)
+					push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, Line: line})
+					continue
+				}
+				// Parse as an unsigned bit pattern so that 0x8000000000000000
+				// (2^63) survives as the int64 minimum: -0x8000000000000000 is
+				// the standard spelling of LONG_MIN. ParseInt would overflow
+				// on it and leave v == 0.
+				u, err := strconv.ParseUint(text[2:], 16, 64)
+				var v int64
+				if err == nil {
+					v = int64(u)
+				}
+				unsig, long := false, false
+				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
+					if src[i] == 'u' || src[i] == 'U' {
+						unsig = true
+					} else {
+						long = true
 					}
 					i++
 				}
-				// Go's ParseFloat only accepts hex floats with a binary
-				// exponent; C23 allows its omission, so add a p0 for it.
-				if !strings.ContainsAny(text, "pP") {
-					text += "p0"
-				}
-				f, _ := strconv.ParseFloat(text, 64)
-				push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, Line: line})
+				push(Token{Kind: TNum, Text: text, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
 				continue
 			}
-			// Parse as an unsigned bit pattern so that 0x8000000000000000
-			// (2^63) survives as the int64 minimum: -0x8000000000000000 is
-			// the standard spelling of LONG_MIN. ParseInt would overflow
-			// on it and leave v == 0.
-			u, err := strconv.ParseUint(text[2:], 16, 64)
-			var v int64
-			if err == nil {
-				v = int64(u)
-			}
-			unsig, long := false, false
-			for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
-				if src[i] == 'u' || src[i] == 'U' {
-					unsig = true
-				} else {
-					long = true
+			// Binary literal: 0b[01]+ (C23), optional ' separators.
+			if c == '0' && i+1 < n && (src[i+1] == 'b' || src[i+1] == 'B') {
+				i += 2
+				for i < n && (src[i] == '0' || src[i] == '1' || src[i] == 39) {
+					i++
 				}
-				i++
-			}
-			push(Token{Kind: TNum, Text: text, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
-			continue
-		}
-		// Binary literal: 0b[01]+ (C23), optional ' separators.
-		if c == '0' && i+1 < n && (src[i+1] == 'b' || src[i+1] == 'B') {
-			i += 2
-			for i < n && (src[i] == '0' || src[i] == '1' || src[i] == 39) {
-				i++
-			}
-			raw := src[start:i]
-			btext := strings.ReplaceAll(raw, "'", "")
-			u, err := strconv.ParseUint(btext[2:], 2, 64)
-			var v int64
-			if err == nil {
-				v = int64(u)
-			}
-			unsig, long := false, false
-			for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
-				if src[i] == 'u' || src[i] == 'U' {
-					unsig = true
-				} else {
-					long = true
+				raw := src[start:i]
+				btext := strings.ReplaceAll(raw, "'", "")
+				u, err := strconv.ParseUint(btext[2:], 2, 64)
+				var v int64
+				if err == nil {
+					v = int64(u)
 				}
-				i++
+				unsig, long := false, false
+				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
+					if src[i] == 'u' || src[i] == 'U' {
+						unsig = true
+					} else {
+						long = true
+					}
+					i++
+				}
+				push(Token{Kind: TNum, Text: raw, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
+				continue
 			}
-			push(Token{Kind: TNum, Text: raw, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
-			continue
-		}
 			for i < n && (isDigit(src[i]) || src[i] == 39) {
 				i++
 			}
@@ -481,7 +481,7 @@ func Lex(src string) ([]Token, error) {
 				}
 			}
 			raw := src[start:i]
-				text := strings.ReplaceAll(raw, "'", "")
+			text := strings.ReplaceAll(raw, "'", "")
 			// C23 bit-precise suffix after the decimal digits (42wb, 42uwb),
 			// before the u/l suffix loop: bigSuffix owns the optional u.
 			if !isDbl {
@@ -538,17 +538,17 @@ func Lex(src string) ([]Token, error) {
 				if err == nil {
 					v = int64(u)
 				}
-			unsig, long := false, false
-			for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
-				if src[i] == 'u' || src[i] == 'U' {
-					unsig = true
-				} else {
-					long = true
+				unsig, long := false, false
+				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
+					if src[i] == 'u' || src[i] == 'U' {
+						unsig = true
+					} else {
+						long = true
+					}
+					i++
 				}
-				i++
+				push(Token{Kind: TNum, Text: text, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
 			}
-			push(Token{Kind: TNum, Text: text, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
-		}
 		case c == '.' && i+1 < n && isDigit(src[i+1]):
 			// Leading-dot floating constant: .5, .5f, .5e2, .5L, .1'2 (C23).
 			// Only taken when a digit directly follows the '.', so member access
@@ -588,7 +588,7 @@ func Lex(src string) ([]Token, error) {
 				i++
 			}
 			raw := src[start:i]
-				text := strings.ReplaceAll(raw, "'", "")
+			text := strings.ReplaceAll(raw, "'", "")
 			// Inline assembly: "__asm { ... }" (and the MSVC alias "_asm")
 			// begins a block whose body is raw assembler text, not C. The
 			// block is only entered when the keyword is directly followed by
