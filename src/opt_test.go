@@ -476,24 +476,30 @@ func TestSlotNeverGrows(t *testing.T) {
 }
 
 // TestSlotEndToEnd compiles the recursive ternary fib (the bench2 shape) at
-// -O2. Its prologue stores the parameter and reloads it before the setcc
-// dance; slotCache must turn that reload into a register move (the t16d
-// snapshot had `mov rax, [rbp-48]` there, the pass produces `mov rax, rcx`),
-// while the reloads inside the branches -- separated by labels and branches --
-// must survive as memory loads.
+// -O2.
+//
+// T2.1 (R2) changed the expected shape here. fib is recursive, so it is NOT
+// an inline candidate, and its parameter is a register-capable scalar -- so it
+// is homed in a callee-save register. The old expectation encoded the
+// pre-R2 pipeline: a prologue spill to [rbp-48] with slotCache forwarding the
+// reload into a register move. Now the prologue moves rcx straight into rbx and
+// the branch-guarded reloads are register moves from the start, so the spill
+// and every reload disappear rather than being forwarded.
 func TestSlotEndToEnd(t *testing.T) {
 	src := `int fib(int n) { return n < 2 ? n : fib(n-1) + fib(n-2); }
 int main(){ return fib(10); }`
 	asm := genAsmOpt(t, src, 2)
 	body := fnAsm(asm, "fib")
-	if !strings.Contains(body, "\tmov [rbp-48], rcx\n\tmov rax, rcx") {
-		t.Fatalf("param reload must be forwarded to a register move, got:\n%s", body)
+	if !strings.Contains(body, "\tmov rbx, rcx\n") {
+		t.Fatalf("param must be homed in a callee-save register, got:\n%s", body)
 	}
-	// fnAsm stops at the first label, so count the branch-guarded reloads on
-	// the whole assembly: they sit after .Lcmp1/.Lelse3 and must survive as
-	// memory loads.
-	if strings.Count(asm, "mov rax, [rbp-48]") < 2 {
-		t.Fatalf("branch-guarded reloads must survive as memory loads, got:\n%s", asm)
+	if strings.Contains(asm, "mov [rbp-48], rcx") {
+		t.Fatalf("a register-homed param must not be spilled to a slot, got:\n%s", asm)
+	}
+	// The reloads inside the branches, previously memory loads that had to
+	// survive slotCache's window, are now register moves.
+	if strings.Count(asm, "mov rax, rbx") < 2 {
+		t.Fatalf("branch-guarded reloads must become register moves, got:\n%s", asm)
 	}
 }
 

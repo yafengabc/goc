@@ -60,6 +60,12 @@ type CG struct {
 	// into each varInfo.ptr. Built once per function by analyzePtrCapable
 	// before any declareVar runs (see src/ptrcap.go).
 	ptrCapable map[string]bool
+	// t21Called is the set of function names some function calls. T2.1 R2
+	// needs it before generating any body: a small call-free function that
+	// nobody calls is never inlined, so its parameters can safely live in
+	// callee-save registers, while the same function WITH a caller would
+	// lose its inlinability. Filled once from prog.Funcs.
+	t21Called map[string]bool
 	// resPtr records whether the value currently in rax was loaded from a
 	// ptrCapable variable: such a value's high 32 bits are pointer bits, and
 	// the narrow sites (N5b/N11/N12/N17/N22) must not movsxd it. Every
@@ -2597,6 +2603,19 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 			}
 		}
 
+	// T2.1 (R2): build the call graph over the user's functions before any
+	// body is generated, so genFunc can tell "small leaf that nobody calls"
+	// (safe to register-home parameters) from "small leaf with a caller"
+	// (must stay inlinable). Only prog.Funcs is scanned: a goclib helper is
+	// emitted on demand and never competes with a user function for the
+	// inliner's attention in a way that depends on our choice here.
+	c.t21Called = map[string]bool{}
+	for _, f := range prog.Funcs {
+		for name := range t21BodyScan(f).callees {
+			c.t21Called[name] = true
+		}
+	}
+
 	var body strings.Builder
 	for _, f := range prog.Funcs {
 		if err := c.genFunc(f); err != nil {
@@ -4879,16 +4898,28 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	if hasAsm {
 		regPool = nil
 	}
+	// T2.1 (R3): a call-free function may also park a local in a CALLER-save
+	// register. Nothing in the body can clobber r8/r9 (there is no call to
+	// pass them to), and the fixed prologue/epilogue push and restore exactly
+	// calleeSaveAll, so a home there costs no push, no restore and no frame
+	// slot at all. r10/r11 are deliberately NOT offered: genBinary and
+	// genCall use them as scratch (45 and 19 emit sites), so a local living
+	// there would be shredded by any arithmetic expression. rbx/r12-r14 are
+	// the only registers goc never touches as scratch, which is why the pool
+	// was capped at four and why spilling was so common.
+	bst := t21BodyScan(f)
+	if regPool != nil && !bst.hasCall && !bst.hasAgg {
+		regPool = append(append([]string{}, calleeSaveAll...), "r8", "r9")
+	}
 	c.usedRegs = nil
 	regOf := map[string]string{}
 	ri := 0
 	stackDecls := make([]localDecl, 0, len(decls))
 	for _, d := range decls {
-		// Only integer-class scalars get a callee-save home: float rides in
+		// Only integer-class scalars get a register home: float rides in
 		// XMM registers like double (and is 4 bytes in memory), so it must
 		// stay on the stack.
-		intClass := d.typ != nil && !d.typ.IsArray() && !d.typ.IsFloating() &&
-			d.typ.Kind != KStruct && d.typ.Kind != KUnion && d.typ.Kind != KBitInt
+		intClass := regCapable(d.typ)
 		if intClass && !addrTaken[d.name] && ri < len(regPool) {
 			regOf[d.name] = regPool[ri]
 			c.usedRegs = append(c.usedRegs, regPool[ri])
@@ -4898,6 +4929,54 @@ func (c *CG) genFunc(f *FuncDecl) error {
 			ri++
 		} else {
 			stackDecls = append(stackDecls, d)
+		}
+	}
+	// T2.1 (R2): parameters are variables too, and the probe attributes a
+	// large share of the removable frame traffic to parameter RELOADS
+	// (bench2's bsort re-reads its array argument 7 times inside one
+	// call-free loop). A parameter in a register needs no frame slot at all:
+	// the prologue PUSH already preserves it across every call, so each
+	// reload disappears outright rather than being traded for a write-back.
+	//
+	// They are allocated AFTER the locals, and that ordering is the whole
+	// point -- an earlier version gave parameters first place and it was a
+	// measured LOSS (+218 instructions on the -Os corpus). The pool is only
+	// four callee-save registers, so a parameter taken off the top is a
+	// local pushed back onto the stack, and a spilled local is far more
+	// expensive than a spilled parameter: fmt_int_part's loop counter went
+	// from `dec r13d` to load/dec/store/reload, four extra memory round trips
+	// per iteration, which swamped the reloads saved on the parameters. With
+	// the locals served first, a parameter only gets a register when the
+	// function never needed one for a local, so R2 is now free of downside.
+	//
+	// Excluded, each for a concrete reason:
+	//   - variadic functions: va_arg reads the incoming arguments by slot
+	//     index in the save area, so they must stay addressable;
+	//   - aggregates: they arrive through a hidden pointer and are copied
+	//     into a slot this function owns;
+	//   - address-taken parameters: something can write the slot behind the
+	//     compiler's back, and a register copy could not be observed;
+	//   - floating parameters: they live in XMM argument registers, and the
+	//     pool is GPR-only;
+	//   - i >= regCap (stack-passed): their incoming home is already a
+	//     caller-owned slot, and R2 keeps the scope to register parameters;
+	//   - small call-free functions somebody calls: register-homing them
+	//     puts a callee-save write in the body and the inliner rightly
+	//     refuses such a template (see t21InlineLikely).
+	// hasAsm empties regPool above, so an asm function keeps every parameter
+	// on the stack automatically.
+	paramReg := map[string]bool{}
+	if !f.Variadic && !c.t21InlineLikely(f, bst) {
+		for i, p := range f.Params {
+			if i >= regCap || !regCapable(f.ParamTypes[i]) || addrTaken[p] || ri >= len(regPool) {
+				continue
+			}
+			regOf[p] = regPool[ri]
+			paramReg[p] = true
+			c.usedRegs = append(c.usedRegs, regPool[ri])
+			c.varEnts[paramUIDs[i]] = varInfo{reg: regPool[ri],
+				typ: f.ParamTypes[i], ptr: c.ptrCapable[p]}
+			ri++
 		}
 	}
 
@@ -4960,6 +5039,10 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	}
 	for i, p := range f.Params {
 		pt := f.ParamTypes[i]
+		if paramReg[p] {
+			// T2.1 (R2): homed in a callee-save register; it has no slot.
+			continue
+		}
 		if !isAgg(pt) {
 			if i < regCap {
 				localBytes += 8
@@ -5181,6 +5264,13 @@ func (c *CG) genFunc(f *FuncDecl) error {
 				}
 				continue
 			}
+		}
+		if vi.reg != "" {
+			// T2.1 (R2): the parameter already lives in its callee-save home;
+			// the prologue PUSH preserved it, so this is a pure register move
+			// and the frame slot is never allocated.
+			c.emit("mov %s, %s", vi.reg, argRegs[i+regShift])
+			continue
 		}
 		c.emit("mov [rbp%+d], %s", vi.off, argRegs[i+regShift])
 	}
@@ -7274,6 +7364,188 @@ func (c *CG) copyBytes(dst, src string, n int) {
 // loaded into a register but always handled by address + copyBytes.
 func isAgg(t *Type) bool {
 	return t != nil && (t.IsStruct() || t.IsUnion() || t.Kind == KBitInt)
+}
+
+// regCapable reports whether a value of type t may live in a callee-save GPR
+// rather than a frame slot: integer-class scalars only. Floating values ride
+// in XMM registers, arrays and aggregates own contiguous storage, and a
+// _BitInt travels by address. This is the single rule shared by the local and
+// the parameter register allocators (T2.1 R2/R3) so the two can never drift.
+func regCapable(t *Type) bool {
+	return t != nil && !t.IsArray() && !t.IsFloating() &&
+		t.Kind != KStruct && t.Kind != KUnion && t.Kind != KBitInt
+}
+
+// t21BodyStats is what R2 needs to know about a function body: how big it is,
+// whether it calls anything (a leaf is the only shape inlineCalls will
+// expand), and which names it calls.
+type t21BodyStats struct {
+	stmts   int
+	hasCall bool
+	// hasAgg is set when the function declares or takes an array, struct,
+	// union or _BitInt. Such a function can acquire a call the AST never
+	// shows: genBraceInit / copyBytes lower big aggregate copies and zero
+	// fills into emitCall("memcpy") / emitCall("memset"), and those take
+	// their 3rd/4th arguments in r8/r9 on Win64.
+	hasAgg  bool
+	callees map[string]bool
+}
+
+// t21HasAggType reports whether t is aggregate data in the sense above.
+func t21HasAggType(t *Type) bool {
+	return t != nil && (t.IsArray() || t.IsStruct() || t.IsUnion() || t.Kind == KBitInt)
+}
+
+// t21BodyScan walks f's body counting statements and collecting callees.
+func t21BodyScan(f *FuncDecl) t21BodyStats {
+	st := t21BodyStats{callees: map[string]bool{}}
+	for _, pt := range f.ParamTypes {
+		if t21HasAggType(pt) {
+			st.hasAgg = true
+		}
+	}
+	var walkS func(Stmt)
+	var walkE func(Expr)
+	walkE = func(e Expr) {
+		switch n := e.(type) {
+		case *Call:
+			st.hasCall = true
+			if n.Name != "" {
+				st.callees[n.Name] = true
+			}
+			for _, a := range n.Args {
+				walkE(a)
+			}
+		case *IndirectCall:
+			// An indirect callee names nothing, but the function still is not
+			// a leaf, so it is not an inline candidate.
+			st.hasCall = true
+			for _, a := range n.Args {
+				walkE(a)
+			}
+		case *Binary:
+			walkE(n.L)
+			walkE(n.R)
+		case *Unary:
+			walkE(n.E)
+		case *CastExpr:
+			walkE(n.E)
+		case *AssignExpr:
+			walkE(n.Lhs)
+			walkE(n.Rhs)
+		case *IncDecExpr:
+			walkE(n.E)
+		case *Index:
+			walkE(n.Base)
+			walkE(n.Idx)
+		case *MemberExpr:
+			walkE(n.Base)
+		case *CondExpr:
+			walkE(n.Cond)
+			walkE(n.Then)
+			walkE(n.Else)
+		case *CommaExpr:
+			walkE(n.Left)
+			walkE(n.Right)
+		}
+	}
+	walkS = func(s Stmt) {
+		switch n := s.(type) {
+		case *Block:
+			for _, st := range n.Stmts {
+				walkS(st)
+			}
+		case *DeclList:
+			st.stmts += len(n.Decls)
+			for _, d := range n.Decls {
+				if t21HasAggType(d.Typ) {
+					st.hasAgg = true
+				}
+				if d.Init != nil {
+					walkE(d.Init)
+				}
+			}
+		case *DeclStmt:
+			st.stmts++
+			if t21HasAggType(n.Typ) {
+				st.hasAgg = true
+			}
+			if n.Init != nil {
+				walkE(n.Init)
+			}
+		case *ExprStmt:
+			st.stmts++
+			walkE(n.E)
+		case *AssignStmt:
+			st.stmts++
+			walkE(n.Lhs)
+			walkE(n.Rhs)
+		case *IfStmt:
+			st.stmts++
+			walkE(n.Cond)
+			walkS(n.Then)
+			if n.Else != nil {
+				walkS(n.Else)
+			}
+		case *WhileStmt:
+			st.stmts++
+			walkE(n.Cond)
+			walkS(n.Body)
+		case *DoWhileStmt:
+			st.stmts++
+			walkS(n.Body)
+			walkE(n.Cond)
+		case *ForStmt:
+			st.stmts++
+			if n.Init != nil {
+				walkS(n.Init)
+			}
+			if n.Cond != nil {
+				walkE(n.Cond)
+			}
+			if n.Post != nil {
+				walkE(n.Post)
+			}
+			walkS(n.Body)
+		case *ReturnStmt:
+			st.stmts++
+			if n.E != nil {
+				walkE(n.E)
+			}
+		case *SwitchStmt:
+			st.stmts++
+			walkE(n.Src)
+			walkS(n.Body)
+		case *LabelStmt:
+			walkS(n.Stmt)
+		}
+	}
+	walkS(f.Body)
+	return st
+}
+
+// t21InlineLikely reports whether f is one of the small call-free functions
+// inlineCalls expands at -O1, AND somebody actually calls it. Register-homing
+// such a function's parameters puts a `mov rbx, rcx` in its body, and the
+// inliner rightly refuses any template that writes a callee-save register (it
+// would corrupt the caller's own register-homed locals). For a function that
+// is about to be inlined, dropping a parameter reload is worth far less than
+// keeping the call itself expandable -- inlining deletes the whole body.
+//
+// Both conditions matter, and the second is why a plain size threshold is the
+// wrong tool. Measured on bench2, raising the statement bound made things
+// WORSE, not better (4 -> net 0, 12 -> +208, 30 -> +214 instructions): a wide
+// threshold parameter-homes functions that were only medium-sized, and the
+// inlining it destroys costs more than the reloads it saves. So decide by
+// call graph instead: an uncalled function is never inlined and is therefore
+// always safe, a caller (recursive or not) is never a leaf, and only a small
+// leaf that is actually called is at risk.
+func (c *CG) t21InlineLikely(f *FuncDecl, st t21BodyStats) bool {
+	const maxInlineStmts = 4
+	if st.hasCall || st.stmts > maxInlineStmts {
+		return false // not leaf, or too big to be worth inlining anyway
+	}
+	return c.t21Called[f.Name]
 }
 
 // zeroBytes emits code that stores n zero bytes at the memory pointed to by
