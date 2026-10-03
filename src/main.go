@@ -107,6 +107,13 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if cfg.rtdiag {
+		// Must happen BEFORE injectDefines/Preprocess so the macro reaches the
+		// user translation unit too -- that is what makes the <rt.h> diagnostic
+		// API (goc_rt_stats_t, __goc_rt_print, ...) visible to user code.
+		cfg.defines = append(cfg.defines, "GOC_RTDIAG=1")
+		SetRtdiag(true)
+	}
 	src = []byte(injectDefines(string(src), cfg.defines))
 
 	toks, err := PreprocessTarget(string(src), srcPath, cfg.linux, cfg.incDirs...)
@@ -290,6 +297,7 @@ type buildCfg struct {
 	linux   bool
 	winGUI  bool // -mwindows: PE subsystem 2 (GUI), no console window
 	opt     int  // optimisation level from -O<level> (0 = none)
+	rtdiag  bool // -rtdiag: compile-time diagnostic runtime (memory tracker)
 	outFile string
 	defines []string
 	incDirs []string
@@ -426,6 +434,11 @@ func parseArgs(args []string) (buildCfg, bool) {
 		case "-target":
 			v := takeVal(val)
 			cfg.linux = v == "linux" || v == "elf"
+		case "-rt", "-rtdiag":
+			// Compile-time optional diagnostic runtime: instruments malloc/free
+			// with a heap-object tracker, redzone OOB detection and (on Windows)
+			// a crash handler that dumps live allocations. No separate value.
+			cfg.rtdiag = true
 		// The following are accepted and ignored: they only make sense for a
 		// real multi-stage toolchain (separate linking, full warnings,
 		// alternate standards, ...). goc is a single-pass compiler.
@@ -544,6 +557,9 @@ Options:
   -target linux   emit a Linux ELF64 instead of a Windows PE32+
   -mwindows       PE subsystem 2 (windows GUI): no console window is
                   allocated; hInstance comes from GetModuleHandleA(NULL)
+  -rt, -rtdiag    enable the diagnostic runtime (memory tracker, redzone OOB
+                  detection, leak report; <rt.h> exposes runtime_stats() /
+                  runtime_print() / runtime_dump() / runtime_scan())
   -O* -Wall -W* -std -m* -g -static -pthread -f* -s -l -L -Wl,*
                   accepted and ignored (goc is a single-pass compiler)
   --version       show version

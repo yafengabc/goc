@@ -1,27 +1,44 @@
 #include "goclib.h"
+#include "rt.h"
 
 /* ----------------------------- <stdlib.h> ------------------------------- */
 
 void *malloc(size_t size) {
+#ifdef GOC_RTDIAG
+    return __goc_rt_malloc((long)size);
+#else
     return __goclib_heap_alloc((long)size);
+#endif
 }
 
 void free(void *p) {
+#ifdef GOC_RTDIAG
+    if (p) __goc_rt_free(p);
+#else
     __goclib_heap_free(p);
+#endif
 }
 
 void *calloc(size_t n, size_t size) {
+#ifdef GOC_RTDIAG
+    return __goc_rt_calloc((long)n, (long)size);
+#else
     size_t total = n * size;
     void *p = __goclib_heap_alloc((long)total);
     if (p) memset(p, 0, total);
     return p;
+#endif
 }
 
 /* realloc needs the old block's size, so the platform primitive owns the
  * job: Windows hands it to HeapReAlloc, Linux reads the size header the
  * bump allocator keeps in front of every block. */
 void *realloc(void *ptr, size_t size) {
+#ifdef GOC_RTDIAG
+    return __goc_rt_realloc(ptr, (long)size);
+#else
     return __goclib_heap_realloc(ptr, (long)size);
+#endif
 }
 
 /* goc's heap allocator returns 16-byte aligned blocks, which satisfies every

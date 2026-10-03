@@ -1,4 +1,5 @@
 #include "goclib.h"
+#include "rt.h"
 
 /* =============================================================================
  * os.c -- the five __goclib_* OS primitives.
@@ -45,6 +46,9 @@ long __goclib_read(char *buf, long len) {
 }
 
 void __goclib_exit(long code) {
+#ifdef GOC_RTDIAG
+    __goc_rt_report();
+#endif
     ExitProcess(code);
 }
 
@@ -98,6 +102,9 @@ long __goclib_read(char *buf, long len) {
 }
 
 void __goclib_exit(long code) {
+#ifdef GOC_RTDIAG
+    __goc_rt_report();
+#endif
     exit_group(code);
 }
 

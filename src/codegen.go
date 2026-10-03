@@ -304,9 +304,9 @@ var goclibCFS embed.FS
 func init() {
 	// Compile the built-in C library for both targets. A failure is reported
 	// through goclibErr when Gen runs.
-	clibCWin, clibCErr = buildClibC(false)
+	clibCWin, clibCErr = buildClibC(false, "")
 	if clibCErr == nil {
-		clibCLinux, clibCErr = buildClibC(true)
+		clibCLinux, clibCErr = buildClibC(true, "")
 	}
 	goclibErr = clibCErr
 }
@@ -342,6 +342,37 @@ var (
 	goclibErr  error
 )
 
+// Diagnostic runtime (compile-time optional via `goc -rtdiag`). When enabled,
+// a second copy of the embedded C library is compiled with GOC_RTDIAG defined,
+// so goclib's malloc/free/calloc/realloc wrappers and the allocation tracker
+// in rt.c activate. The two targets are compiled independently so a failure
+// on one does not block the other.
+var (
+	rtdiagMode     bool
+	rtdiagErr      error
+	clibCWinDiag   *clibCProgram
+	clibCLinuxDiag *clibCProgram
+)
+
+// SetRtdiag turns the compile-time diagnostic runtime on. It eagerly compiles
+// both target libraries with GOC_RTDIAG defined so any error surfaces before
+// Gen runs (Gen checks rtdiagErr up front). Safe to call once; repeated calls
+// are ignored.
+func SetRtdiag(on bool) {
+	if !on || rtdiagMode {
+		return
+	}
+	rtdiagMode = true
+	var e error
+	if clibCWinDiag, e = buildClibC(false, "#define GOC_RTDIAG 1\n"); e != nil {
+		rtdiagErr = e
+		return
+	}
+	if clibCLinuxDiag, e = buildClibC(true, "#define GOC_RTDIAG 1\n"); e != nil {
+		rtdiagErr = e
+	}
+}
+
 // calleeSaveAll is the complete set of callee-save GPRs the register allocator
 // may use as local-register homes (and as scratch). Every generated function
 // pushes and pops all of them so the callee-save ABI contract holds for its
@@ -349,8 +380,15 @@ var (
 // caller's cached local. See the prologue/epilogue emission in genFunction.
 var calleeSaveAll = []string{"rbx", "r12", "r13", "r14"}
 
-// clibCStore picks the compiled C library for a target.
+// clibCStore picks the compiled C library for a target. With the diagnostic
+// runtime enabled it returns the GOC_RTDIAG-instrumented copy instead.
 func clibCStore(linux bool) *clibCProgram {
+	if rtdiagMode {
+		if linux {
+			return clibCLinuxDiag
+		}
+		return clibCWinDiag
+	}
 	if linux {
 		return clibCLinux
 	}
@@ -362,10 +400,15 @@ func clibCStore(linux bool) *clibCProgram {
 // headers, so definitions placed there are collected too), then the .c files
 // in name order. The library has no main(), so that one checker diagnostic is
 // expected and filtered; anything else is a hard error -- the library must
-// compile for every program.
-func buildClibC(linux bool) (*clibCProgram, error) {
+// compile for every program. `defines` (may be empty) is prepended to every
+// source so a single macro (e.g. "#define GOC_RTDIAG 1\n") reaches each
+// translation unit -- the library files are compiled independently.
+func buildClibC(linux bool, defines string) (*clibCProgram, error) {
 	lib := &clibCProgram{funcs: map[string]*FuncDecl{}}
 	compile := func(name, src string) error {
+		if defines != "" {
+			src = defines + src
+		}
 		toks, err := PreprocessTarget(src, "goclib/"+name, linux)
 		if err != nil {
 			return fmt.Errorf("goclib/%s: %v", name, err)
@@ -2513,6 +2556,9 @@ func (c *CG) genExpr(e Expr) error {
 func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 	if goclibErr != nil {
 		return "", goclibErr
+	}
+	if rtdiagMode && rtdiagErr != nil {
+		return "", fmt.Errorf("rtdiag library build failed: %w", rtdiagErr)
 	}
 	c := &CG{
 		strLab:       map[*StrLit]string{},
