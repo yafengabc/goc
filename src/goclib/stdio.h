@@ -44,6 +44,14 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
 int vfprintf(FILE *stream, const char *fmt, va_list ap);
 int vprintf(const char *fmt, va_list ap);
 
+/* Internal: printf for a format the compiler proved is "lite" -- only %s,
+ * integers, %c and %f, with no field width, precision or flags (see the
+ * vfmt_lite comment in stdio.c). Writes straight to the OS handle, bypassing
+ * the FILE layer. Not called by user code: codegen rewrites those printf
+ * calls to this, and anything richer keeps the real printf. */
+int __goclib_printf_lite(const char *fmt, ...);
+int __goclib_printf_lite_f(const char *fmt, ...);
+
 /* getc/putc are the traditional macro spellings of fgetc/fputc. */
 #define getc(f)  fgetc(f)
 #define putc(c, f) fputc(c, f)

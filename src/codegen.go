@@ -9492,15 +9492,23 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 		c.resTyp = TInt
 		return TInt, nil
 	}
-	// Constant-format printf/fprintf fast path: a format string literal with
-	// no '%' and no extra arguments turns the format engine into a pure echo,
-	// so call fwrite directly. This keeps vfmt -- and the floating-point
-	// conversion machinery it statically pulls in (log/frexp/fmod/...) -- out
-	// of binaries that never use a conversion. fwrite returns the number of
-	// bytes written, exactly what printf would return here, so value
-	// semantics are unchanged.
+	// Constant-format printf specialisation, in two steps. A format string
+	// literal with no '%' and no extra arguments turns the format engine into a
+	// pure echo, so call fwrite directly. A literal format that is "lite" --
+	// only %s, integers, %c and %f, with no field width, precision or flags --
+	// is routed to vfmt_lite, which writes straight to the OS handle. Both
+	// keep vfmt, the FILE layer and the float exponent machinery
+	// (log/frexp/fmod/...) out of binaries that do not need them. Anything
+	// richer (width, precision, %e/%g/%a, %p) keeps the real printf; the
+	// decision is compile-time, so a run-time probe is never needed. See
+	// constantFormatLite and the vfmt_lite comment in stdio.c.
 	if n.Name == "printf" || n.Name == "fprintf" {
 		if repl := c.constantFormatFwrite(n); repl != nil {
+			return c.genCallExpr(repl)
+		}
+	}
+	if n.Name == "printf" {
+		if repl := c.constantFormatLite(n); repl != nil {
 			return c.genCallExpr(repl)
 		}
 	}
@@ -9548,6 +9556,120 @@ func (c *CG) constantFormatFwrite(n *Call) *Call {
 		&NumLit{Val: int64(len(lit.Bytes)), Kind: TInt},
 		stream,
 	}}
+}
+
+// constantFormatLite rewrites printf(fmt, ...) into __goclib_printf_lite when
+// fmt is a literal that the lite formatter can handle exactly: %s, %c, %d %i
+// %u %o %x %X, %f, and %%. goc prunes the embedded C library by call graph at
+// function granularity, so the full vfmt would drag the float exponent
+// machine (log/log10/frexp/fmod) into any binary that prints one %f, and the
+// FILE layer into any binary that prints anything at all. vfmt_lite has
+// neither.
+//
+// The decision is made here, at compile time, from the literal. A run-time
+// "try lite, fall back to vfmt" probe would not help: the fallback keeps vfmt
+// reachable, so nothing would be pruned. Rejecting the call outright leaves
+// the program correct via the ordinary printf, just larger.
+//
+// Returns nil -- the real printf handles it -- when the format is not a
+// literal, carries a field width, precision or any flag character ('-', '0',
+// '+', ' ', '#'), uses a length modifier, or names a specifier outside the
+// lite set (notably %e/%g/%a, which need the exponent estimator, and %p, whose
+// printf lowering ufcs_print_test.go asserts on).
+func (c *CG) constantFormatLite(n *Call) *Call {
+	if len(n.Args) < 1 {
+		return nil
+	}
+	lit, ok := n.Args[0].(*StrLit)
+	if !ok {
+		return nil // run-time format string: nothing to prove
+	}
+	target, ok := liteTargetFor(string(lit.Bytes))
+	if !ok {
+		return nil
+	}
+	if c.funcs[target] {
+		return nil // the program defines its own lite entry
+	}
+	if _, _, shadowed := c.fnPtrVar(target); shadowed {
+		return nil
+	}
+	args := make([]Expr, 0, len(n.Args))
+	args = append(args, n.Args...)
+	return &Call{Name: target, Args: args}
+}
+
+// liteTargetFor picks the cheapest lite formatter that covers a format
+// literal: the integer-only entry when there is no %f, the float one when
+// there is. Splitting them is what keeps double_to_buf/floor/fmod/signbit and
+// friends out of a program that never prints a double -- a single vfmt_lite
+// with an unconditional %f branch referenced them even for printf("%d").
+// Returns ok = false when the format is not lite at all.
+func liteTargetFor(f string) (string, bool) {
+	has, hasFloat := scanLiteFormat(f)
+	if !has {
+		return "", false
+	}
+	if hasFloat {
+		return "__goclib_printf_lite_f", true
+	}
+	return "__goclib_printf_lite", true
+}
+
+// scanLiteFormat reports whether every conversion in a printf format literal is
+// one the lite formatters reproduce exactly, whether there is at least one
+// conversion (a format with none is constantFormatFwrite's echo case, and a
+// separate function keeps each rewrite to one job), and whether any of them is
+// %f/%F -- which decides the integer-only or the float entry point.
+//
+// The walk follows the printf grammar vfmt parses, so it rejects exactly what
+// lite cannot do. Any of these after a '%' disqualify the format:
+//
+//   - a flag character  -  0  +  space  #
+//   - a width: '*' or any digit
+//   - a precision: '.', optionally followed by '*' or digits
+//   - a length modifier: h l L q j z t
+//   - a specifier outside s c d i u o x X f F
+//
+// '%%' is a literal percent, not a conversion; a 'f' or '%' anywhere outside a
+// conversion is plain text. A trailing lone '%' is malformed but harmless, so
+// it is treated as text rather than a reason to reject.
+func scanLiteFormat(f string) (has, hasFloat bool) {
+	has = false
+	for i := 0; i < len(f); i++ {
+		if f[i] != '%' {
+			continue
+		}
+		i++
+		if i >= len(f) {
+			break // trailing '%': not a conversion
+		}
+		if f[i] == '%' {
+			continue // "%%" is a literal percent
+		}
+		// From here on the conversion must be bare: no flags, width,
+		// precision or length modifier may precede the specifier.
+		if strings.IndexByte("-+0 #.", f[i]) >= 0 {
+			return false, false
+		}
+		if f[i] == '*' || (f[i] >= '0' && f[i] <= '9') {
+			return false, false // field width
+		}
+		if strings.IndexByte("hlLqjzt", f[i]) >= 0 {
+			return false, false // length modifier
+		}
+		switch f[i] {
+		case 'f', 'F':
+			has = true
+			hasFloat = true
+		case 's', 'c', 'd', 'i', 'u', 'o', 'x', 'X':
+			has = true
+		default:
+			// %p, %e, %g, %a and anything unknown stay on the full vfmt.
+			return false, false
+		}
+	}
+	return has, hasFloat
 }
 
 // needsFullExit reports whether the entry stub must terminate through the

@@ -178,6 +178,282 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
     return n;
 }
 
+/* ============================ vfmt_lite ====================================
+ * Minimal formatters for size-constrained targets.
+ *
+ * Why they exist: goc prunes the embedded C library by call graph at FUNCTION
+ * granularity, so any single printf that reaches the full vfmt drags in the
+ * whole float formatting machine -- __goclib_double_to_exp, _to_hex,
+ * _strip_g, fmt_pow10, fmt_g_exp, fmt_split_dec and, behind those,
+ * frexp/log/log10/fmod. On a host that is noise; on an embedded target it is
+ * the whole flash budget.
+ *
+ * There are two, and the split is the point:
+ *
+ *   vfmt_i / __goclib_printf_lite     integers, chars, strings, %%. Holds NO
+ *                                    reference to a float helper, so a binary
+ *                                    that never prints a double links none of
+ *                                    double_to_buf, floor, fmod, signbit, fabs,
+ *                                    trunc, trunc_to_zero, fmt_int_part.
+ *   vfmt_f / __goclib_printf_lite_f   the same plus %f / %F at 6 fractional
+ *                                    digits. %f is cheap -- it needs only
+ *                                    double_to_buf (floor/fmod/signbit behind
+ *                                    it). %e and %g need the exponent estimator
+ *                                    (fmt_split_dec -> frexp/log/log10) plus
+ *                                    strip_g, so those stay out of both.
+ *
+ * codegen picks between them by scanning the literal (scanLiteFormat), so a
+ * program pays only for the conversions it actually writes.
+ *
+ * The two bodies below are literal copies differing only in the %f branch.
+ * That duplication is deliberate and load-bearing: it is what lets goc's
+ * function-granular call-graph pruning drop the float chain from the integer
+ * build. It is generated from one template rather than hand-maintained, and
+ * goc's preprocessor cannot express it -- it does not constant-fold `0 && x`
+ * (so a parameterised macro keeps the branch) and a macro that expands to
+ * nothing mid-if-chain leaves a dangling `else`. If you change one, change
+ * both, or better: change the template and regenerate.
+ *
+ * NOT supported, by design: field width, precision, the '-', '0', '+', ' '
+ * and '#' flags, length modifiers, %p, and the %e/%g/%a family. A format
+ * needing any of those is rejected at compile time and printed by the full
+ * vfmt instead, so behaviour is never wrong -- only the code path differs.
+ * The compile-time check is what makes this worthwhile: a run-time "try lite,
+ * else fall back" probe would keep vfmt reachable and the saving would vanish.
+ *
+ * Output goes straight to the OS handle via WriteFile/write, bypassing the
+ * FILE layer. That drops another ~15KB (fwrite, the stream objects, the
+ * seek/write_at machinery) and removes buffering, which is what an embedded
+ * console wants. The trade-off: printf_lite output is not interleaved with
+ * buffered stdout writes, so mixing printf_lite and printf on one stream can
+ * reorder if the latter is still buffered.
+ *
+ * Both format in two passes (measure, then write) so a long %s gets an exactly
+ * sized heap buffer instead of a silent truncation.
+ */
+
+/* vfmt_i: no floating point at all. */
+static int vfmt_i(char *out, long limit, const char *fmt, va_list ap) {
+    long n = 0;
+    const char *p = fmt;
+    while (*p) {
+        if (*p != '%') {
+            if (limit < 0 || n < limit) out[n] = *p;
+            n++;
+            p++;
+            continue;
+        }
+        p++;
+        if (*p == '%') {
+            if (limit < 0 || n < limit) out[n] = '%';
+            n++;
+            p++;
+            continue;
+        }
+        /* No flags, width or precision are parsed: scanLiteFormat guarantees
+         * none is present, so anything landing here is a bare conversion. */
+        char spec = *p++;
+        char field[512];
+        int fl = 0;
+        const char *s = 0;
+        if (spec == 's') {
+            s = va_arg(ap, const char *);
+            if (!s) s = "(null)";
+        } else if (spec == 'c') {
+            int c = va_arg(ap, int);
+            field[fl++] = (char)c;
+        } else if (spec == 'd' || spec == 'i' || spec == 'u' ||
+                   spec == 'o' || spec == 'x' || spec == 'X') {
+            unsigned long v;
+            if (spec == 'd' || spec == 'i') {
+                long sv = va_arg(ap, long);
+                if (sv < 0 && spec != 'u') {
+                    field[fl++] = '-';
+                    v = (unsigned long)(-sv);
+                } else {
+                    v = (unsigned long)sv;
+                }
+                if (spec == 'u') v = (unsigned long)sv;
+            } else {
+                v = va_arg(ap, unsigned long);
+            }
+            int base = 10;
+            if (spec == 'o') base = 8;
+            else if (spec == 'x' || spec == 'X') base = 16;
+            char tmp[32];
+            int t = 0;
+            if (v == 0) { tmp[t++] = '0'; }
+            while (v > 0) {
+                int d = (int)(v % base);
+                v /= base;
+                if (d < 10) tmp[t++] = (char)('0' + d);
+                else tmp[t++] = (char)((spec == 'X' ? 'A' : 'a') + (d - 10));
+            }
+            while (t-- > 0) field[fl++] = tmp[t];
+        } else {
+            /* Unreachable: scanLiteFormat rejects anything else. Emitting the
+             * specifier verbatim matches vfmt's unknown-specifier behaviour. */
+            field[fl++] = spec;
+        }
+        if (spec == 's') {
+            while (*s) { if (limit < 0 || n < limit) out[n] = *s; n++; s++; }
+        } else {
+            int k;
+            for (k = 0; k < fl; k++) {
+                if (limit < 0 || n < limit) out[n] = field[k];
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/* vfmt_f: identical, plus %f / %F. */
+static int vfmt_f(char *out, long limit, const char *fmt, va_list ap) {
+    long n = 0;
+    const char *p = fmt;
+    while (*p) {
+        if (*p != '%') {
+            if (limit < 0 || n < limit) out[n] = *p;
+            n++;
+            p++;
+            continue;
+        }
+        p++;
+        if (*p == '%') {
+            if (limit < 0 || n < limit) out[n] = '%';
+            n++;
+            p++;
+            continue;
+        }
+        /* No flags, width or precision are parsed: scanLiteFormat guarantees
+         * none is present, so anything landing here is a bare conversion. */
+        char spec = *p++;
+        char field[512];
+        int fl = 0;
+        const char *s = 0;
+        if (spec == 's') {
+            s = va_arg(ap, const char *);
+            if (!s) s = "(null)";
+        } else if (spec == 'c') {
+            int c = va_arg(ap, int);
+            field[fl++] = (char)c;
+        } else if (spec == 'd' || spec == 'i' || spec == 'u' ||
+                   spec == 'o' || spec == 'x' || spec == 'X') {
+            unsigned long v;
+            if (spec == 'd' || spec == 'i') {
+                long sv = va_arg(ap, long);
+                if (sv < 0 && spec != 'u') {
+                    field[fl++] = '-';
+                    v = (unsigned long)(-sv);
+                } else {
+                    v = (unsigned long)sv;
+                }
+                if (spec == 'u') v = (unsigned long)sv;
+            } else {
+                v = va_arg(ap, unsigned long);
+            }
+            int base = 10;
+            if (spec == 'o') base = 8;
+            else if (spec == 'x' || spec == 'X') base = 16;
+            char tmp[32];
+            int t = 0;
+            if (v == 0) { tmp[t++] = '0'; }
+            while (v > 0) {
+                int d = (int)(v % base);
+                v /= base;
+                if (d < 10) tmp[t++] = (char)('0' + d);
+                else tmp[t++] = (char)((spec == 'X' ? 'A' : 'a') + (d - 10));
+            }
+            while (t-- > 0) field[fl++] = tmp[t];
+        }
+        else if (spec == 'f' || spec == 'F') {
+            double x = va_arg(ap, double);
+            fl = __goclib_double_to_buf(field, x, 6);
+        } else {
+            /* Unreachable: scanLiteFormat rejects anything else. Emitting the
+             * specifier verbatim matches vfmt's unknown-specifier behaviour. */
+            field[fl++] = spec;
+        }
+        if (spec == 's') {
+            while (*s) { if (limit < 0 || n < limit) out[n] = *s; n++; s++; }
+        } else {
+            int k;
+            for (k = 0; k < fl; k++) {
+                if (limit < 0 || n < limit) out[n] = field[k];
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/* Raw output to a standard handle, bypassing the FILE layer. Mirrors the
+ * crash-safe writer in rt.c: one WriteFile per call, no stdio state. */
+#ifdef _WIN32
+extern void *GetStdHandle(long which);
+extern long  WriteFile(void *h, const void *buf, long n, long *written, long overlapped);
+#define GOC_LITE_STDOUT (-11)  /* STD_OUTPUT_HANDLE: a HANDLE, not an fd */
+static int lite_write(const char *s, long n) {
+    void *h = GetStdHandle(GOC_LITE_STDOUT);
+    long w = 0;
+    if (!h || n <= 0) return -1;
+    return WriteFile(h, s, n, &w, 0) ? (int)w : -1;
+}
+#else
+extern long write(long fd, const void *buf, long n);
+#define GOC_LITE_STDOUT 1      /* stdout is file descriptor 1 */
+static int lite_write(const char *s, long n) {
+    if (n <= 0) return -1;
+    return (int)write(GOC_LITE_STDOUT, s, n);
+}
+#endif
+
+/* Shared measure-then-write driver. goc's va_list is a pointer, so copying the
+ * started list restarts it -- that is what makes the measuring pass possible.
+ * Copy ap, never an unstarted local: va_start writes through ap, and a copy of
+ * a never-started va_list is garbage (symptom: two printf_lite calls in a row
+ * exit 127 and the second line is lost, while a single call happens to work). */
+static int printf_lite_with(int (*fmtfn)(char *, long, const char *, va_list),
+                            const char *fmt, va_list ap) {
+    va_list measure = ap;
+    long n = fmtfn(0, 0, fmt, measure);      /* pass 1: length only */
+    if (n <= 0) return (int)n;
+    if (n <= 512) {
+        char buf[512];
+        fmtfn(buf, n, fmt, ap);
+        int w = lite_write(buf, n);
+        return w < 0 ? (int)n : w;
+    }
+    char *big = (char *)malloc(n + 1);
+    if (big != 0) {
+        fmtfn(big, n, fmt, ap);
+        int w = lite_write(big, n);
+        free(big);
+        return w < 0 ? (int)n : w;
+    }
+    char buf[4096];                          /* out of memory: never crash */
+    fmtfn(buf, 4096, fmt, ap);
+    int w = lite_write(buf, 4096);
+    return w < 0 ? 4096 : w;
+}
+
+int __goclib_printf_lite(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = printf_lite_with(vfmt_i, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int __goclib_printf_lite_f(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = printf_lite_with(vfmt_f, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
 /* ----------------- shared floating-point conversion -----------------------
  * The %f/%g machinery of vfmt, extracted so the array printers can reuse it:
  * a floating-point array is printed element by element with the very same
