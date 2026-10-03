@@ -1060,3 +1060,82 @@ int main(){ return f(-7); }`
 		t.Fatalf("(long) cast of materialized int must sign-extend, got:\n%s", body3)
 	}
 }
+
+// TestCopyElimBlockWideChain: a GP-GP mov with two mov consumers before the
+// next rewrite of D is deleted; both consumers read the root.
+func TestCopyElimBlockWideChain(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r12"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+		{Kind: instInstr, Text: "\tmov r11, rax"},
+		{Kind: instInstr, Text: "\tmov rax, 5"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov rax, r12") != 0 {
+		t.Fatalf("mov must be deleted, got %v", got)
+	}
+	if countText(got, "mov r10, r12") != 1 || countText(got, "mov r11, r12") != 1 {
+		t.Fatalf("consumers must read the root, got %v", got)
+	}
+}
+
+// TestCopyElimBlockWideStore: a store consumer before the rewrite is
+// substituted and the mov deleted.
+func TestCopyElimBlockWideStore(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r12"},
+		{Kind: instInstr, Text: "\tmov [rbp-8], rax"},
+		{Kind: instInstr, Text: "\tmov rax, 5"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov rax, r12") != 0 {
+		t.Fatalf("mov must be deleted, got %v", got)
+	}
+	if countText(got, "mov [rbp-8], r12") != 1 {
+		t.Fatalf("store consumer must read the root, got %v", got)
+	}
+}
+
+// TestCopyElimBlockWideAbortNonMov: a non-mov read of D aborts the deletion.
+func TestCopyElimBlockWideAbortNonMov(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r12"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+		{Kind: instInstr, Text: "\tadd r11, rax"},
+		{Kind: instInstr, Text: "\tmov rax, 5"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov rax, r12") != 1 {
+		t.Fatalf("non-mov consumer must abort deletion, got %v", got)
+	}
+}
+
+// TestCopyElimBlockWideAbortSrcWrite: a write of src before the consumer
+// aborts the deletion.
+func TestCopyElimBlockWideAbortSrcWrite(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r12"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+		{Kind: instInstr, Text: "\tmov r12, 7"},
+		{Kind: instInstr, Text: "\tmov r11, rax"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov rax, r12") != 1 {
+		t.Fatalf("src write must abort deletion, got %v", got)
+	}
+}
+
+// TestCopyElimBlockWideUnterminated: a window ending at a block boundary
+// without D being rewritten must not delete (D may be read later).
+func TestCopyElimBlockWideUnterminated(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r12"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+		{Kind: instInstr, Text: "\tjmp .L1"},
+		{Kind: instLabel, Text: ".L1:"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov rax, r12") != 1 {
+		t.Fatalf("unterminated window must not delete, got %v", got)
+	}
+}

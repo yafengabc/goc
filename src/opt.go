@@ -711,60 +711,6 @@ func copyElim(insts []Inst) []Inst {
 		killed[r] = true
 	}
 
-	// readBeforeWrite scans forward from start+2 (skipping the immediate
-	// consumer at start+1, which we are folding) up to max 8 instructions,
-	// looking for a read of D before any write of D.
-	readBeforeWrite := func(start int, d string) bool {
-		for j := start + 2; j < len(insts) && j <= start+8; j++ {
-			in := insts[j]
-			if in.Kind != instInstr {
-				return true // block end: conservative, D is "read"
-			}
-			t := strings.TrimSpace(in.Text)
-			if t == "" || strings.HasPrefix(t, ".") {
-				return true
-			}
-			pl, ok := parseBodyLine(in.Text)
-			if !ok {
-				return true
-			}
-			// Control flow breaks the block.
-			if pl.op == "call" || pl.op == "ret" || pl.op == "leave" ||
-				pl.op == "push" || pl.op == "pop" || pl.op == "loop" ||
-				strings.HasPrefix(pl.op, "j") {
-				return true
-			}
-			// div/idiv/mul implicitly read rdx:rax (dividend) — treat as read.
-			if (pl.op == "div" || pl.op == "idiv" || pl.op == "mul") &&
-				(d == "rax" || d == "rdx" || d == "eax" || d == "edx") {
-				return true
-			}
-			// Does this instruction write D?
-			if writesReg(in.Text, d) {
-				// But dstReadWrite ops also READ D as a source.
-				if dstReadWrite(pl.op) && readsReg(in.Text, d) {
-					return true // D is read (e.g. "add D, Y" reads D's old value)
-				}
-				return false // D is written without being read first
-			}
-			// Does this instruction read D (any width, including in mem)?
-			if readsReg(in.Text, d) {
-				return true
-			}
-			// Check registers inside memory operands.
-			for _, o := range pl.operands {
-				if isMemOperand(o) {
-					for _, r := range regsInMem(o) {
-						if r == d {
-							return true
-						}
-					}
-				}
-			}
-		}
-		return true // scanned to block end: conservative
-	}
-
 	// goclib library functions contain long mov chains that this basic-block
 	// pass does not yet handle safely (observed corruption). Skip them.
 	skipFunc := false
@@ -834,65 +780,122 @@ func copyElim(insts []Inst) []Inst {
 					out = append(out, in)
 					continue
 				}
-				// --- Adjacent deletion check (A version: only i+1) ---
-				// If next instruction (i+1) is a mov consumer of D (X,D) or
-				// store consumer ([s],D), and D is not read before being
-				// rewritten (within 8 instructions), then delete this mov
-				// and substitute the consumer to read directly from root.
-				deleted := false
-				if i+1 < len(insts) && insts[i+1].Kind == instInstr {
-					next := insts[i+1]
-					pln, okn := parseBodyLine(next.Text)
-					if okn && pln.op == "mov" && len(pln.operands) == 2 {
-						consumeReg := ""
-						if !isMemOperand(pln.operands[0]) && pln.operands[1] == dst &&
-							gp64Regs[pln.operands[0]] {
-							consumeReg = pln.operands[0]
-						} else if isMemOperand(pln.operands[0]) && pln.operands[1] == dst {
-							consumeReg = "STORE"
+				// --- Block-local deletion (B version) ---
+				// Scan the whole basic block: every mov consumer of D (X,D /
+				// [s],D) before the first rewrite of D is substituted to read
+				// the root directly and the mov is deleted. Any non-mov read
+				// of D, any write of src (the substitution target), any
+				// dstReadWrite of D, any memory operand using D, or a window
+				// that ends at a block boundary without D being rewritten
+				// aborts the deletion.
+				type b1Consumer struct {
+					idx  int
+					text string
+				}
+				var b1cs []b1Consumer
+				safe := true
+				terminated := false
+				lastC := -1
+				for j := i + 1; j < len(insts); j++ {
+					if insts[j].Kind != instInstr {
+						safe = false
+						break
+					}
+					tj := strings.TrimSpace(insts[j].Text)
+					if tj == "" || strings.HasPrefix(tj, ".") {
+						safe = false
+						break
+					}
+					plj, okj := parseBodyLine(insts[j].Text)
+					if !okj {
+						safe = false
+						break
+					}
+					if plj.op == "call" || plj.op == "ret" || plj.op == "leave" ||
+						plj.op == "push" || plj.op == "pop" || plj.op == "loop" ||
+						strings.HasPrefix(plj.op, "j") {
+						break // block boundary: window ends without rewrite
+					}
+					if (plj.op == "div" || plj.op == "idiv" || plj.op == "mul") &&
+						(dst == "rax" || dst == "rdx" || dst == "eax" || dst == "edx") {
+						safe = false
+						break
+					}
+					// D rewritten without being read first: window ends.
+					if writesReg(insts[j].Text, dst) {
+						if dstReadWrite(plj.op) && readsReg(insts[j].Text, dst) {
+							safe = false // dstReadWrite consumer not handled
+						} else {
+							terminated = true
 						}
-						if consumeReg != "" && !readBeforeWrite(i, dst) {
-							// Safe to delete this mov and substitute consumer.
-							if consumeReg == "STORE" {
-								out = append(out, Inst{Kind: next.Kind,
-									Text: "\tmov " + pln.operands[0] + ", " + r})
-							} else {
-								out = append(out, Inst{Kind: next.Kind,
-									Text: "\tmov " + consumeReg + ", " + r})
-								// Update state: consumeReg now copies root.
-								killReg(consumeReg)
-								copyOf[consumeReg] = r
-								killed[consumeReg] = false
+						break
+					}
+					// src must stay live for substituted consumers.
+					if writesReg(insts[j].Text, src) {
+						safe = false
+						break
+					}
+					// Any read of D inside a memory operand breaks analysis.
+					for _, o := range plj.operands {
+						if isMemOperand(o) {
+							for _, rr := range regsInMem(o) {
+								if rr == dst {
+									safe = false
+									break
+								}
 							}
-							i++ // skip the consumer (already emitted)
-							deleted = true
-						} else if consumeReg != "" {
-							// Not safe to delete (D has later reads), but still
-							// substitute the consumer to read from root.
-							// Emit original mov first, then substituted consumer.
-							out = append(out, in)
-							if consumeReg == "STORE" {
-								out = append(out, Inst{Kind: next.Kind,
-									Text: "\tmov " + pln.operands[0] + ", " + r})
-							} else {
-								out = append(out, Inst{Kind: next.Kind,
-									Text: "\tmov " + consumeReg + ", " + r})
-								killReg(consumeReg)
-								copyOf[consumeReg] = r
-								killed[consumeReg] = false
-							}
-							i++ // skip the consumer (already emitted)
-							continue
 						}
 					}
+					if !safe {
+						break
+					}
+					if readsReg(insts[j].Text, dst) {
+						if plj.op == "mov" && len(plj.operands) == 2 && plj.operands[1] == dst {
+							if !isMemOperand(plj.operands[0]) && gp64Regs[plj.operands[0]] {
+								b1cs = append(b1cs, b1Consumer{j, "\tmov " + plj.operands[0] + ", " + r})
+								lastC = j
+								continue
+							}
+							if isMemOperand(plj.operands[0]) {
+								b1cs = append(b1cs, b1Consumer{j, "\tmov " + plj.operands[0] + ", " + r})
+								lastC = j
+								continue
+							}
+						}
+						safe = false // non-mov consumer of D
+						break
+					}
+				}
+				deleted := false
+				if safe && terminated && len(b1cs) > 0 {
+					// Delete the mov; emit the window up to the last consumer
+					// with consumers substituted; restart the chain cleanly.
+					for k := i + 1; k <= lastC; k++ {
+						ct := ""
+						for _, c := range b1cs {
+							if c.idx == k {
+								ct = c.text
+								break
+							}
+						}
+						if ct != "" {
+							out = append(out, Inst{Kind: insts[k].Kind, Text: ct})
+						} else {
+							out = append(out, insts[k])
+						}
+					}
+					clearAll()
+					i = lastC
+					deleted = true
+				} else {
+					// Not deletable: emit the mov, flattened to the root.
+					out = append(out, Inst{Kind: in.Kind,
+						Text: "\tmov " + dst + ", " + r})
+					continue
 				}
 				if deleted {
 					continue
 				}
-				// Emit the mov, flattened to the root.
-				out = append(out, Inst{Kind: in.Kind,
-					Text: "\tmov " + dst + ", " + r})
-				continue
 			}
 			// 32-bit/8-bit mov: killReg, no chain.
 			if !gp64Regs[dst] || !gp64Regs[src] {
