@@ -679,3 +679,214 @@ func splitSizedMem(m string) (sz, bare string) {
 	}
 	return "", m
 }
+
+// sibFoldSkip bypasses the SIB-index-address fold pass in Gen() -- its
+// independent switch.
+var sibFoldSkip bool
+
+// f2IdxRegSkip bypasses the F2 direct-register index consumption in
+// genLValue -- its independent switch.
+var f2IdxRegSkip bool
+
+// sibFold collapses the address-computation idiom that genLValue emits for
+// array indexing
+//
+//	imul r11, K       ; index * element_width (K is 1/2/4/8)
+//	add  r10, r11     ; base + scaled index
+//	mov  D, [r10]     ; (or mov [r10], S) -- the element load / store
+//
+// into a single SIB memory operand
+//
+//	mov  D, [r10+r11*K]
+//
+// A signed index was movsxd'd into r11 before the imul, so a negative index
+// has already been sign-extended and the 64-bit two's-complement scaled add
+// wraps exactly like the SIB scale (which uses the full 64-bit index register
+// times the scale); the fold is therefore safe for negative indices too.
+//
+// Correctness discipline (mirrors slotCache's window model):
+//   - only the exact three-instruction idiom, strictly adjacent, all
+//     instInstr lines;
+//   - the load/store must address plain [r10] (no displacement) and its
+//     destination / source must not reference r10 or r11 (a load into the
+//     base register would destroy the SIB base; a store whose source is the
+//     base or index would race the SIB read);
+//   - after the fold, r10 holds only the BASE address and r11 the scaled
+//     index, whereas before it held base+index / scaled index; the fold is
+//     allowed only when neither register is read again before it is next
+//     written;
+//   - flags: imul/add write flags, so no flag-reading instruction may sit
+//     between the fold point and the next flag-writing instruction;
+//   - windows break at labels, calls, jumps, returns and inline asm.
+func sibFold(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	reAdd := []byte("\tadd r10, r11")
+	reImul := []byte("\timul r11, ")
+	for i := 0; i < len(insts); i++ {
+		in := insts[i]
+		if in.Kind != instInstr || !strings.HasPrefix(in.Text, string(reImul)) {
+			out = append(out, in)
+			continue
+		}
+		k, err := strconv.Atoi(strings.TrimSpace(in.Text[len(reImul):]))
+		if err != nil || (k != 1 && k != 2 && k != 4 && k != 8) {
+			out = append(out, in)
+			continue
+		}
+		if i+2 >= len(insts) || insts[i+1].Kind != instInstr ||
+			!strings.HasPrefix(insts[i+1].Text, string(reAdd)) {
+			out = append(out, in)
+			continue
+		}
+		mv := insts[i+2]
+		if mv.Kind != instInstr {
+			out = append(out, in)
+			continue
+		}
+		folded, ok := sibFoldMov(mv.Text, k)
+		if !ok || !sibFoldWindowSafe(insts, i+3) {
+			out = append(out, in)
+			continue
+		}
+		out = append(out, Inst{Kind: instInstr, Text: folded})
+		i += 2 // skip the imul and the add
+	}
+	return out
+}
+
+// sibFoldMov rewrites the element load/store of the idiom into its SIB form,
+// or reports !ok when the mov is not the plain-[r10] form we fold.
+func sibFoldMov(t string, k int) (string, bool) {
+	rest := strings.TrimPrefix(t, "\tmov ")
+	if rest == t {
+		return "", false
+	}
+	rest = strings.TrimSpace(rest)
+	scale := strconv.Itoa(k)
+	// store direction: "mov [r10], S"
+	if strings.HasPrefix(rest, "[r10]") {
+		after := rest[len("[r10]"):]
+		if !strings.HasPrefix(after, ",") {
+			return "", false
+		}
+		src := strings.TrimSpace(after[1:])
+		if strings.Contains(src, "r10") || strings.Contains(src, "r11") {
+			return "", false
+		}
+		return "\tmov [r10+r11*" + scale + "], " + src, true
+	}
+	// sized store: "mov byte [r10], S" / "mov word [r10], rax" / "mov dword [r10], eax"
+	for _, pre := range []string{"byte ", "word ", "dword "} {
+		if strings.HasPrefix(rest, pre+"[r10]") {
+			after := rest[len(pre+"[r10]"):]
+			if !strings.HasPrefix(after, ",") {
+				return "", false
+			}
+			src := strings.TrimSpace(after[1:])
+			if strings.Contains(src, "r10") || strings.Contains(src, "r11") {
+				return "", false
+			}
+			return "\tmov " + pre + "[r10+r11*" + scale + "], " + src, true
+		}
+	}
+	// load direction: "mov D, [r10]" with D not referencing r10/r11
+	if strings.HasSuffix(rest, "[r10]") {
+		dst := strings.TrimSpace(strings.TrimSuffix(rest, "[r10]"))
+		dst = strings.TrimSpace(strings.TrimSuffix(dst, ","))
+		if dst == "" || strings.Contains(dst, "r10") || strings.Contains(dst, "r11") {
+			return "", false
+		}
+		return "\tmov " + dst + ", [r10+r11*" + scale + "]", true
+	}
+	return "", false
+}
+
+// sibFoldWindowSafe reports whether nothing between from and the next write of
+// r10/r11 (or a window break) reads either register, and no flag read
+// observes the deleted imul/add's flags.
+func sibFoldWindowSafe(insts []Inst, from int) bool {
+	flagsFresh := false // false until the first flag write after the fold point
+	for j := from; j < len(insts); j++ {
+		in := insts[j]
+		if in.Kind != instInstr {
+			// labels break the window; other non-instruction lines (rare) too
+			return true
+		}
+		t := strings.TrimSpace(in.Text)
+		if t == "" {
+			continue
+		}
+		op := strings.SplitN(t, " ", 2)[0]
+		// hard breaks: unconditional control flow, calls, inline asm (its flag
+		// effects are the author's business), stack ops that may alias r10/r11
+		// slots. Conditional jumps (jcc) are NOT breaks: they read flags, so
+		// they fall through to the flag check below.
+		if op == "call" || op == "jmp" ||
+			op == "ret" || op == "syscall" || op == "int" || op == "lock" || op == "rep" {
+			return true
+		}
+		if strings.Contains(t, "__asm") {
+			return true
+		}
+		// a write of r10 or r11 ends the observation window: after the fold
+		// the register carries a fresh value, so no later read can observe the
+		// deleted add/imul's result. (A write that also READS the register,
+		// e.g. "mov r10, [r10]", fails the read check below.)
+		if writesReg(t, "r10") || writesReg(t, "r11") {
+			// the write itself must not read the old value
+			if readsReg(in.Text, "r10") || readsReg(in.Text, "r11") {
+				return false
+			}
+			return true
+		}
+		// a read of r10/r11 would observe the pre-fold values: not foldable
+		if readsReg(in.Text, "r10") || readsReg(in.Text, "r11") {
+			return false
+		}
+		if isFlagWriteOp(op) {
+			flagsFresh = true
+			continue
+		}
+		if !flagsFresh && isFlagReadOp(op) {
+			return false
+		}
+	}
+	return true
+}
+
+// writesReg reports whether an instruction writes register reg (or a
+// sub-register r10d/r10b/r10w). Only dst-writing ALU/mov forms count.
+func writesReg(t, reg string) bool {
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return false
+	}
+	parts := strings.SplitN(t, " ", 2)
+	op := parts[0]
+	switch op {
+	case "mov", "add", "sub", "imul", "lea", "and", "or", "xor", "inc", "dec",
+		"neg", "not", "shl", "shr", "sar", "sal", "rol", "ror":
+	default:
+		return false
+	}
+	if len(parts) < 2 {
+		return false
+	}
+	rest := strings.TrimSpace(parts[1])
+	dst := strings.TrimSpace(strings.SplitN(rest, ",", 2)[0])
+	return dst == reg || strings.HasPrefix(dst, reg+"d") ||
+		strings.HasPrefix(dst, reg+"b") || strings.HasPrefix(dst, reg+"w")
+}
+
+// readsReg reports whether an instruction reads register reg (any width).
+// A write whose source also references the register ("mov r10, [r10]") counts
+// as a read as well.
+func readsReg(t, reg string) bool {
+	if !strings.Contains(t, reg) {
+		return false
+	}
+	if !writesReg(t, reg) {
+		return true
+	}
+	return strings.Count(t, reg) > 1
+}

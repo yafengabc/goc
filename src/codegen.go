@@ -2695,6 +2695,9 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 		if !algebraicIdentSkip {
 			c.insts = algebraicIdent(c.insts)
 		}
+		if !sibFoldSkip {
+			c.insts = sibFold(c.insts)
+		}
 		c.insts = deadStores(c.insts)
 		c.insts = livenessDSE(c.insts)
 	}
@@ -6461,21 +6464,52 @@ func (c *CG) genLValue(e Expr) error {
 		// Element address = base_address + index*8. Compute the index first
 		// and spill it, because evaluating the base may call a function and
 		// clobber the volatile registers.
-		if _, err := c.genExprT(n.Idx); err != nil {
-			return err
+		//
+		// F2: when the index is a register-cached int variable (varInfo.reg,
+		// a callee-save home assigned by T2.1 that survives calls), skip the
+		// genExprT + spill + reload entirely: the value is already live in the
+		// callee-save across the base evaluation, and its low dword (or full
+		// width for long/pointer indices) is consumed directly below.
+		var idxReg string
+		if !f2IdxRegSkip {
+			if id, ok := n.Idx.(*Ident); ok {
+				if vi, ok2 := c.lookupVar(id.Name); ok2 && vi.reg != "" {
+					idxReg = vi.reg
+				}
+			}
+		}
+		if idxReg == "" {
+			if _, err := c.genExprT(n.Idx); err != nil {
+				return err
+			}
 		}
 		// N11: capture the index's own width/sign -- a signed int index is
 		// materialized (high 32 = 0), so the 64-bit scaled add below needs
 		// movsxd for negative indexes (p[-3]). An unsigned int index must stay
 		// zero-extended (large indexes >= 2^31 address real memory), and a long
 		// index is already full width.
-		iw, is := c.resW, c.resSigned
-		// T1.6 (C4): a ptrCapable index holds pointer bits; the movsxd below
-		// is skipped so the full 64-bit index reaches the scaled add.
-		ip := c.resPtr
-		c.tmpDepth++
-		islot := c.tmpSlot(c.tmpDepth)
-		c.emit("mov [rbp%+d], rax", islot)
+		var iw int
+		var is bool
+		var ip bool
+		if idxReg != "" {
+			// F2 direct path: the index type comes from the variable's own
+			// declaration, not from an evaluation.
+			if vi, ok := c.lookupVar(n.Idx.(*Ident).Name); ok {
+				iw = c.semWOf(vi.typ)
+				is = vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Signed
+				ip = vi.ptr
+			}
+		} else {
+			iw, is, ip = c.resW, c.resSigned, c.resPtr
+		}
+		islot := 0
+		if idxReg == "" {
+			// T1.6 (C4): a ptrCapable index holds pointer bits; the movsxd below
+			// is skipped so the full 64-bit index reaches the scaled add.
+			c.tmpDepth++
+			islot = c.tmpSlot(c.tmpDepth)
+			c.emit("mov [rbp%+d], rax", islot)
+		}
 		if id, ok := n.Base.(*Ident); ok {
 			// Local scope wins (C block scoping); only then file-scope names.
 			// A static local shadows a same-named TLS global, but a static
@@ -6538,12 +6572,28 @@ func (c *CG) genLValue(e Expr) error {
 			}
 			c.emit("mov r10, rax")
 		}
-		if iw == 4 && is && !ip {
+		if idxReg != "" {
+			// F2: consume the index from its home register -- the value is
+			// live in the callee-save across the base evaluation (which may
+			// call). A signed int sign-extends from the low dword; an unsigned
+			// int zero-extends (mov r11d); a long/pointer index is full width.
+			l32 := low32Reg(idxReg)
+			if iw == 4 && is && !ip {
+				c.emit("movsxd r11, %s", l32)
+			} else if iw == 4 && !is {
+				c.emit("mov r11d, %s", l32)
+			} else {
+				c.emit("mov r11, %s", idxReg)
+			}
+		} else if iw == 4 && is && !ip {
 			// N11: sign-extend a signed int index from the slot's low dword
 			// (the spilled materialized value) for the 64-bit scale-and-add.
 			c.emit("movsxd r11, dword [rbp%+d]", islot)
 		} else {
 			c.emit("mov r11, [rbp%+d]", islot)
+		}
+		if idxReg == "" {
+			c.tmpDepth--
 		}
 		// byte offset = index * element_width. Char elements pack one byte
 		// per slot (string literals, char arrays, char* buffers); everything
@@ -6552,7 +6602,6 @@ func (c *CG) genLValue(e Expr) error {
 		ew := c.elemWidthOf(n.Base)
 		c.emit("imul r11, %d", ew)
 		c.emit("add r10, r11")
-		c.tmpDepth--
 		return nil
 	case *MemberExpr:
 		// Resolve the struct/union type behind the base so we can look the
@@ -7143,6 +7192,17 @@ func (c *CG) elemSignedOf(e Expr) bool {
 		return t.Signed
 	}
 	return false
+}
+
+// low32Reg returns the 32-bit name of a 64-bit register (rax->eax, r12->r12d).
+// Used wherever a value is sign/zero-extended from the low dword of a
+// register-cached variable (F2 index consumption). rbx's low dword is ebx,
+// NOT "rbxd".
+func low32Reg(r string) string {
+	if len(r) >= 2 && r[0] == 'r' && r[1] >= 'a' && r[1] <= 'z' {
+		return "e" + r[1:]
+	}
+	return r + "d"
 }
 
 // genLoadElem emits code that loads the value at the address held in reg into
