@@ -19,7 +19,7 @@ export GOTMPDIR="$TMP"
 [ -n "${GOCACHE:-}" ] || export GOCACHE="$HOME/.cache/go-build"
 
 echo "== building goa =="
-go build -trimpath -ldflags="-s -w" -o goa.exe . || { echo "BUILD FAILED"; exit 1; }
+go build -trimpath -ldflags="-s -w" -o goa.exe ./cmd/goa || { echo "BUILD FAILED"; exit 1; }
 (cd ../../tools && go build -o msgboxcheck.exe ./msgboxcheck) || { echo "TOOL BUILD FAILED"; exit 1; }
 # elfcheck verifies the ELF *structure*; deciding what the program prints is
 # ucrun.exe's job now (see find_ucrun below).

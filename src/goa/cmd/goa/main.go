@@ -1,9 +1,16 @@
 package main
 
+// The goa command-line assembler. The assembler itself lives in the goa
+// package (../..) so goc can link it in instead of shelling out to a separate
+// binary; this is the standalone front-end that keeps bin/goa.exe working
+// (used by src/goa/run_tests.sh and by hand-written asm).
+
 import (
 	"fmt"
 	"os"
 	"strings"
+
+	"goa"
 )
 
 func usage() {
@@ -52,58 +59,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	elf := false
-	switch format {
-	case "pe", "win", "windows":
-	case "elf", "linux":
-		elf = true
-	default:
-		fmt.Fprintf(os.Stderr, "goa: unknown output format %q (want pe or elf)\n", format)
-		os.Exit(1)
-	}
-
 	srcPath := positional[0]
-	src, err := os.ReadFile(srcPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "read error:", err)
-		os.Exit(1)
-	}
-
-	a := NewAssembler()
-	if elf {
-		a.target = targetELF
-	}
-	if err := a.Assemble(string(src)); err != nil {
-		fmt.Fprintln(os.Stderr, "assemble error:", err)
-		os.Exit(1)
-	}
-
 	outPath := ""
 	if len(positional) > 1 {
 		outPath = positional[1]
-	} else if elf {
+	} else if format == "elf" || format == "linux" {
 		// Linux executables conventionally carry no suffix.
 		outPath = strings.TrimSuffix(srcPath, ".asm")
 	} else {
 		outPath = strings.TrimSuffix(srcPath, ".asm") + ".exe"
 	}
 
-	if elf {
-		err = a.BuildELF(outPath)
-	} else {
-		err = a.BuildPE(outPath)
-	}
+	n, err := goa.AssembleFile(srcPath, outPath, format)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "build error:", err)
+		fmt.Fprintln(os.Stderr, "goa:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("compiled %s (%d bytes)\n", outPath, mustSize(outPath))
-}
-
-func mustSize(p string) int64 {
-	fi, err := os.Stat(p)
-	if err != nil {
-		return 0
-	}
-	return fi.Size()
+	fmt.Printf("compiled %s (%d bytes)\n", outPath, n)
 }
