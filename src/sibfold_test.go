@@ -283,3 +283,32 @@ func TestSibFoldSwitchOff(t *testing.T) {
 		t.Fatalf("with sibFoldSkip no SIB operand may appear:\n%s", asm)
 	}
 }
+
+// TestF2NarrowIndex: a register-cached SHORT index must still be sign-extended
+// into the 64-bit SIB index register, not copied full-width with garbage upper
+// bits. Regression test for the F2 narrow-index bug: the home register of a
+// char/short variable carries only its raw low 8/16 bits (loadVar extends them
+// on read); a bare "mov r11, <reg>" would drag stale upper bits into the index
+// and mis-address. Negative indices (here -3..3) are the trigger.
+func TestF2NarrowIndex(t *testing.T) {
+	src := `int main(void) {
+    int buf[16];
+    int *p = buf + 8;
+    short i;
+    for (i = -3; i <= 3; i++) {
+        p[i] = (int)i;
+    }
+    return p[-3] + p[0] + p[3]; /* 0 */
+}`
+	asm := genAsmOpt(t, src, 3)
+	// F2 must fire: the short counter is consumed straight from its callee-save
+	// home register (r8/r9/r12..r15), not spilled and reloaded.
+	if !strings.Contains(asm, "mov r11, r1") && !strings.Contains(asm, "mov r11, r8") &&
+		!strings.Contains(asm, "mov r11, r9") {
+		t.Fatalf("F2 must consume a register-cached short index from its home register:\n%s", asm)
+	}
+	// the narrow index must be sign-extended into r11 (signed short -> shl/sar 48)
+	if !strings.Contains(asm, "shl r11, 48") || !strings.Contains(asm, "sar r11, 48") {
+		t.Fatalf("F2 must sign-extend a short index into r11 (no raw full-width copy):\n%s", asm)
+	}
+}

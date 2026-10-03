@@ -6624,12 +6624,32 @@ func (c *CG) genLValue(e Expr) error {
 			// call). A signed int sign-extends from the low dword; an unsigned
 			// int zero-extends (mov r11d); a long/pointer index is full width.
 			l32 := low32Reg(idxReg)
-			if iw == 4 && is && !ip {
+			switch {
+			case iw == 4 && is && !ip:
 				c.emit("movsxd r11, %s", l32)
-			} else if iw == 4 && !is {
+			case iw == 4 && !is:
 				c.emit("mov r11d, %s", l32)
-			} else {
+			case iw == 8 || ip:
+				// long / pointer / ptrCapable index: full 64-bit value.
 				c.emit("mov r11, %s", idxReg)
+			case iw == 1 && is:
+				// signed char index: the home register carries only the raw
+				// low 8 bits (loadVar extends on read), so copy then sign-extend
+				// -- a plain full-width copy would drag garbage upper bits into
+				// the 64-bit SIB index (same bug class as a non-F2 short load).
+				c.emit("mov r11, %s", idxReg)
+				c.emit("shl r11, 56")
+				c.emit("sar r11, 56")
+			case iw == 1:
+				c.emit("mov r11, %s", idxReg)
+				c.emit("and r11, 0xff")
+			case iw == 2 && is:
+				c.emit("mov r11, %s", idxReg)
+				c.emit("shl r11, 48")
+				c.emit("sar r11, 48")
+			default: // iw == 2 unsigned short
+				c.emit("mov r11, %s", idxReg)
+				c.emit("and r11, 0xffff")
 			}
 		} else if iw == 4 && is && !ip {
 			// N11: sign-extend a signed int index from the slot's low dword
