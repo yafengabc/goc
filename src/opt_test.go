@@ -503,6 +503,180 @@ int main(){ return fib(10); }`
 	}
 }
 
+// ---------- F4 slotCache value-snapshot (copy-chain) unit tests ----------
+
+// mov64 builds a GP64-to-GP64 register move fixture.
+func mov64(dst, src string) Inst {
+	return Inst{Kind: instInstr, Text: "\tmov " + dst + ", " + src}
+}
+
+// TestSlotSnapshotChainForward: the headline F4 case. Store a copy of r12
+// through rax, then clobber rax; the snapshot root (r12) survives, so the
+// reload forwards from r12 instead of doing a real load.
+func TestSlotSnapshotChainForward(t *testing.T) {
+	in := []Inst{
+		mov64("rax", "r12"),    // copyOf[rax] = r12
+		slotStore("rax"),       // cache[8] = {reg: root(rax)=r12}
+		{Kind: instInstr, Text: "\tmov rax, 5"}, // kill rax (not r12)
+		slotLoad("rcx"),        // forward -> mov rcx, r12
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, r12") != 1 {
+		t.Fatalf("chain-root forward must give mov rcx, r12, got %v", got)
+	}
+	if countText(got, "mov rcx, [rbp-8]") != 0 {
+		t.Fatalf("slot load must be replaced, got %v", got)
+	}
+}
+
+// TestSlotSnapshotRootKilled: if the chain root itself is written, the slot
+// is invalidated and the reload stays a real memory load.
+func TestSlotSnapshotRootKilled(t *testing.T) {
+	in := []Inst{
+		mov64("rax", "r12"),    // copyOf[rax] = r12
+		slotStore("rax"),       // cache[8] = {reg: r12}
+		{Kind: instInstr, Text: "\tmov r12, 5"}, // kill the ROOT
+		slotLoad("rcx"),        // root dead: real load
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("root killed must block forwarding, got %v", got)
+	}
+}
+
+// TestSlotSnapshotNoChain: without a copy chain, the store source IS the root.
+// Writing that register kills the slot (same as T1.4).
+func TestSlotSnapshotNoChain(t *testing.T) {
+	in := []Inst{
+		slotStore("rax"),       // cache[8] = {reg: rax}
+		{Kind: instInstr, Text: "\tmov rax, 5"}, // kill rax (root)
+		slotLoad("rcx"),        // root dead: real load
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("no-chain root killed must block forwarding, got %v", got)
+	}
+}
+
+// TestSlotSnapshotChainTwoHop: a two-hop copy chain still resolves to the
+// ultimate root. This is one of the three probe field cases.
+func TestSlotSnapshotChainTwoHop(t *testing.T) {
+	in := []Inst{
+		mov64("rbx", "rcx"),    // copyOf[rbx] = rcx
+		mov64("rax", "rbx"),    // copyOf[rax] = root(rbx)=rcx
+		slotStore("rax"),       // cache[8] = {reg: rcx}
+		{Kind: instInstr, Text: "\tmov rax, 2"}, // kill rax (not rcx)
+		slotLoad("r10"),        // forward -> mov r10, rcx
+	}
+	got := runSlot(in)
+	if countText(got, "mov r10, rcx") != 1 {
+		t.Fatalf("two-hop chain must resolve to rcx, got %v", got)
+	}
+	if countText(got, "mov r10, [rbp-8]") != 0 {
+		t.Fatalf("slot load must be replaced, got %v", got)
+	}
+}
+
+// TestSlotSnapshotForwardKillsDst: a forwarded load writes dst, so the slot
+// that was rooted at dst must be invalidated (sum7 discipline). The slot
+// rooted at the surviving root still forwards.
+func TestSlotSnapshotForwardKillsDst(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov [rbp-8], r12"},   // cache[8] = {reg: r12}
+		{Kind: instInstr, Text: "\tmov [rbp-16], rax"},  // cache[16] = {reg: rax}
+		mov64("rcx", "r12"),                              // copyOf[rcx] = r12
+		{Kind: instInstr, Text: "\tmov [rbp-24], rcx"},   // cache[24] = {reg: r12}
+		// Forward [rbp-8] into rcx: rcx was a copy of r12, but now rcx is
+		// overwritten by the forward. The slot [rbp-24] still roots at r12
+		// (alive), so it should still forward.
+		{Kind: instInstr, Text: "\tmov rcx, [rbp-8]"},   // forward -> mov rcx, r12
+		{Kind: instInstr, Text: "\tmov r10, [rbp-24]"},  // root r12 alive: forward
+	}
+	got := runSlot(in)
+	if countText(got, "mov r10, r12") != 1 {
+		t.Fatalf("slot rooted at alive r12 must still forward, got %v", got)
+	}
+}
+
+// TestSlotSnapshotNarrowWriteBreaksChain: a 32-bit write to the copy register
+// kills that register but NOT the root. The slot rooted at the root still
+// forwards.
+func TestSlotSnapshotNarrowWriteBreaksChain(t *testing.T) {
+	in := []Inst{
+		mov64("rax", "r12"),    // copyOf[rax] = r12
+		slotStore("rax"),       // cache[8] = {reg: r12}
+		{Kind: instInstr, Text: "\txor eax, eax"}, // kill rax (32-bit), not r12
+		slotLoad("rcx"),        // root r12 alive: forward -> mov rcx, r12
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, r12") != 1 {
+		t.Fatalf("narrow write to copy must not break root forwarding, got %v", got)
+	}
+	if countText(got, "mov rcx, [rbp-8]") != 0 {
+		t.Fatalf("slot load must be replaced, got %v", got)
+	}
+}
+
+// TestSlotSnapshotSizedStoreInvalidates: a sized (partial) store to the slot
+// clears the cached value even in snapshot mode.
+func TestSlotSnapshotSizedStoreInvalidates(t *testing.T) {
+	in := []Inst{
+		mov64("rax", "r12"),
+		slotStore("rax"),       // cache[8] = {reg: r12}
+		{Kind: instInstr, Text: "\tmov dword [rbp-8], 0"}, // sized store: clobber
+		slotLoad("rcx"),        // slot cleared: real load
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("sized store must clear the slot, got %v", got)
+	}
+}
+
+// TestSlotSnapshotLeaEscape: lea of a slot address clears all knowledge even
+// in snapshot mode.
+func TestSlotSnapshotLeaEscape(t *testing.T) {
+	in := []Inst{
+		mov64("rax", "r12"),
+		slotStore("rax"),
+		{Kind: instInstr, Text: "\tlea r10, [rbp-8]"},
+		slotLoad("rcx"),
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("lea escape must clear all, got %v", got)
+	}
+}
+
+// TestSlotSnapshotIndirectWrite: an indirect (non-slot) memory write clears
+// all knowledge even in snapshot mode.
+func TestSlotSnapshotIndirectWrite(t *testing.T) {
+	in := []Inst{
+		mov64("rax", "r12"),
+		slotStore("rax"),
+		{Kind: instInstr, Text: "\tmov [r10], rbx"},
+		slotLoad("rcx"),
+	}
+	got := runSlot(in)
+	if countText(got, "mov rcx, [rbp-8]") != 1 {
+		t.Fatalf("indirect write must clear all, got %v", got)
+	}
+}
+
+// TestSlotSnapshotRedundantStoreRoot: storing through the same copy chain
+// root twice is redundant (second store dropped).
+func TestSlotSnapshotRedundantStoreRoot(t *testing.T) {
+	in := []Inst{
+		mov64("rax", "r12"),
+		slotStore("rax"),       // cache[8] = {reg: r12}
+		mov64("rcx", "r12"),    // copyOf[rcx] = r12
+		slotStore("rcx"),       // root(rcx)=r12 == cache[8].reg: redundant
+	}
+	got := runSlot(in)
+	if countText(got, "mov [rbp-8], ") != 1 {
+		t.Fatalf("same-root re-store must be dropped, got %v", got)
+	}
+}
+
 // ---------- T1.3 algebraic-identity unit tests (comparison-to-zero) ----------
 
 // runAlg runs algebraicIdent over the fixture and returns the surviving

@@ -326,6 +326,13 @@ func sourceSignCanon(src string, signCanon map[string]bool) bool {
 // switch.
 var slotCacheSkip bool
 
+// slotCacheSnapshotSkip bypasses the value-snapshot (copy-chain) extension of
+// slotCache (F4) -- its independent switch. When set, slotCache runs the
+// original T1.4 semantics (kill-by-source); when clear, the value-snapshot
+// semantics (kill-by-root, GP-GP copy-chain recording + root forwarding) are
+// active on top of the existing cache.
+var slotCacheSnapshotSkip bool
+
 // slotVal is the value the slot cache believes a slot holds: a tracked
 // immediate, or a full-width register (with the register's current write
 // version at record time, so a later write to that register invalidates it).
@@ -359,8 +366,47 @@ type slotVal struct {
 func slotCache(insts []Inst) []Inst {
 	out := make([]Inst, 0, len(insts))
 	cache := map[string]slotVal{}
-	clearAll := func() { cache = map[string]slotVal{} }
+	// F4 value-snapshot state (only consulted when !slotCacheSnapshotSkip).
+	copyOf := map[string]string{} // reg -> copy-chain root
+	killed := map[string]bool{}   // reg -> current value dead/unknown
+	clearAll := func() {
+		cache = map[string]slotVal{}
+		copyOf = map[string]string{}
+		killed = map[string]bool{}
+	}
 	clearSlot := func(s string) { delete(cache, s) }
+
+	// rootOf walks the copy chain from r to the ultimate root. If any node on
+	// the path (or the root itself) is killed, returns "" (invalid).
+	rootOf := func(r string) string {
+		if slotCacheSnapshotSkip {
+			return r
+		}
+		seen := map[string]bool{}
+		for r != "" {
+			if killed[r] || seen[r] {
+				return ""
+			}
+			seen[r] = true
+			if next, ok := copyOf[r]; ok {
+				r = next
+			} else {
+				return r
+			}
+		}
+		return ""
+	}
+
+	// markLive records that dst now holds a fresh, known value (a register
+	// move from imm, an ALU result, a memory load). dst is its own root.
+	markLive := func(dst string) {
+		if !slotCacheSnapshotSkip {
+			dst = reg64Name(dst)
+			delete(copyOf, dst)
+			killed[dst] = false
+		}
+	}
+
 	killReg := func(r string) {
 		r = reg64Name(r)
 		switch r {
@@ -384,6 +430,18 @@ func slotCache(insts []Inst) []Inst {
 			if !v.isImm && v.reg == r {
 				delete(cache, k)
 			}
+		}
+		if !slotCacheSnapshotSkip {
+			// Break copies pointing to r: any register whose root is r now
+			// has an invalid root.
+			for x, root := range copyOf {
+				if root == r {
+					delete(copyOf, x)
+					killed[x] = true
+				}
+			}
+			delete(copyOf, r)
+			killed[r] = true
 		}
 	}
 
@@ -423,6 +481,21 @@ func slotCache(insts []Inst) []Inst {
 				}
 				src := pl.operands[1]
 				if gp64Regs[src] {
+					if !slotCacheSnapshotSkip {
+						// F4: store the copy-chain root, not the immediate source.
+						root := rootOf(src)
+						if root == "" {
+							clearSlot(bare)
+							out = append(out, in)
+							continue
+						}
+						if v, ok := cache[bare]; ok && !v.isImm && v.reg == root {
+							continue // the slot already holds the same root value
+						}
+						cache[bare] = slotVal{reg: root}
+						out = append(out, in)
+						continue
+					}
 					if v, ok := cache[bare]; ok && !v.isImm && v.reg == src {
 						continue // the slot already holds exactly this value
 					}
@@ -454,6 +527,7 @@ func slotCache(insts []Inst) []Inst {
 				continue
 			}
 			killReg(pl.operands[0])
+			markLive(pl.operands[0])
 			out = append(out, in)
 			continue
 		}
@@ -479,21 +553,45 @@ func slotCache(insts []Inst) []Inst {
 						if v.isImm {
 							in = Inst{Kind: instInstr,
 								Text: "\tmov " + dst + ", " + strconv.FormatInt(v.imm, 10)}
+							markLive(dst)
 							out = append(out, in)
 							continue
 						}
+						if !slotCacheSnapshotSkip && killed[v.reg] {
+							// Root is dead: cannot forward. Fall through to real load.
+							goto realLoad
+						}
 						in = Inst{Kind: instInstr, Text: "\tmov " + dst + ", " + v.reg}
+						if !slotCacheSnapshotSkip {
+							copyOf[dst] = v.reg
+							killed[dst] = false
+						}
 						out = append(out, in)
 						continue
 					}
 				}
+			realLoad:
 				// No forwardable value: the destination register is still
 				// written (killing any cache entry sourced from it).
 				killReg(dst)
+				markLive(dst)
 				out = append(out, in)
 				continue
 			}
+			// GP-GP register move or immediate move.
 			killReg(dst)
+			if !slotCacheSnapshotSkip && gp64Regs[dst] && gp64Regs[src] {
+				// GP-GP mov: record the copy chain.
+				root := rootOf(src)
+				if root != "" {
+					copyOf[dst] = root
+					killed[dst] = false
+				} else {
+					killed[dst] = true
+				}
+			} else {
+				markLive(dst)
+			}
 			out = append(out, in)
 			continue
 		}
@@ -504,18 +602,30 @@ func slotCache(insts []Inst) []Inst {
 		case "cqo", "cdq":
 			killReg("rax")
 			killReg("rdx")
+			// cqo/cdq produce unknown values in rdx (and rax sign-extends):
+			// mark both dead in the snapshot model.
+			if !slotCacheSnapshotSkip {
+				killed["rax"] = true
+				killed["rdx"] = true
+			}
 			out = append(out, in)
 		case "imul", "mul", "div", "idiv":
 			if len(pl.operands) == 1 {
 				killReg("rax")
 				killReg("rdx")
+				if !slotCacheSnapshotSkip {
+					killed["rax"] = true
+					killed["rdx"] = true
+				}
 			} else if len(pl.operands) > 0 {
 				killReg(pl.operands[0])
+				markLive(pl.operands[0])
 			}
 			out = append(out, in)
 		default:
 			if len(pl.operands) > 0 && !isMemOperand(pl.operands[0]) {
 				killReg(pl.operands[0])
+				markLive(pl.operands[0])
 			}
 			out = append(out, in)
 		}
