@@ -42,7 +42,7 @@ echo "== goc =="
 (cd src && go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "../bin/goc$EXE" .)
 
 echo "== goa =="
-(cd src/goa && go build -trimpath -ldflags="-s -w" -o "../../bin/goa$EXE" .)
+(cd src/goa && go build -trimpath -ldflags="-s -w" -o "../../bin/goa$EXE" ./cmd/goa)
 
 echo "== tools =="
 (cd tools && go build -o "../bin/elfcheck$EXE"    ./elfcheck)

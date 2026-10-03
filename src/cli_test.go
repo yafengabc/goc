@@ -142,24 +142,33 @@ func TestOutputPaths(t *testing.T) {
 // for the source), the first bare token is the source file, and everything
 // after it is passed to the program verbatim.
 func TestSplitRunArgs(t *testing.T) {
-	ba, src, pa := splitRunArgs([]string{"-O1", "-DFOO=7", "-I", "inc", "-target", "win", "a.c", "x", "-y"})
+	ba, inputs, pa := splitRunArgs([]string{"-O1", "-DFOO=7", "-I", "inc", "-target", "win", "a.c", "x", "-y"})
 	if len(ba) != 6 || ba[0] != "-O1" || ba[2] != "-I" || ba[4] != "-target" {
 		t.Errorf("buildArgs = %v", ba)
 	}
-	if src != "a.c" {
-		t.Errorf("src = %q, want a.c", src)
+	if len(inputs) != 1 || inputs[0] != "a.c" {
+		t.Errorf("inputs = %v, want [a.c]", inputs)
 	}
 	if len(pa) != 2 || pa[0] != "x" || pa[1] != "-y" {
 		t.Errorf("progArgs = %v, want [x -y]", pa)
 	}
 	// A separate-value flag right before the source must not eat it.
-	ba, src, pa = splitRunArgs([]string{"-o", "out", "a.c"})
-	if len(ba) != 2 || src != "a.c" || len(pa) != 0 {
-		t.Errorf("ba=%v src=%q pa=%v", ba, src, pa)
+	ba, inputs, pa = splitRunArgs([]string{"-o", "out", "a.c"})
+	if len(ba) != 2 || len(inputs) != 1 || inputs[0] != "a.c" || len(pa) != 0 {
+		t.Errorf("ba=%v inputs=%v pa=%v", ba, inputs, pa)
 	}
-	// No source at all: src == "" signals the usage error.
-	ba, src, pa = splitRunArgs([]string{"-O1"})
-	if src != "" || len(pa) != 0 || len(ba) != 1 {
-		t.Errorf("ba=%v src=%q pa=%v", ba, src, pa)
+	// No source at all: no inputs signals the usage error.
+	ba, inputs, pa = splitRunArgs([]string{"-O1"})
+	if len(inputs) != 0 || len(pa) != 0 || len(ba) != 1 {
+		t.Errorf("ba=%v inputs=%v pa=%v", ba, inputs, pa)
+	}
+	// Several sources: every immediately following .c joins the build, and
+	// the first non-source token starts the program's arguments.
+	_, inputs, pa = splitRunArgs([]string{"a.c", "b.c", "arg1", "x.c"})
+	if len(inputs) != 2 || inputs[0] != "a.c" || inputs[1] != "b.c" {
+		t.Errorf("inputs = %v, want [a.c b.c]", inputs)
+	}
+	if len(pa) != 2 || pa[0] != "arg1" || pa[1] != "x.c" {
+		t.Errorf("progArgs = %v, want [arg1 x.c]", pa)
 	}
 }

@@ -15,7 +15,13 @@ bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面�
 ./bin/goc.exe -S src/examples/hello.c                # 只输出汇编（hello.asm）
 ./bin/goc.exe -c -o bin/goc-out src/examples/hello.c # 产物集中到 bin/goc-out/，不污染源码树
 ./bin/goc.exe -c -target linux src/examples/hello.c  # 出 Linux ELF64（无后缀）
+./bin/goc.exe a.c b.c -o app.exe                     # 多个 .c 编成一个可执行
 ```
+
+多个 `.c` 各自是一个**独立的翻译单元**（宏、typedef、struct 标签互不干扰），
+声明合并后一起编译：`static` 的符号只在本文件可见（重名时自动改成每文件唯一的
+内部名），两个文件都定义的同名外部符号则是重复定义错误。汇编器 goa 已编译进
+goc 二进制，不需要旁边放 `goa.exe`（独立的 `bin/goa.exe` 仍然保留，供手写汇编使用）。
 
 Windows 产物只导入 **Windows 系统 DLL**（kernel32/user32/gdi32
 导出，按程序实际调用取子集；每个 API 的归属 DLL 写在同名头文件的 `extern ... , dll` 原型里，例如
@@ -31,7 +37,8 @@ GitHub Release 由 `v*` tag 触发，产出版本化 zip（如
 （Linux 同理，找旁边的 `goa`），所以 zip 内的文件名不带版本号——版本在
 zip 文件名和 Release 的 tag 上。Windows zip 含 `goc.exe` / `cc.exe` /
 `goa.exe`，Linux zip 含 `goc` / `goa`，均附 `README.md` / `LICENSE`，另有一份
-`SHA256SUMS.txt` 校验所有资产。
+`SHA256SUMS.txt` 校验所有资产。goc 自带汇编器（goa 已编译进二进制），所以
+zip 里那份独立 `goa` 只是给手写汇编用的，goc 编译 C 不再需要它。
 
 ## 目录结构
 

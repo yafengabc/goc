@@ -118,6 +118,123 @@
 #define WM_USER             0x0400
 
 /* ------------------------------------------------------------------ */
+/* Virtual-key codes (VK_), as delivered in wParam of WM_KEYDOWN /      */
+/* WM_CHAR and returned by GetKeyState.                                 */
+/* ------------------------------------------------------------------ */
+#define VK_LBUTTON          0x01
+#define VK_RBUTTON          0x02
+#define VK_CANCEL           0x03
+#define VK_MBUTTON          0x04
+#define VK_BACK             0x08
+#define VK_TAB              0x09
+#define VK_CLEAR            0x0C
+#define VK_RETURN           0x0D
+#define VK_SHIFT            0x10
+#define VK_CONTROL          0x11
+#define VK_MENU             0x12
+#define VK_PAUSE            0x13
+#define VK_CAPITAL          0x14
+#define VK_ESCAPE           0x1B
+#define VK_SPACE            0x20
+#define VK_PRIOR            0x21
+#define VK_NEXT             0x22
+#define VK_END              0x23
+#define VK_HOME             0x24
+#define VK_LEFT             0x25
+#define VK_UP               0x26
+#define VK_RIGHT            0x27
+#define VK_DOWN             0x28
+#define VK_SELECT           0x29
+#define VK_PRINT            0x2A
+#define VK_EXECUTE          0x2B
+#define VK_SNAPSHOT         0x2C
+#define VK_INSERT           0x2D
+#define VK_DELETE           0x2E
+#define VK_HELP             0x2F
+#define VK_0                0x30
+#define VK_1                0x31
+#define VK_2                0x32
+#define VK_3                0x33
+#define VK_4                0x34
+#define VK_5                0x35
+#define VK_6                0x36
+#define VK_7                0x37
+#define VK_8                0x38
+#define VK_9                0x39
+#define VK_A                0x41
+#define VK_B                0x42
+#define VK_C                0x43
+#define VK_D                0x44
+#define VK_E                0x45
+#define VK_F                0x46
+#define VK_G                0x47
+#define VK_H                0x48
+#define VK_I                0x49
+#define VK_J                0x4A
+#define VK_K                0x4B
+#define VK_L                0x4C
+#define VK_M                0x4D
+#define VK_N                0x4E
+#define VK_O                0x4F
+#define VK_P                0x50
+#define VK_Q                0x51
+#define VK_R                0x52
+#define VK_S                0x53
+#define VK_T                0x54
+#define VK_U                0x55
+#define VK_V                0x56
+#define VK_W                0x57
+#define VK_X                0x58
+#define VK_Y                0x59
+#define VK_Z                0x5A
+#define VK_NUMPAD0          0x60
+#define VK_NUMPAD1          0x61
+#define VK_NUMPAD2          0x62
+#define VK_NUMPAD3          0x63
+#define VK_NUMPAD4          0x64
+#define VK_NUMPAD5          0x65
+#define VK_NUMPAD6          0x66
+#define VK_NUMPAD7          0x67
+#define VK_NUMPAD8          0x68
+#define VK_NUMPAD9          0x69
+#define VK_MULTIPLY         0x6A
+#define VK_ADD              0x6B
+#define VK_SEPARATOR        0x6C
+#define VK_SUBTRACT         0x6D
+#define VK_DECIMAL          0x6E
+#define VK_DIVIDE           0x6F
+#define VK_F1               0x70
+#define VK_F2               0x71
+#define VK_F3               0x72
+#define VK_F4               0x73
+#define VK_F5               0x74
+#define VK_F6               0x75
+#define VK_F7               0x76
+#define VK_F8               0x77
+#define VK_F9               0x78
+#define VK_F10              0x79
+#define VK_F11              0x7A
+#define VK_F12              0x7B
+#define VK_F13              0x7C
+#define VK_F14              0x7D
+#define VK_F15              0x7E
+#define VK_F16              0x7F
+#define VK_NUMLOCK          0x90
+#define VK_SCROLL           0x91
+#define VK_OEM_1            0xBA
+#define VK_OEM_PLUS         0xBB
+#define VK_OEM_COMMA        0xBC
+#define VK_OEM_MINUS        0xBD
+#define VK_OEM_PERIOD       0xBE
+#define VK_OEM_2            0xBF
+#define VK_OEM_3            0xC0
+#define VK_OEM_4            0xDB
+#define VK_OEM_5            0xDC
+#define VK_OEM_6            0xDD
+#define VK_OEM_7            0xDE
+#define VK_OEM8             0xDF
+
+/* ------------------------------------------------------------------ */
 /* Window styles (WS_)                                                 */
 /* ------------------------------------------------------------------ */
 #define WS_OVERLAPPED       0x00000000
@@ -142,6 +259,31 @@
 #define WS_MAXIMIZEBOX      0x00010000
 #define WS_OVERLAPPEDWINDOW (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | \
                              WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+
+/* Extended window styles (WS_EX_), OR-ed into the exStyle argument.        */
+#define WS_EX_DLGMODALFRAME  0x00000001
+#define WS_EX_NOPARENTNOTIFY 0x00000004
+#define WS_EX_TOPMOST        0x00000008
+#define WS_EX_ACCEPTFILES    0x00000010
+#define WS_EX_TRANSPARENT    0x00000020
+#define WS_EX_MDICHILD       0x00000040
+#define WS_EX_TOOLWINDOW     0x00000080
+#define WS_EX_WINDOWEDGE     0x00000100
+#define WS_EX_CLIENTEDGE     0x00000200
+#define WS_EX_CONTEXTHELP    0x00000400
+#define WS_EX_RIGHT          0x00001000
+#define WS_EX_LEFT           0x00000000
+#define WS_EX_RTLREADING     0x00002000
+#define WS_EX_LEFTSCROLLBAR  0x00004000
+#define WS_EX_CONTROLPARENT  0x00010000
+#define WS_EX_STATICEDGE     0x00020000
+#define WS_EX_APPWINDOW      0x00040000
+#define WS_EX_LAYERED        0x00080000
+#define WS_EX_NOINHERITLAYOUT 0x00100000
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000
+#define WS_EX_LAYOUTRTL      0x00400000
+#define WS_EX_COMPOSITED     0x02000000
+#define WS_EX_NOACTIVATE     0x08000000
 
 /* ------------------------------------------------------------------ */
 /* ShowWindow commands (SW_)                                           */
@@ -434,16 +576,24 @@ extern BOOL     KillTimer(HWND h, UINT_PTR id), user32;
 extern WORD   RegisterClassA(const WNDCLASS *cls), user32;
 extern WORD   RegisterClassExA(const WNDCLASSEX *cls), user32;
 extern BOOL   UnregisterClassA(LPCSTR name, HINSTANCE h), user32;
-extern ATOM   GlobalAddAtomA(LPCSTR name), user32;
-extern ATOM   GlobalFindAtomA(LPCSTR name), user32;
+extern ATOM   GlobalAddAtomA(LPCSTR name), kernel32;
+extern ATOM   GlobalFindAtomA(LPCSTR name), kernel32;
+extern ATOM   GlobalAddAtomW(LPCWSTR name), kernel32;
+extern ATOM   GlobalFindAtomW(LPCWSTR name), kernel32;
 
 /* Window creation: 12 args -- the longest Win32 API goc supports (maxArgs). */
 extern HWND   CreateWindowExA(DWORD exStyle, LPCSTR cls, LPCSTR name, DWORD style,
                        int x, int y, int w, int h,
                        HWND parent, HMENU menu, HINSTANCE inst, LPVOID param), user32;
-extern HWND   CreateWindowA(LPCSTR cls, LPCSTR name, DWORD style,
-                     int x, int y, int w, int h,
-                     HWND parent, HMENU menu, HINSTANCE inst, LPVOID param), user32;
+/* There is no CreateWindowA/W export on Windows: the plain CreateWindow is a
+ * macro over CreateWindowEx with exStyle 0, and the SDK only ever emits the
+ * Ex forms. goclib provides the macro so ported code compiles. */
+#define CreateWindowA(cls, name, style, x, y, w, h, parent, menu, inst, param) \
+    CreateWindowExA(0, (cls), (name), (style), (x), (y), (w), (h), \
+                    (parent), (menu), (inst), (param))
+#define CreateWindowW(cls, name, style, x, y, w, h, parent, menu, inst, param) \
+    CreateWindowExW(0, (cls), (name), (style), (x), (y), (w), (h), \
+                    (parent), (menu), (inst), (param))
 extern HWND   DestroyWindow(HWND h), user32;
 extern int    GetWindowLongA(HWND h, int index), user32;
 extern int    SetWindowLongA(HWND h, int index, int value), user32;
@@ -474,5 +624,229 @@ extern BOOL   DrawIcon(HDC dc, int x, int y, HICON icon), user32;
 extern BOOL   DrawIconEx(HDC dc, int x, int y, HICON icon, int w, int h,
                   UINT step, HBRUSH brush, UINT flags), user32;
 extern BOOL   SetLayeredWindowAttributes(HWND h, COLORREF key, BYTE alpha, DWORD flags), user32;
+
+/* ------------------------------------------------------------------ */
+/* Additional window messages (WM_)                                    */
+/* ------------------------------------------------------------------ */
+#define WM_CONTEXTMENU      0x007B
+#define WM_GETMINMAXINFO    0x0024
+#define WM_SETCURSOR        0x0020
+#define WM_NOTIFY           0x004E
+#define WM_DROPFILES        0x0233
+#define WM_NCCREATE         0x0081
+#define WM_NCDESTROY        0x0082
+#define WM_SETFONT          0x0030
+#define WM_GETFONT          0x0031
+#define WM_INITDIALOG       0x0110
+#define WM_MOUSEFIRST       0x0200
+
+/* ------------------------------------------------------------------ */
+/* Scrollbar constants (SB_ / SIF_)                                     */
+/* ------------------------------------------------------------------ */
+#define SB_HORZ             0
+#define SB_VERT             1
+#define SB_CTL              2
+#define SB_BOTH             3
+#define SB_LINEUP           0
+#define SB_LINELEFT         0
+#define SB_LINEDOWN         1
+#define SB_LINERIGHT        1
+#define SB_PAGEUP           2
+#define SB_PAGELEFT         2
+#define SB_PAGEDOWN         3
+#define SB_PAGERIGHT        3
+#define SB_THUMBPOSITION    4
+#define SB_THUMBTRACK       8
+#define SB_TOP              0
+#define SB_LEFT             0
+#define SB_BOTTOM           1
+#define SB_RIGHT            1
+#define SB_LEFTCLICK        1
+#define SB_RIGHTCLICK       2
+#define SB_THUMB            4
+#define SB_TOPLEFT          6
+#define SB_TOPRIGHT         7
+#define SB_BOTTOMLEFT       8
+#define SB_BOTTOMRIGHT     9
+#define SIF_RANGE           0x0001
+#define SIF_PAGE            0x0002
+#define SIF_POS             0x0004
+#define SIF_DISABLENOSCROLL 0x0008
+#define SIF_TRACKPOS        0x0010
+#define SIF_ALL             (SIF_RANGE | SIF_PAGE | SIF_POS | SIF_TRACKPOS)
+
+/* ------------------------------------------------------------------ */
+/* Menu flags (MF_) and TrackPopupMenu flags (TPM_)                      */
+/* ------------------------------------------------------------------ */
+#define MF_STRING           0x00000000L
+#define MF_SEPARATOR        0x00000800L
+#define MF_POPUP            0x00000010L
+#define MF_GRAYED           0x00000001L
+#define MF_DISABLED         0x00000002L
+#define MF_CHECKED          0x00000008L
+#define MF_UNCHECKED         0x00000000L
+#define MF_BYPOSITION       0x00000400L
+#define MF_BYCOMMAND        0x00000000L
+
+#define TPM_LEFTALIGN       0x0000
+#define TPM_CENTERALIGN     0x0004
+#define TPM_RIGHTALIGN      0x0008
+#define TPM_TOPALIGN        0x0000
+#define TPM_VCENTERALIGN    0x0010
+#define TPM_BOTTOMALIGN     0x0020
+#define TPM_RETURNCMD       0x0100
+#define TPM_NONOTIFY        0x0080
+#define TPM_LEFTBUTTON      0x0000
+#define TPM_RIGHTBUTTON     0x0002
+
+#define MAKEINTRESOURCEW(x) ((LPCWSTR)((UINT_PTR)(x)))
+
+/* ------------------------------------------------------------------ */
+/* Extra struct types                                                   */
+/* ------------------------------------------------------------------ */
+
+/* WNDCLASSEXW -- Unicode extended window class (lpsz* are wide). */
+typedef struct {
+    UINT     cbSize;
+    UINT     style;
+    WNDPROC  lpfnWndProc;
+    int      cbClsExtra;
+    int      cbWndExtra;
+    HINSTANCE hInstance;
+    HICON    hIcon;
+    HCURSOR  hCursor;
+    HBRUSH   hbrBackground;
+    LPCWSTR  lpszMenuName;
+    LPCWSTR  lpszClassName;
+    HICON    hIconSm;
+} WNDCLASSEXW;
+
+/* MINMAXINFO -- WM_GETMINMAXINFO payload. */
+typedef struct {
+    POINT ptReserved;
+    POINT ptMaxSize;
+    POINT ptMaxPosition;
+    POINT ptMinTrackSize;
+    POINT ptMaxTrackSize;
+} MINMAXINFO;
+
+/* NMHDR -- notification header prepended to every WM_NOTIFY struct. */
+typedef struct {
+    HWND     hwndFrom;
+    UINT_PTR idFrom;
+    UINT     code;
+} NMHDR;
+
+/* SCROLLINFO -- SetScrollInfo / GetScrollInfo payload. */
+typedef struct {
+    UINT cbSize;
+    UINT fMask;
+    int  nMin;
+    int  nMax;
+    UINT nPage;
+    int  nPos;
+    int  nTrackPos;
+} SCROLLINFO;
+
+/* ------------------------------------------------------------------ */
+/* Unicode (W) window APIs                                              */
+/* ------------------------------------------------------------------ */
+
+/* Window classes / creation (W variants) */
+extern ATOM   RegisterClassExW(const WNDCLASSEXW *cls), user32;
+extern HWND   CreateWindowExW(DWORD exStyle, LPCWSTR cls, LPCWSTR name, DWORD style,
+                       int x, int y, int w, int h,
+                       HWND parent, HMENU menu, HINSTANCE inst, LPVOID param), user32;
+extern LRESULT DefWindowProcW(HWND h, UINT msg, WPARAM wp, LPARAM lp), user32;
+extern LRESULT CallWindowProcW(WNDPROC prev, HWND h, UINT msg, WPARAM wp, LPARAM lp), user32;
+extern LONG_PTR GetWindowLongPtrW(HWND h, int index), user32;
+extern LONG_PTR SetWindowLongPtrW(HWND h, int index, LONG_PTR value), user32;
+
+/* Messages (W variants) */
+extern LRESULT SendMessageW(HWND h, UINT msg, WPARAM wp, LPARAM lp), user32;
+extern BOOL   PostMessageW(HWND h, UINT msg, WPARAM wp, LPARAM lp), user32;
+extern BOOL   GetMessageW(MSG *msg, HWND h, UINT min, UINT max), user32;
+extern BOOL   PeekMessageW(MSG *msg, HWND h, UINT min, UINT max, UINT remove), user32;
+extern LRESULT DispatchMessageW(const MSG *msg), user32;
+
+/* Cursors / icons (W variants) */
+extern HCURSOR LoadCursorW(HINSTANCE h, LPCWSTR name), user32;
+extern HICON  LoadIconW(HINSTANCE h, LPCWSTR name), user32;
+
+/* Text / dialogs (W variants) */
+extern BOOL   SetWindowTextW(HWND h, LPCWSTR text), user32;
+extern int    MessageBoxW(HWND parent, LPCWSTR text, LPCWSTR caption, UINT flags), user32;
+extern HICON  LoadImageW(HINSTANCE h, LPCWSTR name, UINT type, int cx, int cy, UINT fuLoad), user32;
+
+/* LoadImage type / fuLoad selectors. */
+#define IMAGE_BITMAP     0
+#define IMAGE_ICON       1
+#define IMAGE_CURSOR     2
+#define LR_DEFAULTCOLOR  0x00000000
+#define LR_MONOCHROME    0x00000001
+#define LR_DIBANDDEVMAP  0x00000002
+#define LR_LOADFROMFILE  0x00000010
+#define LR_LOADFROMRESOURCE 0x00000008
+#define LR_DEFAULTSIZE   0x00000040
+#define LR_USEDEFERDC    0x00000000
+#define LR_SCREEN        0x00000080
+
+/* Menus */
+extern HMENU  CreateMenu(void), user32;
+extern HMENU  CreatePopupMenu(void), user32;
+extern BOOL   DestroyMenu(HMENU h), user32;
+extern BOOL   AppendMenuW(HMENU h, UINT flags, UINT_PTR id, LPCWSTR text), user32;
+extern BOOL   SetMenu(HWND h, HMENU menu), user32;
+extern BOOL   DrawMenuBar(HWND h), user32;
+extern BOOL   TrackPopupMenu(HMENU h, UINT flags, int x, int y, int reserved, HWND wnd, LPVOID prc), user32;
+
+/* Clipboard */
+/* Standard clipboard formats (CF_). Custom formats must be >= CF_PRIVATEFIRST;
+ * registering a string name gives a handle usable with any of the CF_ APIs. */
+#define CF_TEXT             1
+#define CF_BITMAP           2
+#define CF_METAFILEPICT     3
+#define CF_SYLK             4
+#define CF_DIF              5
+#define CF_TIFF             6
+#define CF_OEMTEXT          7
+#define CF_DIB              8
+#define CF_PALETTE          9
+#define CF_PENDATA          10
+#define CF_RIFF             11
+#define CF_WAVE             12
+#define CF_UNICODETEXT      13
+#define CF_ENHMETAFILE      14
+#define CF_HDROP            15
+#define CF_LOCALE           16
+#define CF_DIBV5            17
+#define CF_OWNERDISPLAY     0x80
+#define CF_DSPBITMAP        0x82
+#define CF_DSPTEXT          0x83
+#define CF_DSPMETAFILEPICT  0x83
+#define CF_DSPENHMETAFILE   0x8E
+#define CF_PRIVATEFIRST     0x200
+#define CF_PRIVATELAST      0x2FF
+#define CF_GDIOBJFIRST      0x300
+#define CF_GDIOBJLAST       0x3FF
+
+extern BOOL   OpenClipboard(HWND h), user32;
+extern BOOL   CloseClipboard(void), user32;
+extern BOOL   EmptyClipboard(void), user32;
+extern HANDLE SetClipboardData(UINT fmt, HANDLE data), user32;
+extern HANDLE GetClipboardData(UINT fmt), user32;
+extern UINT   RegisterClipboardFormatW(LPCWSTR name), user32;
+extern int    CountClipboardFormats(void), user32;
+extern UINT   EnumClipboardFormats(UINT fmt), user32;
+extern BOOL   IsClipboardFormatAvailable(UINT fmt), user32;
+
+/* Misc */
+extern BOOL   SetForegroundWindow(HWND h), user32;
+extern HWND   SetCapture(HWND h), user32;
+extern BOOL   ReleaseCapture(void), user32;
+extern SHORT  GetKeyState(int vkey), user32;
+extern BOOL   SetScrollInfo(HWND h, int bar, const SCROLLINFO *si, BOOL redraw), user32;
+extern int    GetScrollInfo(HWND h, int bar, SCROLLINFO *si), user32;
+extern BOOL   InvalidateRgn(HWND h, HANDLE rgn, BOOL erase), user32;
 
 #endif /* GOC_WINUSER_H */

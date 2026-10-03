@@ -187,6 +187,39 @@ char *strdup(const char *s) {
     return p;
 }
 
+/* ---- MSVC spellings --------------------------------------------------- */
+/* _strdup is deprecated-but-widely-used MSVC spelling of strdup; the
+ * leading underscore is the only difference. */
+char *_strdup(const char *s) {
+    return strdup(s);
+}
+
+/* _stricmp / _strnicmp are the MSVC case-insensitive compares. They fold only
+ * ASCII, which is what the CRT's "C" locale does; that is enough for the
+ * ASCII-only identifiers and paths this is normally used on. */
+static int lower_ascii(int c) {
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
+}
+
+int _stricmp(const char *a, const char *b) {
+    int x, y;
+    do {
+        x = lower_ascii((unsigned char)*a++);
+        y = lower_ascii((unsigned char)*b++);
+    } while (x && x == y);
+    return x - y;
+}
+
+int _strnicmp(const char *a, const char *b, size_t n) {
+    int x = 0, y = 0;
+    while (n-- > 0) {
+        x = lower_ascii((unsigned char)*a++);
+        y = lower_ascii((unsigned char)*b++);
+        if (!x || x != y) return x - y;
+    }
+    return 0;
+}
+
 char *stpcpy(char *dest, const char *src) {
     while ((*dest++ = *src++) != 0)
         ;

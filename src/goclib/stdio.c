@@ -866,6 +866,32 @@ int snprintf(char *buf, size_t n, const char *fmt, ...) {
     return r;
 }
 
+/* The _s spellings differ from the standard bounded functions only in the
+ * return value: MSVC reports a buffer-too-small as -1, whereas C99 snprintf
+ * returns the length the text would have had. Callers that only check "did it
+ * fit" see the same answer either way.
+ *
+ * `count` is the buffer's element count from the prototype. goc has a single
+ * calling convention, so there is no __cdecl variant for it to disagree with
+ * and it is ignored in favour of `size`. _TRUNCATE arrives as (size_t)-1,
+ * which vsnprintf already treats as "no room", so it needs no special case. */
+int _vsnprintf_s(char *buf, size_t count, size_t size, const char *fmt, va_list ap) {
+    int r;
+    (void)count;
+    r = vsnprintf(buf, size, fmt, ap);
+    if (size > 0 && size != (size_t)-1 && (size_t)r >= size) return -1;
+    return r;
+}
+
+int _snprintf_s(char *buf, size_t count, size_t size, const char *fmt, ...) {
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    r = _vsnprintf_s(buf, count, size, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
 void perror(const char *s) {
     FILE *e = __goclib_stderr();
     if (s && *s) {

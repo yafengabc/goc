@@ -12,6 +12,17 @@
 typedef unsigned long size_t;
 typedef long          ptrdiff_t;
 
+/* wchar_t (C11 7.19 / 7.29). It lives in <stddef.h> because it is an integer
+ * type, not a string type -- <wchar.h> merely adds the functions.
+ *
+ * The width is an ABI decision: 2 bytes unsigned on Windows (one UTF-16 code
+ * unit, matching WCHAR in <windef.h>) and 4 bytes signed on Linux. goc emits
+ * Windows first -- that is where a real ABI sits behind it -- so wchar_t is
+ * unsigned short, and the UTF-16 data behind an L"..." literal agrees with it. */
+typedef unsigned short wchar_t;
+#define WCHAR_MIN 0
+#define WCHAR_MAX 0xFFFF
+
 /* C23 nullptr_t: the type of the nullptr keyword. goc models it as void*
  * (the keyword itself lowers to a null pointer constant, i.e. 0). */
 typedef void* nullptr_t;

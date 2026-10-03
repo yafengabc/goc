@@ -41,8 +41,33 @@ int sprintf(char *buf, const char *fmt, ...);
  * length the fully-formatted text would have had (possibly > n-1). */
 int snprintf(char *buf, size_t n, const char *fmt, ...);
 int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
+
+/* _TRUNCATE is the MSVC sentinel for the secure *_s string functions meaning
+ * "write at most the buffer size, then NUL-terminate" (the snprintf contract).
+ * Real-world Windows C leans on it, so goclib defines it alongside the
+ * functions it pairs with. */
+#ifndef _TRUNCATE
+#define _TRUNCATE ((size_t)-1)
+#endif
 int vfprintf(FILE *stream, const char *fmt, va_list ap);
 int vprintf(const char *fmt, va_list ap);
+
+/* ---- MSVC secure-CRT spellings ---------------------------------------- */
+/* MSVC's "secure" CRT renames the bounded string functions with a _s suffix
+ * and adds a _TRUNCATE size sentinel. The bounds are the same as the standard
+ * functions, so these are declared here and implemented in stdio.c as thin
+ * wrappers -- porting existing Windows code should not require rewriting every
+ * snprintf call. _snprintf_s differs from snprintf only in that it returns 0
+ * on truncation (-1) rather than the would-be length.
+ *
+ * The MSVC prototypes carry a buffer element count before the size: the
+ * underlying routine is also reachable with a __cdecl signature where the two
+ * disagree, and the count is what that variant needs. goc has a single calling
+ * convention, so `count` is accepted and ignored, and the bound is taken from
+ * `size` alone. Passing _TRUNCATE as the size is the standard "fill the
+ * buffer" request. */
+int _snprintf_s(char *buf, size_t count, size_t size, const char *fmt, ...);
+int _vsnprintf_s(char *buf, size_t count, size_t size, const char *fmt, va_list ap);
 
 /* Internal: printf for a format the compiler proved is "lite" -- only %s,
  * integers, %c and %f, with no field width, precision or flags (see the
@@ -79,6 +104,16 @@ void perror(const char *s);
 
 /* file I/O */
 FILE *fopen(const char *path, const char *mode);
+/* fopen_s is the MSVC secure fopen: it reports failure through the FILE*
+ * out-parameter plus an errno-style return (0 on success) instead of a bare
+ * NULL, which is what makes the "was the open rejected?" question impossible
+ * to forget at a call site. A failed open leaves *fp NULL. */
+int   fopen_s(FILE **fp, const char *path, const char *mode);
+/* _wfopen takes a UTF-16 path, which is what a Win32 GUI program already has
+ * in hand (GetOpenFileNameW, wWinMain's command line). On Windows it opens
+ * with CreateFileW so non-ANSI path characters survive; the mode string is
+ * still narrow-ASCII, as in the real CRT. */
+FILE *_wfopen(const wchar_t *path, const wchar_t *mode);
 /* Reopen `stream` on `path` with `mode`, closing its current association;
  * the FILE * itself stays valid (the freopen(stdout, ...) idiom). */
 FILE *freopen(const char *path, const char *mode, FILE *stream);

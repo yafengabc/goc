@@ -94,8 +94,16 @@ func Check(prog *Program) []error {
 		c.checkLabels(f.Body)
 		c.pop()
 	}
+	// The entry point: main, or one of the two MSVC GUI entries (a
+	// /SUBSYSTEM:WINDOWS program has no main at all). Check does not know the
+	// target, so it accepts all three and codegen rejects a GUI entry when
+	// targeting Linux, where the entry really must be main.
 	if _, ok := c.funcs["main"]; !ok {
-		c.errf(0, "program has no main()")
+		_, wide := c.funcs["wWinMain"]
+		_, ansi := c.funcs["WinMain"]
+		if !wide && !ansi {
+			c.errf(0, "program has no main()")
+		}
 	}
 	return c.errs
 }
@@ -145,13 +153,32 @@ func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 			c.put(n.Name, n.Typ, n.Line)
 			return
 		}
+		// The name is in scope inside its own initialiser: C 6.2.1p7 puts the
+		// scope of an identifier at the end of its declarator, so the
+		// "self-referential sizeof" idiom -- T x = { sizeof(x), ... } -- is
+		// legal and is how every Win32 struct with a dwSize field is filled in
+		// (INITCOMMONCONTROLSEX, BITMAPINFOHEADER, ...). put is a pointer store
+		// into the scope, so the array-length inference below, which mutates
+		// n.Typ in place, is still visible through it.
+		c.put(n.Name, n.Typ, n.Line)
 		// Initialiser forms, in order of specificity: a string literal for a
 		// char array (the one array initialiser C allows outside braces), a
 		// braced initialiser for any aggregate (or scalar), and everything
 		// else through the normal expression/assignable path.
 		strInit, braceInit := false, false
 		if n.Typ.IsArray() && n.Init != nil {
-			if sl, ok := n.Init.(*StrLit); ok && n.Typ.Elem.IsChar() {
+		if sl, ok := n.Init.(*StrLit); ok {
+			if sl.Wide && n.Typ.Elem.Width == 2 {
+				// L"..." initialises a wchar_t[] array (UTF-16 elements).
+				strInit = true
+				need := len(sl.Bytes)/2 + 1
+				if n.Typ.Len == 0 {
+					n.Typ.Len = need
+				} else if n.Typ.Len < need {
+					c.errf(n.Line, "initialiser wide string of %d elements does not fit in wchar_t array %q of %d elements",
+						len(sl.Bytes)/2, n.Name, n.Typ.Len)
+				}
+			} else if !sl.Wide && n.Typ.Elem.IsChar() {
 				strInit = true
 				need := len(sl.Bytes) + 1
 				if n.Typ.Len == 0 {
@@ -160,6 +187,7 @@ func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 					c.errf(n.Line, "initialiser string of length %d does not fit in char array %q of %d bytes",
 						len(sl.Bytes), n.Name, n.Typ.Len)
 				}
+			}
 			} else if _, ok := n.Init.(*BraceInit); ok {
 				braceInit = true
 				c.checkBraceInit(n.Typ, n.Init.(*BraceInit), fn, n.Line)
@@ -170,7 +198,6 @@ func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 			braceInit = true
 			c.checkBraceInit(n.Typ, bi, fn, n.Line)
 		}
-		c.put(n.Name, n.Typ, n.Line)
 		if n.Init != nil && !strInit && !braceInit {
 			t := c.checkExpr(n.Init, fn)
 			// A string literal "decays" to char*, which is not assignable to
@@ -480,6 +507,25 @@ func (c *checker) deduceAutoType(init Expr, fn *FuncDecl, line int) *Type {
 
 // checkLValue returns the type of e and whether e is a modifiable lvalue.
 func (c *checker) checkLValue(e Expr, fn *FuncDecl) (*Type, bool) {
+	return c.checkLValueAddr(e, fn, false)
+}
+
+// checkAddrOperand validates the operand of unary "&" and returns its type.
+//
+// C11 6.5.3.2p1 asks for an lvalue, but deliberately NOT a *modifiable* one:
+// "&const_object" is well-formed and yields a pointer-to-const, and arrays and
+// function designators are addressable too. Reusing checkLValue here used to
+// reject all three, so `return &static_const_struct;` -- the ordinary way to
+// hand out a table of constant data -- was reported as "cannot assign to
+// const-typed". Only bit-fields and register objects stay forbidden, and the
+// bit-field case is filtered out by the caller.
+func (c *checker) checkAddrOperand(e Expr, fn *FuncDecl) (*Type, bool) {
+	return c.checkLValueAddr(e, fn, true)
+}
+
+// checkLValueAddr is the shared implementation. addrOf relaxes the
+// "modifiable" requirement to plain "addressable" (see checkAddrOperand).
+func (c *checker) checkLValueAddr(e Expr, fn *FuncDecl, addrOf bool) (*Type, bool) {
 	switch n := e.(type) {
 	case *Ident:
 		t := c.lookup(n.Name)
@@ -493,14 +539,29 @@ func (c *checker) checkLValue(e Expr, fn *FuncDecl) (*Type, bool) {
 			return IntType(), false
 		}
 		if t.IsArray() {
+			// "&arr" is well-formed and yields a pointer to the array; only
+			// assigning to the array itself is not.
+			if addrOf {
+				return t, true
+			}
 			c.errf(n.Line, "array %q is not a modifiable lvalue", n.Name)
 			return t, false
 		}
 		if t.IsFunc() {
+			// A function designator is addressable: "&f" and "f" are
+			// equivalent for a pointer-to-function.
+			if addrOf {
+				return t, true
+			}
 			c.errf(n.Line, "function %q is not a modifiable lvalue", n.Name)
 			return t, false
 		}
 		if t.Const {
+			// "&const_obj" is well-formed (pointer-to-const); only writing
+			// through the object is not.
+			if addrOf {
+				return t, true
+			}
 			c.errf(n.Line, "cannot assign to const-typed %q", n.Name)
 			return t, false
 		}
@@ -542,12 +603,17 @@ func (c *checker) checkLValue(e Expr, fn *FuncDecl) (*Type, bool) {
 	case *CompoundLit:
 		// A compound literal is a modifiable lvalue: "(T){...} = ..." is
 		// nonsense but "&(T){...}" and "(T){...}.member" are ordinary C.
-		c.checkExpr(n, fn)
-		if n.Typ.Const {
-			c.errf(n.Line, "compound literal is const-qualified")
-			return n.Typ, false
-		}
-		return n.Typ, true
+			// A const-qualified compound literal is still addressable, so
+			// "&(const T){...}" is fine; only writing to it is not.
+			c.checkExpr(n, fn)
+			if n.Typ.Const {
+				if addrOf {
+					return n.Typ, true
+				}
+				c.errf(n.Line, "compound literal is const-qualified")
+				return n.Typ, false
+			}
+			return n.Typ, true
 	}
 	c.errf(0, "expression is not an lvalue")
 	return IntType(), false
@@ -643,8 +709,14 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			}
 			return DoubleType()
 		}
+		if n.Wide {
+			return WCharType() // L'x' is a wchar_t constant
+		}
 		return IntType()
 	case *StrLit:
+		if n.Wide {
+			return PtrType(WCharType()) // L"..." decays to wchar_t*
+		}
 		return PtrType(CharType()) // string literal decays to char*
 	case *Ident:
 		t := c.lookup(n.Name)
@@ -721,7 +793,7 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 					return IntType()
 				}
 			}
-			lt, ok := c.checkLValue(n.E, fn)
+			lt, ok := c.checkAddrOperand(n.E, fn)
 			if !ok {
 				return IntType()
 			}
@@ -1290,14 +1362,27 @@ func (c *checker) checkBraceElem(t *Type, e Expr, fn *FuncDecl, line int) {
 		return
 	}
 	if sl, ok := e.(*StrLit); ok {
-		if t.IsArray() && t.Elem.IsChar() {
-			if t.Len != 0 && t.Len < len(sl.Bytes)+1 {
-				c.errf(line, "string of length %d does not fit in char array of %d bytes", len(sl.Bytes), t.Len)
+		if t.IsArray() {
+			if sl.Wide {
+				// An L"..." literal initialises a wchar_t[] array (UTF-16).
+				if t.Elem.Width == 2 {
+					n := len(sl.Bytes) / 2
+					if t.Len != 0 && t.Len < n+1 {
+						c.errf(line, "wide string of %d elements does not fit in wchar_t array of %d elements", n, t.Len)
+					}
+					return
+				}
+			} else if t.Elem.IsChar() {
+				if t.Len != 0 && t.Len < len(sl.Bytes)+1 {
+					c.errf(line, "string of length %d does not fit in char array of %d bytes", len(sl.Bytes), t.Len)
+				}
+				return
 			}
-			return
 		}
-		if t.IsPtr() && t.Elem.IsChar() {
-			return // a char* member/element may hold a string literal
+		if t.IsPtr() {
+			if (sl.Wide && t.Elem.Width == 2) || (!sl.Wide && t.Elem.IsChar()) {
+				return // a (wchar_t*|char*) member/element may hold a string literal
+			}
 		}
 		c.errf(line, "string literal cannot initialise %s", t)
 		return

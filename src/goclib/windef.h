@@ -2,6 +2,7 @@
 #define GOC_WINDEF_H
 
 #include <stddef.h>
+#include <string.h>
 
 /* goc windef.h -- fundamental Win32 scalar types, handles and the basic
  * geometry structs. This is the first include of <windows.h>.
@@ -53,6 +54,32 @@ typedef long               LRESULT;
 
 typedef unsigned int       COLORREF;
 typedef unsigned short     WCHAR;
+
+/* Word packing, as in the real SDK. These deliberately yield a WORD (unsigned
+ * short) rather than an int: the idiomatic C is (int)(short)LOWORD(wp), which
+ * sign-extends a coordinate that arrived as a negative 16-bit value. Widening
+ * to int first would lose that sign. */
+#define MAKEWORD(h, l)  ((WORD)(((WORD)(h) << 8) | (WORD)(l)))
+#define HIWORD(w)       ((WORD)(((DWORD_PTR)(w)) >> 16))
+#define LOWORD(w)       ((WORD)(((DWORD_PTR)(w)) & 0xFFFF))
+#define MAKELPARAM(l, h) ((LPARAM)(((DWORD_PTR)HIWORD(l) << 16) | (LOWORD(h) & 0xFFFF)))
+#define MK_WPARAM(w)    ((WPARAM)((DWORD_PTR)HIWORD(w) << 16 | (LOWORD(w) & 0xFFFF)))
+
+/* ZeroMemory / SecureZeroMemory / RtlZeroMemory are the Windows spellings for
+ * clearing a buffer. They live in <windows.h> in the real SDK (via winnt.h),
+ * not in <string.h>, which matters because Win32 code reaches for them
+ * without including the CRT headers. ZeroMemory is exactly memset(p, 0, n);
+ * the Secure variant exists to stop the optimiser eliding a clear whose
+ * result is never read, so goclib backs it with the C23 memset_explicit. All
+ * three take a BYTE count, as in the real SDK. */
+#define ZeroMemory(p, n)         memset((p), 0, (n))
+#define SecureZeroMemory(p, n)   memset_explicit((p), 0, (n))
+#define RtlZeroMemory(p, n)      memset((p), 0, (n))
+
+/* COM status codes. A plain 32-bit signed value; the low 16 bits carry the
+ * severity (S_OK/E_FAIL) and the high 16 the facility. */
+typedef int                HRESULT;
+typedef unsigned long      REFIID;
 typedef unsigned short     ATOM;
 
 /* ------------------------------------------------------------------ */
@@ -81,6 +108,10 @@ typedef char              *LPSTR;
 typedef const char        *LPCSTR;
 typedef unsigned short    *LPWSTR;
 typedef const unsigned short *LPCWSTR;
+typedef unsigned short    *PWSTR;     /* Win64: identical width to LPWSTR */
+typedef const unsigned short *PCWSTR;
+typedef char              *PSTR;
+typedef const char        *PCSTR;
 typedef unsigned char     *LPBYTE;
 typedef unsigned int      *LPDWORD;
 typedef int               *LPBOOL;

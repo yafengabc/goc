@@ -9,6 +9,12 @@
  *     extern HDC GetDC(HWND), gdi32;
  */
 
+/* COLORREF packs R/G/B into the low 24 bits as 0x00BBGGRR (little-endian
+ * channel order, matching Windows). RGB() is the standard construction macro. */
+#ifndef RGB
+#define RGB(r, g, b) ((COLORREF)(((r) & 0xFF) | (((g) & 0xFF) << 8) | (((b) & 0xFF) << 16)))
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Stock objects (GetStockObject)                                      */
 /* ------------------------------------------------------------------ */
@@ -29,6 +35,22 @@
 #define DEFAULT_PALETTE      15
 #define SYSTEM_FIXED_FONT    16
 #define DEFAULT_GUI_FONT     17
+
+/* Object-type tags returned by GetObject and accepted by GetCurrentObject /
+ * EnumObjects. Each identifies which of the per-type header structs the
+ * buffer should hold (BITMAP, LOGFONTW, ...). */
+#define OBJ_BITMAP           0
+#define OBJ_PEN              1
+#define OBJ_PALETTE          2
+#define OBJ_BRUSH            3
+#define OBJ_FONT             4
+#define OBJ_REGION           5
+#define OBJ_METAFILE         6
+#define OBJ_ELLIPSE          7
+#define OBJ_RBITMAP          8
+#define OBJ_METAFILEPICT     9
+#define OBJ_ICON             12
+#define OBJ_CURSOR           13
 
 /* ------------------------------------------------------------------ */
 /* Background / text modes                                             */
@@ -122,9 +144,41 @@ typedef struct {
     DWORD biClrImportant;
 } BITMAPINFOHEADER;
 
+/* One palette entry. Declared before BITMAPINFO because that struct's
+ * bmiColors member is an array of these. Note the member order is BGR, not
+ * RGB: a 32-bit DIB stores pixels little-endian, so the first byte in memory
+ * is the blue channel. The names match the real SDK exactly, since code that
+ * walks a 32-bit DIB's pixels uses them directly. */
+typedef struct {
+    BYTE  rgbBlue;
+    BYTE  rgbGreen;
+    BYTE  rgbRed;
+    BYTE  rgbReserved;
+} RGBQUAD;
+
+/* bmiColors is a variable-length array in practice (one entry per palette
+ * colour, omitted entirely for BI_RGB 24/32bpp). Declaring it as a 1-element
+ * array reproduces the real sizeof(BITMAPINFO) == 44, which matters because
+ * callers pass the struct straight to CreateDIBSection. */
 typedef struct {
     BITMAPINFOHEADER bmiHeader;
+    RGBQUAD          bmiColors[1];
 } BITMAPINFO;
+
+/* BITMAP is the GDI's own bitmap object header -- the thing a GetObject on a
+ * HBITMAP fills in. It is NOT the DIB: the pixels live in the GDI's own
+ * storage, so only the dimensions and the handle are visible here. The struct
+ * is 4-byte aligned with a trailing WORD bmBytesPixel that older code reads,
+ * which brings the real size to 32 bytes on Win64. */
+typedef struct {
+    LONG  bmType;          /* 0 = bitmap */
+    LONG  bmWidth;
+    LONG  bmHeight;
+    WORD  bmWidthBytes;
+    WORD  bmPlanes;
+    WORD  bmBitsPixel;
+    void *bmBits;          /* points into GDI memory; not a client pointer */
+} BITMAP;
 
 #define BI_RGB       0
 #define BI_RLE8      1
@@ -139,9 +193,15 @@ extern HGDIOBJ SelectObject(HDC dc, HGDIOBJ obj), gdi32;
 extern BOOL    DeleteObject(HGDIOBJ obj), gdi32;
 
 extern HDC     CreateCompatibleDC(HDC dc), gdi32;
+extern HGDIOBJ GetCurrentObject(HDC dc, UINT type), gdi32;
 extern HBITMAP CreateCompatibleBitmap(HDC dc, int w, int h), gdi32;
 extern BOOL    DeleteDC(HDC dc), gdi32;
-extern HDC     CreateDC(LPCSTR driver, LPCSTR device, LPCSTR output, LPVOID init), gdi32;
+/* The device-context constructors are CreateDCA / CreateDCW; the unsuffixed
+ * CreateDC is an SDK macro, not an export. */
+extern HDC     CreateDCA(LPCSTR driver, LPCSTR device, LPCSTR output, LPVOID init), gdi32;
+extern HDC     CreateDCW(LPCWSTR driver, LPCWSTR device, LPCWSTR output, LPVOID init), gdi32;
+#define CreateDC(driver, device, output, init) \
+    CreateDCA((driver), (device), (output), (init))
 extern int     GetDeviceCaps(HDC dc, int index), gdi32;
 
 extern BOOL    SetBkColor(HDC dc, COLORREF color), gdi32;
@@ -173,5 +233,88 @@ extern BOOL    Pie(HDC dc, int l, int t, int r, int b, int x1, int y1, int x2, i
 extern BOOL    ExtTextOutA(HDC dc, int x, int y, UINT opts, LPRECT rc,
                     LPCSTR text, UINT len, LPVOID gaps), gdi32;
 extern BOOL    TextOutW(HDC dc, int x, int y, LPCWSTR text, int len), gdi32;
+
+/* ------------------------------------------------------------------ */
+/* LOGFONTW -- logical font description (lfFaceName is LF_FACESIZE=32 WCHAR). */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    LONG   lfHeight;
+    LONG   lfWidth;
+    LONG   lfEscapement;
+    LONG   lfOrientation;
+    LONG   lfWeight;
+    BYTE   lfItalic;
+    BYTE   lfUnderline;
+    BYTE   lfStrikeOut;
+    BYTE   lfCharSet;
+    BYTE   lfOutPrecision;
+    BYTE   lfClipPrecision;
+    BYTE   lfQuality;
+    BYTE   lfPitchAndFamily;
+    WCHAR  lfFaceName[32];
+} LOGFONTW;
+
+typedef SIZE *LPSIZE;
+typedef LOGFONTW *LPLOGFONTW;
+
+/* ------------------------------------------------------------------ */
+/* Font / pen / brush creation constants                                */
+/* ------------------------------------------------------------------ */
+#define PS_SOLID           0
+#define PS_DASH            1
+#define PS_DOT             2
+#define PS_DASHDOT         3
+#define PS_DASHDOTDOT      4
+#define PS_NULL            5
+#define PS_INSIDEFRAME     6
+
+#define FW_DONTCARE        0
+#define FW_NORMAL          400
+#define FW_BOLD            700
+
+#define DEFAULT_CHARSET     1
+#define ANSI_CHARSET       0
+#define DEFAULT_PITCH      0
+#define FF_DONTCARE        0
+#define OUT_DEFAULT_PRECIS  0
+#define CLIP_DEFAULT_PRECIS 0
+#define DEFAULT_QUALITY     0
+#define CLEARTYPE_QUALITY   5
+
+#define DIB_RGB_COLORS     0
+#define DIB_PAL_COLORS     1
+
+/* ------------------------------------------------------------------ */
+/* Object-creation gdi32 APIs                                           */
+/* ------------------------------------------------------------------ */
+extern HPEN    CreatePen(int style, int width, COLORREF color), gdi32;
+extern HBRUSH  CreateSolidBrush(COLORREF color), gdi32;
+extern HBRUSH  CreatePatternBrush(HBITMAP bmp), gdi32;
+extern HFONT   CreateFontIndirectW(const LOGFONTW *lf), gdi32;
+extern BOOL    GetTextExtentPoint32W(HDC dc, LPCWSTR text, int len, LPSIZE size), gdi32;
+extern HBITMAP CreateDIBSection(HDC dc, const BITMAPINFO *info, UINT usage,
+                        void **bits, LPVOID section, DWORD offset), gdi32;
+extern int     SaveDC(HDC dc), gdi32;
+extern BOOL    RestoreDC(HDC dc, int saved), gdi32;
+
+/* GDI object interrogation and DIB transfer. GetObject{A,W} fills a
+ * caller-sized buffer with the object's type-specific header -- BITMAP for a
+ * HBITMAP, LOGFONTW for an HFONT -- and returns how many bytes it wrote, or 0
+ * if the buffer is too small. The unsuffixed GetObject is a macro in the real
+ * SDK and not an exported symbol, so the A and W entry points are declared
+ * separately here and the header below spells the macro. */
+extern int     GetObjectA(HGDIOBJ obj, int bufSize, LPVOID buf), gdi32;
+extern int     GetObjectW(HGDIOBJ obj, int bufSize, LPVOID buf), gdi32;
+extern int     GetDIBits(HDC dc, HBITMAP bmp, UINT start, UINT cLines,
+                         LPVOID bits, BITMAPINFO *info, UINT usage), gdi32;
+extern int     SetDIBits(HDC dc, HBITMAP bmp, UINT start, UINT cLines,
+                         LPVOID bits, BITMAPINFO *info, UINT usage), gdi32;
+extern HBITMAP CreateBitmap(int w, int h, UINT planes, UINT bitsPixel, LPVOID bits), gdi32;
+
+/* GetObject is a function-like macro in the real SDK, not an export. It
+ * dispatches on UNICODE, which goc always defines, so it resolves to the wide
+ * entry point unconditionally -- the buffer it fills is a plain byte buffer
+ * whose interpretation the caller decides from the object type. */
+#define GetObject(obj, size, buf) GetObjectW((obj), (size), (buf))
 
 #endif /* GOC_WINGDI_H */

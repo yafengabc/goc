@@ -228,26 +228,57 @@ static int __goclib_file_flush(__goclib_FILE *f) {
 
 /* ----------------------------- fopen / fclose ----------------------------- */
 
-FILE *fopen(const char *path, const char *mode) {
-    __goclib_FILE *f;
-    int readable = 0, writable = 0, creat = 0, trunc = 0, append = 0;
-    long fd, i;
+/* finish_open wraps an OS handle that has already been opened into a FILE.
+ * Shared by fopen (ANSI path) and _wfopen (wide path) so the two can never
+ * drift apart in how they size the buffer or position an append stream. */
+static FILE *finish_open(long fd, int readable, int writable, int append) {
+    __goclib_FILE *f = (__goclib_FILE *)__goclib_heap_alloc(sizeof(__goclib_FILE));
+    if (f == 0) { __goclib_os_close(fd); return 0; }
+    f->_fd = fd;
+    f->_readable = readable; f->_writable = writable; f->_append = append;
+    f->_eof = 0; f->_err = 0; f->_unget = -1;
+    f->_pos = 0; f->_len = 0; f->_off = 0;
+    f->_base = (char *)__goclib_heap_alloc(4096);
+    f->_own = 1;
+    if (f->_base == 0) { f->_size = 0; f->_own = 0; }  /* fall back to unbuffered */
+    else f->_size = 4096;
+    if (append) f->_off = __goclib_os_size(fd);  /* ftell reflects the end */
+    return (FILE *)f;
+}
 
-    if (mode == 0 || path == 0) return 0;
+/* parse_mode decodes the fopen mode string into the four flags both openers
+ * need. Returns 0 for a mode string goclib does not accept. */
+/* The out-params are named do_rd/do_wr/do_cr/do_tr/do_ap rather than the
+ * obvious readable/writable/creat/trunc/append because goclib.h pulls in
+ * math.h, which declares trunc(); a local named trunc here resolves to that
+ * function instead of shadowing it, and &trunc then has type double(*). */
+static int parse_mode(const char *mode, int *do_rd, int *do_wr,
+                      int *do_cr, int *do_tr, int *do_ap) {
+    long i;
+    if (mode == 0) return 0;
     switch (mode[0]) {
-        case 'r': readable = 1; break;
-        case 'w': writable = 1; creat = 1; trunc = 1; break;
-        case 'a': writable = 1; creat = 1; append = 1; break;
+        case 'r': *do_rd = 1; break;
+        case 'w': *do_wr = 1; *do_cr = 1; *do_tr = 1; break;
+        case 'a': *do_wr = 1; *do_cr = 1; *do_ap = 1; break;
         default:  return 0;
     }
     /* '+' adds the missing direction; 'b'/'t' are accepted and ignored. */
     for (i = 0; mode[i]; i++) {
         if (mode[i] == 'b' || mode[i] == 't') continue;
         if (mode[i] == '+') {
-            if (readable) writable = 1;
-            else if (writable) readable = 1;
+            if (*do_rd) *do_wr = 1;
+            else if (*do_wr) *do_rd = 1;
         }
     }
+    return 1;
+}
+
+FILE *fopen(const char *path, const char *mode) {
+    int readable = 0, writable = 0, creat = 0, dotrunc = 0, append = 0;
+    long fd;
+
+    if (path == 0) return 0;
+    if (!parse_mode(mode, &readable, &writable, &creat, &dotrunc, &append)) return 0;
 
 #if defined(_WIN32)
     {
@@ -255,7 +286,7 @@ FILE *fopen(const char *path, const char *mode) {
         if (readable && writable) access = FA_READ | FA_WRITE;
         else if (readable)       access = FA_READ;
         else                     access = FA_WRITE;
-        disp = creat ? ((trunc || append) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS)
+        disp = creat ? ((dotrunc || append) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS)
                      : FA_OPEN_EXISTING;
         {
             void *h = CreateFileA(path, access, FA_SHARE, 0, disp, FA_NORMAL, 0);
@@ -270,25 +301,82 @@ FILE *fopen(const char *path, const char *mode) {
         else if (readable)       flags = LO_RDONLY;
         else                     flags = LO_WRONLY;
         if (creat)  flags |= LO_CREAT;
-        if (trunc)  flags |= LO_TRUNC;
+        if (dotrunc) flags |= LO_TRUNC;
         if (append) flags |= LO_APPEND;
         fd = open(path, flags, 0644);
         if (fd < 0) return 0;
     }
 #endif
 
-    f = (__goclib_FILE *)__goclib_heap_alloc(sizeof(__goclib_FILE));
-    if (f == 0) { __goclib_os_close(fd); return 0; }
-    f->_fd = fd;
-    f->_readable = readable; f->_writable = writable; f->_append = append;
-    f->_eof = 0; f->_err = 0; f->_unget = -1;
-    f->_pos = 0; f->_len = 0; f->_off = 0;
-    f->_base = (char *)__goclib_heap_alloc(4096);
-    f->_own = 1;
-    if (f->_base == 0) { f->_size = 0; f->_own = 0; }  /* fall back to unbuffered */
-    else f->_size = 4096;
-    if (append) f->_off = __goclib_os_size(fd);  /* ftell reflects the end */
-    return (FILE *)f;
+    return finish_open(fd, readable, writable, append);
+}
+
+/* _wfopen is the wide-path fopen of the MSVC CRT. It exists because a Win32
+ * GUI program naturally holds its paths as wchar_t* (that is what
+ * GetOpenFileNameW and wWinMain hand it), and round-tripping those through a
+ * temporary narrow buffer loses any character outside the active code page.
+ * Opening with CreateFileW keeps the path exact; only the mode string needs
+ * narrowing, and it is always ASCII ("r", "wb", "a", ...). */
+FILE *_wfopen(const wchar_t *path, const wchar_t *mode) {
+    char narrow[16];
+    int readable = 0, writable = 0, creat = 0, dotrunc = 0, append = 0;
+    long i, fd;
+
+    if (path == 0 || mode == 0) return 0;
+    for (i = 0; i < (long)sizeof(narrow) - 1 && mode[i]; i++)
+        narrow[i] = (char)mode[i];
+    narrow[i] = 0;
+    if (!parse_mode(narrow, &readable, &writable, &creat, &dotrunc, &append)) return 0;
+
+#if defined(_WIN32)
+    {
+        long access = 0, disp = 0;
+        if (readable && writable) access = FA_READ | FA_WRITE;
+        else if (readable)       access = FA_READ;
+        else                     access = FA_WRITE;
+        disp = creat ? ((dotrunc || append) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS)
+                     : FA_OPEN_EXISTING;
+        {
+            void *h = CreateFileW(path, access, FA_SHARE, 0, disp, FA_NORMAL, 0);
+            if ((long)h == -1) return 0;
+            fd = (long)h;
+        }
+    }
+#else
+    /* Other targets have no wide OS interface; a path that is pure ASCII is
+     * still usable, so narrow it and fall through to the byte-oriented path. */
+    {
+        char *narrow_path = (char *)__goclib_heap_alloc((size_t)(i + 1) * 4 + 1);
+        FILE *r;
+        long j = 0;
+        if (narrow_path == 0) return 0;
+        for (i = 0; path[i] && path[i] < 0x80; i++)
+            narrow_path[j++] = (char)path[i];
+        narrow_path[j] = 0;
+        r = (path[i] == 0) ? fopen(narrow_path, narrow) : 0;
+        __goclib_heap_free(narrow_path);
+        return r;
+    }
+#endif
+
+    return finish_open(fd, readable, writable, append);
+}
+
+/* fopen_s: the MSVC secure fopen. It hands the stream back through a FILE*
+ * and returns 0 on success or an errno-style code on failure, leaving *fp
+ * NULL so a caller that ignores the return value still cannot mistake an
+ * unopened stream for a good one. EINVAL covers a bad argument (which is what
+ * MSVC reports for those); ENOENT stands in for every open failure, since
+ * goclib's fopen does not surface the underlying reason. */
+int fopen_s(FILE **fp, const char *path, const char *mode) {
+    FILE *f;
+    if (fp == 0) return EINVAL;
+    *fp = 0;
+    if (path == 0 || mode == 0) return EINVAL;
+    f = fopen(path, mode);
+    if (f == 0) return ENOENT;
+    *fp = f;
+    return 0;
 }
 
 int fclose(FILE *stream) {

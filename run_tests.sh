@@ -35,7 +35,7 @@ echo "== building goc =="
 (cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc.exe .) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
-(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa.exe .) || { echo "GOA BUILD FAILED"; exit 1; }
+(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa.exe ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }
 
 # elfcheck verifies the ELF *structure* (headers, segments, entry). It no longer
 # decides whether the program's output is right -- the Linux binaries below are

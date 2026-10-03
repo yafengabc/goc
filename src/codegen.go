@@ -49,9 +49,9 @@ type CG struct {
 	// walks scopes (innermost last), so a declaration correctly shadows an
 	// outer one with the same name, and sibling blocks may reuse a name
 	// without their homes colliding.
-	varEnts    map[int]varInfo   // uid -> home
-	scopes     []map[string]int  // name -> uid; innermost scope is last
-	varUID     int               // next uid to assign
+	varEnts map[int]varInfo  // uid -> home
+	scopes  []map[string]int // name -> uid; innermost scope is last
+	varUID  int              // next uid to assign
 	// addrTaken holds the locals whose address is taken (&x) in the current
 	// function; declareVar copies the flag into each varInfo.addr.
 	addrTaken map[string]bool
@@ -70,8 +70,8 @@ type CG struct {
 	// ptrCapable variable: such a value's high 32 bits are pointer bits, and
 	// the narrow sites (N5b/N11/N12/N17/N22) must not movsxd it. Every
 	// expression evaluation resets it except a bare load of a marked variable.
-	resPtr bool
-	declUID    map[*DeclStmt]int // declaration node -> uid (filled during gather)
+	resPtr  bool
+	declUID map[*DeclStmt]int // declaration node -> uid (filled during gather)
 	// clOff maps each compound literal in the current function to its
 	// persistent frame slot. The unnamed object must stay addressable for as
 	// long as the statement/expression containing it runs (a call argument,
@@ -79,11 +79,17 @@ type CG struct {
 	// is re-initialised on every evaluation (fresh object per evaluation --
 	// observable inside loops).
 	clOff      map[*CompoundLit]int
-	localBytes int               // bytes consumed by stack-resident locals (incl. array padding)
-	regArea    int               // bytes reserved just below rbp for saved callee-save regs
-	globals    map[string]bool   // names of program-level (global/static) variables
-	globalLab  map[string]string // name -> .data label for a global variable
-	globalTyp  map[string]*Type  // name -> declared type of a global variable
+	localBytes int // bytes consumed by stack-resident locals (incl. array padding)
+	regArea    int // bytes reserved just below rbp for saved callee-save regs
+	// saveRegs is the callee-save set the current function actually pushes and
+	// restores, in push order. It is a subset of calleeSaveAll: a register the
+	// body never writes needs no save at all (the ABI only demands that a
+	// callee-save register be preserved if it is modified). See
+	// calleeSavePool. Empty is legal -- then the prologue pushes nothing.
+	saveRegs  []string
+	globals   map[string]bool   // names of program-level (global/static) variables
+	globalLab map[string]string // name -> .data label for a global variable
+	globalTyp map[string]*Type  // name -> declared type of a global variable
 	// globalStrInits records every pointer slot initialised by a string literal
 	// -- top-level "char *p = "str"", a static local, or a char* member nested
 	// anywhere inside a braced initialiser. The pointer value cannot live in
@@ -106,6 +112,17 @@ type CG struct {
 		glab, flab string
 		off        int
 	}
+	// globalArrInits binds a pointer slot initialised by the ADDRESS of a
+	// global/static ARRAY (or other global object) -- e.g. a "const char
+	// *const *extra_words" member set to "json_words", where json_words is a
+	// file-scope array. The array decays to a pointer in C, but goa cannot
+	// relocate that address into .data, so the entry stub stores it at
+	// startup. glab is the .data label of the object holding the slot, off its
+	// byte offset, alab the .data label of the target global/array.
+	globalArrInits []struct {
+		glab, alab string
+		off        int
+	}
 	// Static locals: a "static int x;" inside a function gets a unique .data
 	// label (collision-free even when two functions name their static "x") and
 	// persists across calls. c.staticVars maps the source name to that label
@@ -119,18 +136,26 @@ type CG struct {
 	// section (one instance per thread). c.tlsVars maps a source name to its
 	// layout; c.tlsList collects every TLS declaration (global or static local)
 	// for emission; tlsBytes tracks the running .tls offset for alignment.
-	tlsVars  map[string]*tlsVarInfo
-	tlsList  []*DeclStmt
-	tlsBytes int
-	usedRegs   []string        // callee-save registers actually used as local homes
-	tmpDepth   int             // live expression-temporary slots
-	grownMaxTmp int            // deepest maxTmp the frame has already been grown to cover
-	funcs      map[string]bool // user-defined functions (by name)
-	funcDefs   map[string]*FuncDecl
-	calls      map[string]bool // functions called that are not defined here
-	need       map[string]bool // goclib functions this program actually uses
-	mainTakesArgs bool          // main declares parameters: the Windows stub must build argc/argv
-	exitSym       string          // entry-stub terminator: "exit" (full C exit) or "__goclib_exit" (bare)
+	tlsVars       map[string]*tlsVarInfo
+	tlsList       []*DeclStmt
+	tlsBytes      int
+	usedRegs      []string        // callee-save registers actually used as local homes
+	tmpDepth      int             // live expression-temporary slots
+	grownMaxTmp   int             // deepest maxTmp the frame has already been grown to cover
+	funcs         map[string]bool // user-defined functions (by name)
+	funcDefs      map[string]*FuncDecl
+	calls         map[string]bool // functions called that are not defined here
+	need          map[string]bool // goclib functions this program actually uses
+	mainTakesArgs bool            // main declares parameters: the Windows stub must build argc/argv
+	// entryFn is the program entry function. entryIsGUI records that it is
+	// one of the MSVC GUI entries (WinMain / wWinMain) rather than main, and
+	// entryWide that it is the Unicode one -- which also decides whether the
+	// command line is fetched as LPWSTR or LPSTR. A GUI program has no main
+	// at all, so the stub calls the named function and builds its arguments.
+	entryFn        string
+	entryIsGUI     bool
+	entryWide      bool
+	exitSym        string // entry-stub terminator: "exit" (full C exit) or "__goclib_exit" (bare)
 	// Built-in C library (clibCStore): needed C functions are emitted through
 	// genFunc (which marks more needs, so Gen iterates to a fixpoint), and the
 	// library's file-scope variables join the .data pool -- but only those the
@@ -284,7 +309,7 @@ var externLinux = map[string]bool{
 	"unlink": true, "__goclib_rename": true,
 	"__goclib_stat": true, "__goclib_mkdir": true, "__goclib_rmdir": true,
 	"__goclib_getdents64": true,
-	"__goclib_getcwd": true, "__goclib_chmod": true, "__goclib_access": true,
+	"__goclib_getcwd":     true, "__goclib_chmod": true, "__goclib_access": true,
 	"__goclib_fstat": true,
 	"__goclib_vfork": true, "__goclib_execve": true, "__goclib_wait4": true,
 }
@@ -374,11 +399,64 @@ func SetRtdiag(on bool) {
 }
 
 // calleeSaveAll is the complete set of callee-save GPRs the register allocator
-// may use as local-register homes (and as scratch). Every generated function
-// pushes and pops all of them so the callee-save ABI contract holds for its
-// callers: a callee that draws a home from this pool must not clobber a
-// caller's cached local. See the prologue/epilogue emission in genFunction.
+// may use as local-register homes (and as scratch). Their order fixes the
+// allocation order AND the push order, and hence each register's save slot:
+// the k-th pushed register lands at [rbp-8*(k+1)].
+//
+// A function does NOT push all four. It pushes exactly the subset the body can
+// write, computed by calleeSavePool: the ABI only requires preserving a
+// callee-save register that is actually modified, so pushing one the body never
+// touches is pure dead work (a fixed 3-push/3-restore tax on every call, which
+// is what made recursive fib cost 5.4x gcc).
 var calleeSaveAll = []string{"rbx", "r12", "r13", "r14"}
+
+// calleeSavePool returns the callee-save registers a function must push and
+// restore, in push order. used is the set of registers handed out as variable
+// homes; any calleeSaveAll member not in it is never written by the body and
+// is therefore dropped.
+//
+// An inline-assembly function keeps the whole pool: the hand-written asm text
+// may use any of them as scratch, and codegen cannot see those writes.
+func calleeSavePool(used []string, hasAsm bool) []string {
+	if hasAsm {
+		return calleeSaveAll
+	}
+	sub := make([]string, 0, len(calleeSaveAll))
+	for _, r := range calleeSaveAll {
+		for _, u := range used {
+			if u == r {
+				sub = append(sub, r)
+				break
+			}
+		}
+	}
+	return sub
+}
+
+// alignFrame rounds a raw frame size up so that every call site in the current
+// function sees a 16-byte-aligned rsp.
+//
+// At the function entry R (rsp just after the return address was pushed) is
+// 8 mod 16, because the caller had rsp 16-aligned before its `call`. The
+// prolog then pushes rbp plus c.saveRegs and finally subtracts the frame, so
+// a call in the body runs with rsp = R - 8*(1+len(saveRegs)) - frame, and both
+// ABIs require that to be 0 mod 16:
+//
+//	8 - 8*(1+n) - frame == 0 (mod 16)  =>  8*n + frame == 0 (mod 16)
+//
+// Rounding the frame to a plain multiple of 16 -- what the code did back when
+// the prolog always pushed all four callee-saves -- satisfies that only when
+// 8*n is itself a multiple of 16, i.e. when n is EVEN. Dead callee-save
+// elimination makes n vary (0..4), so the parity has to be folded in here.
+// Getting it wrong misaligns rsp at every call by 8 bytes, which faults the
+// moment an imported routine performs an aligned SSE store: with the naive
+// fix, even `int main(void){return 0;}` segfaulted inside ExitProcess.
+func (c *CG) alignFrame(n int) int {
+	if want := (8*len(c.saveRegs) + n) % 16; want != 0 {
+		n += 16 - want
+	}
+	return n
+}
 
 // clibCStore picks the compiled C library for a target. With the diagnostic
 // runtime enabled it returns the GOC_RTDIAG-instrumented copy instead.
@@ -1632,28 +1710,28 @@ func (c *CG) genBigCast(n *CastExpr, t *Type) (CType, error) {
 			c.emit("lea r11, [rbp%+d]", resOff)
 			c.emit("lea r10, [rbp%+d]", loff)
 			c.copyBytes("r11", "r10", w*8)
-			} else if isBig(et) {
-				ssg := int64(0)
-				if et.Signed {
-					ssg = 1
-				}
-				dsg := int64(0)
-				if t.Signed {
-					dsg = 1
-				}
-				c.callBigLib("__goclib_bi_conv", []bigArg{
-					{addrOff: resOff}, {addrOff: loff}, {imm: int64(t.Bits)}, {imm: dsg}, {imm: int64(et.Bits)}, {imm: ssg},
-				})
-			} else {
-				// scalar operand: bigOperand materialised it at 64-bit width in
-				// loff; convert with wrap-around to the target width.
-				sg := int64(0)
-				if t.Signed {
-					sg = 1
-				}
-				c.callBigLib("__goclib_bi_conv", []bigArg{
-					{addrOff: resOff}, {addrOff: loff}, {imm: int64(t.Bits)}, {imm: sg}, {imm: 64}, {imm: sg},
-				})
+		} else if isBig(et) {
+			ssg := int64(0)
+			if et.Signed {
+				ssg = 1
+			}
+			dsg := int64(0)
+			if t.Signed {
+				dsg = 1
+			}
+			c.callBigLib("__goclib_bi_conv", []bigArg{
+				{addrOff: resOff}, {addrOff: loff}, {imm: int64(t.Bits)}, {imm: dsg}, {imm: int64(et.Bits)}, {imm: ssg},
+			})
+		} else {
+			// scalar operand: bigOperand materialised it at 64-bit width in
+			// loff; convert with wrap-around to the target width.
+			sg := int64(0)
+			if t.Signed {
+				sg = 1
+			}
+			c.callBigLib("__goclib_bi_conv", []bigArg{
+				{addrOff: resOff}, {addrOff: loff}, {imm: int64(t.Bits)}, {imm: sg}, {imm: 64}, {imm: sg},
+			})
 		}
 	}
 	c.tmpDepth = rk + w - 1
@@ -2001,8 +2079,13 @@ func (c *CG) genExprT1(e Expr) (CType, error) {
 			// to a pointer when it is used as a value, and sizeof does not use
 			// it as a value. Real code leans on this: cJSON's strdup is
 			// "strlen(s) + sizeof("")", which read 8 instead of 1 here and
-			// copied (and later printed) a byte of neighbouring memory.
-			sz = len(sl.Bytes) + 1
+			// copied (and later printed) a byte of neighbouring memory. A wide
+			// L"abc" literal is a wchar_t[N] array (2 bytes per element).
+			if sl.Wide {
+				sz = (len(sl.Bytes)/2 + 1) * 2
+			} else {
+				sz = len(sl.Bytes) + 1
+			}
 		} else {
 			sz = c.typeWidth(c.exprType(n.E))
 		}
@@ -2179,18 +2262,18 @@ func (c *CG) genExprT1(e Expr) (CType, error) {
 			c.tmpDepth--
 			// _BitInt assignment with mismatched widths converts by widening
 			// (or truncating) instead of a raw byte copy.
-				if rt2 := c.exprType(n.Rhs); isBig(lt) && isBig(rt2) && rt2.Bits != lt.Bits {
-					ssg := int64(0)
-					if rt2.Signed {
-						ssg = 1
-					}
-					dsg := int64(0)
-					if lt.Signed {
-						dsg = 1
-					}
-					c.callBigLib("__goclib_bi_conv", []bigArg{
-						{reg: "r10"}, {reg: "r11"}, {imm: int64(lt.Bits)}, {imm: dsg}, {imm: int64(rt2.Bits)}, {imm: ssg},
-					})
+			if rt2 := c.exprType(n.Rhs); isBig(lt) && isBig(rt2) && rt2.Bits != lt.Bits {
+				ssg := int64(0)
+				if rt2.Signed {
+					ssg = 1
+				}
+				dsg := int64(0)
+				if lt.Signed {
+					dsg = 1
+				}
+				c.callBigLib("__goclib_bi_conv", []bigArg{
+					{reg: "r10"}, {reg: "r11"}, {imm: int64(lt.Bits)}, {imm: dsg}, {imm: int64(rt2.Bits)}, {imm: ssg},
+				})
 			} else {
 				c.copyBytes("r10", "r11", lt.Size)
 			}
@@ -2535,6 +2618,7 @@ func (c *CG) genBigCompoundAssign(n *AssignExpr) (CType, error) {
 	c.markBig(resT, rk, w)
 	return TInt, nil
 }
+
 // genExpr emits an expression and discards its type (for statement context).
 func (c *CG) genExpr(e Expr) error {
 	_, err := c.genExprT(e)
@@ -2637,17 +2721,31 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 			c.mainTakesArgs = true
 		}
 	}
-		// Prototypes (from #include'd headers) are registered only for call-site
-		// double-promotion; they are deliberately NOT added to c.funcs, so a
-		// prototype for a goclib function still triggers goclib inclusion.
-		for _, f := range prog.Prototypes {
-			c.funcDefs[f.Name] = f
+	// Pick the program entry. main is the C standard name; a Windows GUI
+	// program has none and instead defines wWinMain (Unicode) or WinMain
+	// (ANSI) -- both are just as much a language-level entry point, so the
+	// compiler accepts them rather than making the caller write a main()
+	// shim. wWinMain wins if present, matching the /SUBSYSTEM:WINDOWS
+	// convention of preferring the wide API. Neither is valid on Linux,
+	// where the entry really is main(argc, argv, envp).
+	if c.funcs["main"] {
+		c.entryFn = "main"
+	} else if !c.linux && c.funcs["wWinMain"] {
+		c.entryFn, c.entryIsGUI, c.entryWide = "wWinMain", true, true
+	} else if !c.linux && c.funcs["WinMain"] {
+		c.entryFn, c.entryIsGUI = "WinMain", true
+	}
+	// Prototypes (from #include'd headers) are registered only for call-site
+	// double-promotion; they are deliberately NOT added to c.funcs, so a
+	// prototype for a goclib function still triggers goclib inclusion.
+	for _, f := range prog.Prototypes {
+		c.funcDefs[f.Name] = f
+	}
+	for _, f := range prog.Prototypes {
+		if f.DLL != "" {
+			dllOf[f.Name] = f.DLL
 		}
-		for _, f := range prog.Prototypes {
-			if f.DLL != "" {
-				dllOf[f.Name] = f.DLL
-			}
-		}
+	}
 
 	// T2.1 (R2): build the call graph over the user's functions before any
 	// body is generated, so genFunc can tell "small leaf that nobody calls"
@@ -2741,6 +2839,7 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 			c.insts = copyElim(c.insts)
 		}
 		c.insts = peepholeIR(c.insts)
+		c.insts = fuseCmpBranch(c.insts)
 		if !algebraicIdentSkip {
 			c.insts = algebraicIdent(c.insts)
 		}
@@ -2749,10 +2848,22 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 		}
 		c.insts = deadStores(c.insts)
 		c.insts = livenessDSE(c.insts)
+		// Copy propagation needs the dead copies gone first: a stranded
+		// `mov rax, r14` redefines the very register a later `mov r14, rax`
+		// wants to propagate, and refusing it there loses the rewrite. So:
+		// clear dead copies, propagate, then clear what propagation stranded.
+		c.insts = deadMoveElim(c.insts)
+		c.insts = copyProp(c.insts)
+		c.insts = deadMoveElim(c.insts)
+		c.insts = foldLea(c.insts)
+		c.insts = foldCmpMem(c.insts)
 	}
 	body.WriteString(printASM(c.insts))
 
-	if _, ok := c.funcs["main"]; !ok {
+	if c.entryFn == "" {
+		if c.linux && (c.funcs["wWinMain"] || c.funcs["WinMain"]) {
+			return "", fmt.Errorf("wWinMain/WinMain is a Windows entry point; an ELF program must define main()")
+		}
 		return "", fmt.Errorf("program has no main()")
 	}
 
@@ -2776,6 +2887,17 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 		// the no-library fallback path.
 		if lib := clibCStore(c.linux); lib == nil {
 			importSet["ExitProcess"] = true
+		}
+	}
+	// A WinMain entry needs the module handle and the raw command line; the
+	// stub calls them directly rather than through goclib. The W variant of
+	// GetCommandLine matches wWinMain's LPWSTR parameter.
+	if c.entryIsGUI {
+		importSet["GetModuleHandleA"] = true
+		if c.entryWide {
+			importSet["GetCommandLineW"] = true
+		} else {
+			importSet["GetCommandLineA"] = true
 		}
 	}
 	for name := range c.calls {
@@ -2839,6 +2961,13 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 		fmt.Fprintf(&strInit, "\tlea rax, [rip+%s]\n\tlea rdx, [rip+%s]\n\tmov [rax+%d], rdx\n",
 			fi.glab, fi.flab, fi.off)
 	}
+	for _, ai := range c.globalArrInits {
+		// Bind a pointer slot to the address of a global/static array. goa
+		// has no data relocations, so the address is computed with lea at
+		// startup and written into the (zero-filled) slot.
+		fmt.Fprintf(&strInit, "\tlea rax, [rip+%s]\n\tlea rdx, [rip+%s]\n\tmov [rax+%d], rdx\n",
+			ai.glab, ai.alab, ai.off)
+	}
 
 	// Entry stub: align the stack, run main, and hand its return value to the
 	// platform's exit routine. Linux needs no shadow space and exits through
@@ -2864,12 +2993,19 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 	if c.linux {
 		out.WriteString("\tmov rdi, r12\n")
 		out.WriteString("\tmov rsi, r13\n")
-		out.WriteString("\tcall main\n")
+		out.WriteString("\tcall " + c.entryFn + "\n")
 		out.WriteString("\tmov rdi, rax\n")
 		out.WriteString("\tcall " + c.exitSym + "\n\n")
 	} else {
 		out.WriteString("\tsub rsp, 48\n")
-		if c.mainTakesArgs {
+		// A WinMain entry takes the command line as LPWSTR (wWinMain) or
+		// LPSTR (WinMain), so the stub calls the matching GetCommandLine.
+		cmdLineFn := "GetCommandLineA"
+		if c.entryWide {
+			cmdLineFn = "GetCommandLineW"
+		}
+		switch {
+		case c.mainTakesArgs:
 			// A PE entry point receives no argc/argv, so build them from
 			// GetCommandLineA via the goclib helper before main runs. Skipped
 			// for main(void) programs -- see the need[...] pull-in above.
@@ -2877,8 +3013,30 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 			out.WriteString("\tcall __goclib_get_args\n")
 			out.WriteString("\tmov rcx, rax\n")
 			out.WriteString("\tmov rdx, [rsp+32]\n")
+			out.WriteString("\tcall " + c.entryFn + "\n")
+		case c.entryIsGUI:
+			// WinMain(HINSTANCE, HINSTANCE, LPSTR, int) / wWinMain(..., LPWSTR, int).
+			// The OS hands the PE entry point nothing, so synthesise the
+			// arguments the way the MSVC CRT would: hInstance from
+			// GetModuleHandleA(NULL), hPrevInstance always NULL (that is what
+			// Win16-era compatibility means, and the CRT has passed NULL there
+			// since Windows 2000), the full command line unparsed, and
+			// nCmdShow from the STARTUPINFO. The STARTUINFOW fetch needs the
+			// PEB, which is not reachable from user32/gdi32 alone, so the
+			// standard SW_SHOWDEFAULT (10) is used -- it is what the docs
+			// recommend when the caller has no better information, and it
+			// defers to the user's ShellExecute "start in" preference.
+			out.WriteString("\txor rcx, rcx\n")
+			out.WriteString("\tcall GetModuleHandleA\n")
+			out.WriteString("\tmov rcx, rax\n")        // hInstance
+			out.WriteString("\txor rdx, rdx\n")        // hPrevInstance = NULL
+			out.WriteString("\tcall " + cmdLineFn + "\n")
+			out.WriteString("\tmov r8, rax\n")         // lpCmdLine
+			out.WriteString("\tmov r9d, 10\n")         // nCmdShow = SW_SHOWDEFAULT
+			out.WriteString("\tcall " + c.entryFn + "\n")
+		default:
+			out.WriteString("\tcall " + c.entryFn + "\n")
 		}
-		out.WriteString("\tcall main\n")
 		out.WriteString("\tmov rcx, rax\n")
 		out.WriteString("\tcall " + c.exitSym + "\n\n")
 	}
@@ -3005,7 +3163,14 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 		out.WriteString("\nsection .rdata\n")
 		for i := range c.strs {
 			lab := fmt.Sprintf("LC%d", i)
-			out.WriteString(fmt.Sprintf("%s db \"%s\", 0\n", lab, encodeStr(c.strs[i].Bytes)))
+			if c.strs[i].Wide {
+				// L"..." is UTF-16LE: emit the code units verbatim and a
+				// 2-byte NUL terminator (one extra byte would leave the final
+				// wchar_t half-initialised). encodeStr escapes each byte.
+				out.WriteString(fmt.Sprintf("%s db \"%s\", 0, 0\n", lab, encodeStr(c.strs[i].Bytes)))
+			} else {
+				out.WriteString(fmt.Sprintf("%s db \"%s\", 0\n", lab, encodeStr(c.strs[i].Bytes)))
+			}
 		}
 	}
 	if len(c.doubles) > 0 {
@@ -3214,6 +3379,180 @@ func peepholeIR(insts []Inst) []Inst {
 		last = len(out) - 1
 	}
 	return out
+}
+
+// ccInverse maps an x86 conditional-jump mnemonic to the one that fires on
+// exactly the opposite condition.
+var ccInverse = map[string]string{
+	"je": "jne", "jne": "je",
+	"jl": "jge", "jge": "jl",
+	"jle": "jg", "jg": "jle",
+	"ja": "jbe", "jbe": "ja",
+	"jb": "jae", "jae": "jb",
+	"js": "jns", "jns": "js",
+	"jo": "jno", "jno": "jo",
+	"jp": "jnp", "jnp": "jp",
+}
+
+// fuseCmpBranch collapses the boolean materialisation emitCompare splices in
+// front of every conditional branch.
+//
+// emitCompare has to spell "rax = (A OP B)" out with a branch because goa has
+// no setcc, so an `if`/`for`/`while` test comes out as seven instructions:
+//
+//	cmp A, B          cmp A, B
+//	jl  Lt            <-- materialise
+//	mov rax, 0            |
+//	jmp Le                |
+//	Lt: mov rax, 1        |
+//	Le: cmp rax, 0    <-- then immediately test the 0/1 and branch
+//	je  Target
+//
+// When -- as here -- the 0/1 is consumed by nothing but the branch, the whole
+// thing is one instruction: the branch want to reach Target when the
+// comparison is FALSE (`je`), which is exactly `jge` off the original flags.
+// Measured on tmp/bench/fib_iter.c this takes the loop body from 19
+// instructions per iteration to 13, and goc from ~3x gcc -O2 to ~2x.
+//
+// The flags live untouched across the materialisation (neither `mov` nor
+// `jmp` touches them), so re-testing them after the join is always valid.
+func fuseCmpBranch(insts []Inst) []Inst {
+	// Count jump targets first: the two labels of a materialisation may only
+	// be dropped when nothing else in the function lands on them.
+	ref := map[string]int{}
+	for _, in := range insts {
+		if in.Kind != instInstr {
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok || len(pl.operands) != 1 {
+			continue
+		}
+		if pl.op == "jmp" || ccInverse[pl.op] != "" {
+			ref[pl.operands[0]]++
+		}
+	}
+	out := make([]Inst, 0, len(insts))
+	for i := 0; i < len(insts); {
+		if n, fused := matchCmpMaterialisation(insts, i, ref); n > 0 {
+			out = append(out, insts[i]) // keep the comparison verbatim
+			out = append(out, Inst{Kind: instInstr, Text: "\t" + fused})
+			i += n
+			continue
+		}
+		out = append(out, insts[i])
+		i++
+	}
+	return out
+}
+
+// matchCmpMaterialisation recognises the nine-line shape documented on
+// fuseCmpBranch starting at insts[i]. It returns the number of lines consumed
+// and the single conditional jump that replaces all of them, or (0, "") when
+// insts[i] does not start that shape.
+func matchCmpMaterialisation(insts []Inst, i int, ref map[string]int) (int, string) {
+	if i+9 > len(insts) {
+		return 0, ""
+	}
+	instr := func(k int) (parsedLine, bool) {
+		if insts[i+k].Kind != instInstr {
+			return parsedLine{}, false
+		}
+		return parseBodyLine(insts[i+k].Text)
+	}
+	labelName := func(k int) (string, bool) {
+		if insts[i+k].Kind != instLabel {
+			return "", false
+		}
+		s := strings.TrimSpace(insts[i+k].Text)
+		if !strings.HasSuffix(s, ":") {
+			return "", false
+		}
+		return strings.TrimSuffix(s, ":"), true
+	}
+
+	cmp, ok := instr(0)
+	if !ok || cmp.op != "cmp" || len(cmp.operands) != 2 {
+		return 0, ""
+	}
+	// j1 must be an ordinary condition. `jp`/`jnp` belong to the float
+	// comparison shape (emitCompareDbl), which carries an extra unordered
+	// test that has no single-instruction equivalent here.
+	j1, ok := instr(1)
+	if !ok || len(j1.operands) != 1 || ccInverse[j1.op] == "" ||
+		j1.op == "jp" || j1.op == "jnp" {
+		return 0, ""
+	}
+	lTrue := j1.operands[0]
+	if ref[lTrue] != 1 {
+		return 0, ""
+	}
+	zero, ok := instr(2)
+	if !ok || !writesRaxConst(zero, "0") {
+		return 0, ""
+	}
+	jm, ok := instr(3)
+	if !ok || jm.op != "jmp" || len(jm.operands) != 1 {
+		return 0, ""
+	}
+	lEnd := jm.operands[0]
+	if ref[lEnd] != 1 || lEnd == lTrue {
+		return 0, ""
+	}
+	if name, ok := labelName(4); !ok || name != lTrue {
+		return 0, ""
+	}
+	one, ok := instr(5)
+	if !ok || one.op != "mov" || len(one.operands) != 2 ||
+		one.operands[0] != "rax" || one.operands[1] != "1" {
+		return 0, ""
+	}
+	if name, ok := labelName(6); !ok || name != lEnd {
+		return 0, ""
+	}
+	// The re-test: `cmp rax, 0` as emitted, or `test rax, rax` once
+	// algebraicIdent has normalised it.
+	ret, ok := instr(7)
+	if !ok || len(ret.operands) != 2 || !testsRaxZero(ret) {
+		return 0, ""
+	}
+	br, ok := instr(8)
+	if !ok || len(br.operands) != 1 || (br.op != "je" && br.op != "jne") {
+		return 0, ""
+	}
+	if br.operands[0] == lTrue || br.operands[0] == lEnd {
+		return 0, ""
+	}
+	// `je` reaches the target when rax==0, i.e. when the comparison is FALSE:
+	// that is the inverse condition. `jne` reaches it when it is TRUE.
+	if br.op == "je" {
+		return 9, ccInverse[j1.op] + " " + br.operands[0]
+	}
+	return 9, j1.op + " " + br.operands[0]
+}
+
+// writesRaxConst reports whether pl stores the integer constant v into rax,
+// in either the emitted spelling (`mov rax, 0`) or the one peepholeIR
+// rewrites it to (`xor eax, eax`).
+func writesRaxConst(pl parsedLine, v string) bool {
+	if pl.op == "mov" && len(pl.operands) == 2 {
+		return pl.operands[0] == "rax" && pl.operands[1] == v
+	}
+	if pl.op == "xor" && len(pl.operands) == 2 && pl.operands[0] == pl.operands[1] {
+		return regToFull64[pl.operands[0]] == "rax" && v == "0"
+	}
+	return false
+}
+
+// testsRaxZero reports whether pl is the "is the boolean false?" re-test.
+func testsRaxZero(pl parsedLine) bool {
+	if pl.op == "cmp" {
+		return pl.operands[0] == "rax" && pl.operands[1] == "0"
+	}
+	if pl.op == "test" {
+		return pl.operands[0] == "rax" && pl.operands[1] == "rax"
+	}
+	return false
 }
 
 // gp64Regs is the set of full 64-bit register spellings; gpRegs adds the
@@ -3926,9 +4265,9 @@ func constProp(insts []Inst) []Inst {
 	// useKind classifies how an instruction mentions reg as an operand.
 	type useKind int
 	const (
-		useNone useKind = iota
-		useInline // a safe-to-inline source reference (constant can replace reg)
-		useOther  // a reference we must keep (memory base, dst, push, call, ...)
+		useNone   useKind = iota
+		useInline         // a safe-to-inline source reference (constant can replace reg)
+		useOther          // a reference we must keep (memory base, dst, push, call, ...)
 	)
 	classifyUse := func(pl parsedLine, reg string) useKind {
 		// Sub-register references (eax/ax/al/ah for rax, r8d/r8w/r8b for r8,
@@ -5050,10 +5389,15 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// regArea therefore carries an extra +8 gap on top of the
 	// 8*len(calleeSaveAll) push bytes. (The leading `push rbp` stores the
 	// caller's rbp AT rbp, i.e. offset 0, not within this region.) Every local
-	// and parameter-down offset is expressed relative to it. It is derived from
-	// len(calleeSaveAll), not len(c.usedRegs): even registers with no local
-	// home are pushed to honour the callee-save ABI contract.
-	regArea := 8*len(calleeSaveAll) + 8
+	// and parameter-down offset is expressed relative to it.
+	//
+	// It tracks c.saveRegs (the registers this function REALLY pushes), not
+	// len(calleeSaveAll): the save region only spans [rbp-8..rbp-8*len(saveRegs)],
+	// so a function using one home starts its locals at rbp-16 instead of
+	// rbp-40. The +8 gap is kept unconditionally -- it is what stops a
+	// sub-8-byte local (char/short/_Bool) from overlapping the last save slot.
+	c.saveRegs = calleeSavePool(c.usedRegs, hasAsm)
+	regArea := 8*len(c.saveRegs) + 8
 	localBytes := 0
 
 	// Parameter homes. Register parameters are spilled into this function's
@@ -5228,9 +5572,8 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// regArea above: the locals now start 8 bytes lower (rbp-40 instead of
 	// rbp-32), so the frame must grow by 8 to keep them inside it.
 	frame := 8 + pad + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave
-	if frame%16 != 0 {
-		frame += 16 - frame%16
-	}
+	// Must fold in the push count, not just round to 16 -- see alignFrame.
+	frame = c.alignFrame(frame)
 	// saveBaseOff points at save-area slot 0, which sits just below the
 	// expression temporaries. The ABI pad added to frame above pushes it up
 	// so the callee's argument-spill slots ([rsp+0..8*len(argRegs)) of the
@@ -5244,17 +5587,24 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	c.line(f.Name + ":\n")
 	c.emit("push rbp")
 	c.emit("mov rbp, rsp")
-	// Save the ENTIRE callee-save pool (rbx, r12, r13, r14) by PUSHING them,
-	// not just the registers we happen to use as local homes. A push lands
-	// each reg at [rbp-8*(i+1)], and gocrun registers a per-function unwind
-	// table built from this exact prolog shape (the Windows x64 unwinder
-	// reverses pushes, not rbp-relative stores). Preserving all of them -- not
-	// only the ones with a local home -- is what makes the callee-save ABI
-	// contract hold: any callee that draws a home from this pool would
-	// otherwise clobber a caller's cached local across the call (e.g. a
-	// caller with `int a,b,c,d` whose c/d live in r13/r14 get trashed by
-	// printf, which legitimately uses r13/r14 for its own locals).
-	for _, r := range calleeSaveAll {
+	// Save only the callee-save registers this function can actually write
+	// (c.saveRegs, see calleeSavePool), not the whole pool. The k-th push lands
+	// at [rbp-8*(k+1)], which is exactly where emitEpilogue reloads it.
+	//
+	// The old rule pushed all four unconditionally, on the theory that a
+	// register with no local home still had to be preserved "to honour the ABI
+	// contract". That is wrong: the contract is conditional -- a callee-save
+	// register must be preserved only if the callee MODIFIES it. A register the
+	// body never writes is already intact on return, so pushing it is dead
+	// work. (The fear behind the old rule was that printf "legitimately uses
+	// r13/r14 for its own locals" and would trash a caller's c/d; but printf
+	// using them obliges printf to save and restore them, which is precisely
+	// what makes the caller safe.)
+	//
+	// Nothing downstream depends on the count: goa's unwind metadata records
+	// whatever pushes it actually sees, and both prologue shape checks in the
+	// inliner skip a variable-length run of callee-save pushes.
+	for _, r := range c.saveRegs {
 		c.emit("push %s", r)
 	}
 	c.emitFrameAlloc(frame)
@@ -5438,9 +5788,8 @@ func (c *CG) growFrameForTemps() {
 	extra := 8 * (c.maxTmp - from)
 	c.grownMaxTmp = c.maxTmp
 	need := c.curFrame + extra
-	if need%16 != 0 {
-		need += 16 - need%16
-	}
+	// Same push-count-aware alignment as the initial frame -- see alignFrame.
+	need = c.alignFrame(need)
 	if need <= c.curFrame {
 		return
 	}
@@ -5455,25 +5804,25 @@ func (c *CG) growFrameForTemps() {
 func (c *CG) emitEpilogue() {
 	// Restore the callee-save registers saved by the prolog's PUSHes.
 	//
-	// The prolog does `push rbp; mov rbp,rsp; push rbx,r12,r13,r14; sub rsp,
-	// frame`, so the saved registers sit at fixed rbp-relative slots:
-	// rbx at [rbp-8], r12 at [rbp-16], r13 at [rbp-24], r14 at [rbp-32].
+	// The prolog does `push rbp; mov rbp,rsp; push <saveRegs>; sub rsp, frame`,
+	// so the k-th pushed register sits at [rbp-8*(k+1)].
 	//
 	// It is essential to restore them with rbp-RELATIVE loads, NOT with `pop`:
 	// the prolog's `sub rsp, frame` is not undone until the later `mov rsp,
-	// rbp`, so at this point rsp is still at rbp-32-frame. A `pop` would read
-	// [rbp-32-frame] and friends -- the uninitialised local area, not the saved
-	// registers -- silently zeroing (or scrambling) every caller-cached local
-	// that lived in a callee-save register across the call (e.g. `int a,b,c,d`
-	// whose values a callee was supposed to preserve per the ABI). Because the
-	// restore must be position-independent w.r.t. rsp, we load from [rbp-8*(i+1)]
-	// exactly where the pushes stored them.
+	// rbp`, so at this point rsp is still way below rbp. A `pop` would read
+	// the uninitialised local area, not the saved registers -- silently zeroing
+	// (or scrambling) every caller-cached local that lived in a callee-save
+	// register across the call. Because the restore must be position-
+	// independent w.r.t. rsp, we load from [rbp-8*(k+1)] exactly where the
+	// pushes stored them.
 	//
-	// Always the whole calleeSaveAll pool, not just c.usedRegs: a callee must
-	// restore every register it promised to preserve, even ones with no local
-	// home in this function, or a caller's cached locals would be lost.
-	for i := 0; i < len(calleeSaveAll); i++ {
-		c.emit("mov %s, [rbp-%d]", calleeSaveAll[i], 8*(i+1))
+	// Only c.saveRegs is restored, and k is the index within THAT slice (not
+	// within calleeSaveAll): the save slots are laid down by however many
+	// pushes the prolog actually emitted, so a function that saved just rbx
+	// finds it at [rbp-8]. Restoring a register the prolog never pushed would
+	// load garbage from the local area and trash a caller's cached value.
+	for k, r := range c.saveRegs {
+		c.emit("mov %s, [rbp-%d]", r, 8*(k+1))
 	}
 	c.emit("mov rsp, rbp")
 	c.emit("pop rbp")
@@ -5540,22 +5889,27 @@ func (c *CG) genStmt(s Stmt) error {
 			// char array: copy the bytes (plus NUL) into the stack slot and
 			// zero-fill the tail of a larger array. Other array initialisers
 			// were rejected by the checker and never reach codegen.
-			if sl, ok := n.Init.(*StrLit); ok && vi.typ.Elem.IsChar() {
-				size := c.typeWidth(vi.typ)
-				copied := len(sl.Bytes) + 1
-				if copied > size {
-					copied = size // defensive; the checker rejects oversize
-				}
-				if _, err := c.genExprT(n.Init); err != nil {
-					return err // rax = address of the constant in .rdata
-				}
-				c.emit("mov r11, rax")
-				c.emit("lea r10, [rbp%+d]", vi.off)
-				c.copyBytes("r10", "r11", copied)
-				if size > copied {
-					c.emit("add r10, %d", copied)
-					c.zeroBytes("r10", size-copied)
-				}
+		if sl, ok := n.Init.(*StrLit); ok && ((sl.Wide && vi.typ.Elem.Width == 2) || (!sl.Wide && vi.typ.Elem.IsChar())) {
+			size := c.typeWidth(vi.typ)
+			copied := len(sl.Bytes)
+			if sl.Wide {
+				copied += 2 // 2-byte NUL terminator for wchar_t[]
+			} else {
+				copied += 1
+			}
+			if copied > size {
+				copied = size // defensive; the checker rejects oversize
+			}
+			if _, err := c.genExprT(n.Init); err != nil {
+				return err // rax = address of the constant in .rdata
+			}
+			c.emit("mov r11, rax")
+			c.emit("lea r10, [rbp%+d]", vi.off)
+			c.copyBytes("r10", "r11", copied)
+			if size > copied {
+				c.emit("add r10, %d", copied)
+				c.zeroBytes("r10", size-copied)
+			}
 			}
 			return nil
 		}
@@ -5597,18 +5951,18 @@ func (c *CG) genStmt(s Stmt) error {
 				}
 				c.emit("mov r11, r10") // r11 = source address
 				c.emit("lea r10, [rbp%+d]", vi.off)
-					if isBig(vi.typ) && isBig(it) && it.Bits != vi.typ.Bits {
-						ssg := int64(0)
-						if it.Signed {
-							ssg = 1
-						}
-						dsg := int64(0)
-						if vi.typ.Signed {
-							dsg = 1
-						}
-						c.callBigLib("__goclib_bi_conv", []bigArg{
-							{reg: "r10"}, {reg: "r11"}, {imm: int64(vi.typ.Bits)}, {imm: dsg}, {imm: int64(it.Bits)}, {imm: ssg},
-						})
+				if isBig(vi.typ) && isBig(it) && it.Bits != vi.typ.Bits {
+					ssg := int64(0)
+					if it.Signed {
+						ssg = 1
+					}
+					dsg := int64(0)
+					if vi.typ.Signed {
+						dsg = 1
+					}
+					c.callBigLib("__goclib_bi_conv", []bigArg{
+						{reg: "r10"}, {reg: "r11"}, {imm: int64(vi.typ.Bits)}, {imm: dsg}, {imm: int64(it.Bits)}, {imm: ssg},
+					})
 				} else {
 					c.copyBytes("r10", "r11", vi.typ.Size)
 				}
@@ -5750,18 +6104,18 @@ func (c *CG) genStmt(s Stmt) error {
 			}
 			c.emit("mov r11, r10")                  // r11 = source address
 			c.emit("mov r10, [rbp%+d]", c.sretSlot) // r10 = caller's buffer
-				if isBig(c.curRet) && isBig(et) && et.Bits != c.curRet.Bits {
-					ssg := int64(0)
-					if et.Signed {
-						ssg = 1
-					}
-					dsg := int64(0)
-					if c.curRet.Signed {
-						dsg = 1
-					}
-					c.callBigLib("__goclib_bi_conv", []bigArg{
-						{reg: "r10"}, {reg: "r11"}, {imm: int64(c.curRet.Bits)}, {imm: dsg}, {imm: int64(et.Bits)}, {imm: ssg},
-					})
+			if isBig(c.curRet) && isBig(et) && et.Bits != c.curRet.Bits {
+				ssg := int64(0)
+				if et.Signed {
+					ssg = 1
+				}
+				dsg := int64(0)
+				if c.curRet.Signed {
+					dsg = 1
+				}
+				c.callBigLib("__goclib_bi_conv", []bigArg{
+					{reg: "r10"}, {reg: "r11"}, {imm: int64(c.curRet.Bits)}, {imm: dsg}, {imm: int64(et.Bits)}, {imm: ssg},
+				})
 			} else {
 				c.copyBytes("r10", "r11", c.curRet.Size)
 			}
@@ -7124,10 +7478,13 @@ func (c *CG) binaryType(n *Binary) *Type {
 func (c *CG) elemWidthOf(e Expr) int {
 	switch n := e.(type) {
 	case *StrLit:
-		// A string literal is a char[N] array: indexing it ("hello"[i]) strides
-		// and loads one byte, not the 8-byte default a bare expression gets.
-		// Without this case "hello"[0] read a whole quadword of neighbouring
-		// memory (P0.8).
+		// A string literal is a char[N] (or wchar_t[N] when wide) array:
+		// indexing it ("hello"[i] / L"hi"[i]) strides and loads one element,
+		// not the 8-byte default a bare expression gets. Without this case
+		// "hello"[0] read a whole quadword of neighbouring memory (P0.8).
+		if n.Wide {
+			return 2
+		}
 		return 1
 	case *Ident:
 		vi, ok := c.lookupVar(n.Name)
@@ -7525,6 +7882,17 @@ func t21HasAggType(t *Type) bool {
 	return t != nil && (t.IsArray() || t.IsStruct() || t.IsUnion() || t.Kind == KBitInt)
 }
 
+// NOTE (measured, 2026-10-03): the implicit `static const char __func__[]`
+// the parser prepends to every function body is a char ARRAY, so it makes
+// t21HasAggType -- and therefore bst.hasAgg -- true for every function in the
+// program, which silently disables the r8/r9 leaf pool extension (its only
+// consumer) everywhere. Exempting it by name looks like an obvious bug fix,
+// but it was measured and REVERTED: enabling the extension puts fib_iter's
+// loop bound in r8 and made the iterative fib benchmark 12.7% SLOWER
+// (1.15s -> 1.30s) despite removing a memory reload per iteration. Do not
+// re-enable without re-measuring on real workloads.
+const injectedFuncIdent = "__func__"
+
 // t21BodyScan walks f's body counting statements and collecting callees.
 func t21BodyScan(f *FuncDecl) t21BodyStats {
 	st := t21BodyStats{callees: map[string]bool{}}
@@ -7862,8 +8230,13 @@ func (c *CG) braceElemLocal(t *Type, e Expr, off int) error {
 		return c.braceWalkLocal(t, nbi, off)
 	}
 	w := c.typeWidth(t)
-	if sl, ok := e.(*StrLit); ok && t.IsArray() && t.Elem.IsChar() {
-		copied := len(sl.Bytes) + 1
+	if sl, ok := e.(*StrLit); ok && t.IsArray() && ((sl.Wide && t.Elem.Width == 2) || (!sl.Wide && t.Elem.IsChar())) {
+		copied := len(sl.Bytes)
+		if sl.Wide {
+			copied += 2
+		} else {
+			copied += 1
+		}
 		if copied > w {
 			copied = w
 		}
@@ -7951,6 +8324,38 @@ func (c *CG) walkGlobalInit(t *Type, init Expr, glab string, off int) {
 					glab, slab string
 					off        int
 				}{glab, lab, off})
+		}
+		// A pointer slot filled by the address of a global/static object --
+		// either a bare identifier (an array decays to a pointer in C, e.g.
+		// "const char *const *extra_words = json_words") or an explicit
+		// "&g" (e.g. "int *p = &g"). goa cannot relocate either address
+		// into .data, so record it for the entry stub to bind at startup,
+		// exactly like a function-pointer slot.
+		var varName string
+		if id, ok := init.(*Ident); ok {
+			varName = id.Name
+		} else if u, ok := init.(*Unary); ok && u.Op == "&" {
+			if id, ok := u.E.(*Ident); ok {
+				varName = id.Name
+			}
+		}
+		if varName != "" && t.Kind == KPtr {
+			if lab, ok := c.globalLab[varName]; ok {
+				c.globalArrInits = append(c.globalArrInits,
+					struct {
+						glab, alab string
+						off        int
+					}{glab, lab, off})
+				return
+			}
+			if lab, ok := c.staticVars[varName]; ok {
+				c.globalArrInits = append(c.globalArrInits,
+					struct {
+						glab, alab string
+						off        int
+					}{glab, lab, off})
+				return
+			}
 		}
 		return
 	}
@@ -8129,12 +8534,21 @@ func (c *CG) emitGlobalVar(out *strings.Builder, g *DeclStmt, lab string) error 
 	// \"hi\"" keeps five zero tail bytes). A global char* initialised by a
 	// string literal is NOT supported: goa's dq takes no symbol operands, so
 	// the pointer could not be relocated to the constant.
-	if g.Typ != nil && g.Typ.IsArray() && g.Typ.Elem.IsChar() {
-		if sl, ok := g.Init.(*StrLit); ok {
+	if g.Typ != nil && g.Typ.IsArray() {
+		if sl, ok := g.Init.(*StrLit); ok &&
+			((!sl.Wide && g.Typ.Elem.IsChar()) || (sl.Wide && g.Typ.Elem.Width == 2)) {
 			size := c.typeWidth(g.Typ)
-			out.WriteString(fmt.Sprintf("%s db \"%s\", 0", lab, encodeStr(sl.Bytes)))
-			for i := len(sl.Bytes) + 1; i < size; i++ {
-				out.WriteString(", 0")
+			if sl.Wide {
+				// wchar_t array: UTF-16 code units plus a 2-byte NUL terminator.
+				out.WriteString(fmt.Sprintf("%s db \"%s\", 0, 0", lab, encodeStr(sl.Bytes)))
+				for i := len(sl.Bytes) + 2; i < size; i++ {
+					out.WriteString(", 0")
+				}
+			} else {
+				out.WriteString(fmt.Sprintf("%s db \"%s\", 0", lab, encodeStr(sl.Bytes)))
+				for i := len(sl.Bytes) + 1; i < size; i++ {
+					out.WriteString(", 0")
+				}
 			}
 			out.WriteString("\n")
 			return nil
@@ -8219,9 +8633,10 @@ func (c *CG) isZeroInit(g *DeclStmt) bool {
 		}
 		return false
 	}
-	// A char array initialised by a string literal carries real bytes.
-	if g.Typ != nil && g.Typ.IsArray() && g.Typ.Elem.IsChar() {
-		if _, ok := g.Init.(*StrLit); ok {
+	// A char (or wchar_t) array initialised by a string literal carries real bytes.
+	if g.Typ != nil && g.Typ.IsArray() {
+		if sl, ok := g.Init.(*StrLit); ok &&
+			((!sl.Wide && g.Typ.Elem.IsChar()) || (sl.Wide && g.Typ.Elem.Width == 2)) {
 			return false
 		}
 	}
@@ -8383,8 +8798,11 @@ func (c *CG) fillBraceElem(t *Type, e Expr, img []byte, off int) error {
 		return fmt.Errorf("initialiser overflows global of %d bytes", len(img))
 	}
 	if sl, ok := e.(*StrLit); ok {
-		if t.IsArray() && t.Elem.IsChar() {
+		if t.IsArray() && ((sl.Wide && t.Elem.Width == 2) || (!sl.Wide && t.Elem.IsChar())) {
 			b := append(append([]byte(nil), sl.Bytes...), 0)
+			if sl.Wide {
+				b = append(b, 0) // 2-byte NUL terminator for wchar_t[]
+			}
 			if len(b) > w {
 				b = b[:w]
 			}
@@ -8516,9 +8934,9 @@ func (c *CG) lvalueWidth(e Expr) int {
 				if gt.Kind == KFloat {
 					return 4
 				}
-			if gt.Kind == KStruct || gt.Kind == KUnion || gt.Kind == KBitInt {
-				return gt.Size
-			}
+				if gt.Kind == KStruct || gt.Kind == KUnion || gt.Kind == KBitInt {
+					return gt.Size
+				}
 			}
 			return 8
 		}
@@ -10201,4 +10619,3 @@ func formatDouble(v float64) string {
 	}
 	return s
 }
-

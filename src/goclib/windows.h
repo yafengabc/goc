@@ -32,5 +32,12 @@
 #include <winbase.h>
 #include <winuser.h>
 #include <wingdi.h>
+#include <winreg.h>
+#include <ole32.h>
+#include <commdlg.h>
+#include <commctrl.h>
+#include <shlobj.h>
+#include <shellapi.h>
+#include <shlwapi.h>
 
 #endif /* GOC_WINDOWS_H */

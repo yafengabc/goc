@@ -38,6 +38,11 @@ void  *memchr(const void *s, int c, size_t n);
  * the two string functions programs reach for most after the C89 set.
  * strdup mallocs its copy, so the caller frees it. */
 char  *strdup(const char *s);
+/* MSVC spellings kept for porting Windows code: _strdup is the deprecated
+ * duplicate of strdup, _stricmp/_strnicmp the ASCII case-insensitive compares. */
+char  *_strdup(const char *s);
+int    _stricmp(const char *s1, const char *s2);
+int    _strnicmp(const char *s1, const char *s2, size_t n);
 /* Length of s, stopping at n -- never reads past n bytes, so it is safe on a
  * buffer that is not NUL-terminated. */
 size_t strnlen(const char *s, size_t n);

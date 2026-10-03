@@ -27,7 +27,7 @@ mkdir -p bin
 (cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc .) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
-(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa .) || { echo "GOA BUILD FAILED"; exit 1; }
+(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }
 
 # Fresh output dir: goc -o bin/goc-out writes every .asm/ELF here, keeping
 # src/examples/ pristine (only the .c files live there).

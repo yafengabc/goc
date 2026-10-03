@@ -6,9 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+
+	"goa"
 )
 
 // goc: a tiny C compiler.
@@ -23,14 +24,16 @@ import (
 // into existing build scripts as a drop-in `cc`. Unknown options that have no
 // meaning for a single-translation-unit compiler (optimisation levels, warning
 // flags, standard selection, machine/linker flags, ...) are accepted and
-// ignored rather than rejected. The one hard limitation is linking: goc builds
-// one program (with its library) end to end, so it cannot consume .o files or
-// link several objects together -- gcc's "compile to .o then link" split is
-// simply not representable here.
+// ignored rather than rejected. There is no separate linking stage: `goc a.c
+// b.c` parses each file as its own translation unit, merges the declarations
+// (statics stay private to their file, duplicate externals are an error) and
+// compiles the result into one executable -- so goc still cannot consume .o
+// files or link objects together (see src/multi.go).
 //
 // Usage (goc convenience front-end):
 //
 //	goc file.c                 compile only (emit file.exe)
+//	goc a.c b.c                compile several translation units into one exe
 //	goc run file.c [args...]   compile to a temp dir, run with args (go run)
 //	goc -c file.c              compile only (produce file.exe / file)
 //	goc -S file.c              emit assembly only (produce file.asm)
@@ -97,15 +100,11 @@ func main() {
 // modes write their own outputs and return "". Compile errors terminate the
 // process (exit 1), matching the historical behaviour.
 func buildProgram(cfg buildCfg, isCC bool) (string, error) {
-	srcPath := cfg.inputs[0]
-	if strings.HasSuffix(srcPath, ".o") || strings.HasSuffix(srcPath, ".obj") ||
-		strings.HasSuffix(srcPath, ".a") || strings.HasSuffix(srcPath, ".lib") {
-		return "", fmt.Errorf("goc: %s -- goc cannot consume object/library files (no separate linking stage)", srcPath)
-	}
-
-	src, err := os.ReadFile(srcPath)
-	if err != nil {
-		return "", err
+	for _, p := range cfg.inputs {
+		if strings.HasSuffix(p, ".o") || strings.HasSuffix(p, ".obj") ||
+			strings.HasSuffix(p, ".a") || strings.HasSuffix(p, ".lib") {
+			return "", fmt.Errorf("goc: %s -- goc cannot consume object/library files (no separate linking stage)", p)
+		}
 	}
 	if cfg.rtdiag {
 		// Must happen BEFORE injectDefines/Preprocess so the macro reaches the
@@ -113,6 +112,17 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 		// API (goc_rt_stats_t, __goc_rt_print, ...) visible to user code.
 		cfg.defines = append(cfg.defines, "GOC_RTDIAG=1")
 		SetRtdiag(true)
+	}
+	// Several .c files: each is its own translation unit (its own macros and
+	// type names), and the merged program is compiled as one executable.
+	if len(cfg.inputs) > 1 {
+		return buildMulti(cfg, isCC)
+	}
+
+	srcPath := cfg.inputs[0]
+	src, err := os.ReadFile(srcPath)
+	if err != nil {
+		return "", err
 	}
 	src = []byte(injectDefines(string(src), cfg.defines))
 
@@ -142,6 +152,14 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse error: %w", err)
 	}
+	return emitProgram(prog, cfg, isCC)
+}
+
+// emitProgram is everything that happens after parsing: type-check the whole
+// program, generate assembly, and hand it to goa. Shared by the single-file
+// path and the multi-file one (which parses each .c separately and merges the
+// translation units before calling this).
+func emitProgram(prog *Program, cfg buildCfg, isCC bool) (string, error) {
 	if errs := Check(prog); len(errs) > 0 {
 		var b strings.Builder
 		b.WriteString("type error(s):")
@@ -154,7 +172,9 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("codegen error: %w", err)
 	}
-	asmPath, outPath := outputPaths(srcPath, cfg.outFile, cfg.linux, cfg.mode == "asm")
+	// outputPaths names the outputs after the first input; a multi-file build
+	// produces one program, so that is the right base name.
+	asmPath, outPath := outputPaths(cfg.inputs[0], cfg.outFile, cfg.linux, cfg.mode == "asm")
 	if err := os.MkdirAll(filepath.Dir(asmPath), 0755); err != nil {
 		return "", err
 	}
@@ -169,41 +189,40 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 		return "", nil
 	}
 
-	// Hand the assembly to goa, our own assembler. No gcc involved.
-	goa, err := findGoa()
-	if err != nil {
-		return "", fmt.Errorf("cannot find goa: %w (build it with: cd src/goa && go build ., or set GOA=<path>)", err)
-	}
-
-	var cmd *exec.Cmd
-	if cfg.linux {
-		cmd = exec.Command(goa, "-f", "elf", asmPath, outPath)
-	} else {
-		cmd = exec.Command(goa, asmPath, outPath)
-	}
-	// goa prints "compiled X (N bytes)" on success; that is fine for the goc
-	// front-end but gcc is silent, so drop goa's stdout when acting as cc.
-	if isCC {
-		cmd.Stdout = nil
-	} else {
-		cmd.Stdout = os.Stdout
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("goa failed: %w", err)
-	}
-	if !isCC {
-		fmt.Printf("compiled %s -> %s\n", srcPath, outPath)
+	// Hand the assembly to goa, our own assembler -- linked into this binary,
+	// so there is no external goa process and nothing to find on disk.
+	if err := assemble(asm, outPath, cfg.linux, cfg.inputs[0], isCC); err != nil {
+		return "", err
 	}
 	return outPath, nil
 }
 
-// splitRunArgs divides `goc run` arguments into build flags, the source file
-// and the program arguments: everything up to the first bare token is a build
-// flag (known separate-value flags swallow their value so it is not mistaken
-// for the source); the first bare token is the source; everything after it
-// goes to the compiled program verbatim -- the go run contract.
-func splitRunArgs(args []string) (buildArgs []string, src string, progArgs []string) {
+// assemble runs the in-process goa assembler over asm text and writes the
+// executable to outPath. It reports the same one-line summary the goa CLI
+// used to print (silently, when acting as cc, because gcc is silent).
+func assemble(asm, outPath string, linux bool, srcPath string, isCC bool) error {
+	n, err := goa.AssembleSource(asm, outPath, linux)
+	if err != nil {
+		return fmt.Errorf("goa failed: %w", err)
+	}
+	if !isCC {
+		if n > 0 {
+			fmt.Printf("compiled %s -> %s (%d bytes)\n", srcPath, outPath, n)
+		} else {
+			fmt.Printf("compiled %s -> %s\n", srcPath, outPath)
+		}
+	}
+	return nil
+}
+
+// splitRunArgs divides `goc run` arguments into build flags, the source
+// file(s) and the program arguments: everything up to the first bare token is
+// a build flag (known separate-value flags swallow their value so it is not
+// mistaken for the source); the first bare token is a source file, and any
+// immediately following bare token that looks like a C source joins it (so
+// `goc run a.c b.c` builds both); everything after that goes to the compiled
+// program verbatim -- the go run contract.
+func splitRunArgs(args []string) (buildArgs []string, inputs []string, progArgs []string) {
 	takesValue := map[string]bool{
 		"-o": true, "-D": true, "-I": true, "-target": true,
 		"-MF": true, "-MT": true, "-MQ": true, "-include": true,
@@ -219,10 +238,32 @@ func splitRunArgs(args []string) (buildArgs []string, src string, progArgs []str
 		}
 		// Attached forms (-ofile, -O2, -Wall) carry no separate value.
 	}
-	if i < len(args) {
-		return args[:i], args[i], args[i+1:]
+	if i >= len(args) {
+		return args, nil, nil
 	}
-	return args, "", nil
+	inputs = append(inputs, args[i])
+	j := i + 1
+	// Extra translation units: `goc run a.c b.c -- args to the program`.
+	for ; j < len(args); j++ {
+		if strings.HasPrefix(args[j], "-") && args[j] != "-" {
+			break
+		}
+		if !isCSource(args[j]) {
+			break
+		}
+		inputs = append(inputs, args[j])
+	}
+	return args[:i], inputs, args[j:]
+}
+
+// isCSource reports whether a bare `goc run` argument is another C source
+// file rather than an argument for the compiled program.
+func isCSource(p string) bool {
+	switch strings.ToLower(filepath.Ext(p)) {
+	case ".c", ".i":
+		return true
+	}
+	return false
 }
 
 // runCmd implements `goc run [build-flags] file.c [program-args...]`:
@@ -232,15 +273,15 @@ func splitRunArgs(args []string) (buildArgs []string, src string, progArgs []str
 // GetCommandLineA, Linux reads [rsp] at entry), so exec-ing with progArgs is
 // all the forwarding needed.
 func runCmd(args []string) {
-	buildArgs, src, progArgs := splitRunArgs(args)
-	if src == "" {
+	buildArgs, inputs, progArgs := splitRunArgs(args)
+	if len(inputs) == 0 {
 		fmt.Fprintln(os.Stderr, "goc run: no input files")
-		fmt.Fprintln(os.Stderr, "usage: goc run [-O*] [-Dname[=val]] [-Idir] file.c [args...]")
+		fmt.Fprintln(os.Stderr, "usage: goc run [-O*] [-Dname[=val]] [-Idir] file.c [file2.c...] [args...]")
 		os.Exit(1)
 	}
 
 	cfg, _ := parseArgs(buildArgs)
-	cfg.inputs = []string{src}
+	cfg.inputs = inputs
 	cfg.mode = "compile" // the run below is runCmd's job
 	if cfg.linux {
 		fmt.Fprintln(os.Stderr, "goc run: cannot execute a Linux ELF on this host (drop -target linux, or use -c and run it on Linux)")
@@ -542,8 +583,12 @@ func isDir(p string) bool {
 func printHelp() {
 	fmt.Print(`goc - a tiny C compiler (gcc/clang-compatible front-end)
 
-Usage: goc [options] file.c
-       goc run [build-flags] file.c [program-args...]
+Usage: goc [options] file.c [file2.c ...]
+       goc run [build-flags] file.c [file2.c ...] [program-args...]
+
+Several .c files are compiled as separate translation units (each with its own
+macros and type names) and merged into one executable; static keeps a symbol
+private to its file.
 
 Options:
   run             compile to a temp dir, run with the given arguments;
@@ -565,26 +610,11 @@ Options:
   --version       show version
   --help          show this help
 
-Note: goc compiles one translation unit into a complete executable; it has no
-separate linking stage, so it cannot consume .o files or link several objects.
+Note: goc compiles its inputs into one complete executable; it has no separate
+linking stage, so it cannot consume .o files or link several objects.
 `)
 }
 
-// findGoa locates the goa assembler: $GOA if set, then next to the goc
-// executable, then PATH. The binary is goa.exe on Windows and goa elsewhere.
-func findGoa() (string, error) {
-	if v := os.Getenv("GOA"); v != "" {
-		return v, nil
-	}
-	name := "goa"
-	if runtime.GOOS == "windows" {
-		name = "goa.exe"
-	}
-	if self, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(self), name)
-		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-			return cand, nil
-		}
-	}
-	return exec.LookPath(name)
-}
+// The assembler used to be an external binary that goc located via $GOA /
+// next to its own executable / PATH. Since 2026-10-04 it is the goa package
+// linked into this binary (see assemble above), so there is nothing to find.

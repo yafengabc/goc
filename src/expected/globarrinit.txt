@@ -1,0 +1,1 @@
+name=t n=3 first=alpha third=gamma pg=42
