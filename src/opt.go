@@ -1,4 +1,4 @@
-﻿// Package main: optimisation passes that are kept out of codegen.go
+// Package main: optimisation passes that are kept out of codegen.go
 // (which is already very large). T1.6 / T1.4 live here, each with an
 // independent switch and unit tests.
 package main
@@ -38,7 +38,7 @@ var elimRedundantExtSkip bool
 func elimRedundantExt(insts []Inst) []Inst {
 	out := make([]Inst, 0, len(insts))
 	signCanon := make(map[string]bool) // reg -> holds a sign-canonical int
-	slotSign := make(map[string]bool)   // "[rbp-N]"/"[rip+lab]" -> holds one
+	slotSign := make(map[string]bool)  // "[rbp-N]"/"[rip+lab]" -> holds one
 	var prevWrap map[string]bool       // regs whose kept pair is output-adjacent
 	clearAll := func() {
 		signCanon = make(map[string]bool)
@@ -66,59 +66,59 @@ func elimRedundantExt(insts []Inst) []Inst {
 			continue
 		}
 
-	// A marked sign-wrap pair: `shl r, 32; sar r, 32` with IntWrap on both
-	// halves. Drop the whole pair when r already holds a sign-canonical
-	// value. Two flag arguments make a drop safe: (a) the immediately
-	// preceding emitted instruction was the sar of a kept marked pair on the
-	// same register -- then shl/sar is idempotent, the value and every flag
-	// (SF/ZF/PF/CF/OF) after the pair are identical with or without it; or
-	// (b) no flag-reading instruction appears between the pair and the next
-	// flag-writing instruction (extDeletable). Otherwise keep the pair and
-	// record that r now holds a sign-canonical value.
-	if in.IntWrap && pl.op == "shl" && len(pl.operands) == 2 &&
-		pl.operands[1] == "32" && i+1 < len(insts) {
-		r := pl.operands[0]
-		nxt := insts[i+1]
-		if np, ok2 := parseBodyLine(nxt.Text); ok2 && nxt.IntWrap &&
-			(np.op == "sar" || np.op == "shr") && len(np.operands) == 2 &&
-			np.operands[0] == r && np.operands[1] == "32" {
-			if signCanon[r] && (prevWrap[r] || extDeletable(insts, i+2)) {
-				skip = 1 // drop both halves; the output tail keeps the same flags
-				continue
-			}
-			// T1.6 (C5-b): the pair cannot be dropped, but it is still exactly
-			// equivalent to ONE widening move -- `shl r,32; sar r,32` is
-			// `movsxd r, r32` and `shl r,32; shr r,32` is `mov r32, r32`
-			// (writing a 32-bit register zero-extends). The only behavioural
-			// difference is that shl/sar/shr write the flags and the moves do
-			// not, so the collapse is legal only when nothing reads the flags
-			// before the next flag writer -- which is exactly extDeletable.
-			if extDeletable(insts, i+2) {
-				r32 := reg32Name(r)
-				if np.op == "sar" {
-					out = append(out, Inst{Kind: instInstr,
-						Text: "\tmovsxd " + r + ", " + r32})
-				} else {
-					out = append(out, Inst{Kind: instInstr,
-						Text: "\tmov " + r32 + ", " + r32})
+		// A marked sign-wrap pair: `shl r, 32; sar r, 32` with IntWrap on both
+		// halves. Drop the whole pair when r already holds a sign-canonical
+		// value. Two flag arguments make a drop safe: (a) the immediately
+		// preceding emitted instruction was the sar of a kept marked pair on the
+		// same register -- then shl/sar is idempotent, the value and every flag
+		// (SF/ZF/PF/CF/OF) after the pair are identical with or without it; or
+		// (b) no flag-reading instruction appears between the pair and the next
+		// flag-writing instruction (extDeletable). Otherwise keep the pair and
+		// record that r now holds a sign-canonical value.
+		if in.IntWrap && pl.op == "shl" && len(pl.operands) == 2 &&
+			pl.operands[1] == "32" && i+1 < len(insts) {
+			r := pl.operands[0]
+			nxt := insts[i+1]
+			if np, ok2 := parseBodyLine(nxt.Text); ok2 && nxt.IntWrap &&
+				(np.op == "sar" || np.op == "shr") && len(np.operands) == 2 &&
+				np.operands[0] == r && np.operands[1] == "32" {
+				if signCanon[r] && (prevWrap[r] || extDeletable(insts, i+2)) {
+					skip = 1 // drop both halves; the output tail keeps the same flags
+					continue
 				}
-				// movsxd leaves a sign-canonical value; the zero-extending
-				// form does not (the low half may have its top bit set).
-				signCanon[r] = np.op == "sar"
-				prevWrap = nil
+				// T1.6 (C5-b): the pair cannot be dropped, but it is still exactly
+				// equivalent to ONE widening move -- `shl r,32; sar r,32` is
+				// `movsxd r, r32` and `shl r,32; shr r,32` is `mov r32, r32`
+				// (writing a 32-bit register zero-extends). The only behavioural
+				// difference is that shl/sar/shr write the flags and the moves do
+				// not, so the collapse is legal only when nothing reads the flags
+				// before the next flag writer -- which is exactly extDeletable.
+				if extDeletable(insts, i+2) {
+					r32 := reg32Name(r)
+					if np.op == "sar" {
+						out = append(out, Inst{Kind: instInstr,
+							Text: "\tmovsxd " + r + ", " + r32})
+					} else {
+						out = append(out, Inst{Kind: instInstr,
+							Text: "\tmov " + r32 + ", " + r32})
+					}
+					// movsxd leaves a sign-canonical value; the zero-extending
+					// form does not (the low half may have its top bit set).
+					signCanon[r] = np.op == "sar"
+					prevWrap = nil
+					i++
+					continue
+				}
+				signCanon[r] = true
+				prevWrap = map[string]bool{r: true}
+				out = append(out, in, nxt)
 				i++
 				continue
 			}
-			signCanon[r] = true
-			prevWrap = map[string]bool{r: true}
-			out = append(out, in, nxt)
-			i++
-			continue
 		}
-	}
-	// Any other instruction breaks the adjacency that makes a preceding kept
-	// pair flag-equivalent, so prevWrap no longer applies.
-	prevWrap = nil
+		// Any other instruction breaks the adjacency that makes a preceding kept
+		// pair flag-equivalent, so prevWrap no longer applies.
+		prevWrap = nil
 
 		// Memory writes of any kind: an exact slot stays canonical only when
 		// this is a plain full-width `mov [slot], src` of a canonical source;
@@ -320,7 +320,6 @@ func sourceSignCanon(src string, signCanon map[string]bool) bool {
 	}
 	return false
 }
-
 
 // slotCacheSkip bypasses the slot-cache pass in Gen() -- its independent
 // switch.
@@ -958,6 +957,7 @@ func copyElim(insts []Inst) []Inst {
 	}
 	return out
 }
+
 var algebraicIdentSkip bool
 
 // algebraicIdent folds a small set of algebraic identities that goc emits
@@ -1403,4 +1403,344 @@ var gp64RegOrder = []string{
 	"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
 }
 
+// ---------- -O1: fold `mov rX, rA; add rX, rB` into `lea rX, [rA+rB]` ----------
+//
+// goc evaluates `t = a + b` by copying one operand into the accumulator and
+// adding the other, because every expression result is materialised there.
+// `lea` does the whole thing in one instruction -- but it does NOT write
+// flags, while `add` does. That asymmetry is the only hazard: the fold is
+// legal exactly when no later instruction reads the flags the add produced.
+//
+// fib_iter's loop is the motivating case: three instructions become one,
+// across 30M iterations.
 
+// leaFlagWrite names the instructions that overwrite every condition flag.
+// inc/dec are deliberately absent: they leave CF alone, so they do not
+// shield a later carry reader from the add's CF.
+var leaFlagWrite = map[string]bool{
+	"cmp": true, "test": true, "add": true, "sub": true, "adc": true,
+	"sbb": true, "and": true, "or": true, "xor": true, "neg": true,
+	"not": true, "shl": true, "shr": true, "sar": true, "sal": true,
+	"imul": true, "mul": true, "div": true, "idiv": true,
+}
+
+// leaCFRead names the instructions that consume CF specifically.
+var leaCFRead = map[string]bool{
+	"jc": true, "jnc": true, "jb": true, "jnae": true, "jbe": true,
+	"jna": true, "ja": true, "jnbe": true, "jae": true, "jnb": true,
+	"adc": true, "sbb": true, "rcl": true, "rcr": true,
+}
+
+// leaFlagRead classifies how op consumes flags: 1 = carry only,
+// 2 = some non-carry flag, 0 = none at all.
+func leaFlagRead(op string) int {
+	if leaCFRead[op] {
+		return 1
+	}
+	if strings.HasPrefix(op, "j") && op != "jmp" {
+		return 2
+	}
+	if strings.HasPrefix(op, "set") || strings.HasPrefix(op, "cmov") {
+		return 2
+	}
+	return 0
+}
+
+// leaFlagsSafe reports whether the flags written by the instruction at index
+// i are dead from there on, which is what licenses replacing it with a lea.
+func leaFlagsSafe(insts []Inst, i int) bool {
+	cfLive, otherLive := true, true
+	for j := i + 1; j < len(insts) && j <= i+32; j++ {
+		in := insts[j]
+		if in.Kind == instRaw {
+			return false
+		}
+		if in.Kind == instLabel {
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			// `ret` has no operands, so it will not parse. Reaching it
+			// means no instruction from here to the end of the function
+			// reads the flags, and no caller may rely on flags across a
+			// call either -- so the flags really are dead. Anything else
+			// unparsed is unmodelled and must be refused.
+			if strings.TrimSpace(strings.TrimPrefix(in.Text, "\t")) == "ret" {
+				return true
+			}
+			return false // call, inline asm: assume the worst
+		}
+		if pl.op == "inc" || pl.op == "dec" {
+			otherLive = false // inc/dec rewrite SF/ZF/OF/AF but not CF
+			continue
+		}
+		switch leaFlagRead(pl.op) {
+		case 1:
+			if cfLive {
+				return false
+			}
+		case 2:
+			if otherLive {
+				return false
+			}
+		}
+		if leaFlagWrite[pl.op] {
+			return true // every flag is rewritten from here on
+		}
+	}
+	return false
+}
+
+// foldLea rewrites `mov rX, rA` + `add rX, rB` into `lea rX, [rA+rB]`.
+func foldLea(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	for i := 0; i < len(insts); {
+		in := insts[i]
+		if in.Kind != instInstr || i+1 >= len(insts) || insts[i+1].Kind != instInstr {
+			out = append(out, in)
+			i++
+			continue
+		}
+		mv, ok1 := parseBodyLine(in.Text)
+		ad, ok2 := parseBodyLine(insts[i+1].Text)
+		if !ok1 || !ok2 || mv.op != "mov" || ad.op != "add" ||
+			len(mv.operands) != 2 || len(ad.operands) != 2 {
+			out = append(out, in)
+			i++
+			continue
+		}
+		dst, a, b := mv.operands[0], mv.operands[1], ad.operands[1]
+		if ad.operands[0] != dst || dst == "rsp" || dst == "rbp" ||
+			a == "rsp" || b == "rsp" { // rsp cannot be a SIB index
+			out = append(out, in)
+			i++
+			continue
+		}
+		if !gp64Regs[dst] || !gp64Regs[a] || !gp64Regs[b] {
+			out = append(out, in)
+			i++
+			continue
+		}
+		if !leaFlagsSafe(insts, i+1) {
+			out = append(out, in)
+			i++
+			continue
+		}
+		out = append(out, Inst{Kind: instInstr, Text: "\tlea " + dst + ", [" + a + "+" + b + "]"})
+		i += 2
+	}
+	return out
+}
+
+// ---------- -O1: register copy propagation ----------
+
+// copyProp replaces later uses of a copied-to register with the register it
+// was copied from, which leaves the copy itself with no reader so the
+// existing deadMoveElim can remove it.
+//
+// fib_iter pays for this once per iteration: `mov r14, rax` exists only so
+// that the following `mov r12, r14` has a name for the new value. Writing
+// r12 straight from rax strands the middle copy.
+func copyProp(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	for _, seg := range splitTopSegments(insts) {
+		out = append(out, cpSegment(seg)...)
+	}
+	return out
+}
+
+func cpSegment(seg []Inst) []Inst {
+	for i := 0; i < len(seg); i++ {
+		if seg[i].Kind != instInstr {
+			continue
+		}
+		pl, ok := parseBodyLine(seg[i].Text)
+		if !ok || pl.op != "mov" || len(pl.operands) != 2 {
+			continue
+		}
+		d, s := pl.operands[0], pl.operands[1]
+		if !gp64Regs[d] || !gp64Regs[s] || d == s ||
+			d == "rsp" || d == "rbp" || s == "rsp" || s == "rbp" {
+			continue
+		}
+		cpForward(seg, i+1, d, s)
+	}
+	return seg
+}
+
+// operand0Reads reports whether an instruction's first operand is consumed
+// rather than overwritten. Only these three are; everything else with a
+// register destination writes it.
+//
+// This must be the short list and not an "instructions that define their
+// destination" allowlist: the allowlist silently classifies `pop` and the
+// setcc family as readers, which is backwards. A propagated `pop r14`
+// rewritten to `pop r12` pops into the wrong register -- r14 keeps the stale
+// value while r12 now holds what r14 should have -- and that is exactly the
+// infinite loop nine examples fell into. Anything unrecognised is treated as
+// a write, which can only stop propagation early.
+func operand0Reads(op string) bool {
+	return op == "cmp" || op == "test" || op == "push"
+}
+
+// cpForward rewrites uses of d into s from start onwards, stopping at the
+// first thing that can break the d == s equivalence.
+func cpForward(seg []Inst, start int, d, s string) {
+	for i := start; i < len(seg); i++ {
+		in := seg[i]
+		if in.Kind == instLabel {
+			return // a branch target: d may arrive holding anything
+		}
+		if in.Kind != instInstr {
+			return
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			return // ret, inline asm: unmodelled reads and clobbers
+		}
+		if pl.op == "call" || pl.op == "div" || pl.op == "idiv" || pl.op == "mul" ||
+			(pl.op == "imul" && len(pl.operands) == 1) || pl.op == "xchg" {
+			return // implicit operands: rax/rdx are read and written silently
+		}
+		writes := !operand0Reads(pl.op)
+		for j, o := range pl.operands {
+			_, rest := stripSize(o)
+			rest = strings.TrimSpace(rest)
+			full, isReg := regToFull64[rest]
+			if !isReg {
+				continue
+			}
+			if j == 0 && writes && (full == d || full == s) {
+				return // one side of the equivalence is overwritten here
+			}
+		}
+		newOps := append([]string(nil), pl.operands...)
+		changed := false
+		for j, o := range pl.operands {
+			if j == 0 && writes {
+				continue // a defined destination is not a use
+			}
+			_, rest := stripSize(o)
+			rest = strings.TrimSpace(rest)
+			// Only a genuine 64-bit spelling may be renamed. regToFull64
+			// maps `eax` to `rax` too, so matching on the parent alone
+			// would rewrite `mov r10, eax` (zero-extended 32-bit read) into
+			// `mov r10, r12` (full 64-bit read) -- a different value
+			// whenever the source's high half is non-zero. The same rule
+			// keeps `shl r10, cl` from becoming `shl r10, r12`, which is
+			// not encodable at all.
+			if !gp64Regs[rest] {
+				continue
+			}
+			full, isReg := regToFull64[rest]
+			if isReg && full == d {
+				newOps[j] = s
+				changed = true
+			}
+		}
+		if changed {
+			seg[i].Text = "\t" + pl.op + " " + strings.Join(newOps, ", ")
+		}
+	}
+}
+
+// ---------- -O1: fold a loop-invariant load into the compare that reads it ----
+
+// foldCmpMem rewrites `mov rX, [mem]` + `cmp rY, rX` into `cmp rY, [mem]`.
+//
+// goc reloads a variable from its home slot every time it is mentioned, so a
+// loop bound that never changes still costs a load per iteration. Folding the
+// load into the compare's source operand keeps the value in the compare and
+// drops the register entirely -- legal only when rX has no further reader
+// before something overwrites it.
+func foldCmpMem(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	for i := 0; i < len(insts); {
+		in := insts[i]
+		if in.Kind != instInstr || i+1 >= len(insts) || insts[i+1].Kind != instInstr {
+			out = append(out, in)
+			i++
+			continue
+		}
+		mv, ok1 := parseBodyLine(in.Text)
+		cm, ok2 := parseBodyLine(insts[i+1].Text)
+		if !ok1 || !ok2 || mv.op != "mov" || cm.op != "cmp" ||
+			len(mv.operands) != 2 || len(cm.operands) != 2 {
+			out = append(out, in)
+			i++
+			continue
+		}
+		x, mem := mv.operands[0], mv.operands[1]
+		y, rhs := cm.operands[0], cm.operands[1]
+		if !gp64Regs[x] || !gp64Regs[y] || rhs != x || !strings.HasPrefix(mem, "[") {
+			out = append(out, in)
+			i++
+			continue
+		}
+		// The memory operand must not depend on the register being dropped.
+		deps := false
+		for _, r := range regsInside(mem) {
+			if r == x {
+				deps = true
+			}
+		}
+		if deps || !regDeadBeforeRedef(insts, i+1, x) {
+			out = append(out, in)
+			i++
+			continue
+		}
+		out = append(out, Inst{Kind: instInstr, Text: "\tcmp " + y + ", " + mem})
+		i += 2
+	}
+	return out
+}
+
+// regDeadBeforeRedef reports whether x has no reader between at (exclusive)
+// and the first instruction that overwrites it. A label in between makes the
+// answer unknowable from the linear stream alone, so it is refused.
+func regDeadBeforeRedef(insts []Inst, at int, x string) bool {
+	for j := at + 1; j < len(insts); j++ {
+		in := insts[j]
+		if in.Kind == instLabel {
+			return false
+		}
+		if in.Kind != instInstr {
+			return false
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			return false
+		}
+		if pl.op == "call" || pl.op == "div" || pl.op == "idiv" || pl.op == "mul" ||
+			(pl.op == "imul" && len(pl.operands) == 1) || pl.op == "xchg" {
+			return false
+		}
+		writes := opDefinesReg(pl.op)
+		for j2, o := range pl.operands {
+			_, rest := stripSize(o)
+			rest = strings.TrimSpace(rest)
+			if strings.HasPrefix(rest, "[") {
+				for _, r := range regsInside(rest) {
+					if r == x {
+						return false
+					}
+				}
+				continue
+			}
+			full, isReg := regToFull64[rest]
+			if !isReg {
+				continue
+			}
+			if j2 == 0 && writes {
+				if full == x {
+					return true // overwritten before anything read it
+				}
+				continue
+			}
+			if full == x {
+				return false
+			}
+		}
+	}
+	return false
+}

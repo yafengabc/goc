@@ -61,6 +61,11 @@ type Token struct {
 	BigSigned bool
 	BigBits   int // declared bit width of the literal's own _BitInt type
 	Str     []byte
+	// Wide marks an L"..." literal: Str holds UTF-16LE code units (2 bytes
+	// each) instead of UTF-8 bytes, and the literal's type is wchar_t* rather
+	// than char*. The terminating NUL is added by the code generator, which
+	// knows whether it must be 1 or 2 bytes wide.
+	Wide    bool
 	Line    int
 	Space   bool // true if whitespace preceded this token (separates macro name from '(' etc.)
 }
@@ -155,6 +160,27 @@ func isHexDigit(b byte) bool { return hexVal(b) >= 0 }
 // covers the simple escapes, octal \ooo (1-3 digits), hex \xhh (greedy), and
 // universal character names \uXXXX / \UXXXXXXXX (encoded as UTF-8), per C89
 // 6.1.3.4 and C99 6.4.3 / 6.4.4.4.
+// utf16le re-encodes a UTF-8 string literal payload as UTF-16LE code units,
+// which is what a wchar_t array holds on Windows (2-byte wchar_t). Surrogate
+// pairs are emitted for code points above the BMP. The result carries no
+// terminator: the code generator appends the NUL, since only it knows whether
+// the target slot is 1 or 2 bytes wide.
+func utf16le(s []byte) []byte {
+	out := make([]byte, 0, 2*(len(s)+1))
+	for _, r := range string(s) {
+		switch {
+		case r < 0x10000:
+			out = append(out, byte(r), byte(r>>8))
+		default:
+			r -= 0x10000
+			hi := 0xD800 + (r >> 10)
+			lo := 0xDC00 + (r & 0x3FF)
+			out = append(out, byte(hi), byte(hi>>8), byte(lo), byte(lo>>8))
+		}
+	}
+	return out
+}
+
 func decodeEscape(buf []byte, src string, i, line int) ([]byte, int, error) {
 	n := len(src)
 	c := src[i]
@@ -257,6 +283,17 @@ func Lex(src string) ([]Token, error) {
 	n := len(src)
 	for i < n {
 		c := src[i]
+		// Wide literal prefix: L"..." / L'...' (C11 6.4.5). The payload is
+		// UTF-16LE, matching goc's 2-byte wchar_t, so the prefix is NOT a
+		// no-op like u8 above -- it changes both the encoding and the type.
+		// 'L' alone is still an ordinary identifier (LONG, Label, ...), so
+		// only the prefix-adjacent forms are consumed here.
+		wide := false
+		if c == 'L' && i+1 < n && (src[i+1] == '"' || src[i+1] == '\'') {
+			i++
+			c = src[i]
+			wide = true
+		}
 		// C23 u8 string/char prefix: u8"..." / u8'...'. goc strings are already
 		// UTF-8, so the prefix is a no-op semantically; consume "u8" and let the
 		// normal string/char literal lexing below handle the rest.
@@ -599,7 +636,10 @@ func Lex(src string) ([]Token, error) {
 				return nil, fmt.Errorf("line %d: unterminated string literal", line)
 			}
 			i++ // closing quote
-			push(Token{Kind: TStr, Str: buf, Line: line})
+			if wide {
+				buf = utf16le(buf)
+			}
+			push(Token{Kind: TStr, Str: buf, Line: line, Wide: wide})
 		case c == '\'':
 			// Character literal 'x' (or '\n', '\0', ...). Carried as an integer
 			// constant (the byte value) so the parser/codegen need no new node.
@@ -624,14 +664,22 @@ func Lex(src string) ([]Token, error) {
 				return nil, fmt.Errorf("line %d: unterminated character literal", line)
 			}
 			i++ // closing quote
-			// goc char is signed: a character constant's value is the byte
-			// sign-extended to int (C89 6.1.3.4), so '\377' (0xFF) is -1,
-			// matching gcc rather than the raw byte 255.
-			cv := int64(ch)
-			if cv >= 128 {
-				cv -= 256
+			var cv int64
+			if wide {
+				// L'x' is a wchar_t constant: an unsigned value in the range of
+				// wchar_t (0..0xFFFF here). No sign extension -- '\xff' is 255,
+				// not -1, because the wide literal's type is unsigned short.
+				cv = int64(ch)
+			} else {
+				// goc char is signed: a character constant's value is the byte
+				// sign-extended to int (C89 6.1.3.4), so '\377' (0xFF) is -1,
+				// matching gcc rather than the raw byte 255.
+				cv = int64(ch)
+				if cv >= 128 {
+					cv -= 256
+				}
 			}
-			push(Token{Kind: TNum, Text: string(rune(ch)), Num: cv, IsChar: true, Line: line})
+			push(Token{Kind: TNum, Text: string(rune(ch)), Num: cv, IsChar: true, Wide: wide, Line: line})
 		default:
 			two := ""
 			if i+1 < n {

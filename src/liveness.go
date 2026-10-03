@@ -157,6 +157,7 @@ type fxEffects struct {
 	use     []string // direct slots whose stored value this instruction reads
 	def     string   // direct slot this instruction overwrites ("" when none)
 	store   bool     // def is a deletable full-width store
+	csStore bool     // the store's source is a callee-save register
 	unknown bool     // unmodelled: reads every slot seen in the function
 	jump    string   // branch target (jmp/jcc), without colon
 	cond    bool     // jump is conditional (also falls through)
@@ -291,8 +292,22 @@ func scanFX(seg []Inst) ([]fxEffects, map[string]bool, map[string]bool) {
 				fx.def = sl
 				srcRest := strings.TrimSpace(pl.operands[1])
 				regWide := gprWidth[srcRest] == 8
-				fx.store = w == 8 && (regWide || (op == "movsd" && strings.HasPrefix(srcRest, "xmm"))) &&
-					!calleeSaveRegs[srcRest]
+				// A callee-save SOURCE used to disqualify the store outright:
+				// the prologue/epilogue save-restore pairs were assumed to look
+				// like this. They never do -- goc spills those registers with
+				// `push` and reloads them with `mov reg, [rbp-N]`, so a `mov`
+				// store of rbx/r12/r13/r14 is always a homed local being
+				// materialised, and liveness is the right judge of it. What the
+				// guard really bought was silence, at the price of every
+				// callee-save-homed local's spill surviving forever: fib_iter's
+				// loop wrote [rbp-56] twice per iteration and never read it.
+				//
+				// Keep a trace of the shape anyway, and let dseSegment delete
+				// such a store only under the stronger condition that the slot
+				// is never read anywhere in the function -- a genuine
+				// save/restore must have a reader, so this cannot touch one.
+				fx.store = w == 8 && (regWide || (op == "movsd" && strings.HasPrefix(srcRest, "xmm")))
+				fx.csStore = calleeSaveRegs[srcRest]
 			case j == 0 && opWritesDst(op):
 				fx.def = sl
 				if opReadsDst(op) {
@@ -382,6 +397,30 @@ func dseSegment(seg []Inst) []Inst {
 	fxs, esc, known := scanFX(seg)
 	if fxs == nil {
 		return seg
+	}
+
+	// neverRead: slots no instruction in the function reads at all. This is
+	// the licence a callee-save-sourced store needs (see fxEffects.csStore).
+	// A slot touched by an unmodelled instruction never gets here: fx.unknown
+	// marks every known slot live, which already blocks deletion.
+	neverRead := map[string]bool{}
+	for k := range known {
+		if !esc[k] {
+			neverRead[k] = true
+		}
+	}
+	saveMax := saveAreaLimit(seg)
+	for i := range fxs {
+		if fxs[i].unknown {
+			// Reads every slot: nothing is provably unread.
+			for k := range neverRead {
+				delete(neverRead, k)
+			}
+			break
+		}
+		for _, u := range fxs[i].use {
+			delete(neverRead, u)
+		}
 	}
 
 	// Leaders: the first instruction, every label, and anything following a
@@ -533,7 +572,8 @@ func dseSegment(seg []Inst) []Inst {
 				continue
 			}
 			fx := &fxs[i]
-			if fx.store && fx.def != "" && !esc[fx.def] && !live[fx.def] {
+			if fx.store && fx.def != "" && !esc[fx.def] && !live[fx.def] &&
+				(!fx.csStore || (neverRead[fx.def] && slotOffset(fx.def) > saveMax)) {
 				dead[i] = true
 				continue // gone: its def no longer covers anything
 			}
@@ -576,4 +616,427 @@ func mapEq(a, b map[string]bool) bool {
 		}
 	}
 	return true
+}
+
+// ---------- -O1: dead register-to-register copies ----------
+
+// retLiveRegs are the registers that must still hold a meaningful value when a
+// function returns: the Win64/SysV callee-save set the caller is entitled to,
+// plus rax (the return value) and rsp. The caller-save registers are
+// deliberately absent -- no caller may read them across a return, so a copy
+// whose only reader is one of them really is dead. Getting this set right
+// matters: modelling `ret` as "everything is live" keeps r10 alive around an
+// entire loop and hides every dead copy out of it.
+var retLiveRegs = map[string]bool{
+	"rax": true, "rbx": true, "rbp": true, "rsp": true,
+	"r12": true, "r13": true, "r14": true, "r15": true,
+}
+
+var retLiveList = []string{"rax", "rbx", "rbp", "rsp", "r12", "r13", "r14", "r15"}
+
+// reg32Forms are the 32-bit GP register spellings. Writing one zero-extends
+// into the whole 64-bit register, so it defines all of it.
+var reg32Forms = map[string]bool{
+	"eax": true, "ebx": true, "ecx": true, "edx": true,
+	"esi": true, "edi": true, "ebp": true, "esp": true,
+	"r8d": true, "r9d": true, "r10d": true, "r11d": true,
+	"r12d": true, "r13d": true, "r14d": true, "r15d": true,
+}
+
+// opPureWrite reports whether op writes its first operand without reading it
+// (mov, lea, the widening loads). Everything else on opDefinesReg's list is
+// read-modify-write and genuinely consumes the old value.
+func opPureWrite(op string) bool {
+	switch op {
+	case "mov", "lea", "movzx", "movsx", "movsxd", "movslq":
+		return true
+	}
+	return false
+}
+
+// opDefinesReg reports whether op overwrites its first operand outright when
+// that operand is a register. Anything off the list is treated as defining
+// nothing, which can only widen liveness -- the safe direction.
+func opDefinesReg(op string) bool {
+	switch op {
+	case "mov", "movzx", "movsx", "movsxd", "movslq", "lea",
+		"add", "sub", "adc", "sbb", "and", "or", "xor",
+		"shl", "sal", "sar", "shr", "neg", "not", "inc", "dec", "imul":
+		return true
+	}
+	return false
+}
+
+// regsInside returns the base/index registers of a memory operand, so that
+// `mov rax, [r10]` counts as a read of r10 and not as a bare address.
+func regsInside(mem string) []string {
+	var out []string
+	inner := strings.Trim(mem, "[]")
+	for _, tok := range strings.FieldsFunc(inner, func(r rune) bool {
+		return r == '+' || r == '-' || r == '*' || r == ' ' || r == '\t'
+	}) {
+		if full, ok := regToFull64[tok]; ok {
+			out = append(out, full)
+		}
+	}
+	return out
+}
+
+// regFX is the register-level effect of one instruction: which full 64-bit
+// registers it reads, and which single one it completely overwrites.
+type regFX struct {
+	use     []string
+	def     string
+	jump    string
+	cond    bool
+	ret     bool
+	unknown bool // reads every register: a call, or anything unmodelled
+}
+
+func scanRegFX(seg []Inst) ([]regFX, bool) {
+	fxs := make([]regFX, len(seg))
+	for i, in := range seg {
+		switch in.Kind {
+		case instRaw:
+			return nil, false // inline __asm: off limits
+		case instLabel:
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		fx := &fxs[i]
+		if !ok {
+			t := strings.TrimSpace(strings.TrimPrefix(in.Text, "\t"))
+			if t == "ret" {
+				fx.ret = true
+				fx.use = append(fx.use, retLiveList...)
+			} else {
+				fx.unknown = true
+			}
+			continue
+		}
+		switch {
+		case pl.op == "call":
+			fx.unknown = true // arguments and clobbers: read everything
+			continue
+		case pl.op == "jmp" || (strings.HasPrefix(pl.op, "j") && pl.op != "jmp"):
+			if len(pl.operands) != 1 || strings.Contains(pl.operands[0], "[") {
+				return nil, false // indirect branch
+			}
+			fx.jump = pl.operands[0]
+			fx.cond = pl.op != "jmp"
+			continue
+		case pl.op == "ret":
+			fx.ret = true
+			fx.use = append(fx.use, retLiveList...)
+			continue
+		}
+		// Implicit operands. `div`/`idiv` consume the rdx:rax dividend and
+		// overwrite both; `mul` and the one-operand `imul` do the same to
+		// rax. None of them name those registers, so modelling them from the
+		// operand list alone reports rax dead and deletes the copy that set
+		// it up -- which is exactly how a `%ld` in vfmt started printing
+		// zeros. Reading every register is the honest description.
+		switch {
+		case pl.op == "div" || pl.op == "idiv" || pl.op == "mul" ||
+			(pl.op == "imul" && len(pl.operands) == 1) || pl.op == "xchg":
+			fx.unknown = true
+			continue
+		}
+		for j, o := range pl.operands {
+			_, rest := stripSize(o)
+			rest = strings.TrimSpace(rest)
+			if strings.HasPrefix(rest, "[") {
+				fx.use = append(fx.use, regsInside(rest)...)
+				continue
+			}
+			// A variable shift counts cl, which the mnemonic never names.
+			if j == 1 && rest == "cl" && strings.HasPrefix(pl.op, "s") {
+				fx.use = append(fx.use, "rcx")
+				continue
+			}
+			full, isReg := regToFull64[rest]
+			if !isReg {
+				continue // immediate
+			}
+			// An 8/16-bit destination leaves the upper bits alone, so it is
+			// not a complete definition and liveness must survive it.
+			fullDef := j == 0 && opDefinesReg(pl.op) && (gp64Regs[rest] || reg32Forms[rest])
+			if fullDef {
+				fx.def = full
+				// A pure write does not read its destination. Counting it as
+				// a use made every copy's target upward-exposed in its block,
+				// so liveness saturated and nothing was ever deleted.
+				if opPureWrite(pl.op) {
+					continue
+				}
+			}
+			fx.use = append(fx.use, full)
+		}
+	}
+	return fxs, true
+}
+
+// isRegCopy reports whether in is a plain register-to-register copy, and
+// returns its destination. rsp/rbp are never candidates: unwinding and the
+// frame itself depend on them regardless of what the liveness says.
+func isRegCopy(in Inst) (string, bool) {
+	if in.Kind != instInstr {
+		return "", false
+	}
+	pl, ok := parseBodyLine(in.Text)
+	if !ok || pl.op != "mov" || len(pl.operands) != 2 {
+		return "", false
+	}
+	d, dOK := regToFull64[pl.operands[0]]
+	if !dOK || !regToFull64OK(pl.operands[1]) {
+		return "", false
+	}
+	if d == "rsp" || d == "rbp" {
+		return "", false
+	}
+	return d, true
+}
+
+func regToFull64OK(o string) bool {
+	_, ok := regToFull64[o]
+	return ok
+}
+
+// deadMoveElim drops register-to-register copies whose destination no path
+// reads again, using the same per-function CFG and backward fixpoint as
+// livenessDSE -- only over registers instead of frame slots.
+//
+// This is the last third of fib_iter's loop overhead. The loop is split by
+// labels into four short blocks, so no within-block rule reaches the copies:
+// `mov r10, r13` and `mov rax, r13` are each the last write of their register
+// on that path and only global liveness proves them dead.
+func deadMoveElim(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	for _, seg := range splitTopSegments(insts) {
+		out = append(out, dmeSegment(seg)...)
+	}
+	return out
+}
+
+func dmeSegment(seg []Inst) []Inst {
+	if len(seg) < 2 {
+		return seg
+	}
+	fxs, ok := scanRegFX(seg)
+	if !ok {
+		return seg
+	}
+
+	leader := make([]bool, len(seg))
+	leader[0] = true
+	for i, in := range seg {
+		switch in.Kind {
+		case instLabel:
+			leader[i] = true
+		case instInstr:
+			if fxs[i].jump != "" || fxs[i].ret {
+				if i+1 < len(seg) {
+					leader[i+1] = true
+				}
+			}
+		}
+	}
+	var blocks []*lvBlock
+	labBlock := map[string]*lvBlock{}
+	for i := 0; i < len(seg); i++ {
+		if !leader[i] {
+			continue
+		}
+		j := i + 1
+		for j < len(seg) && !leader[j] {
+			j++
+		}
+		b := &lvBlock{start: i, end: j}
+		blocks = append(blocks, b)
+		if seg[i].Kind == instLabel {
+			name := strings.TrimSuffix(strings.TrimSpace(seg[i].Text), ":")
+			labBlock[name] = b
+		}
+	}
+	for bi, b := range blocks {
+		tail := &fxs[b.end-1]
+		switch {
+		case tail.jump != "":
+			tb, found := labBlock[tail.jump]
+			if !found {
+				return seg
+			}
+			b.succ = append(b.succ, tb)
+			if tail.cond {
+				if b.end >= len(seg) {
+					return seg
+				}
+				b.succ = append(b.succ, blocks[bi+1])
+			}
+		case tail.ret:
+			// no successors
+		default:
+			if b.end >= len(seg) {
+				return seg
+			}
+			b.succ = append(b.succ, blocks[bi+1])
+		}
+	}
+
+	for _, b := range blocks {
+		useSet := map[string]bool{}
+		defSet := map[string]bool{}
+		for i := b.start; i < b.end; i++ {
+			if seg[i].Kind != instInstr {
+				continue
+			}
+			fx := &fxs[i]
+			if fx.unknown {
+				for r := range gp64Regs {
+					if !defSet[r] {
+						useSet[r] = true
+					}
+				}
+				continue
+			}
+			for _, u := range fx.use {
+				if !defSet[u] {
+					useSet[u] = true
+				}
+			}
+			if fx.def != "" {
+				defSet[fx.def] = true
+			}
+		}
+		b.use, b.def = useSet, defSet
+	}
+
+	for _, b := range blocks {
+		b.liveIn = map[string]bool{}
+		b.liveOut = map[string]bool{}
+	}
+	changed := true
+	for changed {
+		changed = false
+		for bi := len(blocks) - 1; bi >= 0; bi-- {
+			b := blocks[bi]
+			outSet := map[string]bool{}
+			for _, s := range b.succ {
+				for k := range s.liveIn {
+					outSet[k] = true
+				}
+			}
+			inSet := map[string]bool{}
+			for k := range outSet {
+				if !b.def[k] {
+					inSet[k] = true
+				}
+			}
+			for k := range b.use {
+				inSet[k] = true
+			}
+			if !mapEq(inSet, b.liveIn) || !mapEq(outSet, b.liveOut) {
+				b.liveIn, b.liveOut = inSet, outSet
+				changed = true
+			}
+		}
+	}
+
+	dead := make([]bool, len(seg))
+	for _, b := range blocks {
+		live := map[string]bool{}
+		for k := range b.liveOut {
+			live[k] = true
+		}
+		for i := b.end - 1; i >= b.start; i-- {
+			if seg[i].Kind != instInstr {
+				continue
+			}
+			// A removed copy neither reads nor writes anything observable,
+			// so liveness across it is unchanged -- do not touch `live`.
+			if dst, isCopy := isRegCopy(seg[i]); isCopy && !live[dst] {
+				dead[i] = true
+				continue
+			}
+			fx := &fxs[i]
+			if fx.unknown {
+				for r := range gp64Regs {
+					live[r] = true
+				}
+				continue
+			}
+			if fx.def != "" {
+				delete(live, fx.def)
+			}
+			for _, u := range fx.use {
+				live[u] = true
+			}
+		}
+	}
+	res := make([]Inst, 0, len(seg))
+	for i, in := range seg {
+		if !dead[i] {
+			res = append(res, in)
+		}
+	}
+	return res
+}
+
+// saveAreaLimit returns the deepest rbp-relative offset, in bytes, that can
+// belong to this function's callee-save save area: the prologue spills those
+// registers with `push`, so n pushes own [rbp-8] .. [rbp-8n]. A store into one
+// of them is never deleted even when nothing in the stream reads it back --
+// that area is what an unwinder and the callee-save contract describe, and its
+// contents are not ours to reason about from the instructions alone.
+//
+// Without a visible prologue (a synthetic snippet, a hand-written body) there
+// is no such evidence, so the whole conservative range stays reserved.
+func saveAreaLimit(seg []Inst) int {
+	n := 0
+	for i := 0; i < len(seg); i++ {
+		if seg[i].Kind != instInstr {
+			if seg[i].Kind == instLabel && i > 0 {
+				break
+			}
+			continue
+		}
+		pl, ok := parseBodyLine(seg[i].Text)
+		if !ok {
+			continue
+		}
+		if pl.op == "push" && len(pl.operands) == 1 && calleeSaveRegs[pl.operands[0]] {
+			n++
+			continue
+		}
+		if n > 0 {
+			break
+		}
+	}
+	if n == 0 {
+		return 32
+	}
+	return 8 * n
+}
+
+// slotOffset returns the byte offset of a direct frame slot from rbp, as a
+// positive number, or -1 when s is not that shape.
+func slotOffset(s string) int {
+	if !strings.HasPrefix(s, "[rbp") || len(s) < 7 || s[len(s)-1] != ']' {
+		return -1
+	}
+	sign := s[4]
+	if sign != '-' && sign != '+' {
+		return -1
+	}
+	n := 0
+	for i := 5; i < len(s)-1; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return -1
+		}
+		n = n*10 + int(s[i]-'0')
+	}
+	if sign == '+' {
+		return -n
+	}
+	return n
 }

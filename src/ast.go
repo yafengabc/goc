@@ -36,6 +36,11 @@ type FuncDecl struct {
 	ParamTypes []*Type
 	Variadic   bool
 	Body       *Block
+	// Storage is the storage-class specifier that preceded the definition
+	// ("static", "extern" or ""), recorded since 2026-10-04 so a multi-file
+	// build can give a static function internal linkage (one file's static
+	// helper must not collide with another file's identically named one).
+	Storage string
 	// DLL is the import library named on a prototype: "extern long
 	// MessageBoxA(...), user32;" -- the same `extern Name, dll` shape the
 	// assembler takes. Empty means the symbol resolves to a goclib C function
@@ -211,6 +216,7 @@ type NumLit struct {
 	IsFloat bool   // a "1.5f" literal: type float rather than double
 	Unsig   bool   // u/U suffix: the constant's type is unsigned
 	Long    bool   // l/L suffix: the constant is at least 64 bits wide
+	Wide    bool   // L'x' wide character literal: type is wchar_t, not int
 	// C23 bit-precise literal (wb/uwb suffix): BigWords holds the value as
 	// little-endian 64-bit words and BigBits its declared _BitInt width.
 	// Non-nil BigWords switches the literal's type to _BitInt(BigBits).
@@ -221,7 +227,15 @@ type NumLit struct {
 
 type StrLit struct {
 	Bytes []byte
+	// Wide marks an L"..." literal: Bytes holds UTF-16LE code units rather
+	// than UTF-8 bytes and the literal's type is wchar_t*, not char*. See the
+	// matching field on the lexer token for where the re-encode happens.
+	Wide bool
 }
+
+// WCharType is the type of wchar_t: a 2-byte unsigned integer, matching
+// Windows' UTF-16 code unit (and the typedef in <stddef.h>).
+func WCharType() *Type { return &Type{Kind: KInt, Width: 2, Signed: false} }
 
 // InitElem is one element of a brace initialiser. Desig holds the member
 // name for a designated initialiser (".x = 1"); DesigIdx holds the array

@@ -292,6 +292,7 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 			ParamTypes: d.typ.Params,
 			Variadic:   d.variadic,
 			Body:       body,
+			Storage:    storage,
 		}, nil
 	}
 	// A declaration: either a function prototype (no body) or a global
@@ -322,6 +323,7 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 			ParamTypes: d.typ.Params,
 			Variadic:   d.variadic,
 			DLL:        dll,
+			Storage:    storage,
 		}, nil
 	}
 	// Global variable declaration(s), optionally comma-separated:
@@ -2633,7 +2635,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 				BigBits:   t.BigBits,
 			}, nil
 		}
-		return &NumLit{Val: t.Num, Kind: TInt, Unsig: t.IsUnsig, Long: t.IsLong}, nil
+		return &NumLit{Val: t.Num, Kind: TInt, Unsig: t.IsUnsig, Long: t.IsLong, Wide: t.Wide}, nil
 	case t.Kind == TStr:
 		// Adjacent string literals concatenate (C translation phase 6), e.g.
 		// "a" "b" becomes "ab". This is what lets a pasting macro like
@@ -2641,12 +2643,24 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		//   GREET("there")   ->   "hi " "there"   ->   "hi there"
 		// produce a single usable string.
 		b := append([]byte(nil), t.Str...)
+		wide := t.Wide
 		p.next()
 		for p.cur().Kind == TStr {
+			// L"a" L"b" and "a" L"b" both concatenate: C says a wide literal
+			// in the sequence makes the whole result wide (with the narrow
+			// ones converted, which for UTF-8 input is a plain re-encode).
+			if p.cur().Wide && !wide {
+				b = utf16le(b)
+				wide = true
+			} else if wide && !p.cur().Wide {
+				b = append(b, utf16le(p.cur().Str)...)
+				p.next()
+				continue
+			}
 			b = append(b, p.cur().Str...)
 			p.next()
 		}
-		return &StrLit{Bytes: b}, nil
+		return &StrLit{Bytes: b, Wide: wide}, nil
 	case t.Kind == TKeyword && (t.Text == "true" || t.Text == "false"):
 		p.next()
 		v := int64(0)
