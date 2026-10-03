@@ -1,4 +1,4 @@
-// Package main: optimisation passes that are kept out of codegen.go
+﻿// Package main: optimisation passes that are kept out of codegen.go
 // (which is already very large). T1.6 / T1.4 live here, each with an
 // independent switch and unit tests.
 package main
@@ -633,7 +633,328 @@ func slotCache(insts []Inst) []Inst {
 	return out
 }
 
-// algebraicIdentSkip bypasses the algebraic-identity pass in Gen().
+// copyElimSkip bypasses the basic-block local copy-elimination pass in Gen().
+var copyElimSkip bool
+
+// copyElim is a basic-block-local copy-chain pass. Unlike the old F3
+// copyProp (which suspended moves across instructions and caused 28
+// regressions), this pass NEVER reorders or suspends a mov: every mov is
+// either emitted in place, or deleted only when the very next instruction
+// consumes its destination AND a backward scan confirms the destination is
+// dead before its next write.
+//
+// Correctness discipline:
+//   - basic-block local: label/jmp/jcc/call/ret/instRaw/inline asm breaks the
+//     window (clearAll + emit as-is);
+//   - only full 64-bit GP-GP mov builds a copy chain; 32/8-bit mov kills the
+//     chain without building one;
+//   - consumer substitution rewrites the operand at the consuming instruction
+//     (rebuilt from parsed operands, never text Replace);
+//   - a mov is deleted only when the next instruction consumes D and a
+//     backward scan (鈮? insns) shows D is not read before its next write;
+//   - op0 of a writing instruction is never substituted (would move the write
+//     to the root register).
+func copyElim(insts []Inst) []Inst {
+	out := make([]Inst, 0, len(insts))
+	copyOf := map[string]string{} // D -> root it copies
+	killed := map[string]bool{}   // D's tracked value is dead
+
+	clearAll := func() {
+		copyOf = map[string]string{}
+		killed = map[string]bool{}
+	}
+
+	// rootOf walks the copy chain to the ultimate live root.
+	rootOf := func(r string) string {
+		seen := map[string]bool{}
+		for r != "" {
+			if killed[r] || seen[r] {
+				return ""
+			}
+			seen[r] = true
+			if next, ok := copyOf[r]; ok {
+				r = next
+			} else {
+				return r
+			}
+		}
+		return ""
+	}
+
+	killReg := func(r string) {
+		r = reg64Name(r)
+		switch r {
+		case "al":
+			r = "rax"
+		case "bl":
+			r = "rbx"
+		case "cl":
+			r = "rcx"
+		case "dl":
+			r = "rdx"
+		case "sil":
+			r = "rsi"
+		case "dil":
+			r = "rdi"
+		}
+		if len(r) == 3 && r[0] == 'r' && r[2] == 'b' {
+			r = r[:2]
+		}
+		// Break copies pointing to r.
+		for x, root := range copyOf {
+			if root == r {
+				delete(copyOf, x)
+				killed[x] = true
+			}
+		}
+		delete(copyOf, r)
+		killed[r] = true
+	}
+
+	// readBeforeWrite scans forward from start+2 (skipping the immediate
+	// consumer at start+1, which we are folding) up to max 8 instructions,
+	// looking for a read of D before any write of D.
+	readBeforeWrite := func(start int, d string) bool {
+		for j := start + 2; j < len(insts) && j <= start+8; j++ {
+			in := insts[j]
+			if in.Kind != instInstr {
+				return true // block end: conservative, D is "read"
+			}
+			t := strings.TrimSpace(in.Text)
+			if t == "" || strings.HasPrefix(t, ".") {
+				return true
+			}
+			pl, ok := parseBodyLine(in.Text)
+			if !ok {
+				return true
+			}
+			// Control flow breaks the block.
+			if pl.op == "call" || pl.op == "ret" || pl.op == "leave" ||
+				pl.op == "push" || pl.op == "pop" || pl.op == "loop" ||
+				strings.HasPrefix(pl.op, "j") {
+				return true
+			}
+			// div/idiv/mul implicitly read rdx:rax (dividend) — treat as read.
+			if (pl.op == "div" || pl.op == "idiv" || pl.op == "mul") &&
+				(d == "rax" || d == "rdx" || d == "eax" || d == "edx") {
+				return true
+			}
+			// Does this instruction write D?
+			if writesReg(in.Text, d) {
+				// But dstReadWrite ops also READ D as a source.
+				if dstReadWrite(pl.op) && readsReg(in.Text, d) {
+					return true // D is read (e.g. "add D, Y" reads D's old value)
+				}
+				return false // D is written without being read first
+			}
+			// Does this instruction read D (any width, including in mem)?
+			if readsReg(in.Text, d) {
+				return true
+			}
+			// Check registers inside memory operands.
+			for _, o := range pl.operands {
+				if isMemOperand(o) {
+					for _, r := range regsInMem(o) {
+						if r == d {
+							return true
+						}
+					}
+				}
+			}
+		}
+		return true // scanned to block end: conservative
+	}
+
+	// goclib library functions contain long mov chains that this basic-block
+	// pass does not yet handle safely (observed corruption). Skip them.
+	skipFunc := false
+
+	for i := 0; i < len(insts); i++ {
+		in := insts[i]
+		// Detect function labels (any line ending in ':' that is not a
+		// local jump label starting with '.').
+		if in.Kind != instInstr {
+			if t := strings.TrimSpace(in.Text); strings.HasSuffix(t, ":") && !strings.HasPrefix(t, ".") {
+				fn := t[:len(t)-1]
+				skipFunc = false
+				for _, p := range []string{"__goclib_", "bi_", "fmt_", "os_", "double_", "goclib_"} {
+					if strings.HasPrefix(fn, p) {
+						skipFunc = true
+						break
+					}
+				}
+				if !skipFunc {
+					switch fn {
+					case "vfmt", "vfprintf", "printf", "sprintf", "snprintf", "fprintf",
+						"fwrite", "fread", "fopen", "fclose", "fflush", "fputc", "fputs", "puts",
+						"memcpy", "memmove", "memset", "strlen", "strcmp", "strncmp", "strcpy", "strcat",
+						"malloc", "calloc", "realloc", "free", "exit", "abort", "qsort",
+						"log", "log10", "frexp", "signbit", "floor", "ceil", "pow", "sqrt":
+						skipFunc = true
+					}
+				}
+			}
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+		if skipFunc {
+			out = append(out, in)
+			continue
+		}
+		pl, ok := parseBodyLine(in.Text)
+		if !ok {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+		// Block boundaries.
+		if pl.op == "call" || pl.op == "ret" || pl.op == "leave" ||
+			pl.op == "push" || pl.op == "pop" || pl.op == "loop" ||
+			strings.HasPrefix(pl.op, "j") {
+			clearAll()
+			out = append(out, in)
+			continue
+		}
+
+		// --- GP-GP mov: the core copy-chain case ---
+		if pl.op == "mov" && len(pl.operands) == 2 &&
+			!isMemOperand(pl.operands[0]) && !isMemOperand(pl.operands[1]) {
+			dst, src := pl.operands[0], pl.operands[1]
+			if gp64Regs[dst] && gp64Regs[src] {
+				// killReg(dst) first.
+				killReg(dst)
+				r := rootOf(src)
+				if r != "" {
+					copyOf[dst] = r
+					killed[dst] = false
+				} else {
+					killed[dst] = true
+					// Emit the mov as-is (src has no live root chain).
+					out = append(out, in)
+					continue
+				}
+				// --- Adjacent deletion check (A version: only i+1) ---
+				// If next instruction (i+1) is a mov consumer of D (X,D) or
+				// store consumer ([s],D), and D is not read before being
+				// rewritten (within 8 instructions), then delete this mov
+				// and substitute the consumer to read directly from root.
+				deleted := false
+				if i+1 < len(insts) && insts[i+1].Kind == instInstr {
+					next := insts[i+1]
+					pln, okn := parseBodyLine(next.Text)
+					if okn && pln.op == "mov" && len(pln.operands) == 2 {
+						consumeReg := ""
+						if !isMemOperand(pln.operands[0]) && pln.operands[1] == dst &&
+							gp64Regs[pln.operands[0]] {
+							consumeReg = pln.operands[0]
+						} else if isMemOperand(pln.operands[0]) && pln.operands[1] == dst {
+							consumeReg = "STORE"
+						}
+						if consumeReg != "" && !readBeforeWrite(i, dst) {
+							// Safe to delete this mov and substitute consumer.
+							if consumeReg == "STORE" {
+								out = append(out, Inst{Kind: next.Kind,
+									Text: "\tmov " + pln.operands[0] + ", " + r})
+							} else {
+								out = append(out, Inst{Kind: next.Kind,
+									Text: "\tmov " + consumeReg + ", " + r})
+								// Update state: consumeReg now copies root.
+								killReg(consumeReg)
+								copyOf[consumeReg] = r
+								killed[consumeReg] = false
+							}
+							i++ // skip the consumer (already emitted)
+							deleted = true
+						} else if consumeReg != "" {
+							// Not safe to delete (D has later reads), but still
+							// substitute the consumer to read from root.
+							// Emit original mov first, then substituted consumer.
+							out = append(out, in)
+							if consumeReg == "STORE" {
+								out = append(out, Inst{Kind: next.Kind,
+									Text: "\tmov " + pln.operands[0] + ", " + r})
+							} else {
+								out = append(out, Inst{Kind: next.Kind,
+									Text: "\tmov " + consumeReg + ", " + r})
+								killReg(consumeReg)
+								copyOf[consumeReg] = r
+								killed[consumeReg] = false
+							}
+							i++ // skip the consumer (already emitted)
+							continue
+						}
+					}
+				}
+				if deleted {
+					continue
+				}
+				// Emit the mov, flattened to the root.
+				out = append(out, Inst{Kind: in.Kind,
+					Text: "\tmov " + dst + ", " + r})
+				continue
+			}
+			// 32-bit/8-bit mov: killReg, no chain.
+			if !gp64Regs[dst] || !gp64Regs[src] {
+				killReg(dst)
+				out = append(out, in)
+				continue
+			}
+		}
+
+		// --- Non-mov instructions: substitute GP operands ---
+		ops := pl.operands
+		substituted := false
+		for oi := 0; oi < len(ops); oi++ {
+			o := ops[oi]
+			if !gp64Regs[o] {
+				continue
+			}
+			// op0 of a writing instruction: never substitute (would move the
+			// write to the root register).
+			if oi == 0 && writesReg(in.Text, o) {
+				continue
+			}
+			if r := rootOf(o); r != "" && r != o {
+				ops[oi] = r
+				substituted = true
+			}
+		}
+		if substituted {
+			out = append(out, Inst{Kind: in.Kind,
+				Text: "\t" + pl.op + " " + strings.Join(ops, ", ")})
+		} else {
+			out = append(out, in)
+		}
+
+		// --- Update state for writes ---
+		if len(pl.operands) > 0 && !isMemOperand(pl.operands[0]) {
+			dst0 := pl.operands[0]
+			if writesReg(in.Text, dst0) {
+				killReg(dst0)
+				// Known-value write: mark live (its own root).
+				if pl.op != "div" && pl.op != "idiv" && pl.op != "mul" &&
+					pl.op != "cdq" && pl.op != "cqo" {
+					full := reg64Name(dst0)
+					delete(copyOf, full)
+					killed[full] = false
+				}
+			}
+		}
+		// Implicit writes.
+		if pl.op == "div" || pl.op == "idiv" || pl.op == "mul" {
+			killReg("rax")
+			killReg("rdx")
+			killed["rax"] = true
+			killed["rdx"] = true
+		}
+		if pl.op == "cdq" || pl.op == "cqo" {
+			killReg("rdx")
+			killed["rdx"] = true
+		}
+	}
+	return out
+}
 var algebraicIdentSkip bool
 
 // algebraicIdent folds a small set of algebraic identities that goc emits
@@ -661,7 +982,7 @@ func algebraicIdent(insts []Inst) []Inst {
 	zeroReg := map[string]bool{} // register (64-bit name) -> holds the constant 0
 	clearAll := func() { zeroReg = map[string]bool{} }
 	// safeCmpZeroRead reports whether a flag-read instruction makes
-	// `cmp r, 0` ≡ `test r, r`. ZF-based (je/jne) and signed (jg/jl/jge/jle,
+	// `cmp r, 0` 鈮?`test r, r`. ZF-based (je/jne) and signed (jg/jl/jge/jle,
 	// setg/setl/setge/setle) comparisons are identical; unsigned (ja/jb/jae/
 	// jbe, seta/setb/setae/setbe) are not, because `test` clears CF.
 	safeCmpZeroRead := func(op string) bool {
@@ -974,8 +1295,22 @@ func writesReg(t, reg string) bool {
 	parts := strings.SplitN(t, " ", 2)
 	op := parts[0]
 	switch op {
-	case "mov", "add", "sub", "imul", "lea", "and", "or", "xor", "inc", "dec",
-		"neg", "not", "shl", "shr", "sar", "sal", "rol", "ror":
+	case "mov", "movsxd", "movzx", "movslq", "add", "sub", "imul", "lea", "and", "or", "xor", "inc", "dec",
+		"neg", "not", "shl", "shr", "sar", "sal", "rol", "ror", "pop",
+		"movq", "movd", "movmskpd", "movmskps",
+		"cvttsd2si", "cvtsd2si", "cvttss2si", "cvtss2si":
+	case "div", "idiv", "mul":
+		// implicit destination: quotient/remainder in rdx:rax (and their
+		// sub-registers). The explicit operand is the divisor, which is
+		// READ, not written.
+		return strings.HasPrefix(reg, "rax") || strings.HasPrefix(reg, "rdx") ||
+			strings.HasPrefix(reg, "eax") || strings.HasPrefix(reg, "edx")
+	case "cdq", "cqo", "cdqe", "cwde":
+		// sign-extend eax/rax into edx:rax; writes rdx (cdq/cqo) or rax.
+		if op == "cdq" || op == "cqo" {
+			return strings.HasPrefix(reg, "rdx") || strings.HasPrefix(reg, "edx")
+		}
+		return strings.HasPrefix(reg, "rax") || strings.HasPrefix(reg, "eax")
 	default:
 		return false
 	}
@@ -984,8 +1319,37 @@ func writesReg(t, reg string) bool {
 	}
 	rest := strings.TrimSpace(parts[1])
 	dst := strings.TrimSpace(strings.SplitN(rest, ",", 2)[0])
-	return dst == reg || strings.HasPrefix(dst, reg+"d") ||
-		strings.HasPrefix(dst, reg+"b") || strings.HasPrefix(dst, reg+"w")
+	if dst == reg || strings.HasPrefix(dst, reg+"d") ||
+		strings.HasPrefix(dst, reg+"b") || strings.HasPrefix(dst, reg+"w") {
+		return true
+	}
+	// Sub-register writes: ebx/bl/bx clobber rbx, r8d/r8w/r8b clobber r8.
+	for _, s := range subRegWrites[reg] {
+		if dst == s {
+			return true
+		}
+	}
+	return false
+}
+
+// subRegWrites maps a 64-bit register to the sub-register names that write it.
+var subRegWrites = map[string][]string{
+	"rax": {"eax", "ax", "al"},
+	"rbx": {"ebx", "bx", "bl"},
+	"rcx": {"ecx", "cx", "cl"},
+	"rdx": {"edx", "dx", "dl"},
+	"rsi": {"esi", "si", "sil"},
+	"rdi": {"edi", "di", "dil"},
+	"rbp": {"ebp", "bp", "bpl"},
+	"rsp": {"esp", "sp", "spl"},
+	"r8":  {"r8d", "r8w", "r8b"},
+	"r9":  {"r9d", "r9w", "r9b"},
+	"r10": {"r10d", "r10w", "r10b"},
+	"r11": {"r11d", "r11w", "r11b"},
+	"r12": {"r12d", "r12w", "r12b"},
+	"r13": {"r13d", "r13w", "r13b"},
+	"r14": {"r14d", "r14w", "r14b"},
+	"r15": {"r15d", "r15w", "r15b"},
 }
 
 // readsReg reports whether an instruction reads register reg (any width).
@@ -1000,3 +1364,40 @@ func readsReg(t, reg string) bool {
 	}
 	return strings.Count(t, reg) > 1
 }
+
+// dstReadWrite reports whether the instruction's destination register is also
+// read as a source: x86 two-operand ALU forms ("add r10, r11" starts from
+// r10's old value) and the single-operand inc/dec/neg/not family. Pure-write
+// destinations (mov/lea/movsxd/movzx/movslq) return false.
+func dstReadWrite(op string) bool {
+	switch op {
+	case "add", "sub", "imul", "and", "or", "xor",
+		"shl", "shr", "sar", "sal", "rol", "ror",
+		"inc", "dec", "neg", "not":
+		return true
+	}
+	return false
+}
+
+// regsInMem returns the general-purpose registers referenced inside a memory
+// operand such as "[rbp-8]", "[r10+r11*4]" or "[rip+G_a]". Longer names
+// first, so r10 is matched before r1.
+func regsInMem(mem string) []string {
+	inner := strings.Trim(strings.TrimSpace(mem), "[]")
+	var out []string
+	for _, r := range gp64RegOrder {
+		if strings.Contains(inner, r) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// gp64RegOrder lists the 64-bit GP registers longest-name-first for substring
+// matching inside memory operands.
+var gp64RegOrder = []string{
+	"r15", "r14", "r13", "r12", "r11", "r10", "r9", "r8",
+	"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+}
+
+

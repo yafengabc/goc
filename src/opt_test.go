@@ -497,8 +497,10 @@ int main(){ return fib(10); }`
 		t.Fatalf("a register-homed param must not be spilled to a slot, got:\n%s", asm)
 	}
 	// The reloads inside the branches, previously memory loads that had to
-	// survive slotCache's window, are now register moves.
-	if strings.Count(asm, "mov rax, rbx") < 2 {
+	// survive slotCache's window, are now register moves from rbx; copyElim
+	// then folds "mov rax, rbx; mov r10, rax" into "mov r10, rbx", so count
+	// both the folded and the unfolded shape.
+	if strings.Count(asm, "mov rax, rbx")+strings.Count(asm, "mov r10, rbx") < 2 {
 		t.Fatalf("branch-guarded reloads must become register moves, got:\n%s", asm)
 	}
 }
@@ -674,6 +676,180 @@ func TestSlotSnapshotRedundantStoreRoot(t *testing.T) {
 	got := runSlot(in)
 	if countText(got, "mov [rbp-8], ") != 1 {
 		t.Fatalf("same-root re-store must be dropped, got %v", got)
+	}
+}
+
+// ---------- F3-R copyElim (basic-block local copy elimination) unit tests ----------
+
+// runCopyElim runs copyElim over the fixture and returns surviving texts.
+func runCopyElim(insts []Inst) []string {
+	out := copyElim(insts)
+	texts := make([]string, 0, len(out))
+	for _, in := range out {
+		texts = append(texts, strings.TrimSpace(in.Text))
+	}
+	return texts
+}
+
+// TestCopyElimChainDrop: mov rax, r14; mov r10, rax; mov rax, 5 ->
+// fold to mov r10, r14 (delete the first mov).
+func TestCopyElimChainDrop(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r14"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+		{Kind: instInstr, Text: "\tmov rax, 5"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov r10, r14") != 1 {
+		t.Fatalf("chain must fold to mov r10, r14, got %v", got)
+	}
+	if countText(got, "mov rax, r14") != 0 {
+		t.Fatalf("dead copy must be deleted, got %v", got)
+	}
+}
+
+// TestCopyElimStoreDrop: mov rax, r12; mov [rbp-8], rax; mov rax, 5 ->
+// fold to mov [rbp-8], r12.
+func TestCopyElimStoreDrop(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r12"},
+		{Kind: instInstr, Text: "\tmov [rbp-8], rax"},
+		{Kind: instInstr, Text: "\tmov rax, 5"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov [rbp-8], r12") != 1 {
+		t.Fatalf("store must fold to mov [rbp-8], r12, got %v", got)
+	}
+	if countText(got, "mov rax, r12") != 0 {
+		t.Fatalf("dead copy must be deleted, got %v", got)
+	}
+}
+
+// TestCopyElimMultiConsumerKeeps: mov rax, r14; mov r10, rax; mov rcx, rax
+// -> second consumer keeps the mov (rax has a later read).
+func TestCopyElimMultiConsumerKeeps(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r14"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+		{Kind: instInstr, Text: "\tmov rcx, rax"},
+	}
+	got := runCopyElim(in)
+	// First mov consumed by r10 AND rcx — rax is read again (rcx) before
+	// being written, so the mov is kept but consumers are substituted.
+	if countText(got, "mov rax, r14") != 1 {
+		t.Fatalf("mov must be kept (rax has later read), got %v", got)
+	}
+	if countText(got, "mov r10, r14") != 1 {
+		t.Fatalf("first consumer must be substituted, got %v", got)
+	}
+	if countText(got, "mov rcx, r14") != 1 {
+		t.Fatalf("second consumer must be substituted, got %v", got)
+	}
+}
+
+// TestCopyElimLabelBreaks: mov chain across a label must not fold.
+func TestCopyElimLabelBreaks(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r14"},
+		{Kind: instLabel, Text: ".L1:"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov rax, r14") != 1 {
+		t.Fatalf("label must break the window, got %v", got)
+	}
+	if countText(got, "mov r10, r14") != 0 {
+		t.Fatalf("no substitution across label, got %v", got)
+	}
+}
+
+// TestCopyElimCallBreaks: mov chain across a call must not fold.
+func TestCopyElimCallBreaks(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r14"},
+		{Kind: instInstr, Text: "\tcall foo"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov rax, r14") != 1 {
+		t.Fatalf("call must break the window, got %v", got)
+	}
+}
+
+// TestCopyElimDstReadWriteNoSub: add rax, rbx's op0 (rax) must NOT be
+// substituted even though rax is in copyOf — the add writes rax.
+func TestCopyElimDstReadWriteNoSub(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r14"},
+		{Kind: instInstr, Text: "\tadd rax, rbx"},
+	}
+	got := runCopyElim(in)
+	// The mov is kept (next insn is add, not a mov consumer).
+	if countText(got, "mov rax, r14") != 1 {
+		t.Fatalf("mov must be kept for non-mov consumer, got %v", got)
+	}
+	// add rax's op0 must stay rax (not substituted to r14).
+	if countText(got, "add r14, rbx") != 0 {
+		t.Fatalf("add dst must not be substituted, got %v", got)
+	}
+}
+
+// TestCopyElimDivImplied: div reads rax/rdx implicitly — backward scan
+// must recognize that.
+func TestCopyElimDivImplied(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r14"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+		{Kind: instInstr, Text: "\tidiv r11"},
+	}
+	got := runCopyElim(in)
+	// The mov rax, r14; mov r10, rax: r10 consumes rax. But div after
+	// implicitly reads rax (dividend). So rax is read before its next write
+	// → mov must be kept.
+	if countText(got, "mov rax, r14") != 1 {
+		t.Fatalf("div reads rax implicitly: mov must be kept, got %v", got)
+	}
+}
+
+// TestCopyElimXmmGpWrite: movq rbx, xmm0 / cvttsd2si rax, xmm0 write GP regs.
+func TestCopyElimXmmGpWrite(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmovq rbx, xmm0"},
+		{Kind: instInstr, Text: "\tmov r10, rbx"},
+	}
+	got := runCopyElim(in)
+	// movq rbx, xmm0 writes rbx (fresh, unknown) — killReg rbx.
+	// Then mov r10, rbx: rbx is killed, no chain, so real load.
+	if countText(got, "movq rbx, xmm0") != 1 {
+		t.Fatalf("movq must be kept, got %v", got)
+	}
+}
+
+// TestCopyElimSubRegNoChain: mov eax, ebx does not build a chain.
+func TestCopyElimSubRegNoChain(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov eax, ebx"},
+		{Kind: instInstr, Text: "\tmov r10, rax"},
+	}
+	got := runCopyElim(in)
+	if countText(got, "mov eax, ebx") != 1 {
+		t.Fatalf("32-bit mov must be kept, got %v", got)
+	}
+}
+
+// TestCopyElimNarrowWriteBreaks: mov rax, r12; xor eax, eax; mov rcx, rax
+// → xor kills rax (narrow write), rcx reads new rax value.
+func TestCopyElimNarrowWriteBreaks(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov rax, r12"},
+		{Kind: instInstr, Text: "\txor eax, eax"},
+		{Kind: instInstr, Text: "\tmov rcx, rax"},
+	}
+	got := runCopyElim(in)
+	// xor eax kills rax (narrow write → reg64Name maps to rax).
+	// After xor, rax=0 (fresh). mov rcx, rax should NOT fold to r12.
+	if countText(got, "mov rcx, r12") != 0 {
+		t.Fatalf("narrow write must break the chain, got %v", got)
 	}
 }
 

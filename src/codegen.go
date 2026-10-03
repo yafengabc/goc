@@ -2737,6 +2737,9 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 		if !slotCacheSkip {
 			c.insts = slotCache(c.insts)
 		}
+		if !copyElimSkip {
+			c.insts = copyElim(c.insts)
+		}
 		c.insts = peepholeIR(c.insts)
 		if !algebraicIdentSkip {
 			c.insts = algebraicIdent(c.insts)
@@ -10198,3 +10201,4 @@ func formatDouble(v float64) string {
 	}
 	return s
 }
+
