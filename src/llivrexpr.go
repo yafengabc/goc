@@ -229,8 +229,14 @@ func (e *irEmitter) numLit(n *NumLit) val {
 		// A float literal lives in an i32 on this path (the same choice the
 		// native generator makes), so it is written as a bit pattern.
 		t := e.newTmp()
+		// The 16-digit form is what LLVM reads for float as well as double,
+		// and it must be exactly representable in the type: for float that is
+		// the bit pattern of the double the float widens to, so 5.0f is
+		// 0x4014000000000000 and not the 32-bit pattern 0x40a00000 padded
+		// out, which lands in the subnormals and is rejected.
 		if n.IsFloat {
-			e.line("%s = bitcast float 0x%016x to float", t, f32bits(n.Fval))
+			e.line("%s = bitcast float 0x%016x to float", t,
+				f64bits(float64(float32(n.Fval))))
 		} else {
 			e.line("%s = bitcast double 0x%016x to double", t, f64bits(n.Fval))
 		}

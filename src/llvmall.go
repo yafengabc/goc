@@ -351,19 +351,42 @@ func (m *irMod) constInitAt(e Expr, t *Type, top bool) (string, bool) {
 			return "", false
 		}
 		if u.Op == "-" {
-			return "neg (" + v + ")", true
+			// LLVM has no neg() -- a negative constant is spelled with a
+			// leading "-", and "i64 neg (-9223372036854775808)" is a syntax
+			// error the reader rejects at the "(".
+			return negateConst(v), true
 		}
 		return v, true
 	}
 	return "", false
 }
 
+// negateConst negates an already-rendered integer constant.
+func negateConst(v string) string {
+	if strings.HasPrefix(v, "-") {
+		return v[1:]
+	}
+	if v == "0" {
+		return v
+	}
+	return "-" + v
+}
+
 func (m *irMod) constScalar(n *NumLit, t *Type) (string, bool) {
-	if n.IsFloat {
-		if t != nil && t.Kind == KFloat {
-			return "0x" + strconv.FormatUint(uint64(f32bits(n.Fval)), 16), true
+	// Kind == TDouble is what marks a literal as floating point at all.
+	// IsFloat only says WHICH width -- "1.5f" is float, "1.5" is double -- so
+	// testing it alone sent a plain double literal down the integer path and
+	// emitted "double 0" for "3.14159".
+	if n.Kind == TDouble {
+		// LLVM spells FP constants in the 16-digit double form even for
+		// float, and rejects one the type cannot hold exactly: a float
+		// constant is therefore the bit pattern of the double that the float
+		// widens to, not the 8-digit float pattern (which it refuses).
+		bits := f64bits(n.Fval)
+		if n.IsFloat || (t != nil && t.Kind == KFloat) {
+			bits = f64bits(float64(float32(n.Fval)))
 		}
-		return "0x" + strconv.FormatUint(f64bits(n.Fval), 16), true
+		return fmt.Sprintf("0x%016x", bits), true
 	}
 	if n.BigWords != nil {
 		// A _BitInt constant is a word array; the front end does not model the
@@ -382,6 +405,11 @@ func (m *irMod) constScalar(n *NumLit, t *Type) (string, bool) {
 		case 4:
 			v = int64(int32(v))
 		}
+	}
+	// A zero integer constant in pointer position is a null pointer; "ptr 0"
+	// is not a thing LLVM accepts.
+	if v == 0 && t != nil && (t.Kind == KPtr || t.Kind == KFunc) {
+		return "null", true
 	}
 	return strconv.FormatInt(v, 10), true
 }
@@ -440,7 +468,9 @@ func (m *irMod) constAggregate(b *BraceInit, t *Type, top bool) (string, bool) {
 		for i := 0; i < t.Len; i++ {
 			e, ok := byIdx[i]
 			if !ok {
-				parts = append(parts, m.zeroOf(t.Elem))
+				// A skipped element still needs its type: "[i32 1, i32 2,
+				// 0, 0]" is read as a type where a value belongs.
+				parts = append(parts, m.typedInAggregate(m.zeroOf(t.Elem), t.Elem))
 				continue
 			}
 			v, ok := m.constInitAt(e, t.Elem, false)
@@ -457,6 +487,9 @@ func (m *irMod) constAggregate(b *BraceInit, t *Type, top bool) (string, bool) {
 	case KStruct, KUnion:
 		parts := make([]string, 0, len(t.Members))
 		for i, mem := range t.Members {
+			if t.Kind == KUnion && i > 0 {
+				break // C initialises only the first member of a union
+			}
 			if i < len(b.Elems) && b.Elems[i].E != nil {
 				v, ok := m.constInitAt(b.Elems[i].E, mem.Type, false)
 				if !ok {
@@ -465,7 +498,14 @@ func (m *irMod) constAggregate(b *BraceInit, t *Type, top bool) (string, bool) {
 				parts = append(parts, m.typedInAggregate(v, mem.Type))
 				continue
 			}
-			parts = append(parts, m.zeroOf(mem.Type))
+			parts = append(parts, m.typedInAggregate(m.zeroOf(mem.Type), mem.Type))
+		}
+		// The union's extra bytes are a member the C source never names, so
+		// append them here to match the type (see unionLayout).
+		if t.Kind == KUnion {
+			if _, pad := unionLayout(t); pad > 0 {
+				parts = append(parts, "["+strconv.Itoa(pad)+" x i8] zeroinitializer")
+			}
 		}
 		if len(parts) == 0 {
 			return "zeroinitializer", true
@@ -488,26 +528,35 @@ func (m *irMod) constAggregate(b *BraceInit, t *Type, top bool) (string, bool) {
 // already a compound constant, or a string literal (which is typed by its own
 // c"..." form only when its type is stated), is passed through.
 func (m *irMod) typedInAggregate(v string, t *Type) string {
-	if v == "" || v == "zeroinitializer" {
+	if v == "" {
 		return v
 	}
-	switch t.Kind {
-	case KStruct, KUnion, KArr:
-		return v // "{ ... }" / "[N x T] ..." already carry their type
-	case KPtr, KFunc:
-		if v == "null" {
-			return v // null is typed on its own
-		}
-		return "ptr " + v
-	}
-	if strings.HasPrefix(v, "getelementptr") {
-		// A constant expression states its own type.
-		return v
+	if v == "zeroinitializer" {
+		// A skipped element still has to say what it is: inside an
+		// aggregate a bare "zeroinitializer" is read as a type. It is only
+		// at the top of a global ("@g = global [3 x %point]
+		// zeroinitializer") that the type is already written.
+		return m.llirType(t) + " zeroinitializer"
 	}
 	if strings.HasPrefix(v, "c\"") {
 		// A bare c"..." does NOT: inside an aggregate LLVM wants
-		// "[4 x i8] c\"UTC\\00\"".
+		// "[6 x i8] c\"hello\\00\"".
 		return m.llirType(t) + " " + v
+	}
+	switch t.Kind {
+	case KStruct, KUnion:
+		// A nested aggregate is spelled "<type> { ... }". A bare "{ ... }" is
+		// taken for the enclosing body and the reader reports "expected '}' at
+		// end of struct" -- and flattening it out ("{i32 1, i32 2, i32 3,
+		// i32 4}") is rejected as having the wrong number of elements.
+		return m.llirType(t) + " " + v
+	case KArr:
+		return v // "[N x T] ..." already carries its type
+	case KPtr, KFunc:
+		// Everything here needs the prefix, including null: "ptr null" and
+		// "ptr getelementptr(...)" are accepted, while a bare null is read as
+		// the start of a type ("expected type").
+		return "ptr " + v
 	}
 	if t.Kind == KInt && (v == "true" || v == "false") {
 		return "i1 " + v

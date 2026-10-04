@@ -189,10 +189,15 @@ func alignOfLlir(ty string) int {
 			}
 			n = n*10 + int(ty[i]-'0')
 		}
-		return n / 8
-	case len(ty) > 5 && ty[:5] == "float":
+		// i1/_Bool is a byte in memory; n/8 would give 0, and LLVM rejects
+		// an alignment of 0.
+		if a := n / 8; a >= 1 {
+			return a
+		}
+		return 1
+	case ty == "float":
 		return 4
-	case len(ty) > 6 && ty[:6] == "double":
+	case ty == "double":
 		return 8
 	case ty == "ptr":
 		return 8
@@ -236,19 +241,20 @@ func (m *irMod) structName(t *Type) string {
 
 	var body string
 	if t.Kind == KUnion {
-		// A union is as wide as its widest member; padding to that keeps
-		// loads and stores of the whole object in bounds.
-		wide := 1
-		for _, mem := range t.Members {
-			if s := sizeOf(mem.Type); s > wide {
-				wide = s
-			}
-		}
+		// A union is as wide as its widest member, and its first member
+		// already occupies that width -- only the remainder, if any, needs an
+		// explicit pad. Adding the whole width on top of the member doubled
+		// it: "union U { char *p; int x; }" came out as "{ ptr, [8 x i8] }",
+		// 16 bytes for what C calls 8.
+		first, pad := unionLayout(t)
 		ty := "i8"
-		if len(t.Members) > 0 {
-			ty = m.llirType(t.Members[0].Type)
+		if first != nil {
+			ty = m.llirType(first)
 		}
-		body = "{ " + ty + ", [" + itoa(wide) + " x i8] }"
+		body = "{ " + ty + " }"
+		if pad > 0 {
+			body = "{ " + ty + ", [" + itoa(pad) + " x i8] }"
+		}
 	} else {
 		parts := make([]string, 0, len(t.Members))
 		for _, mem := range t.Members {
@@ -260,39 +266,44 @@ func (m *irMod) structName(t *Type) string {
 			body = "{ " + joinStrings(parts, ", ") + " }"
 		}
 	}
-	// A struct whose C size exceeds the sum of its members (padding, or a
-	// trailing array) needs explicit padding, or a whole-object access would
-	// read past the end.
-	if need := llirPadFor(t); need != "" {
-		body = "{ " + body[2:len(body)-2] + ", " + need + " }"
-	}
+	// No trailing pad member. LLVM lays a struct out from its members per the
+	// target datalayout -- inserting the same internal and trailing padding the
+	// C ABI does -- so "{ ptr, i32 }" is already 16 bytes with the right
+	// alignment. Adding a pad member of our own both inflates the size (a
+	// pad rounded up to the struct's alignment made it 24) and puts a member
+	// the C source never mentions in the type, which every brace initialiser
+	// then fails to fill ("initializer with struct type has wrong # elements").
 	m.typeLines = append(m.typeLines, "%"+name+" = type "+body)
 	return name
 }
 
-// llirPadFor returns the explicit pad member a struct needs so its LLVM size
-// matches the C layout, or "" when the members already account for it.
-func llirPadFor(t *Type) string {
-	if t.Kind == KUnion || len(t.Members) == 0 {
-		return ""
+// unionLayout describes how a union is laid out in LLVM: the first member
+// keeps its own type (so member access can use it directly) and pad is the
+// number of extra bytes needed to reach the union's C size. The type emitter
+// and the constant initialiser both go through this so they cannot disagree
+// about how many members a union has.
+func unionLayout(t *Type) (first *Type, pad int) {
+	if len(t.Members) == 0 {
+		return nil, 0
 	}
-	sum := 0
-	for _, mem := range t.Members {
-		sum += sizeOf(mem.Type)
+	first = t.Members[0].Type
+	wide := sizeOf(first)
+	for _, mem := range t.Members[1:] {
+		if s := sizeOf(mem.Type); s > wide {
+			wide = s
+		}
 	}
 	size := t.Size
-	if size == 0 {
-		size = sum
+	if size <= 0 {
+		size = wide
 	}
-	if size <= sum {
-		return ""
+	if size > wide {
+		wide = size
 	}
-	// Round the pad up so the struct's own alignment is preserved.
-	pad := size - sum
-	if a := alignOf(t); a > 1 && pad%a != 0 {
-		pad += a - pad%a
+	if pad = wide - sizeOf(first); pad < 0 {
+		pad = 0
 	}
-	return "[" + itoa(pad) + " x i8]"
+	return first, pad
 }
 
 // hasGlobal reports whether name is a module-level variable.
