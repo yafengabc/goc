@@ -1172,20 +1172,71 @@ func sibFold(insts []Inst) []Inst {
 			out = append(out, in)
 			continue
 		}
-		mv := insts[i+2]
+		// The store that consumes the scaled address normally sits
+		// immediately after the `add r10, r11`. But codegen emits the
+		// store's source load *between* the add and the store (e.g.
+		//   imul r11,4 / add r10,r11 / mov rax,[slot] / mov dword [r10],eax),
+		// which breaks the strict three-instruction adjacency. Allow exactly
+		// one gap instruction provided it neither touches r10/r11 nor reads
+		// flags (the deleted imul/add set them) -- it is kept verbatim so the
+		// store still gets its source.
+		storeIdx := i + 2
+		gapIdx := -1
+		if _, ok := sibFoldMov(insts[storeIdx].Text, k); !ok {
+			if i+3 < len(insts) && insts[i+2].Kind == instInstr &&
+				sibFoldGapSafe(insts[i+2]) && insts[i+3].Kind == instInstr {
+				if _, ok2 := sibFoldMov(insts[i+3].Text, k); ok2 {
+					gapIdx = i + 2
+					storeIdx = i + 3
+				}
+			}
+		}
+		mv := insts[storeIdx]
 		if mv.Kind != instInstr {
 			out = append(out, in)
 			continue
 		}
 		folded, ok := sibFoldMov(mv.Text, k)
-		if !ok || !sibFoldWindowSafe(insts, i+3) {
+		if !ok || !sibFoldWindowSafe(insts, storeIdx+1) {
 			out = append(out, in)
 			continue
 		}
+		if gapIdx >= 0 {
+			out = append(out, insts[gapIdx]) // keep the source load
+		}
 		out = append(out, Inst{Kind: instInstr, Text: folded})
-		i += 2 // skip the imul and the add
+		i = storeIdx // drop the imul, the add, the optional gap, and the store
 	}
 	return out
+}
+
+// sibFoldGapSafe reports whether a single instruction may sit between
+// `add r10, r11` and the store it feeds, to be preserved verbatim when the
+// imul/add are folded away. It must not read or write r10/r11 (its value is
+// about to change), must not read flags (the deleted imul/add wrote them),
+// and must not be control flow or a call.
+func sibFoldGapSafe(in Inst) bool {
+	if in.Kind != instInstr {
+		return false
+	}
+	t := strings.TrimSpace(in.Text)
+	if t == "" {
+		return false
+	}
+	if strings.Contains(t, "r10") || strings.Contains(t, "r11") {
+		return false
+	}
+	if strings.HasPrefix(t, "lock") || strings.HasPrefix(t, "rep") {
+		return false
+	}
+	op := strings.SplitN(t, " ", 2)[0]
+	if op == "call" || op == "jmp" || strings.HasPrefix(op, "j") {
+		return false
+	}
+	if isFlagReadOp(op) {
+		return false
+	}
+	return true
 }
 
 // sibFoldMov rewrites the element load/store of the idiom into its SIB form,

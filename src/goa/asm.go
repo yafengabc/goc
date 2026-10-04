@@ -81,6 +81,27 @@ type Fixup struct {
 	ripAdj int    // extra bytes after the displacement before the true RIP
 	// (0 normally; 1 for C6 mov r/m8,imm8 which has a trailing imm8)
 	short bool // true => a 1-byte displacement (rel8 short jump), not disp32
+	// addend is folded into the computed target: the resolved value is
+	// symRVA[sym] + addend. COFF needs it because a relocation against a
+	// *section* symbol carries the position within that section in the field's
+	// existing contents rather than in the symbol -- the unwind tables are the
+	// only place goc sees this. Always 0 for assembler-generated fixups.
+	addend int
+	// absolute makes the fixup store the resolved address verbatim instead of a
+	// displacement. COFF's IMAGE_REL_AMD64_ADDR32NB is such a relocation: the
+	// field wants an RVA, not a distance, and applying the usual
+	// "target minus where the field sits" arithmetic to it yields a large
+	// negative number that the loader rejects.
+	absolute bool
+	// wide makes an absolute fixup write eight bytes instead of four, for
+	// IMAGE_REL_AMD64_ADDR64 -- a pointer-sized slot holding an address.
+	wide bool
+	// virtual makes an absolute fixup store ImageBase+RVA rather than the RVA
+	// alone. The two absolute relocations differ exactly here: an unwind table
+	// entry (ADDR32NB) holds an RVA, because the loader adds the base itself,
+	// while a data pointer (ADDR64) is dereferenced directly and so has to carry
+	// the full address.
+	virtual bool
 }
 
 type Assembler struct {
@@ -114,6 +135,12 @@ type Assembler struct {
 	// syscall's internal exception dispatch (it has no PE unwind info).
 	uwRecs []*uwFunc
 	uwCur  *uwFunc
+	// pdataRVA and pdataSize describe the Win64 exception directory: the
+	// RUNTIME_FUNCTION array the loader walks during exception dispatch. They
+	// stay zero unless an object carrying unwind info was merged in (goa's own
+	// assembler emits none).
+	pdataRVA  int
+	pdataSize int
 }
 
 // uwFunc records one function's prolog for unwind-table emission.
@@ -400,13 +427,33 @@ func (a *Assembler) fixupShort(off int, sym string) {
 // follows the displacement (plus any instruction trailer in ripAdj).
 func applyFixup(s *Section, f Fixup, target, base int) error {
 	size := 4
-	if f.short {
+	switch {
+	case f.short:
 		size = 1
+	case f.wide:
+		size = 8
 	}
 	if f.off+size > len(s.Data) {
 		return fmt.Errorf("fixup out of range for %s", f.sym)
 	}
-	disp := int32(target - (base + f.off + size + f.ripAdj))
+	// An absolute fixup stores the address itself; a relative one stores the
+	// distance from the byte after the field (plus any instruction trailer).
+	if f.absolute {
+		if f.off+size > len(s.Data) {
+			return fmt.Errorf("absolute fixup out of range for %s", f.sym)
+		}
+		addr := uint64(target + f.addend)
+		if f.virtual {
+			// The preferred load address is above 4GB, so a 32-bit field
+			// would truncate it; only the 64-bit form can hold one.
+			addr += uint64(imageBase)
+		}
+		for i := 0; i < size; i++ {
+			s.Data[f.off+i] = byte(addr >> (8 * i))
+		}
+		return nil
+	}
+	disp := int32(target + f.addend - (base + f.off + size + f.ripAdj))
 	if f.short && (disp < -128 || disp > 127) {
 		return fmt.Errorf("short jump to %s is %d bytes away (limit +/-127)", f.sym, disp)
 	}

@@ -93,4 +93,41 @@ int __goclib_get_args(char ***argvp) {
     *argvp = argv;
     return argc;
 }
+
+extern unsigned short *GetCommandLineW(void);
+
+/* Return a pointer into the full command line just past argv[0], matching the
+ * MSVC CRT's wWinMain/WinMain lpCmdLine contract (the program name is NOT
+ * included). A quoted argv[0] is skipped correctly. */
+static unsigned short *skip_prog_w(unsigned short *p) {
+    if (*p == '"') {
+        p++;
+        while (*p && *p != '"') p++;
+        if (*p == '"') p++;
+    } else {
+        while (*p && *p != ' ' && *p != '\t') p++;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+
+static char *skip_prog_a(char *p) {
+    if (*p == '"') {
+        p++;
+        while (*p && *p != '"') p++;
+        if (*p == '"') p++;
+    } else {
+        while (*p && *p != ' ' && *p != '\t') p++;
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+
+unsigned short *__goclib_lp_cmdline_w(void) {
+    return (unsigned short *)skip_prog_w(GetCommandLineW());
+}
+
+char *__goclib_lp_cmdline_a(void) {
+    return (char *)skip_prog_a(GetCommandLineA());
+}
 #endif

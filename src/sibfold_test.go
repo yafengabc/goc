@@ -135,18 +135,45 @@ func TestFoldLabelBreaksWindow(t *testing.T) {
 	}
 }
 
-// TestFoldNonAdjacent: an intervening instruction between add and the load
-// breaks the idiom; no fold.
+// TestFoldNonAdjacent: an intervening instruction that TOUCHES r10/r11 or
+// reads flags between add and the load/store is unsafe and blocks the fold.
 func TestFoldNonAdjacent(t *testing.T) {
 	in := []Inst{
 		{Kind: instInstr, Text: "\timul r11, 4"},
 		{Kind: instInstr, Text: "\tadd r10, r11"},
-		{Kind: instInstr, Text: "\tmov rax, [rbp-8]"}, // unrelated load in between
+		{Kind: instInstr, Text: "\tmov rax, r10"}, // gap reads r10 -> unsafe
 		{Kind: instInstr, Text: "\tmov eax, [r10]"},
 	}
 	got := runFold(in)
 	if countText(got, "[r10+r11*4]") != 0 {
-		t.Fatalf("must only fold the strictly-adjacent idiom: %v", got)
+		t.Fatalf("must not fold when the gap touches r10/r11: %v", got)
+	}
+}
+
+// TestFoldSafeGapStore: codegen places the store's source load between
+// `add r10, r11` and the store itself (the real bsort idiom). A single gap
+// that neither touches r10/r11 nor reads flags is preserved verbatim and the
+// store still folds into a SIB operand.
+func TestFoldSafeGapStore(t *testing.T) {
+	in := []Inst{
+		{Kind: instInstr, Text: "\tmov r10, r14"},
+		{Kind: instInstr, Text: "\tmovsxd r11, r12d"},
+		{Kind: instInstr, Text: "\timul r11, 4"},
+		{Kind: instInstr, Text: "\tadd r10, r11"},
+		{Kind: instInstr, Text: "\tmov rax, [rbp-56]"}, // safe gap: source load
+		{Kind: instInstr, Text: "\tmov dword [r10], eax"},
+		{Kind: instInstr, Text: "\tmov r11, 0"}, // window break
+	}
+	got := runFold(in)
+	if countText(got, "mov dword [r10+r11*4], eax") != 1 {
+		t.Fatalf("store with safe gap must fold into SIB: %v", got)
+	}
+	// the gap (source load) must be preserved before the folded store
+	if countText(got, "mov rax, [rbp-56]") != 1 {
+		t.Fatalf("safe gap must be kept verbatim: %v", got)
+	}
+	if countText(got, "imul r11, 4") != 0 || countText(got, "add r10, r11") != 0 {
+		t.Fatalf("imul/add must be deleted: %v", got)
 	}
 }
 
@@ -234,11 +261,14 @@ func TestF2IndexRegDirect(t *testing.T) {
 	if !strings.Contains(asm, "movsxd r11, ") {
 		t.Fatalf("F2 must consume the index from its home register:\n%s", asm)
 	}
-	// the SIB fold should also fire on the loop's a[i] LOAD (imul/add/mov
-	// are adjacent in the load path; the store path has the rhs evaluation
-	// between add and the store, which sibFold deliberately leaves alone)
+	// the SIB fold should fire on the loop's a[i] LOAD and, since the
+	// store-path gap (the rhs source load) is now tolerated, also on the
+	// a[i] = i STORE.
 	if !strings.Contains(asm, "[r10+r11*4]") {
 		t.Fatalf("sibFold must fold the loop's a[i] loads:\n%s", asm)
+	}
+	if !strings.Contains(asm, "mov dword [r10+r11*4]") && !strings.Contains(asm, "mov [r10+r11*4]") {
+		t.Fatalf("sibFold must also fold the loop's a[i] = i store:\n%s", asm)
 	}
 }
 

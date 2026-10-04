@@ -74,6 +74,7 @@ extern void   ExitProcess(UINT code), kernel32;
 extern HMODULE GetModuleHandleA(LPCSTR name), kernel32;
 extern DWORD  GetModuleFileNameA(HMODULE h, LPSTR buf, DWORD n), kernel32;
 extern LPSTR  GetCommandLineA(void), kernel32;
+extern FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName), kernel32;
 extern HMODULE LoadLibraryA(LPCSTR name), kernel32;
 extern BOOL   FreeLibrary(HMODULE h), kernel32;
 

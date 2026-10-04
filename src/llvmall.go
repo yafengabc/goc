@@ -1,0 +1,408 @@
+package main
+
+// Building the IR for a whole program.
+//
+// Initialisers for globals are constant-folded here; see constInit for the forms
+// that are covered and what happens to the rest.
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+//
+// One generator owns every C function in the program -- the user's and the C
+// runtime's alike -- and goa's own assembler is left with the entry stub, which
+// is not C at all: it establishes the process stack per the platform ABI before
+// main runs. The split is therefore between two different *kinds* of code rather
+// than two compilers racing over the same symbols.
+//
+// That is a change from an earlier arrangement where each function went to
+// whichever generator could handle it. Sharing a program that way needs a symbol
+// table in both, and they disagreed: over a global's assembler-level name, over
+// whether an undefined symbol was an import or something the other half already
+// defined, and over the variadic calls the native path rewrites by inspecting a
+// format string. Every one of those produced either a link error or a silently
+// wrong answer.
+
+// translateProgram lowers a whole program to one LLVM IR module: the user's
+// globals, the user's functions, and every C runtime function the program reaches.
+//
+// lib is the parsed C runtime; a nil lib means "user code only" (used by the unit
+// tests, which exercise fragments without the runtime present). Its function table
+// is consulted for prototypes and for the reachability walk that decides which
+// runtime code has to be emitted.
+func translateProgram(prog *Program, lib *clibCProgram) (string, map[string]bool, error) {
+	m := newIRMod()
+	defined := map[string]bool{}
+	tr := &typeResolver{
+		funcDefs:   map[string]*FuncDecl{},
+		globalTyp:  map[string]*Type{},
+		staticVars: map[string]string{},
+		lib:        lib,
+	}
+
+	// The function table has to hold both halves before anything is generated, so
+	// a call can be resolved whether its target is the user's or the runtime's.
+	for _, f := range prog.Funcs {
+		tr.funcDefs[f.Name] = f
+		defined[f.Name] = true
+	}
+	// The runtime's globals, when the program's own do not shadow them, are part
+	// of the module for the same reason its functions are -- and they have to be
+	// *defined* here, not merely given a type. Registering the type alone left
+	// every reference to a C runtime global pointing at a symbol nobody emitted:
+	// genWith skips these names because `claimed` says LLVM owns them, so neither
+	// half defined them and the program died on the first access. stdout is the
+	// one every program touches, which is why writing anything at all crashed.
+	if lib != nil {
+		for _, lg := range lib.globals {
+			if _, dup := tr.globalTyp[lg.Name]; dup {
+				continue
+			}
+			tr.globalTyp[lg.Name] = lg.Typ
+			defined["G_"+lg.Name] = true
+			if lg.Typ == nil || typUnsupported(lg.Typ) {
+				continue
+			}
+			if lg.IsTLS {
+				m.noteExternGlobal("G_"+lg.Name, m.llirType(lg.Typ))
+				continue
+			}
+			init, ok := m.constInit(lg.Init, lg.Typ)
+			if !ok {
+				m.noteExternGlobal("G_"+lg.Name, m.llirType(lg.Typ))
+				continue
+			}
+			m.globals = append(m.globals, irGlobal{
+				name: "G_" + lg.Name, ty: m.llirType(lg.Typ), init: init,
+			})
+		}
+	}
+
+	// --- globals ---
+	// A definition needs its initialiser lowered to an LLVM constant, which this
+	// front end does for the forms C programs actually use: a scalar constant, a
+	// string, and a brace-initialised array or struct of them. A global whose
+	// initialiser is not one of those keeps the native generator's definition
+	// and is declared external here.
+	for _, gl := range prog.Globals {
+		if gl.Typ == nil || typUnsupported(gl.Typ) {
+			continue
+		}
+		ty := m.llirType(gl.Typ)
+		// Thread-local storage has no representation in the IR front end's
+		// layout and is owned by goa's own assembler; declare it external so
+		// the LLVM-compiled half can still reference it.
+		if gl.IsTLS {
+			m.noteExternGlobal("G_"+gl.Name, ty)
+			continue
+		}
+		init, ok := m.constInit(gl.Init, gl.Typ)
+		if !ok {
+			m.noteExternGlobal("G_"+gl.Name, ty)
+			continue
+		}
+		m.globals = append(m.globals, irGlobal{
+			name: "G_" + gl.Name, ty: ty, init: init,
+		})
+		defined["G_"+gl.Name] = true
+	}
+
+	// --- functions ---
+	// The order does not matter: LLVM resolves calls to definitions that appear
+	// later, because every call names its argument types explicitly.
+	var wanted []*FuncDecl
+	for _, f := range prog.Funcs {
+		if !llvmEligible(f) {
+			return "", nil, fmt.Errorf(
+				"-fllvm: %s uses a construct the LLVM front end does not model yet "+
+					"(inline assembly, bit-fields or _BitInt); "+
+					"build without -fllvm for now", f.Name)
+		}
+		wanted = append(wanted, f)
+	}
+	// The runtime's own functions, in the order the library records, so the
+	// output is stable from one build to the next.
+	if lib != nil {
+		for _, name := range lib.order {
+			f := lib.funcs[name]
+			if f.Body == nil {
+				continue // a prototype, not a definition
+			}
+			if !llvmEligible(f) {
+				return "", nil, fmt.Errorf(
+					"-fllvm: the C runtime function %s uses a construct the LLVM front "+
+						"end does not model yet; build without -fllvm for now", name)
+			}
+			wanted = append(wanted, f)
+		}
+	}
+
+	// Every name this module will define is marked BEFORE any body is
+	// generated, not as each one is reached. A call to a function defined later
+	// in the list would otherwise emit a `declare` for it during the earlier
+	// body's generation, and the later `define` would collide with it: LLVM
+	// reads a declare followed by a matching define as a redefinition.
+	for _, f := range wanted {
+		m.defined[f.Name] = true
+		defined[f.Name] = true
+		tr.funcDefs[f.Name] = f
+	}
+
+	for _, f := range wanted {
+		// The body still needs the name in `defined` so a recursive call emits
+		// no declare; and `defined` tells the assembler half that this name
+		// belongs to the LLVM object, so goa emits only the entry stub and
+		// never re-defines it.
+		body, err := genIRFunc(tr, m, f)
+		if err != nil {
+			return "", nil, err
+		}
+		m.funcBodies = append(m.funcBodies, body)
+	}
+	return m.String(), defined, nil
+}
+
+// constInit lowers a global's initialiser to an LLVM constant.
+//
+// Only the forms C programs actually use are handled: a scalar constant, a
+// string literal, and brace-initialised aggregates of those. Anything else --
+// an address computed from another global, a cast, a function pointer -- reports
+// false, and the caller then leaves the definition to the native generator and
+// declares it external. That keeps a construct this front end cannot yet
+// constant-fold compiling, at the cost of a second owner for that one symbol;
+// the alternative, emitting a wrong constant, would be far worse.
+func (m *irMod) constInit(e Expr, t *Type) (string, bool) {
+	return m.constInitAt(e, t, true)
+}
+
+// constInitAt renders a global's initialiser. `top` says whether the value sits
+// directly after the type in a "@g = global <ty> <value>" line.
+//
+// It matters for arrays. A constant in value position spells the type only when
+// it is nested inside a struct or array -- "[2 x i8] c\"ab\"" -- but at the top
+// level the type has already been written, and repeating it yields
+// "@tzname = global [2 x ptr] [2 x ptr][...]", which LLVM rejects outright
+// ("expected type"). Structs and scalars are unaffected: "{ ... }" carries no
+// prefix in either position.
+func (m *irMod) constInitAt(e Expr, t *Type, top bool) (string, bool) {
+	if e == nil {
+		return "zeroinitializer", true
+	}
+	if bi, ok := e.(*BraceInit); ok {
+		return m.constAggregate(bi, t, top)
+	}
+	if sl, ok := e.(*StrLit); ok {
+		return m.constString(sl.Bytes, t)
+	}
+	if n, ok := e.(*NumLit); ok {
+		return m.constScalar(n, t)
+	}
+	// A cast of a constant folds away rather than becoming a runtime value.
+	if c, ok := e.(*CastExpr); ok && c.Typ != nil {
+		return m.constInitAt(c.E, c.Typ, top)
+	}
+	if u, ok := e.(*Unary); ok && (u.Op == "-" || u.Op == "+") {
+		v, ok2 := m.constInitAt(u.E, t, false)
+		if !ok2 {
+			return "", false
+		}
+		if u.Op == "-" {
+			return "neg (" + v + ")", true
+		}
+		return v, true
+	}
+	return "", false
+}
+
+func (m *irMod) constScalar(n *NumLit, t *Type) (string, bool) {
+	if n.IsFloat {
+		if t != nil && t.Kind == KFloat {
+			return "0x" + strconv.FormatUint(uint64(f32bits(n.Fval)), 16), true
+		}
+		return "0x" + strconv.FormatUint(f64bits(n.Fval), 16), true
+	}
+	if n.BigWords != nil {
+		// A _BitInt constant is a word array; the front end does not model the
+		// type, so this stays with the native generator.
+		return "", false
+	}
+	// A narrow type keeps only the low bits of the value, which is what C says a
+	// conversion to that type does.
+	v := n.Val
+	if t != nil && t.Kind == KInt {
+		switch t.Width {
+		case 1:
+			v = int64(int8(v))
+		case 2:
+			v = int64(int16(v))
+		case 4:
+			v = int64(int32(v))
+		}
+	}
+	return strconv.FormatInt(v, 10), true
+}
+
+func (m *irMod) constString(b []byte, t *Type) (string, bool) {
+	// A char array is initialised by copying the bytes; a char pointer takes the
+	// address of a private copy of them.
+	if t == nil || t.Kind == KArr {
+		n := t.Len
+		if n <= 0 {
+			n = len(b) + 1
+		}
+		body := cStringN(b, n)
+		name := m.internConst(body, "["+strconv.Itoa(n)+" x i8]")
+		if t != nil && t.Kind == KArr {
+			return body, true
+		}
+		return "getelementptr inbounds ([" + strconv.Itoa(n) +
+			" x i8], ptr @" + name + ", i64 0, i64 0)", true
+	}
+	if t.Kind == KPtr {
+		name := m.internConst(cStringN(b, len(b)+1), "["+strconv.Itoa(len(b)+1)+" x i8]")
+		return "getelementptr inbounds ([" + strconv.Itoa(len(b)+1) +
+			" x i8], ptr @" + name + ", i64 0, i64 0)", true
+	}
+	return "", false
+}
+
+// constAggregate renders a brace initialiser for an array or struct.
+//
+// Inside an aggregate, a scalar element must carry its own type:
+// "[ptr getelementptr(...), ptr null]", not "[getelementptr(...), null]". LLVM
+// only lets a struct body ("{ ... }") and a nested array omit it, and a global
+// line already has the aggregate's own type written -- so an element without one
+// is read as the start of a type and the module is rejected with "expected
+// type". See constInitAt for what `top` means.
+func (m *irMod) constAggregate(b *BraceInit, t *Type, top bool) (string, bool) {
+	if t == nil {
+		return "", false
+	}
+	switch t.Kind {
+	case KArr:
+		parts := make([]string, 0, t.Len)
+		byIdx := map[int]Expr{}
+		order := []int{}
+		for _, el := range b.Elems {
+			idx := len(order)
+			if el.DesigIdx >= 0 {
+				idx = el.DesigIdx
+			}
+			if _, dup := byIdx[idx]; !dup {
+				order = append(order, idx)
+			}
+			byIdx[idx] = el.E
+		}
+		for i := 0; i < t.Len; i++ {
+			e, ok := byIdx[i]
+			if !ok {
+				parts = append(parts, m.zeroOf(t.Elem))
+				continue
+			}
+			v, ok := m.constInitAt(e, t.Elem, false)
+			if !ok {
+				return "", false
+			}
+			parts = append(parts, m.typedInAggregate(v, t.Elem))
+		}
+		body := "[" + joinStrings(parts, ", ") + "]"
+		if top {
+			return body, true
+		}
+		return "[" + strconv.Itoa(t.Len) + " x " + m.llirType(t.Elem) + "]" + body, true
+	case KStruct, KUnion:
+		parts := make([]string, 0, len(t.Members))
+		for i, mem := range t.Members {
+			if i < len(b.Elems) && b.Elems[i].E != nil {
+				v, ok := m.constInitAt(b.Elems[i].E, mem.Type, false)
+				if !ok {
+					return "", false
+				}
+				parts = append(parts, m.typedInAggregate(v, mem.Type))
+				continue
+			}
+			parts = append(parts, m.zeroOf(mem.Type))
+		}
+		if len(parts) == 0 {
+			return "zeroinitializer", true
+		}
+		return "{" + joinStrings(parts, ", ") + "}", true
+	}
+	// A braced scalar.
+	if len(b.Elems) > 0 {
+		return m.constInitAt(b.Elems[0].E, t, top)
+	}
+	return "zeroinitializer", true
+}
+
+// typedInAggregate gives a constant element its type when LLVM wants one.
+//
+// A struct body and a nested array are "{ ... }" and "[N x T] ...", which
+// already say what they are. Everything else -- an integer, a pointer, a
+// getelementptr, a null -- has to be written "<ty> <value>" when it sits inside
+// an aggregate, or the reader takes the value for a type. A value that is
+// already a compound constant, or a string literal (which is typed by its own
+// c"..." form only when its type is stated), is passed through.
+func (m *irMod) typedInAggregate(v string, t *Type) string {
+	if v == "" || v == "zeroinitializer" {
+		return v
+	}
+	switch t.Kind {
+	case KStruct, KUnion, KArr:
+		return v // "{ ... }" / "[N x T] ..." already carry their type
+	case KPtr, KFunc:
+		if v == "null" {
+			return v // null is typed on its own
+		}
+		return "ptr " + v
+	}
+	if strings.HasPrefix(v, "getelementptr") {
+		// A constant expression states its own type.
+		return v
+	}
+	if strings.HasPrefix(v, "c\"") {
+		// A bare c"..." does NOT: inside an aggregate LLVM wants
+		// "[4 x i8] c\"UTC\\00\"".
+		return m.llirType(t) + " " + v
+	}
+	if t.Kind == KInt && (v == "true" || v == "false") {
+		return "i1 " + v
+	}
+	return m.llirType(t) + " " + v
+}
+
+// zeroOf renders a zero value of a type, for an element the initialiser skips.
+func (m *irMod) zeroOf(t *Type) string {
+	if t == nil {
+		return "0"
+	}
+	switch t.Kind {
+	case KFloat:
+		return "0.0"
+	case KDouble:
+		return "0.0"
+	case KArr, KStruct, KUnion:
+		return "zeroinitializer"
+	case KPtr, KFunc:
+		return "null"
+	}
+	return "0"
+}
+
+// internConst gives a constant a private global and returns its name, so the
+// same bytes are stored once however many pointers refer to them.
+func (m *irMod) internConst(body, ty string) string {
+	if m.consts == nil {
+		m.consts = map[string]string{}
+	}
+	if n, ok := m.consts[body]; ok {
+		return n
+	}
+	name := ".const." + strconv.Itoa(len(m.consts))
+	m.consts[body] = name
+	m.globals = append(m.globals, irGlobal{name: name, ty: ty, init: body, constant: true})
+	return name
+}

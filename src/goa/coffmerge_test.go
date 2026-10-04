@@ -1,0 +1,126 @@
+package goa
+
+// Merge tests. These run against a real LLVM-produced object when GOC_LLVM_OBJ
+// points at one, because the whole point of the merge is to cope with what LLVM
+// actually emits; the synthetic objects from coff_test.go only pin the parser.
+
+import (
+	"os"
+	"testing"
+)
+
+func realObj(t *testing.T) []byte {
+	t.Helper()
+	p := os.Getenv("GOC_LLVM_OBJ")
+	if p == "" {
+		t.Skip("set GOC_LLVM_OBJ to a real LLVM COFF object to run this")
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	return b
+}
+
+func TestIngestCOFFSectionsMerged(t *testing.T) {
+	src := realObj(t)
+	a := NewAssembler()
+	if err := a.IngestCOFFBytes(src); err != nil {
+		t.Fatalf("IngestCOFFBytes: %v", err)
+	}
+	// Every section the object carried must now exist in the assembler, with
+	// the object's bytes somewhere inside it.
+	for _, name := range []string{".text", ".data", ".rdata", ".xdata", ".pdata"} {
+		s := a.sectionByName(name)
+		if s == nil {
+			t.Errorf("section %s missing after ingest", name)
+			continue
+		}
+		if s.cur == 0 {
+			t.Errorf("section %s is empty after ingest", name)
+		}
+	}
+	if s := a.sectionByName(".bss"); s == nil || !s.Bss {
+		t.Errorf(".bss must be present and marked uninitialised")
+	}
+	t.Logf("merged: .text=%d .data=%d .rdata=%d .xdata=%d .pdata=%d",
+		sz(a, ".text"), sz(a, ".data"), sz(a, ".rdata"), sz(a, ".xdata"), sz(a, ".pdata"))
+}
+
+func sz(a *Assembler, name string) int {
+	if s := a.sectionByName(name); s != nil {
+		return s.cur
+	}
+	return -1
+}
+
+func TestIngestCOFFSymbolsResolved(t *testing.T) {
+	src := realObj(t)
+	a := NewAssembler()
+	if err := a.IngestCOFFBytes(src); err != nil {
+		t.Fatalf("IngestCOFFBytes: %v", err)
+	}
+	// Functions the object defines must land in the symbol table, inside .text.
+	text := a.sectionByName(".text")
+	if text == nil {
+		t.Fatal("no .text")
+	}
+	textIdx := sectionIndexOf(a, text)
+	for _, name := range []string{"main", "fib", "bsort"} {
+		loc, ok := a.syms[name]
+		if !ok {
+			t.Errorf("symbol %q missing after ingest", name)
+			continue
+		}
+		if loc.sect != textIdx {
+			t.Errorf("symbol %q should be in .text, got section %d", name, loc.sect)
+		}
+		if loc.off < 0 || loc.off > text.cur {
+			t.Errorf("symbol %q offset %d outside .text (0..%d)", name, loc.off, text.cur)
+		}
+	}
+	// Data symbols too.
+	for _, name := range []string{"counter", "arr"} {
+		if _, ok := a.syms[name]; !ok {
+			t.Errorf("data symbol %q missing after ingest", name)
+		}
+	}
+}
+
+func TestIngestCOFFUndefinedBecomesImport(t *testing.T) {
+	src := realObj(t)
+	a := NewAssembler()
+	if err := a.IngestCOFFBytes(src); err != nil {
+		t.Fatalf("IngestCOFFBytes: %v", err)
+	}
+	// print is declared but not defined in the object: it has to be registered
+	// as an extern so buildIData emits an address-table slot for it.
+	if dll, ok := a.exts["print"]; !ok {
+		t.Error("undefined symbol print was not registered as an import")
+	} else if dll == "" {
+		t.Error("import print has no DLL name")
+	}
+	// A defined symbol must NOT become an import.
+	if _, ok := a.exts["main"]; ok {
+		t.Error("defined symbol main must not become an import")
+	}
+}
+
+func TestIngestCOFFRelocationsRecorded(t *testing.T) {
+	src := realObj(t)
+	a := NewAssembler()
+	if err := a.IngestCOFFBytes(src); err != nil {
+		t.Fatalf("IngestCOFFBytes: %v", err)
+	}
+	if len(a.fixups) == 0 {
+		t.Fatal("no fixups recorded from the object's relocations")
+	}
+	// Every fixup must name a symbol the assembler can resolve, otherwise
+	// BuildPE fails with "undefined symbol referenced".
+	for _, f := range a.fixups {
+		if f.sym == "" {
+			t.Errorf("fixup with empty symbol at section %d offset %d", f.sect, f.off)
+		}
+	}
+	t.Logf("%d fixups recorded", len(a.fixups))
+}

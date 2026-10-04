@@ -160,7 +160,13 @@ type CG struct {
 	// genFunc (which marks more needs, so Gen iterates to a fixpoint), and the
 	// library's file-scope variables join the .data pool -- but only those the
 	// program actually references (libGlobUsed).
-	libEmitted   map[string]bool
+	libEmitted map[string]bool
+	// skipFuncs names functions the caller is producing as LLVM IR. They are
+	// neither generated nor pulled in from the C library, but everything they
+	// call still is -- so they seed c.need and genClibFuncs ignores them. That
+	// split is what lets the two generators share one program without either
+	// one duplicating or dropping a symbol.
+	skipFuncs    map[string]bool
 	libGlobNames map[string]bool
 	libGlobUsed  map[string]bool
 	libGlobals   []*DeclStmt
@@ -1270,13 +1276,11 @@ func (c *CG) emitCall(target string) {
 func (c *CG) callBigLib(name string, args []bigArg) {
 	aregs := c.argRegs()
 	extra := 0
-	if !c.linux {
-		extra = 32
-		// Windows x64: 5th+ arguments go on the caller stack below the
-		// 32-byte shadow space ([rsp+32], [rsp+40], ...).
-		if len(args) > len(aregs) {
-			extra += (len(args) - len(aregs)) * 8
-		}
+	if !c.linux && len(args) > len(aregs) {
+		// The 32-byte Windows shadow is reserved once in the prologue; only
+		// calls that spill arguments past the register window need a per-call
+		// reservation, which still requires the shadow region above the spills.
+		extra = 32 + (len(args)-len(aregs))*8
 	}
 	if extra > 0 {
 		c.emit("sub rsp, %d", extra)
@@ -2145,7 +2149,34 @@ func (c *CG) genExprT1(e Expr) (CType, error) {
 		// no-op when the source is already a canonical 32-bit value, and it
 		// must NOT run for double sources (xmm0 holds the value, not rax) or
 		// for widening casts to long/unsigned long.
-		if t == TInt && n.Typ != nil && n.Typ.Kind == KInt && n.Typ.Width <= 4 {
+		// Casting an integer value to a narrow int type (char/short) must keep
+		// only the target's low bits and re-extend with the target's
+		// signedness. canonInt (below) only handles the 4-byte case -- it keeps
+		// bits 0..31 and clears 32..63, so a width-1/2 cast leaves the upper
+		// bits of the source in place. That makes `(unsigned char)0xE2` (loaded
+		// as the sign-extended 0xFFFFFFE2) wrongly stay 0xFFFFFFE2 instead of
+		// 0xE2, which breaks UTF-8 byte emission and unsigned char arithmetic;
+		// and `(char)0x80` would wrongly stay 0x80 instead of sign-extending to
+		// 0xFFFFFF80. A width-1/2 signed cast therefore sign-extends from the
+		// low byte/half-word, not the low dword.
+		if n.Typ != nil && n.Typ.Kind == KInt && (n.Typ.Width == 1 || n.Typ.Width == 2) &&
+			t == TInt {
+			if n.Typ.Signed {
+				if n.Typ.Width == 1 {
+					c.emit("shl rax, 56")
+					c.emit("sar rax, 56")
+				} else {
+					c.emit("shl rax, 48")
+					c.emit("sar rax, 48")
+				}
+			} else {
+				if n.Typ.Width == 1 {
+					c.emit("and eax, 0xFF")
+				} else {
+					c.emit("and eax, 0xFFFF")
+				}
+			}
+		} else if t == TInt && n.Typ != nil && n.Typ.Kind == KInt && n.Typ.Width == 4 {
 			c.canonInt(n.Typ.Signed)
 		}
 		// T1.6 (C3/N17): a widening cast of a signed materialized int to an
@@ -2638,13 +2669,17 @@ func (c *CG) genExpr(e Expr) error {
 // CRT convention, not something the OS entry point provides; a GUI program
 // gets hInstance from GetModuleHandleA(NULL) like any CRT would.
 func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
-	if goclibErr != nil {
-		return "", goclibErr
-	}
-	if rtdiagMode && rtdiagErr != nil {
-		return "", fmt.Errorf("rtdiag library build failed: %w", rtdiagErr)
-	}
-	c := &CG{
+	return genWith(prog, linux, opt, winGUI, nil)
+}
+
+// newCGFor builds the code generator's state for a program.
+//
+// Both back ends start from this: the assembly one because it has always, and
+// the IR one because it needs the same function table, the same global types
+// and the same analysis the assembly path consults. Sharing it is what keeps the
+// two from reaching different conclusions about the same program.
+func newCGFor(prog *Program, linux bool, opt int) *CG {
+	return &CG{
 		strLab:       map[*StrLit]string{},
 		doubleLab:    map[float64]string{},
 		varEnts:      map[int]varInfo{},
@@ -2667,6 +2702,28 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 		linux:        linux,
 		opt:          opt,
 	}
+}
+
+// genWith is Gen with a hook for the LLVM backend.
+//
+// skipFuncs names the functions the caller is generating some other way -- as
+// LLVM IR rather than as assembly. They are left out of the output here, and
+// their absence is also what decides the C runtime subset to emit: a library
+// function is generated exactly when the IR side is NOT producing it, so the
+// two halves together always cover every symbol the program calls, with no
+// duplicates and nothing missing.
+//
+// What comes out is still a complete program: the entry stub, the globals, and
+// every library function the IR side did not claim.
+func genWith(prog *Program, linux bool, opt int, winGUI bool, skipFuncs map[string]bool) (string, error) {
+	if goclibErr != nil {
+		return "", goclibErr
+	}
+	if rtdiagMode && rtdiagErr != nil {
+		return "", fmt.Errorf("rtdiag library build failed: %w", rtdiagErr)
+	}
+	c := newCGFor(prog, linux, opt)
+	c.skipFuncs = skipFuncs
 	for _, g := range prog.Globals {
 		if g.IsTLS {
 			// Thread-local global: lay it out in the .tls section, not .data.
@@ -2674,6 +2731,10 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 			c.tlsVars[g.Name] = &tlsVarInfo{off: off, lab: "TL_" + g.Name, typ: g.Typ}
 			c.tlsList = append(c.tlsList, g)
 			c.globalTyp[g.Name] = g.Typ
+			continue
+		}
+		if skipFuncs["G_"+g.Name] {
+			// Owned by the LLVM object; goa must not re-define it.
 			continue
 		}
 		c.globals[g.Name] = true
@@ -2690,6 +2751,10 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 		for _, g := range lib.globals {
 			if c.globals[g.Name] {
 				continue // user global of the same name wins
+			}
+			if skipFuncs["G_"+g.Name] {
+				// Owned by the LLVM object; goa must not re-define it.
+				continue
 			}
 			c.globals[g.Name] = true
 			c.globalLab[g.Name] = "G_" + g.Name
@@ -2762,6 +2827,9 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 
 	var body strings.Builder
 	for _, f := range prog.Funcs {
+		if skipFuncs[f.Name] {
+			continue
+		}
 		if err := c.genFunc(f); err != nil {
 			return "", err
 		}
@@ -2781,6 +2849,16 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 	// other way to reach argc/argv in C).
 	if !c.linux && c.mainTakesArgs {
 		c.need["__goclib_get_args"] = true
+	}
+	// A GUI (wWinMain/WinMain) entry receives the command line with argv[0]
+	// already stripped, like the MSVC CRT -- so the stub calls a goclib
+	// helper that skips the program name instead of GetCommandLine* directly.
+	if !c.linux && c.entryIsGUI {
+		if c.entryWide {
+			c.need["__goclib_lp_cmdline_w"] = true
+		} else {
+			c.need["__goclib_lp_cmdline_a"] = true
+		}
 	}
 	// Entry-stub terminator. Start from the bare __goclib_exit (just
 	// ExitProcess / exit_group) and upgrade to the full C exit -- atexit
@@ -2893,12 +2971,11 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 	// stub calls them directly rather than through goclib. The W variant of
 	// GetCommandLine matches wWinMain's LPWSTR parameter.
 	if c.entryIsGUI {
+		// hInstance comes straight from GetModuleHandleA; the command line is
+		// handed to wWinMain/WinMain argv[0]-stripped via __goclib_lp_cmdline_*
+		// (pulled in through the need graph above), which itself imports
+		// GetCommandLine* -- so it is not listed here.
 		importSet["GetModuleHandleA"] = true
-		if c.entryWide {
-			importSet["GetCommandLineW"] = true
-		} else {
-			importSet["GetCommandLineA"] = true
-		}
 	}
 	for name := range c.calls {
 		importSet[name] = true
@@ -2999,10 +3076,12 @@ func Gen(prog *Program, linux bool, opt int, winGUI bool) (string, error) {
 	} else {
 		out.WriteString("\tsub rsp, 48\n")
 		// A WinMain entry takes the command line as LPWSTR (wWinMain) or
-		// LPSTR (WinMain), so the stub calls the matching GetCommandLine.
-		cmdLineFn := "GetCommandLineA"
+		// LPSTR (WinMain), with argv[0] already stripped (MSVC CRT contract),
+		// so the stub calls the matching goclib helper rather than
+		// GetCommandLine directly.
+		cmdLineFn := "__goclib_lp_cmdline_a"
 		if c.entryWide {
-			cmdLineFn = "GetCommandLineW"
+			cmdLineFn = "__goclib_lp_cmdline_w"
 		}
 		switch {
 		case c.mainTakesArgs:
@@ -4776,7 +4855,7 @@ func (c *CG) genClibFuncs() error {
 	for {
 		var batch []string
 		for name := range c.need {
-			if c.libEmitted[name] {
+			if c.libEmitted[name] || c.skipFuncs[name] {
 				continue
 			}
 			if _, ok := lib.funcs[name]; ok {
@@ -5561,9 +5640,23 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// vararg slots (observed as printf printing 512 instead of 10 on
 	// Linux). Reserve 8*len(argRegs) bytes at the frame bottom on SysV
 	// so the save area sits above the callee's clobber zone.
+	// The mid-frame `pad` was historically Windows' 32-byte shadow reserve,
+	// but it sat above the locals where a call's [rsp]..[rsp+32] shadow never
+	// reached it -- so every call still claimed its own shadow with a
+	// `sub rsp, 32` / `add rsp, 32` sandwich. We now reserve that shadow ONCE
+	// at the very bottom of the frame (winShadow) and drop the per-call
+	// sandwich for the common <=4-register-argument case. The mid-frame pad is
+	// left as-is (dead on Windows, variadic-placement on SysV) so no local or
+	// scratch offset shifts and the alignment invariant is untouched.
 	pad := c.shadowSpace()
 	if c.linux && f.Variadic {
 		pad = 8 * len(c.argRegs())
+	}
+	winShadow := 0
+	if !c.linux {
+		// 32-byte caller-owned scratch every Windows call needs at
+		// [rsp]..[rsp+32]; reserved once, so calls need no adjustment.
+		winShadow = 32
 	}
 	// NOTE: regArea is intentionally NOT added here. The callee-save save
 	// region is now allocated by the prolog's pushes (below rbp), not by the
@@ -5571,7 +5664,7 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// + switch depth + variadic save area. The +8 mirrors the +8 gap baked into
 	// regArea above: the locals now start 8 bytes lower (rbp-40 instead of
 	// rbp-32), so the frame must grow by 8 to keep them inside it.
-	frame := 8 + pad + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave
+	frame := 8 + pad + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave + winShadow
 	// Must fold in the push count, not just round to 16 -- see alignFrame.
 	frame = c.alignFrame(frame)
 	// saveBaseOff points at save-area slot 0, which sits just below the
@@ -5579,6 +5672,11 @@ func (c *CG) genFunc(f *FuncDecl) error {
 	// so the callee's argument-spill slots ([rsp+0..8*len(argRegs)) of the
 	// caller) stay below it.
 	c.saveBaseOff = -(regArea + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave)
+	if winShadow != 0 {
+		// The variadic save area sits just above the bottom shadow; shift it
+		// down by the shadow size so it still lands at the frame bottom.
+		c.saveBaseOff -= winShadow
+	}
 
 	c.curFn = f.Name
 	c.labels = map[string]string{}
@@ -6682,6 +6780,37 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 		c.resW = 8 // address-of yields a pointer value
 		return TInt, nil
 	case "*":
+		// PEXT (opt>=1): fold `*(p ± K)` into p's value plus a constant byte
+		// displacement, then load straight through it. genExprT would
+		// otherwise run the full pointer-arithmetic recipe -- materialise K,
+		// sign-extend, imul by the element width, add -- seven instructions to
+		// read a neighbouring element, where gcc emits one. Gated off at -O0
+		// to honour the byte-identical -O0 guardrail.
+		if c.opt >= 1 {
+			if pe, disp, ok := c.f2PtrConstOffset(n.E); ok {
+				// A register-cached pointer needs no evaluation at all.
+				if id, isID := pe.(*Ident); isID {
+					if vi, ok2 := c.lookupVar(id.Name); ok2 && vi.reg != "" {
+						c.emitLeaDisp(vi.reg, disp)
+					} else {
+						if _, err := c.genExprT(pe); err != nil {
+							return TInt, err
+						}
+						c.emitLeaDisp("rax", disp)
+					}
+				} else {
+					if _, err := c.genExprT(pe); err != nil {
+						return TInt, err
+					}
+					c.emitLeaDisp("rax", disp)
+				}
+				ec := c.elemClassOf(n.E)
+				width := c.elemWidthOf(n.E)
+				signed := c.elemSignedOf(n.E)
+				c.genLoadElem("r10", width, ec, signed)
+				return c.resTyp, nil
+			}
+		}
 		// Dereference: n.E evaluates to the pointer value (in rax).
 		if _, err := c.genExprT(n.E); err != nil {
 			return TInt, err
@@ -6766,6 +6895,142 @@ func (c *CG) genUnary(n *Unary) (CType, error) {
 	c.resSigned = true
 	c.resW = 4 // !x yields a (signed) int
 	return TInt, nil
+}
+
+// f2IndexRegConst extends the F2 register-index optimisation to the common
+// idiom "a[var ± const]" / "a[const + var]" (and "a[var - const]"), where var
+// is a register-cached int-class local and the offset is a small integer
+// literal. It returns the variable's callee-save home register and the
+// constant offset in index units; the Index addressing code folds
+// offset*elemWidth into the final byte-offset add, replacing the
+// materialisation of var±const as a separate spilled value (the redundant
+// j+1 recompute + slot spill + movsxd seen in a bubble-sort inner loop).
+//
+// Only the +1 coefficient forms qualify -- "const - var" would require
+// negating the index register, which is not folded. The offset magnitude is
+// capped at 1<<20 so the byte product always fits a sign-extended imm32.
+// Returns ("", 0) when e is not one of those forms or var is not
+// register-cached (the caller then falls back to the generic spill path).
+// f2PtrConstOffset recognises a pointer expression of the form
+// `p + K` / `K + p` / `p - K` where K is a small integer literal, and returns
+// the pointer sub-expression together with the equivalent byte displacement
+// (K already scaled by the pointee width, sign applied). Anything else -- a
+// non-literal offset, a non-pointer operand, an out-of-range constant, a huge
+// element width -- reports false so the caller keeps the generic path.
+func (c *CG) f2PtrConstOffset(e Expr) (Expr, int64, bool) {
+	b, ok := e.(*Binary)
+	if !ok {
+		return nil, 0, false
+	}
+	var ptr Expr
+	var lit *NumLit
+	neg := false
+	switch b.Op {
+	case "+":
+		// p + K  OR  K + p
+		if l, ok := b.L.(*NumLit); ok && !l.IsFloat {
+			if c.exprType(b.R) != nil && ptrish(c.exprType(b.R)) {
+				ptr, lit = b.R, l
+			}
+		} else if r, ok := b.R.(*NumLit); ok && !r.IsFloat {
+			if c.exprType(b.L) != nil && ptrish(c.exprType(b.L)) {
+				ptr, lit = b.L, r
+			}
+		}
+	case "-":
+		// p - K only; K - p would need a negation the lea cannot express.
+		if r, ok := b.R.(*NumLit); ok && !r.IsFloat {
+			if c.exprType(b.L) != nil && ptrish(c.exprType(b.L)) {
+				ptr, lit, neg = b.L, r, true
+			}
+		}
+	default:
+		return nil, 0, false
+	}
+	if ptr == nil || lit == nil || lit.BigWords != nil {
+		return nil, 0, false
+	}
+	if lit.Val < -(1<<20) || lit.Val > (1<<20) {
+		return nil, 0, false
+	}
+	ew := int64(c.ptrElemWidth(c.exprType(ptr)))
+	disp := lit.Val * ew
+	if neg {
+		disp = -disp
+	}
+	// The displacement must survive the sign-extended imm32 form.
+	if disp > (1<<31)-1 || disp < -(1<<31) {
+		return nil, 0, false
+	}
+	return ptr, disp, true
+}
+
+// ptrish reports whether t is a pointer (or an array that decays to one), the
+// two forms pointer arithmetic and subscripting stride over.
+func ptrish(t *Type) bool {
+	return t != nil && (t.IsPtr() || t.IsArray())
+}
+
+// emitLeaDisp leaves base+disp in r10. A zero displacement degenerates to a
+// plain mov (lea r10, [rax+0] is legal but wasteful, and goa's parser is
+// happier with the short form).
+func (c *CG) emitLeaDisp(base string, disp int64) {
+	switch {
+	case disp == 0:
+		c.emit("mov r10, %s", base)
+	case disp > 0:
+		c.emit("lea r10, [%s+%d]", base, disp)
+	default:
+		c.emit("lea r10, [%s-%d]", base, -disp)
+	}
+}
+
+func (c *CG) f2IndexRegConst(e Expr) (string, int64, string) {
+	b, ok := e.(*Binary)
+	if !ok {
+		return "", 0, ""
+	}
+	var id *Ident
+	var lit *NumLit
+	neg := false
+	switch b.Op {
+	case "+":
+		// var + const  OR  const + var
+		if l, ok := b.L.(*Ident); ok {
+			if r, ok2 := b.R.(*NumLit); ok2 && !r.IsFloat {
+				id, lit = l, r
+			}
+		} else if l, ok := b.L.(*NumLit); ok && !l.IsFloat {
+			if r, ok2 := b.R.(*Ident); ok2 {
+				id, lit = r, l
+			}
+		}
+	case "-":
+		// var - const only; const - var is excluded (would need negation).
+		if l, ok := b.L.(*Ident); ok {
+			if r, ok2 := b.R.(*NumLit); ok2 && !r.IsFloat {
+				id, lit = l, r
+				neg = true
+			}
+		}
+	default:
+		return "", 0, ""
+	}
+	if id == nil || lit == nil || lit.BigWords != nil {
+		return "", 0, ""
+	}
+	if lit.Val < -(1<<20) || lit.Val > (1<<20) {
+		return "", 0, ""
+	}
+	vi, ok := c.lookupVar(id.Name)
+	if !ok || vi.reg == "" {
+		return "", 0, ""
+	}
+	off := lit.Val
+	if neg {
+		off = -off
+	}
+	return vi.reg, off, id.Name
 }
 
 // genLValue emits code that leaves the address of the lvalue e in r10.
@@ -6857,6 +7122,31 @@ func (c *CG) genLValue(e Expr) error {
 		if n.Op != "*" {
 			return fmt.Errorf("expression is not an lvalue")
 		}
+		// PEXT (opt>=1): `*(p ± K)` / `*(K + p)` is just p's value plus a
+		// constant byte displacement. The generic path below runs the whole
+		// pointer-arithmetic recipe instead -- materialise K, sign-extend it,
+		// imul by the element width, add -- which costs seven instructions to
+		// fetch a neighbour element. Folding the displacement into a single
+		// lea turns the bubble-sort idiom `*(p+1)` into one instruction, the
+		// same shape gcc emits. Gated off at -O0 to honour the
+		// byte-identical -O0 guardrail.
+		if c.opt >= 1 {
+			if pe, disp, ok := c.f2PtrConstOffset(n.E); ok {
+				// A register-cached pointer variable needs no evaluation at
+				// all: the callee-save already holds it.
+				if id, isID := pe.(*Ident); isID {
+					if vi, ok2 := c.lookupVar(id.Name); ok2 && vi.reg != "" {
+						c.emitLeaDisp(vi.reg, disp)
+						return nil
+					}
+				}
+				if _, err := c.genExprT(pe); err != nil {
+					return err
+				}
+				c.emitLeaDisp("rax", disp)
+				return nil
+			}
+		}
 		// The address of *p is simply the pointer value p holds.
 		if _, err := c.genExprT(n.E); err != nil {
 			return err
@@ -6874,11 +7164,24 @@ func (c *CG) genLValue(e Expr) error {
 		// callee-save across the base evaluation, and its low dword (or full
 		// width for long/pointer indices) is consumed directly below.
 		var idxReg string
+		var idxConst int64
+		var idxName string
 		if !f2IdxRegSkip {
 			if id, ok := n.Idx.(*Ident); ok {
 				if vi, ok2 := c.lookupVar(id.Name); ok2 && vi.reg != "" {
 					idxReg = vi.reg
+					idxName = id.Name
 				}
+			}
+			// F2-EXT (opt>=1): also fold a small constant offset off an
+			// index of the form a[var±const] / a[const+var] into the final
+			// byte-offset add, instead of materialising var±const as a
+			// separate spilled value (the redundant j+1 recompute + slot
+			// spill + movsxd in a bubble-sort inner loop). Gated off at -O0
+			// to honour the byte-identical -O0 guardrail; the bare-Ident F2
+			// path above stays always-on.
+			if idxReg == "" && c.opt >= 1 {
+				idxReg, idxConst, idxName = c.f2IndexRegConst(n.Idx)
 			}
 		}
 		if idxReg == "" {
@@ -6897,7 +7200,7 @@ func (c *CG) genLValue(e Expr) error {
 		if idxReg != "" {
 			// F2 direct path: the index type comes from the variable's own
 			// declaration, not from an evaluation.
-			if vi, ok := c.lookupVar(n.Idx.(*Ident).Name); ok {
+			if vi, ok := c.lookupVar(idxName); ok {
 				iw = c.semWOf(vi.typ)
 				is = vi.typ != nil && vi.typ.Kind == KInt && vi.typ.Signed
 				ip = vi.ptr
@@ -7023,8 +7326,35 @@ func (c *CG) genLValue(e Expr) error {
 		// else keeps the 8-byte slot stride. goa supports imul-with-immediate,
 		// so a single scaled multiply replaces the old triple doubling-add.
 		ew := c.elemWidthOf(n.Base)
-		c.emit("imul r11, %d", ew)
-		c.emit("add r10, r11")
+		if idxReg != "" && idxConst != 0 {
+			disp := idxConst * int64(ew)
+			if ew == 1 || ew == 2 || ew == 4 || ew == 8 {
+				// F2-EXT: fold var±const directly into a scaled-index LEA,
+				// recovering the single-instruction addressing sibFold would
+				// otherwise produce for a bare var index (a[j+1] -> lea into
+				// [base + r11*ew ± disp]) instead of materialising var±const
+				// as a spilled value. Scale 1/2/4/8 are the only encodable
+				// SIB scales; any other element width falls back below.
+				sign := "+"
+				adisp := disp
+				if disp < 0 {
+					sign = "-"
+					adisp = -disp
+				}
+				c.emit("lea r10, [r10 + r11*%d %s %d]", ew, sign, adisp)
+			} else {
+				c.emit("imul r11, %d", ew)
+				c.emit("add r10, r11")
+				if disp >= 0 {
+					c.emit("add r10, %d", disp)
+				} else {
+					c.emit("sub r10, %d", -disp)
+				}
+			}
+		} else {
+			c.emit("imul r11, %d", ew)
+			c.emit("add r10, r11")
+		}
 		return nil
 	case *MemberExpr:
 		// Resolve the struct/union type behind the base so we can look the
@@ -7819,14 +8149,8 @@ func (c *CG) copyBytes(dst, src string, n int) {
 		c.emit("mov %s, %s", ar[0], dst)
 		c.emit("mov %s, %s", ar[1], src)
 		c.emit("mov %s, %d", ar[2], n)
-		if !c.linux {
-			c.emit("sub rsp, 32")
-		}
 		c.need["memcpy"] = true
 		c.emitCall("memcpy")
-		if !c.linux {
-			c.emit("add rsp, 32")
-		}
 		c.emit("mov r10, [rbp%+d]", s1)
 		c.emit("mov r11, [rbp%+d]", s2)
 		c.tmpDepth -= 2
@@ -8062,14 +8386,8 @@ func (c *CG) zeroBytes(dst string, n int) {
 		c.emit("mov %s, %s", ar[0], dst)
 		c.emit("mov %s, 0", ar[1])
 		c.emit("mov %s, %d", ar[2], n)
-		if !c.linux {
-			c.emit("sub rsp, 32")
-		}
 		c.need["memset"] = true
 		c.emitCall("memset")
-		if !c.linux {
-			c.emit("add rsp, 32")
-		}
 		c.emit("mov r10, [rbp%+d]", s1)
 		c.tmpDepth--
 		return
@@ -10208,11 +10526,13 @@ func (c *CG) genCall(name string, fnExpr Expr, ft *Type, args []Expr) (CType, er
 	extra := 0
 	if stackArgs > 0 {
 		extra = 8 * stackArgs
-	}
-	if !c.linux {
-		// Windows requires a 32-byte shadow space below the stack arguments
-		// for every call, regardless of how many args spill.
-		extra += 32
+		// The 32-byte Windows shadow is now reserved once in the prologue, so
+		// only calls that actually spill arguments past the register window
+		// need a per-call reservation -- and they still need the shadow region
+		// above those spilled args, so the +32 stays here for that case.
+		if !c.linux {
+			extra += 32
+		}
 	}
 	if extra > 0 && extra%16 != 0 {
 		extra += 8

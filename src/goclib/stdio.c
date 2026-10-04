@@ -866,28 +866,39 @@ int snprintf(char *buf, size_t n, const char *fmt, ...) {
     return r;
 }
 
-/* The _s spellings differ from the standard bounded functions only in the
- * return value: MSVC reports a buffer-too-small as -1, whereas C99 snprintf
- * returns the length the text would have had. Callers that only check "did it
- * fit" see the same answer either way.
+/* The _s spellings match the MSVC prototype (buffer, sizeOfBuffer, count, ...)
+ * and differ from the standard bounded functions only in the return value:
+ * MSVC reports a buffer-too-small as -1, whereas C99 snprintf returns the
+ * length the text would have had. Callers that only check "did it fit" see the
+ * same answer either way.
  *
- * `count` is the buffer's element count from the prototype. goc has a single
- * calling convention, so there is no __cdecl variant for it to disagree with
- * and it is ignored in favour of `size`. _TRUNCATE arrives as (size_t)-1,
- * which vsnprintf already treats as "no room", so it needs no special case. */
-int _vsnprintf_s(char *buf, size_t count, size_t size, const char *fmt, va_list ap) {
+ * sizeOfBuffer is the buffer's total element count and is the bound handed to
+ * vsnprintf (so a caller that passes _TRUNCATE as `count` -- which arrives as
+ * (size_t)-1 -- still gets a correctly bounded, NUL-terminated write instead of
+ * the unbounded `vsnprintf(buf, (size_t)-1, ...)` the old (buf, count, size)
+ * order produced). count is a secondary clamp honoured only when it is a real
+ * number; _TRUNCATE fills the whole buffer. */
+int _vsnprintf_s(char *buf, size_t sizeOfBuffer, size_t count, const char *fmt, va_list ap) {
     int r;
-    (void)count;
-    r = vsnprintf(buf, size, fmt, ap);
-    if (size > 0 && size != (size_t)-1 && (size_t)r >= size) return -1;
+    if (buf == NULL || sizeOfBuffer == 0) return -1;
+    size_t bound = (count == (size_t)-1) ? sizeOfBuffer
+                                        : (count + 1 < sizeOfBuffer ? count + 1 : sizeOfBuffer);
+    r = vsnprintf(buf, bound, fmt, ap);
+    if ((size_t)r >= bound) {
+        /* Truncated. _TRUNCATE asks to fill the buffer, so keep what fit; any
+         * other count means "did not fit" and MSVC returns -1 with an empty
+         * buffer. */
+        if (count == (size_t)-1 && bound > 0) buf[bound - 1] = '\0';
+        return -1;
+    }
     return r;
 }
 
-int _snprintf_s(char *buf, size_t count, size_t size, const char *fmt, ...) {
+int _snprintf_s(char *buf, size_t sizeOfBuffer, size_t count, const char *fmt, ...) {
     va_list ap;
     int r;
     va_start(ap, fmt);
-    r = _vsnprintf_s(buf, count, size, fmt, ap);
+    r = _vsnprintf_s(buf, sizeOfBuffer, count, fmt, ap);
     va_end(ap);
     return r;
 }

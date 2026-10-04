@@ -60,14 +60,13 @@ int vprintf(const char *fmt, va_list ap);
  * snprintf call. _snprintf_s differs from snprintf only in that it returns 0
  * on truncation (-1) rather than the would-be length.
  *
- * The MSVC prototypes carry a buffer element count before the size: the
- * underlying routine is also reachable with a __cdecl signature where the two
- * disagree, and the count is what that variant needs. goc has a single calling
- * convention, so `count` is accepted and ignored, and the bound is taken from
- * `size` alone. Passing _TRUNCATE as the size is the standard "fill the
- * buffer" request. */
-int _snprintf_s(char *buf, size_t count, size_t size, const char *fmt, ...);
-int _vsnprintf_s(char *buf, size_t count, size_t size, const char *fmt, va_list ap);
+ * The MSVC prototypes take (buffer, sizeOfBuffer, count, ...): sizeOfBuffer is
+ * the buffer's total element count and is the bound passed to vsnprintf, while
+ * count is the requested maximum (or _TRUNCATE to fill the buffer). goc has a
+ * single calling convention, so count is honoured only as a secondary clamp;
+ * _TRUNCATE is the standard "fill the buffer" request. */
+int _snprintf_s(char *buf, size_t sizeOfBuffer, size_t count, const char *fmt, ...);
+int _vsnprintf_s(char *buf, size_t sizeOfBuffer, size_t count, const char *fmt, va_list ap);
 
 /* Internal: printf for a format the compiler proved is "lite" -- only %s,
  * integers, %c and %f, with no field width, precision or flags (see the

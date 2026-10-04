@@ -1,0 +1,2 @@
+r=5 str=12.34
+r2=11 str2=hello world

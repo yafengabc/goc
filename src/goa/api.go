@@ -55,3 +55,42 @@ func AssembleFile(srcPath, outPath, format string) (int64, error) {
 	}
 	return AssembleSource(string(src), outPath, elf)
 }
+
+// AssembleWithObject assembles src and then merges a COFF object into the same
+// image before writing it out.
+//
+// This is how the two halves of the LLVM backend come together: goa's own
+// assembler produces the entry stub, the globals and the C runtime, LLVM
+// produces the user's own functions, and the two are linked here. Order matters
+// -- the assembly is assembled first so its symbols exist when the object's
+// relocations are resolved against them.
+//
+// obj may be nil, in which case this is exactly AssembleSource.
+func AssembleWithObject(src string, obj []byte, outPath string, elf bool) (int64, error) {
+	a := NewAssembler()
+	if elf {
+		a.target = targetELF
+	}
+	if err := a.Assemble(src); err != nil {
+		return 0, err
+	}
+	if len(obj) > 0 {
+		if err := a.IngestCOFFBytes(obj); err != nil {
+			return 0, fmt.Errorf("linking the LLVM object: %w", err)
+		}
+	}
+	if elf {
+		if err := a.BuildELF(outPath); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := a.BuildPE(outPath); err != nil {
+			return 0, err
+		}
+	}
+	fi, err := os.Stat(outPath)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}

@@ -39,18 +39,27 @@
 /* Object-type tags returned by GetObject and accepted by GetCurrentObject /
  * EnumObjects. Each identifies which of the per-type header structs the
  * buffer should hold (BITMAP, LOGFONTW, ...). */
-#define OBJ_BITMAP           0
-#define OBJ_PEN              1
-#define OBJ_PALETTE          2
-#define OBJ_BRUSH            3
-#define OBJ_FONT             4
-#define OBJ_REGION           5
-#define OBJ_METAFILE         6
-#define OBJ_ELLIPSE          7
-#define OBJ_RBITMAP          8
-#define OBJ_METAFILEPICT     9
-#define OBJ_ICON             12
-#define OBJ_CURSOR           13
+#define OBJ_PEN         1
+#define OBJ_BRUSH       2
+#define OBJ_DC          3
+#define OBJ_METADC      4
+#define OBJ_PAL         5
+#define OBJ_FONT        6
+#define OBJ_BITMAP      7
+#define OBJ_REGION      8
+#define OBJ_METAFILE    9
+#define OBJ_MEMDC       10
+#define OBJ_EXTPEN      11
+#define OBJ_ENHMETADC   12
+#define OBJ_ENHMETAFILE 13
+#define OBJ_COLORSPACE  14
+#define GDI_MIN_OBJ_TYPE OBJ_PEN
+#define GDI_MAX_OBJ_TYPE OBJ_COLORSPACE
+
+/* GetObjectType tags a GDI object's real type; HGDI_ERROR is the sentinel
+ * GetObject/GetCurrentObject return when the handle is invalid. */
+extern DWORD GetObjectType(HGDIOBJ h), gdi32;
+#define HGDI_ERROR ((HGDIOBJ)0x80000001)
 
 /* ------------------------------------------------------------------ */
 /* Background / text modes                                             */

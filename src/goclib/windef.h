@@ -114,6 +114,10 @@ typedef char              *PSTR;
 typedef const char        *PCSTR;
 typedef unsigned char     *LPBYTE;
 typedef unsigned int      *LPDWORD;
+
+/* Generic function pointer returned by GetProcAddress; cast to the concrete
+ * signature at the call site. */
+typedef int (*FARPROC)(void);
 typedef int               *LPBOOL;
 typedef long              *LPLONG;
 typedef void              *PVOID;

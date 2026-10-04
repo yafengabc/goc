@@ -168,7 +168,26 @@ func emitProgram(prog *Program, cfg buildCfg, isCC bool) (string, error) {
 		}
 		return "", errors.New(b.String())
 	}
-	asm, err := Gen(prog, cfg.linux, cfg.opt, cfg.winGUI)
+	// The LLVM back end hands the whole program to one owner: every user
+	// function and every C runtime function becomes LLVM IR, compiled by
+	// libLLVM into a COFF object. goa's own assembler then contributes only the
+	// entry stub -- which is not C -- and links that object into the image.
+	// The names LLVM defined are reported as `claimed` so genWith leaves them
+	// alone and emits nothing but the stub.
+	var irText string
+	var claimed map[string]bool
+	if cfg.llvm {
+		var err error
+		if irText, claimed, err = genLLVMProgram(prog, cfg.linux, cfg.opt); err != nil {
+			return "", err
+		}
+		if len(claimed) == 0 {
+			return "", fmt.Errorf("-fllvm: no function in this program can be compiled " +
+				"by the LLVM front end; every one of them uses a construct it does " +
+				"not model yet (variadic functions, bit-fields, _BitInt or inline asm)")
+		}
+	}
+	asm, err := genWith(prog, cfg.linux, cfg.opt, cfg.winGUI, claimed)
 	if err != nil {
 		return "", fmt.Errorf("codegen error: %w", err)
 	}
@@ -190,8 +209,48 @@ func emitProgram(prog *Program, cfg buildCfg, isCC bool) (string, error) {
 	}
 
 	// Hand the assembly to goa, our own assembler -- linked into this binary,
-	// so there is no external goa process and nothing to find on disk.
-	if err := assemble(asm, outPath, cfg.linux, cfg.inputs[0], isCC); err != nil {
+	// so there is no external goa process and nothing to find on disk. With
+	// -fllvm the object's code goes into the same image.
+	var obj []byte
+	if irText != "" {
+		if cfg.dumpIR {
+			// Name the dump after the executable, which is what the user asked
+			// for: "goc -fllvm -dump-ir foo.c" leaves foo.ll (and foo.obj) beside
+			// foo.exe. The IR is the artifact worth reading -- it is what LLVM
+			// rejected, and what its optimiser would have to say about it -- but
+			// the object is kept too, since its relocations and undefined symbols
+			// are what a link error is really about.
+			llPath := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".ll"
+			if err := os.WriteFile(llPath, []byte(irText), 0644); err != nil {
+				return "", err
+			}
+			if !isCC {
+				fmt.Printf("IR written to %s\n", llPath)
+			}
+		}
+		if obj, err = compileIR(irText, cfg.opt, cfg.linux); err != nil {
+			// The IR is what LLVM rejected, so when it is being dumped, leave it
+			// on disk before failing: without it the error names a line in a file
+			// that no longer exists anywhere.
+			if cfg.dumpIR {
+				llPath := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".ll"
+				if werr := os.WriteFile(llPath, []byte(irText), 0644); werr == nil {
+					fmt.Fprintf(os.Stderr, "IR written to %s\n", llPath)
+				}
+			}
+			return "", err
+		}
+		if cfg.dumpIR {
+			objPath := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".obj"
+			if err := os.WriteFile(objPath, obj, 0644); err != nil {
+				return "", err
+			}
+			if !isCC {
+				fmt.Printf("object written to %s\n", objPath)
+			}
+		}
+	}
+	if err := assemble(asm, outPath, cfg.linux, cfg.inputs[0], isCC, obj); err != nil {
 		return "", err
 	}
 	return outPath, nil
@@ -200,8 +259,8 @@ func emitProgram(prog *Program, cfg buildCfg, isCC bool) (string, error) {
 // assemble runs the in-process goa assembler over asm text and writes the
 // executable to outPath. It reports the same one-line summary the goa CLI
 // used to print (silently, when acting as cc, because gcc is silent).
-func assemble(asm, outPath string, linux bool, srcPath string, isCC bool) error {
-	n, err := goa.AssembleSource(asm, outPath, linux)
+func assemble(asm, outPath string, linux bool, srcPath string, isCC bool, obj []byte) error {
+	n, err := goa.AssembleWithObject(asm, obj, outPath, linux)
 	if err != nil {
 		return fmt.Errorf("goa failed: %w", err)
 	}
@@ -334,10 +393,18 @@ func runCmd(args []string) {
 
 // buildCfg holds the result of parsing the command line.
 type buildCfg struct {
-	mode    string // run | compile | asm | preprocess
-	linux   bool
-	winGUI  bool // -mwindows: PE subsystem 2 (GUI), no console window
-	opt     int  // optimisation level from -O<level> (0 = none)
+	mode   string // run | compile | asm | preprocess
+	linux  bool
+	winGUI bool // -mwindows: PE subsystem 2 (GUI), no console window
+	opt    int  // optimisation level from -O<level> (0 = none)
+	// llvm selects the LLVM back end: the user's own functions are compiled by
+	// LLVM from IR, while the entry stub, the globals and the C runtime still
+	// come from goa's own assembler. Requires a libLLVM shared library at run
+	// time; without one the build fails with an explanation rather than
+	// silently falling back, so a missing library is never mistaken for a
+	// successful build.
+	llvm    bool
+	dumpIR  bool // -dump-ir: keep the LLVM IR (and object) beside the output
 	rtdiag  bool // -rtdiag: compile-time diagnostic runtime (memory tracker)
 	outFile string
 	defines []string
@@ -427,6 +494,25 @@ func parseArgs(args []string) (buildCfg, bool) {
 		// Every other -m* stays accepted-and-ignored below.
 		if arg == "-mwindows" {
 			cfg.winGUI = true
+			continue
+		}
+		// -fllvm selects the LLVM back end. It has to be recognised before the
+		// single-letter pass below, which sees the "f" and treats the whole
+		// thing as an ignored -f option -- so a case in the long-flag switch
+		// further down is never reached and the flag silently does nothing.
+		if arg == "-fllvm" || arg == "--llvm" {
+			cfg.llvm = true
+			continue
+		}
+		// -dump-ir writes the generated LLVM IR next to the output as <base>.ll
+		// (and keeps the intermediate object as <base>.obj). It is the first
+		// thing to reach for when the IR is rejected or the result misbehaves:
+		// the whole point of the LLVM path is that the module it hands over can
+		// be read, and running the C compiler's optimiser over it by hand is the
+		// quickest way to see what the front end actually produced. The default
+		// back end has no equivalent, so the flag is accepted only with -fllvm.
+		if arg == "-dump-ir" || arg == "--dump-ir" {
+			cfg.dumpIR = true
 			continue
 		}
 		if len(arg) > 2 {

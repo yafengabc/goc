@@ -54,7 +54,7 @@ func TestWinMainStubArgs(t *testing.T) {
 	stub := fnAsm(genAsmGUI(t, wmSrc), "_start")
 	for _, want := range []string{
 		"call GetModuleHandleA",
-		"call GetCommandLineW",
+		"call __goclib_lp_cmdline_w",
 		"mov r8, rax",
 		"mov r9d, 10",
 	} {
@@ -113,7 +113,7 @@ int WINAPI WinMain(HINSTANCE a, HINSTANCE b, LPSTR c, int d) { (void)a;(void)b;(
 	if !strings.Contains(stub, "call WinMain") {
 		t.Fatalf("entry stub does not call WinMain:/n%s", stub)
 	}
-	if !strings.Contains(stub, "call GetCommandLineA") {
-		t.Errorf("ANSI WinMain should take LPSTR from GetCommandLineA:/n%s", stub)
+	if !strings.Contains(stub, "call __goclib_lp_cmdline_a") {
+		t.Errorf("ANSI WinMain should take LPSTR from __goclib_lp_cmdline_a (argv[0] stripped):\n%s", stub)
 	}
 }
