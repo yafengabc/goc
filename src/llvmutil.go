@@ -62,6 +62,38 @@ func (e *irEmitter) convert(op string, from, to *Type) string {
 	if to != nil && to.Kind == KArr {
 		to = PtrType(to.Elem)
 	}
+	// Integer <-> floating point is a value conversion, not a reinterpretation,
+	// and it has to be done here rather than in convertTo because the signedness
+	// of the target is a C fact that the target's IR spelling ("i32") does not
+	// carry. Left to convertTo it fell through to that function's
+	// store-and-load fallback, which re-reads the stored bit pattern as the
+	// other type: "f + 1" stored the integer 1 and loaded it back as a float,
+	// so the add saw 1.4e-45 and every float expression with an integer operand
+	// silently evaluated to 0. LLVM has opcodes for both directions.
+	if isFloatTy(from) != isFloatTy(to) {
+		ff, tf := isFloatTy(from), isFloatTy(to)
+		intTy := func(t *Type) bool {
+			return t != nil && (t.Kind == KInt || t.Kind == KBool)
+		}
+		if tf && intTy(from) {
+			v := e.newTmp()
+			opc := "uitofp"
+			if from.Signed {
+				opc = "sitofp"
+			}
+			e.line("%s = %s %s %s to %s", v, opc, e.ty(from), op, e.ty(to))
+			return v
+		}
+		if ff && intTy(to) {
+			v := e.newTmp()
+			opc := "fptoui"
+			if to.Signed {
+				opc = "fptosi"
+			}
+			e.line("%s = %s %s %s to %s", v, opc, e.ty(from), op, e.ty(to))
+			return v
+		}
+	}
 	return e.convertTo(op, from, e.ty(to))
 }
 

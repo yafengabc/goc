@@ -2,6 +2,8 @@ package main
 
 // Operators, calls and aggregates, in LLVM IR.
 
+import "strconv"
+
 // --- unary ------------------------------------------------------------------
 
 func (e *irEmitter) unary(n *Unary) val {
@@ -409,6 +411,29 @@ func (e *irEmitter) assignExpr(n *AssignExpr) val {
 	return res
 }
 
+// foperand adapts one operand of a floating-point instruction.
+//
+// LLVM will not silently promote: "fadd float %x, 1" is rejected with
+// "integer/byte constant must have integer/byte type", and an integer register
+// has to be converted explicitly. An integer constant is rewritten as the
+// equivalent float constant, which keeps the common "x + 1" on a float down to
+// a single instruction; an integer value gets a sitofp/uitofp.
+func (e *irEmitter) foperand(v val, t *Type) val {
+	if v.ty == nil || isFloatTy(v.ty) {
+		return v
+	}
+	if _, err := strconv.ParseInt(v.op, 10, 64); err == nil {
+		return val{op: v.op + ".0", ty: t}
+	}
+	conv := "sitofp"
+	if !v.ty.Signed {
+		conv = "uitofp"
+	}
+	r := e.newTmp()
+	e.line("%s = %s %s %s to %s", r, conv, e.ty(v.ty), v.op, e.ty(t))
+	return val{op: r, ty: t}
+}
+
 // llirBin maps a C binary operator to the name LLVM gives the instruction. They
 // are not the same words -- C says "+", LLVM says "add" -- and passing the C
 // spelling through produces a module LLVM rejects with "expected instruction
@@ -442,6 +467,7 @@ func llirBin(op string) string {
 func (e *irEmitter) arith(a, b val, op string, t *Type) val {
 	r := e.newTmp()
 	if isFloatTy(t) {
+		a, b = e.foperand(a, t), e.foperand(b, t)
 		switch op {
 		case "div":
 			e.line("%s = fdiv %s %s, %s", r, e.ty(t), a.op, b.op)

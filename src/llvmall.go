@@ -43,6 +43,32 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 		lib:        lib,
 	}
 
+	// A file-scope static in the user's program can share a spelling with one
+	// in the C runtime: phase1.c declares its own `static unsigned long
+	// rand_state` and stdlib.c has one too. Both are internal to their own
+	// translation unit, so they are two different objects -- but this front
+	// end names every global "G_<name>", which emitted one symbol twice and
+	// LLVM rejected the module with "redefinition of global". Rename the
+	// user's copy the same way mergePrograms does when two user files declare
+	// the same static, so each side keeps its own storage.
+	if lib != nil {
+		renames := map[string]string{}
+		for _, lg := range lib.globals {
+			for _, gl := range prog.Globals {
+				if gl.Name != lg.Name {
+					continue
+				}
+				cand := gl.Name + "__tu0"
+				for i := 1; irNameTaken(prog, lib, cand); i++ {
+					cand = fmt.Sprintf("%s__tu0_%d", gl.Name, i)
+				}
+				renames[gl.Name] = cand
+				break
+			}
+		}
+		renameInProgram(prog, renames)
+	}
+
 	// The function table has to hold both halves before anything is generated, so
 	// a call can be resolved whether its target is the user's or the runtime's.
 	for _, f := range prog.Funcs {
@@ -81,13 +107,28 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 		}
 	}
 
-	// --- globals ---
-	// A definition needs its initialiser lowered to an LLVM constant, which this
+// --- globals ---
+// A definition needs its initialiser lowered to an LLVM constant, which this
 	// front end does for the forms C programs actually use: a scalar constant, a
 	// string, and a brace-initialised array or struct of them. A global whose
 	// initialiser is not one of those keeps the native generator's definition
 	// and is declared external here.
 	for _, gl := range prog.Globals {
+		// Register the type first, whatever happens to the definition below.
+		// Expression typing looks a name up in tr.globalTyp, and a global that
+		// was never registered there resolved to no type at all -- which the
+		// emitters read as i32. A file-scope array then loaded its first
+		// element instead of decaying to its address, so every subscript of a
+		// global array came out as "ptrtoint ptr <i32>" and LLVM rejected the
+		// module; a global scalar in a comparison was compared against the
+		// symbol itself instead of being loaded. Registering the type is what
+		// makes both of those decay and load correctly.
+		//
+		// The program's own globals are registered after the runtime's, so a
+		// user definition shadows a runtime name of the same spelling.
+		if gl.Typ != nil {
+			tr.globalTyp[gl.Name] = gl.Typ
+		}
 		if gl.Typ == nil || typUnsupported(gl.Typ) {
 			continue
 		}
@@ -132,10 +173,21 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 	// and the few helpers the entry stub names directly.
 	if lib != nil {
 		need := llvmRoots(prog, lib, linux)
+		// lib.order can name a function more than once -- the runtime's
+		// sources are concatenated, so a name that two of them define reaches
+		// the order list twice. Emitting it twice gave LLVM "invalid
+		// redefinition of function"; one definition per name is all a module
+		// may hold, and a name the user's own program defines is already
+		// spoken for.
+		emitted := map[string]bool{}
+		for _, f := range prog.Funcs {
+			emitted[f.Name] = true
+		}
 		for _, name := range lib.order {
-			if !need[name] {
+			if !need[name] || emitted[name] {
 				continue
 			}
+			emitted[name] = true
 			f := lib.funcs[name]
 			if f.Body == nil {
 				continue // a prototype, not a definition
@@ -172,6 +224,24 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 		m.funcBodies = append(m.funcBodies, body)
 	}
 	return m.String(), defined, nil
+}
+
+// irNameTaken reports whether a global spelling is already in use by the
+// program or by the C runtime, so a rename cannot land on a second collision.
+func irNameTaken(prog *Program, lib *clibCProgram, name string) bool {
+	for _, g := range prog.Globals {
+		if g.Name == name {
+			return true
+		}
+	}
+	if lib != nil {
+		for _, g := range lib.globals {
+			if g.Name == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // llvmRoots returns the set of C-runtime functions the IR front end must

@@ -287,10 +287,14 @@ func alignOfIr(ty string) int {
 		}
 		return n / 8
 	}
-	if len(ty) > 5 && ty[:5] == "float" {
+	// NOTE: "float" is 5 characters and "double" is 6, so the length test has
+	// to be >= or these two branches are dead and every float and double ends
+	// up with align 1 -- which is why loads and stores of them came out
+	// misaligned. (This mirrors alignOfLlir in llvmmod.go; both must agree.)
+	if len(ty) >= 5 && ty[:5] == "float" {
 		return 4
 	}
-	if len(ty) > 6 && ty[:6] == "double" {
+	if len(ty) >= 6 && ty[:6] == "double" {
 		return 8
 	}
 	if ty == "ptr" {
