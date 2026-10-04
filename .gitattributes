@@ -6,5 +6,11 @@
 *.go   text eol=lf
 *.c    text eol=lf
 *.asm  text eol=lf
+# LLVM/GAS assembly: LF is not cosmetic here. A CRLF checkout leaves a stray \r
+# at the end of every line, which the AT&T front end then reads as part of the
+# last operand -- turning `movq %rax, %rcx` into a call through a register
+# called `rcx\r`. The .s files under src/goa/testdata/att are byte-compared
+# against what LLVM emits, so they have to survive checkout unchanged.
+*.s    text eol=lf
 *.txt  text eol=lf
 *.yml  text eol=lf

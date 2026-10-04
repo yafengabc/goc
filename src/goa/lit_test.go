@@ -76,23 +76,49 @@ G_g dq 0
 	}
 }
 
-// TestArithMemSrcBad guards the error path: a memory *destination* (or any
-// other non-register dst) is rejected, and an unknown src form is too.
-func TestArithMemSrcBad(t *testing.T) {
-	cases := []string{
-		"add rax, r9", // reg,reg still fine
+// TestArithMemDest covers the arithmetic forms with a memory *destination*.
+//
+// These were rejected outright once, on the grounds that encodeArith only knew
+// how to put a register in the destination. LLVM's output needs all of them --
+// `addl $1000, -12(%rbp)` initialises a local, `cmpb $37, 1(%r8)` is how every
+// string routine tests a character -- so encodeArith grew the r/m forms and
+// this test pins the resulting bytes against the ISA.
+//
+// Reference encodings, from the 83/81/80 groups:
+//
+//	add dword [rbp-8], 5   83 45 F8 05
+//	add qword [rbp-8], 5   48 83 45 F8 05
+//	cmp byte  [rbp-8], 37  80 7D F8 25
+func TestArithMemDest(t *testing.T) {
+	cases := []struct{ src, want string }{
+		{"add dword [rbp-8], 5", "83 45 f8 05"},
+		{"add qword [rbp-8], 5", "48 83 45 f8 05"},
+		{"cmp byte [rbp-8], 37", "80 7d f8 25"},
+		// A large immediate escapes the sign-extended imm8 form.
+		{"add dword [rbp-8], 4096", "81 45 f8 00 10 00 00"},
+		// Register destination and register source are unaffected.
+		{"add eax, dword [rbp-8]", "03 45 f8"},
+		{"add rax, r9", "4c 01 c8"}, // REX.W|B
 	}
+	for _, c := range cases {
+		a := NewAssembler()
+		if err := a.Assemble("section .text\n" + c.src + "\n"); err != nil {
+			t.Errorf("%q: unexpected error: %v", c.src, err)
+			continue
+		}
+		got := hex(a.sectionByName(".text").Data)
+		if got != c.want {
+			t.Errorf("%q:\n got %s\nwant %s", c.src, got, c.want)
+		}
+	}
+}
+
+// TestArithMemSrcBad guards the error path: a malformed memory operand and an
+// unknown register are still rejected.
+func TestArithMemSrcBad(t *testing.T) {
 	bad := []string{
-		"add [rbp-8], eax",    // mem dst not supported (store direction)
-		"add [rbp-8], 5",      // mem dst with imm
 		"add rax, [rbp-16]*4", // malformed mem
 		"add rax, bogusreg",   // unknown register => not a valid operand
-	}
-	for _, src := range cases {
-		a := NewAssembler()
-		if err := a.Assemble("section .text\n" + src + "\n"); err != nil {
-			t.Errorf("unexpected error for %q: %v", src, err)
-		}
 	}
 	for _, src := range bad {
 		a := NewAssembler()

@@ -56,6 +56,40 @@ func AssembleFile(srcPath, outPath, format string) (int64, error) {
 	return AssembleSource(string(src), outPath, elf)
 }
 
+// AssembleATT is AssembleSource for AT&T (GAS) input -- the dialect LLVM's
+// AsmPrinter emits. The front end in att.go rewrites each line into goa's own
+// syntax and hands it to the same encoder, so the produced image is identical to
+// what the equivalent goa-syntax source would have yielded.
+//
+// This exists so a whole LLVM-generated .s file can be assembled by goa instead
+// of by an external assembler. That matters for two reasons: the pipeline stops
+// depending on a COFF object being produced by libLLVM (and on the linker that
+// would then have to consume it), and goa's optimiser and unwind bookkeeping
+// get to see the real code rather than a pre-linked blob.
+func AssembleATT(src, outPath string, elf bool) (int64, error) {
+	a := NewAssembler()
+	if elf {
+		a.target = targetELF
+	}
+	if err := attAssemble(a, src); err != nil {
+		return 0, err
+	}
+	if elf {
+		if err := a.BuildELF(outPath); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := a.BuildPE(outPath); err != nil {
+			return 0, err
+		}
+	}
+	fi, err := os.Stat(outPath)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
 // AssembleWithObject assembles src and then merges a COFF object into the same
 // image before writing it out.
 //

@@ -30,6 +30,7 @@ type Operand struct {
 	imm        int64  // K_IMM
 	memReg     int    // K_MEM register-indirect register index ([reg] form)
 	memSym     string // K_MEM rip-relative symbol ([rip+sym] form)
+	memSymOff  int    // K_MEM: extra byte offset added to a symbolic reference
 	memBase    int    // K_MEM base register for [base+index*scale+disp]
 	memHasBase bool   // K_MEM: operand has a base register
 	memIndex   int    // K_MEM index register (-1 = none) for [base+index*scale]
@@ -135,6 +136,11 @@ type Assembler struct {
 	// syscall's internal exception dispatch (it has no PE unwind info).
 	uwRecs []*uwFunc
 	uwCur  *uwFunc
+	// attAlias maps symbols that LLVM's AsmPrinter invents onto the ones goa
+	// defines. See attDefaultAliases.
+	attAlias map[string]string
+	// attMode switches label qualification over to GAS's rules. See qualify.
+	attMode bool
 	// pdataRVA and pdataSize describe the Win64 exception directory: the
 	// RUNTIME_FUNCTION array the loader walks during exception dispatch. They
 	// stay zero unless an object carrying unwind info was merged in (goa's own
@@ -223,11 +229,27 @@ func (a *Assembler) uwCloseFunc(off, sect int) {
 func isLocalLabel(s string) bool { return strings.HasPrefix(s, ".") }
 
 // qualify maps a label reference to its real symbol name.
+//
+// A dot-prefixed name is local to the enclosing function, so it is qualified
+// with that function's name -- which is what keeps two functions' `.Lrec`
+// apart. That convention comes from the hand-written asm this assembler was
+// built around, where any dot-name is a local label.
+//
+// LLVM's output breaks it: only `.LBB*`/`.Ltmp*`/`.Lfunc*` are function-scoped,
+// while `.str.0`, `.LCPI0_3` and friends are file-scope private names that many
+// functions share. Qualifying those would make every reference after the first
+// dangle, so in AT&T mode qualify asks attIsBlockLabel instead.
 func (a *Assembler) qualify(sym string) string {
-	if isLocalLabel(sym) {
-		return a.curGlobal + sym
+	if !isLocalLabel(sym) {
+		return sym
 	}
-	return sym
+	if a.attMode {
+		if attIsBlockLabel(sym) {
+			return a.curGlobal + sym
+		}
+		return sym
+	}
+	return a.curGlobal + sym
 }
 
 const (
@@ -374,6 +396,15 @@ func (a *Assembler) emitBytes(bs []byte) {
 	s.Data = append(s.Data, bs...)
 	s.cur = len(s.Data)
 }
+
+// emitInt16 writes a 16-bit little-endian value. GAS's `.word` and the 0x66
+// operand-size forms both need it, and routing those through emitInt32 would
+// put two stray bytes in the instruction stream.
+func (a *Assembler) emitInt16(v int16) {
+	a.emitByte(byte(v))
+	a.emitByte(byte(v >> 8))
+}
+
 func (a *Assembler) emitInt32(v int32) {
 	s := a.curSection()
 	s.Data = append(s.Data, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
@@ -820,7 +851,16 @@ func (a *Assembler) parseOperand(tok string) (Operand, error) {
 		innerStripped := strings.ReplaceAll(inner, "RIP+", "")
 		innerStripped = strings.ReplaceAll(innerStripped, "rip+", "")
 		if innerStripped != inner {
-			return Operand{kind: K_MEM, memSym: a.qualify(strings.TrimSpace(innerStripped)), isRip: true, memIndex: -1, memWidth: sizeKw, memSeg: memSeg}, nil
+			// The address may reach into the object (`[rip+G_x+4]`), which
+			// LLVM emits for every field past the first. Stripping the "rip+"
+			// prefix alone would leave "G_x+4" looking like one undefined
+			// symbol, so the offset is split back off here.
+			sym, off := innerStripped, 0
+			if base, o2, ok := splitSymbolOffset(strings.TrimSpace(innerStripped)); ok {
+				sym, off = base, o2
+			}
+			return Operand{kind: K_MEM, memSym: a.qualify(strings.TrimSpace(sym)), memSymOff: off,
+				isRip: true, memIndex: -1, memScale: 1, memWidth: sizeKw, memSeg: memSeg}, nil
 		}
 		// Simple register-indirect: [reg]. Normalize it onto memBase (with
 		// memScale = 1) so planMem sees a well-formed operand -- leaving
@@ -837,6 +877,12 @@ func (a *Assembler) parseOperand(tok string) (Operand, error) {
 		o, err := parseMemInner(inner)
 		if err != nil {
 			return Operand{}, err
+		}
+		// A symbolic reference found among the terms needs the assembler's
+		// label-scoping rules applied, exactly as the bare `[sym]` case above
+		// does.
+		if o.memSym != "" {
+			o.memSym = a.qualify(o.memSym)
 		}
 		o.memWidth = sizeKw
 		o.memSeg = memSeg
@@ -932,16 +978,92 @@ func parseMemInner(inner string) (Operand, error) {
 			continue
 		}
 		v, err := strconv.ParseInt(term, 0, 64)
-		if err != nil {
-			return Operand{}, fmt.Errorf("bad memory term %q", term)
+		if err == nil {
+			if t.neg {
+				v = -v
+			}
+			o.memDisp += int(v)
+			o.memHasDisp = true
+			continue
 		}
-		if t.neg {
-			v = -v
+		// A symbol inside the brackets, possibly carrying an offset: `[rip+G_x]`,
+		// or `[G_x+4]` / `[rip+G_x-8]` for one that reaches into the object.
+		// The offset cannot live in memDisp -- that field is the
+		// *displacement from the base register*, and mixing the two would
+		// silently drop one of them -- so it is kept alongside the symbol and
+		// added back when the reference is resolved.
+		name := term
+		if rest := strings.TrimPrefix(name, "rip"); rest != name && strings.HasPrefix(rest, "+") {
+			name = rest[1:]
 		}
-		o.memDisp += int(v)
-		o.memHasDisp = true
+		if base, off, ok := splitSymbolOffset(name); ok {
+			o.memSym = base
+			o.memSymOff = off
+			o.isRip = true
+			continue
+		}
+		if isSymName(name) {
+			o.memSym = name
+			o.isRip = true
+			continue
+		}
+		return Operand{}, fmt.Errorf("bad memory term %q", term)
 	}
 	return o, nil
+}
+
+// splitSymbolOffset separates a trailing signed offset from a symbol name:
+// `G_gm+4` -> ("G_gm", 4), `.LCPI0_3-8` -> (".LCPI0_3", -8).
+//
+// The sign is what makes this unambiguous. A name may legitimately end in
+// digits -- `.L2`, `G_v2` -- but it can never end in "+4" or "-8", because
+// those characters cannot appear in an identifier. Scanning back over the
+// digits and requiring a sign in front of them therefore never splits a real
+// symbol in half.
+func splitSymbolOffset(s string) (name string, off int, ok bool) {
+	i := len(s)
+	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
+		i--
+	}
+	if i == len(s) || i == 0 {
+		return "", 0, false // no trailing digits, or nothing before them
+	}
+	sign := s[i-1]
+	if sign != '+' && sign != '-' {
+		return "", 0, false
+	}
+	name = s[:i-1]
+	if !isSymName(name) {
+		return "", 0, false
+	}
+	v, err := strconv.ParseInt(s[i-1:], 0, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return name, int(v), true
+}
+
+// isSymName reports whether a token looks like a plain identifier rather than
+// a register, an immediate, or a malformed term. LLVM's private data labels
+// (`.str.0`, `.LCPI0_3`) and C globals (`G_count`) both qualify.
+func isSymName(s string) bool {
+	if s == "" {
+		return false
+	}
+	c := s[0]
+	if !(c == '_' || c == '.' || c == '@' || c == '$' ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if c == '_' || c == '.' || c == '$' || c == '@' ||
+			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // ---- SIB/ModRM planning + emission ---------------------------------------
@@ -1586,7 +1708,17 @@ func (a *Assembler) encode(mnem string, ops []Operand, ln string) error {
 		a.emitByte(0x05)
 		return nil
 	case "movsd", "movss", "addsd", "subsd", "mulsd", "divsd", "sqrtsd",
-		"xorpd", "ucomisd", "cvtsi2sd", "cvttsd2si", "cvtss2sd", "cvtsd2ss", "movq":
+		"xorpd", "ucomisd", "comisd", "cvtsi2sd", "cvtsi2ss", "cvttsd2si",
+		"cvtss2sd", "cvtsd2ss", "minsd", "minss", "maxsd", "maxss",
+		"andpd", "andps", "orpd", "orps", "pand", "pandn", "por",
+		"andnpd", "andnps", "pxor", "xorps", "movmskpd", "movmskps",
+		"cvttpd2dq", "cvtpd2dq", "cvtdq2pd",
+		"addss", "subss", "mulss", "divss", "sqrtss", "rcpss", "rsqrtss",
+		"cmpeqsd", "cmpltsd", "cmplesd", "cmpunordsd", "cmpneqsd",
+		"cmpnltsd", "cmpnlesd", "cmpordsd",
+		"cmpeqss", "cmpltss", "cmpless", "cmpunordss", "cmpneqss",
+		"cmpnltss", "cmpnless", "cmpordss",
+		"movq", "movd", "movaps", "movapd", "movdqa":
 		return a.encodeSSE(mnem, ops, ln)
 	}
 
@@ -2203,18 +2335,50 @@ func (a *Assembler) encodeMov(ops []Operand, ln string) error {
 		return nil
 	}
 
-	// mov [rip+sym], imm  (only supported when imm fits a byte, for tiny vars)
+	// mov [rip+sym], imm -- a RIP-relative immediate store. Used both for tiny
+	// globals (the byte form) and for ordinary 4- and 8-byte ones, which is
+	// what LLVM emits when it initialises a global's slot: `movl $301,
+	// G_gm+28(%rip)`. The immediate trails the disp32, so the recorded RIP is
+	// one byte further along than a plain disp32 field would be.
 	if dst.kind == K_MEM && dst.isRip && src.kind == K_IMM {
-		if src.imm < -128 || src.imm > 255 {
-			return fmt.Errorf("mov [mem], imm: only byte immediates supported: %q", ln)
+		width := dst.memWidth
+		if width == 0 {
+			// No size keyword: match the immediate's own magnitude the way
+			// the byte-only form always did, so an existing caller writing
+			// `mov [rip+x], 5` keeps producing a C6 byte store.
+			if src.imm >= -128 && src.imm <= 255 {
+				width = 1
+			} else {
+				width = 8
+			}
 		}
-		a.emitByte(0xC6) // mov r/m8, imm8 (reg field /0)
+		if width == 2 {
+			a.emitByte(0x66)
+		}
+		if width == 8 {
+			a.emitByte(0x48)
+		}
+		if width == 1 {
+			a.emitByte(0xC6) // mov r/m8, imm8 (reg field /0)
+		} else {
+			a.emitByte(0xC7) // mov r/m, imm32/imm16
+		}
 		a.emitByte(modrmRip(0))
 		off := a.curOff()
 		a.emitInt32(0)
-		// The imm8 follows the disp32, so the true RIP is off+4+1.
-		a.fixups = append(a.fixups, Fixup{sect: a.cur, off: off, sym: dst.memSym, ripAdj: 1})
-		a.emitByte(byte(src.imm)) // the immediate follows the disp32
+		trailer := 1
+		if width != 1 {
+			trailer = 4
+		}
+		a.fixups = append(a.fixups, Fixup{sect: a.cur, off: off, sym: dst.memSym, ripAdj: trailer})
+		switch width {
+		case 1:
+			a.emitByte(byte(src.imm))
+		case 2:
+			a.emitInt16(int16(src.imm))
+		default:
+			a.emitInt32(int32(src.imm))
+		}
 		return nil
 	}
 
@@ -2370,11 +2534,16 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 		return fmt.Errorf("%s needs 2 operands: %q", mnem, ln)
 	}
 	dst, src := ops[0], ops[1]
-	if dst.kind != K_REG {
-		return fmt.Errorf("%s dst must be register: %q", mnem, ln)
+	// A memory destination is legal only where the encoding actually has an
+	// r/m field to put it in: the immediate forms (81 /digit) and the
+	// register-to-memory forms below. The register-to-register form needs
+	// dst.reg and rejects it there. LLVM emits `addq %r14, 64(%r15)` and
+	// `cmpl $0, 12(%rcx)` constantly, so this cannot be a blanket rejection.
+	if dst.kind != K_REG && dst.kind != K_MEM {
+		return fmt.Errorf("%s dst must be register or memory: %q", mnem, ln)
 	}
 
-	if src.kind == K_REG {
+	if src.kind == K_REG && dst.kind == K_REG {
 		// opcode is "op r/m64, r64": modrm reg field = src, rm field = dst.
 		// REX.R extends the reg field (src), REX.B extends the rm field (dst).
 		// Width comes from the operands: `cmp r10d, eax` must encode as a
@@ -2404,6 +2573,98 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 		return nil
 	}
 	if src.kind == K_IMM {
+		// Immediate into memory: op r/m, imm -- 83 /digit ib (sign-extended
+		// imm8) or 81 /digit id. Distinct from the register form above only in
+		// that the r/m field names a memory location instead of a register, so
+		// the ModRM and the following immediate bytes have to be planned
+		// through planMem. LLVM emits this constantly (`addl $1000, -12(%rbp)`,
+		// `cmpl $0, 12(%rcx)`) to materialise a value or test a field, so
+		// rejecting it would make most real compiler output unassemblable.
+		if dst.kind == K_MEM {
+			width := dst.memWidth
+			if width == 0 {
+				width = 8
+			}
+			// 8-bit immediate into memory uses opcode 80 with the sign-extended
+			// imm8 (F6 /0 is the register-only "test" form and must not be
+			// reused here). `cmpb $37, 1(%r8)` -- comparing one byte of a
+			// buffer against a character constant -- is how every string
+			// routine in goclib tests its input, so it has to work.
+			if dst.isRip {
+				if width == 1 {
+					a.emitByte(0x80)
+					a.emitByte(modrmRip(int(c.dig)))
+					off := a.curOff()
+					a.emitInt32(0)
+					a.fixups = append(a.fixups, Fixup{sect: a.cur, off: off, sym: dst.memSym, ripAdj: 1})
+					a.emitByte(byte(src.imm))
+					return nil
+				}
+				if width == 2 {
+					a.emitByte(0x66)
+				}
+				if width == 8 {
+					a.emitByte(0x48)
+				}
+				if src.imm >= -128 && src.imm <= 127 && width != 2 {
+					a.emitByte(0x83)
+					a.emitByte(modrmRip(int(c.dig)))
+					off := a.curOff()
+					a.emitInt32(0)
+					a.fixups = append(a.fixups, Fixup{sect: a.cur, off: off, sym: dst.memSym, ripAdj: 1})
+					a.emitByte(byte(int8(src.imm)))
+					return nil
+				}
+				a.emitByte(0x81)
+				a.emitByte(modrmRip(int(c.dig)))
+				off := a.curOff()
+				a.emitInt32(0)
+				a.fixups = append(a.fixups, Fixup{sect: a.cur, off: off, sym: dst.memSym, ripAdj: 4})
+				a.emitInt32(int32(src.imm))
+				return nil
+			}
+			enc, err := a.planMem(int(c.dig), dst)
+			if err != nil {
+				return err
+			}
+			// REX carries only the memory operand's extension bits here (the
+			// reg field is a group number that never needs extending) plus W
+			// for the 64-bit form.
+			rex := byte(0x40)
+			if width == 8 {
+				rex = 0x48
+			}
+			if enc.rexX {
+				rex |= 0x02
+			}
+			if enc.rexB {
+				rex |= 0x01
+			}
+			if rex != 0x40 {
+				a.emitByte(rex)
+			}
+			if width == 1 {
+				// 80 /digit ib -- the only encoding of an 8-bit immediate into
+				// a memory operand.
+				a.emitByte(0x80)
+				a.emitMemEnc(enc)
+				a.emitByte(byte(src.imm))
+				return nil
+			}
+			if width == 2 {
+				a.emitByte(0x66) // 16-bit operands take an imm16, not an imm8
+			}
+			if src.imm >= -128 && src.imm <= 127 && width != 2 {
+				a.emitByte(0x83)
+				a.emitMemEnc(enc)
+				a.emitByte(byte(int8(src.imm)))
+				return nil
+			}
+			a.emitByte(0x81)
+			a.emitMemEnc(enc)
+			a.emitInt32(int32(src.imm))
+			return nil
+		}
 		if src.imm >= -128 && src.imm <= 127 {
 			a.emitArithRex(regWidth(dst), 0, dst.reg)
 			a.emitByte(0x83)
@@ -2531,6 +2792,77 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 // ---- imul reg, reg ---------------------------------------------------------
 
 func (a *Assembler) encodeImul(ops []Operand, ln string) error {
+	// One-operand form: the unsigned multiply into rdx:rax. AT&T spells it
+	// `imulq %rdx` (one operand, rax implied); goa's own source always writes
+	// the two-operand `mul`. Only the width differs between the signed and
+	// unsigned variants, and neither operand form encodes it, so both share
+	// F6/F7 /5.
+	if len(ops) == 1 && (ops[0].kind == K_REG || ops[0].kind == K_MEM) {
+		o := ops[0]
+		width := 8
+		if o.kind == K_REG {
+			if regWidth(o) != 8 {
+				// 32-bit multiply: same opcode, no REX.W.
+				width = 4
+			}
+		} else if o.memWidth != 0 {
+			width = o.memWidth
+		}
+		if width == 1 {
+			return fmt.Errorf("imul: 8-bit multiply is not defined: %q", ln)
+		}
+		rex := byte(0x48)
+		if width != 8 {
+			rex = 0x40
+		}
+		if o.kind == K_MEM {
+			enc, err := a.planMem(5, o)
+			if err != nil {
+				return err
+			}
+			if enc.rexX {
+				rex |= 0x02
+			}
+			if enc.rexB {
+				rex |= 0x01
+			}
+			if rex != 0x40 {
+				a.emitByte(rex)
+			}
+			if width == 2 {
+				a.emitByte(0x66)
+			}
+			a.emitByte(0xF7)
+			a.emitMemEnc(enc)
+			return nil
+		}
+		if rex != 0x40 {
+			a.emitByte(rex)
+		}
+		if width == 2 {
+			a.emitByte(0x66)
+		}
+		a.emitByte(0xF7)
+		a.emitByte(modrmRegReg(5, o.reg))
+		return nil
+	}
+	// Three-operand form: imul dst, src, imm. AT&T and Intel agree on the
+	// operand order here (destination first either way), so this reaches the
+	// encoder identically from both syntaxes -- which is what lets a whole
+	// LLVM .s file drop straight in. Constant-folding compilers emit this
+	// constantly (`imulq $1374389535, %r8, %r9`).
+	if len(ops) == 3 && ops[0].kind == K_REG && ops[2].kind == K_IMM {
+		dst, src, imm := ops[0], ops[1], ops[2].imm
+		w := arithWidth(dst, src)
+		// 69 /r id -- dst = src * imm32. Unlike the two-operand immediate
+		// form there is a genuine source register, so the destination does
+		// not have to occupy both the reg and rm fields.
+		a.emitArithRex(w, dst.reg, src.reg)
+		a.emitByte(0x69)
+		a.emitByte(modrmRegReg(dst.reg, src.reg))
+		a.emitInt32(int32(imm))
+		return nil
+	}
 	if len(ops) != 2 || ops[0].kind != K_REG {
 		return fmt.Errorf("imul needs a register destination: %q", ln)
 	}
@@ -2586,6 +2918,18 @@ func (a *Assembler) encodeShift(mnem string, ops []Operand, ln string) error {
 	dig, ok := shiftDigit[mnem]
 	if !ok {
 		return fmt.Errorf("bad shift: %q", mnem)
+	}
+	if len(ops) == 1 && ops[0].kind == K_REG {
+		// One-operand form: shift by CL. AT&T writes it as a single operand
+		// (`shrl %eax`) because the count register is implied, while the Intel
+		// spelling is explicit (`shr eax, cl`). Both are the same D2/D3
+		// encoding, and goc's own code generator emits the explicit form, so
+		// the pair has to coexist.
+		dst := ops[0]
+		a.emitShiftRex(dst, int(dig))
+		a.emitByte(0xD3) // /digit, count in CL
+		a.emitByte(modrmRegReg(int(dig), dst.reg))
+		return nil
 	}
 	if len(ops) != 2 || ops[0].kind != K_REG {
 		return fmt.Errorf("%s needs a register and a shift count: %q", mnem, ln)
@@ -2654,10 +2998,77 @@ var sseSpec = map[string]struct {
 	"ucomisd":   {0x66, 0x2E, false, false},
 	"cvtsi2sd":  {0xF2, 0x2A, true, false},
 	"cvttsd2si": {0xF2, 0x2C, true, false},
+	// The packed double<->int32 conversions, all 0F E6 with the prefix
+	// selecting the direction: 66 truncating pd->dq, F2 rounding pd->dq,
+	// F3 dq->pd. goclib's printf reaches these whenever a double has to be
+	// printed as an integer.
+	"cvttpd2dq": {0x66, 0xE6, false, false},
+	"cvtpd2dq":  {0xF2, 0xE6, false, false},
+	"cvtdq2pd":  {0xF3, 0xE6, false, false},
+	// The single-precision counterparts, same opcodes with F3 in place of
+	// F2. goc keeps `float` as a distinct C type, so a float expression
+	// reaches these even though the value is computed in double precision
+	// internally.
+	"addss":   {0xF3, 0x58, false, false},
+	"subss":   {0xF3, 0x5C, false, false},
+	"mulss":   {0xF3, 0x59, false, false},
+	"divss":   {0xF3, 0x5E, false, false},
+	"sqrtss":  {0xF3, 0x51, false, false},
+	"rcpss":   {0xF3, 0x53, false, false},
+	"rsqrtss": {0xF3, 0x52, false, false},
 	// Single <-> double conversions. Both are XMM-dst with an XMM or m32/m64
 	// source, which is exactly the generic two-operand shape above.
 	"cvtss2sd": {0xF3, 0x5A, false, false},
 	"cvtsd2ss": {0xF2, 0x5A, false, false},
+	// Aligned 128-bit moves. LLVM emits these instead of the unaligned
+	// movsd/movupd pair whenever it can prove the operand's alignment (an
+	// alloca with an align, or a struct member of known type), which for
+	// straight-line copies of doubles is the common case. Same encoding as
+	// movsd but with a 66/F3 prefix selecting packed/scalar width.
+	"movaps": {0x00, 0x28, false, false},
+	"movapd": {0x66, 0x28, false, false},
+	// Aligned 128-bit *integer* move, 66 0F 6F (load) / 66 0F 7F (store).
+	// LLVM prefers it over a pair of movq when moving a whole 16-byte
+	// aggregate such as a small struct or vector, which is how a struct
+	// assignment lowers once the type is over-aligned.
+	"movdqa": {0x66, 0x6F, false, false},
+	// min/max. goclib implements fmin/fmax on top of these, and once the
+	// inlining pass has run they are the only floating-point compare left in
+	// an otherwise integer-only instruction stream. 5F is MINSD/MINSS (dest
+	// keeps the second source on a tie or on NaN) and 5F+1 is the MAX pair;
+	// both are 0F 5x with F2 selecting the double form.
+	"minsd": {0xF2, 0x5D, false, false},
+	"minss": {0xF3, 0x5D, false, false},
+	"maxsd": {0xF2, 0x5F, false, false},
+	"maxss": {0xF3, 0x5F, false, false},
+	// The cmp<cc>sd family: ucomisd is 2E, comisd is 2F.
+	"comisd": {0x66, 0x2F, false, false},
+	// The packed bitwise trio, 66 0F 54/55/56. goclib's fabs is `andpd` with
+	// a sign-bit mask and copysign is `andpd`/`xorpd` over it, so these are
+	// how absolute value reaches the hardware.
+	"andpd": {0x66, 0x54, false, false},
+	"andps": {0x00, 0x54, false, false},
+	"orpd":  {0x66, 0x56, false, false},
+	"orps":  {0x00, 0x56, false, false},
+	// andnpd is (NOT src1) AND src2 -- the primitive fmin/fmax are built from,
+	// since the SSE min/max instructions have NaN semantics that do not match C.
+	"andnpd": {0x66, 0x55, false, false},
+	"andnps": {0x00, 0x55, false, false},
+	"xorps":  {0x00, 0x57, false, false},
+	"pxor":   {0x66, 0xEF, false, false},
+	"pand":   {0x66, 0xDB, false, false},
+	"pandn":  {0x66, 0xDF, false, false},
+	"por":    {0x66, 0xEB, false, false},
+}
+
+// emitSSEPrefix emits an SSE mandatory prefix, or nothing when there is none.
+// The two-operand 0F 28/29 forms (movaps, movapd) carry a 66 prefix only for
+// the packed variant; the single-precision one has no prefix at all, and
+// emitting a stray 0x00 there would shift the whole instruction by a byte.
+func (a *Assembler) emitSSEPrefix(p byte) {
+	if p != 0 {
+		a.emitByte(p)
+	}
 }
 
 // emitSSE emits the REX prefix for an SSE instruction: W + R (reg field) + B
@@ -2700,8 +3111,14 @@ func (a *Assembler) emitSSEmem(w bool, e memEnc) {
 }
 
 func (a *Assembler) encodeSSE(mnem string, ops []Operand, ln string) error {
-	if mnem == "movq" {
-		return a.encodeMovQ(ops, ln)
+	if mnem == "movq" || mnem == "movd" {
+		return a.encodeMovQ(mnem, ops, ln)
+	}
+	if _, ok := sseCmpPred[mnem]; ok {
+		return a.encodeSSECmp(mnem, ops, ln)
+	}
+	if mnem == "movmskpd" || mnem == "movmskps" {
+		return a.encodeSSEMaskToGP(mnem, ops, ln)
 	}
 	spec, ok := sseSpec[mnem]
 	if !ok {
@@ -2720,7 +3137,7 @@ func (a *Assembler) encodeSSE(mnem string, ops []Operand, ln string) error {
 		if gp.isXMM || src.kind != K_REG && src.kind != K_MEM {
 			return fmt.Errorf("cvttsd2si needs GP dst: %q", ln)
 		}
-		a.emitByte(spec.prefix)
+		a.emitSSEPrefix(spec.prefix)
 		if src.kind == K_MEM {
 			if src.isRip {
 				a.emitSSE(spec.w, gp.reg, 0)
@@ -2771,7 +3188,7 @@ func (a *Assembler) encodeSSE(mnem string, ops []Operand, ln string) error {
 		}
 	}
 
-	a.emitByte(spec.prefix)
+	a.emitSSEPrefix(spec.prefix)
 	if other.kind == K_MEM && !other.isRip {
 		a.emitSSEmem(spec.w, e)
 	} else {
@@ -2795,18 +3212,63 @@ func (a *Assembler) encodeSSE(mnem string, ops []Operand, ln string) error {
 	return nil
 }
 
-// encodeMovQ implements the two GP <-> XMM moves:
+// encodeMovQ implements the GP <-> XMM moves in both their 32- and 64-bit
+// forms -- `movd` and `movq`, which differ only in whether REX.W is present:
 //
-//	movq xmm, r64   => 66 REX.W 0F 6E   (reg=xmm, rm=r64)   GP -> XMM
-//	movq r64, xmm   => 66 REX.W 0F 7E   (reg=xmm, rm=r64)   XMM -> GP
-func (a *Assembler) encodeMovQ(ops []Operand, ln string) error {
+//	movd xmm, r32   => 66 0F 6E       movq xmm, r64  => 66 REX.W 0F 6E
+//	movd r32, xmm   => 66 0F 7E       movq r64, xmm  => 66 REX.W 0F 7E
+//
+// It also covers the memory halves, which LLVM spells with the same mnemonics
+// but different prefixes:
+//
+//	movd xmm, m32   => 66 0F 6E /r
+//	movq xmm, m64   => 66 REX.W 0F 6E /r
+//	movd m32, xmm   => 66 0F 7E /r
+//	movq m64, xmm   => F3 0F 7E /r      (note: no REX.W, no 66)
+//
+// The asymmetry in the last line is not a typo -- it is what the hardware
+// specifies. The 64-bit load form has no dedicated opcode, so it borrows the
+// single-precision store encoding with F3 in front of it. Getting the prefixes
+// wrong produces a valid-looking instruction that moves the wrong bytes, which
+// is why every case is spelled out rather than folded into the register path.
+func (a *Assembler) encodeMovQ(mnem string, ops []Operand, ln string) error {
 	if len(ops) != 2 {
 		return fmt.Errorf("movq needs 2 operands: %q", ln)
 	}
 	dst, src := ops[0], ops[1]
+	// movd moves 32 bits and carries no REX.W; movq moves 64 and requires it.
+	// Getting this backwards is silent corruption rather than a trap: the
+	// 64-bit form of `movd xmm, eax` would zero-extend into rax and clobber
+	// whatever was there.
+	w := mnem != "movd"
+	if dst.isXMM && src.kind == K_MEM {
+		// 66 [REX.W] 0F 6E /r -- load into the low quadword.
+		a.emitByte(0x66)
+		if w {
+			a.emitSSE(true, dst.reg, 0)
+		} else {
+			a.emitSSE(false, dst.reg, 0)
+		}
+		a.emitByte(0x0F)
+		a.emitByte(0x6E)
+		return a.emitModRMMem(dst.reg, src)
+	}
+	if src.isXMM && dst.kind == K_MEM {
+		// movq stores with F3 and no REX.W; movd uses the 66-prefixed 7E.
+		if w {
+			a.emitByte(0xF3)
+			a.emitSSE(false, src.reg, 0)
+		} else {
+			a.emitByte(0x66)
+			a.emitSSE(false, src.reg, 0)
+		}
+		a.emitByte(0x0F)
+		a.emitByte(0x7E)
+		return a.emitModRMMem(src.reg, dst)
+	}
 	if dst.isXMM && src.kind == K_REG && !src.isXMM {
 		a.emitByte(0x66)
-		a.emitSSE(true, dst.reg, src.reg)
+		a.emitSSE(w, dst.reg, src.reg)
 		a.emitByte(0x0F)
 		a.emitByte(0x6E)
 		a.emitByte(modrmRegReg(dst.reg, src.reg))
@@ -2814,13 +3276,42 @@ func (a *Assembler) encodeMovQ(ops []Operand, ln string) error {
 	}
 	if src.isXMM && dst.kind == K_REG && !dst.isXMM {
 		a.emitByte(0x66)
-		a.emitSSE(true, src.reg, dst.reg)
+		a.emitSSE(w, src.reg, dst.reg)
 		a.emitByte(0x0F)
 		a.emitByte(0x7E)
 		a.emitByte(modrmRegReg(src.reg, dst.reg))
 		return nil
 	}
+	// XMM <-> XMM with the movq mnemonic is a plain 128-bit move in LLVM's
+	// output; fall back to the SSE spec so `movaps`-style handling applies.
+	if dst.isXMM && src.isXMM {
+		a.emitByte(0xF3)
+		a.emitSSE(false, dst.reg, src.reg)
+		a.emitByte(0x0F)
+		a.emitByte(0x7E)
+		a.emitByte(modrmRegReg(dst.reg, src.reg))
+		return nil
+	}
 	return fmt.Errorf("movq: unsupported operands: %q", ln)
+}
+
+// emitModRMMem emits the ModRM byte and any displacement for an SSE
+// instruction whose rm field is a memory operand, recording a fixup when the
+// reference is RIP-relative.
+func (a *Assembler) emitModRMMem(reg int, mem Operand) error {
+	if mem.isRip {
+		a.emitByte(modrmRip(reg))
+		off := a.curOff()
+		a.emitInt32(0)
+		a.fixup(off, mem.memSym)
+		return nil
+	}
+	e, err := a.planMem(reg, mem)
+	if err != nil {
+		return err
+	}
+	a.emitMemEnc(e)
+	return nil
 }
 
 // ---- group-encoded unary ops (idiv / div / mul / neg / not / inc / dec) ----
@@ -2844,6 +3335,121 @@ func (a *Assembler) encodeGrp(op byte, dig int, ops []Operand, ln string) error 
 		return fmt.Errorf("unary op needs a register or memory operand: %q", ln)
 	}
 	return a.emitOpRM(width, nil, false, op, dig, o, nil)
+}
+
+// sseCmpPred maps the packed-SSE comparison family onto the predicate
+// immediate that CMPSD/CMPSS (0F C2 /r ib) carries. The eight predicates are
+// fixed by the ISA and shared by every condition:
+//
+//	0 EQ   1 LT   2 LE   3 UNORD   4 NEQ   5 NLT   6 NLE   7 ORD
+//
+// goclib lowers every floating-point `<`, `<=`, `>` and `>=` onto these rather
+// than onto ucomisd plus a branch, because the comparison result is a mask the
+// following andpd/xorpd consumes directly.
+var sseCmpPred = map[string]byte{
+	"cmpeqsd": 0, "cmpltsd": 1, "cmplesd": 2, "cmpunordsd": 3,
+	"cmpneqsd": 4, "cmpnltsd": 5, "cmpnlesd": 6, "cmpordsd": 7,
+
+	"cmpeqss": 0, "cmpltss": 1, "cmpless": 2, "cmpunordss": 3,
+	"cmpneqss": 4, "cmpnltss": 5, "cmpnless": 6, "cmpordss": 7,
+}
+
+// encodeSSECmp emits the cmp<cond><sd|ss> family: F2/F3 0F C2 /r ib, where the
+// ModRM holds the two sources and the trailing byte selects the predicate.
+func (a *Assembler) encodeSSECmp(mnem string, ops []Operand, ln string) error {
+	pred, ok := sseCmpPred[mnem]
+	if !ok {
+		return fmt.Errorf("unknown SSE compare: %q", mnem)
+	}
+	if len(ops) != 2 {
+		return fmt.Errorf("%s needs 2 operands: %q", mnem, ln)
+	}
+	// F3 selects the single-precision form; everything else here is double.
+	prefix := byte(0xF2)
+	if strings.HasSuffix(mnem, "ss") {
+		prefix = 0xF3
+	}
+	var xmmOp, other Operand
+	if ops[0].isXMM {
+		xmmOp, other = ops[0], ops[1]
+	} else {
+		xmmOp, other = ops[1], ops[0]
+	}
+	a.emitByte(prefix)
+	if other.kind == K_MEM {
+		if other.isRip {
+			a.emitSSE(false, xmmOp.reg, 0)
+			a.emitByte(0x0F)
+			a.emitByte(0xC2)
+			a.emitByte(modrmRip(xmmOp.reg))
+			off := a.curOff()
+			a.emitInt32(0)
+			a.fixup(off, other.memSym)
+			a.emitByte(pred)
+			return nil
+		}
+		e, err := a.planMem(xmmOp.reg, other)
+		if err != nil {
+			return err
+		}
+		a.emitSSEmem(false, e)
+		a.emitByte(0x0F)
+		a.emitByte(0xC2)
+		a.emitMemEnc(e)
+		a.emitByte(pred)
+		return nil
+	}
+	a.emitSSE(false, xmmOp.reg, other.reg)
+	a.emitByte(0x0F)
+	a.emitByte(0xC2)
+	a.emitByte(modrmRegReg(xmmOp.reg, other.reg))
+	a.emitByte(pred)
+	return nil
+}
+
+// encodeSSEMaskToGP implements movmskpd/movmskps: 66 0F 50 /r and 0F 50 /r.
+// It copies the *sign bits* of the packed lanes into a GP register, one bit
+// per lane, and discards the rest -- the standard way to turn a SIMD
+// comparison result back into a branch condition without going through memory.
+// Unlike every other SSE form here the GP register is the reg field and the
+// XMM source is rm, so the operand roles are reversed.
+func (a *Assembler) encodeSSEMaskToGP(mnem string, ops []Operand, ln string) error {
+	if len(ops) != 2 {
+		return fmt.Errorf("%s needs 2 operands: %q", mnem, ln)
+	}
+	gp, src := ops[0], ops[1]
+	if gp.isXMM || (src.kind != K_REG && src.kind != K_MEM) {
+		return fmt.Errorf("%s needs a GP destination: %q", mnem, ln)
+	}
+	if strings.HasSuffix(mnem, "pd") {
+		a.emitByte(0x66)
+	}
+	if src.kind == K_MEM {
+		if src.isRip {
+			a.emitSSE(false, gp.reg, 0)
+			a.emitByte(0x0F)
+			a.emitByte(0x50)
+			a.emitByte(modrmRip(gp.reg))
+			off := a.curOff()
+			a.emitInt32(0)
+			a.fixup(off, src.memSym)
+			return nil
+		}
+		e, err := a.planMem(gp.reg, src)
+		if err != nil {
+			return err
+		}
+		a.emitSSEmem(false, e)
+		a.emitByte(0x0F)
+		a.emitByte(0x50)
+		a.emitMemEnc(e)
+		return nil
+	}
+	a.emitSSE(false, gp.reg, src.reg)
+	a.emitByte(0x0F)
+	a.emitByte(0x50)
+	a.emitByte(modrmRegReg(gp.reg, src.reg))
+	return nil
 }
 
 // ---- movzx / movsx / movsxd ------------------------------------------------
