@@ -206,6 +206,21 @@ func (a *llvmAPI) Version() (int, int, int) {
 // target. This is the whole LLVM side of the backend: everything after it is
 // goa's own assembler and image builder.
 func (a *llvmAPI) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel) error {
+	return a.compileToFile(ir, outPath, opt, 1) // 1 = LLVMCodeGenFileTypeObject
+}
+
+// CompileToAssembly lowers LLVM IR to native assembly text (the AsmPrinter
+// output) and writes it to outPath. This is what `-fllvm -S` wants: the same
+// kind of textual artifact gcc's `cc -S` produces, only for the LLVM back end
+// instead of the native one. The file is not fed back to goa -- it is the
+// final artifact, exactly like the .asm a native `-S` build writes.
+func (a *llvmAPI) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel) error {
+	return a.compileToFile(ir, outPath, opt, 0) // 0 = LLVMCodeGenFileTypeAssembly
+}
+
+// compileToFile runs the shared IR->target lowering and emits either an object
+// (fileType 1) or assembly text (fileType 0) with LLVMTargetMachineEmitToFile.
+func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLevel, fileType int) error {
 	// A NUL-terminated copy: the C API takes a char* and reads to the end.
 	irz := append(append([]byte(nil), ir...), 0)
 	keepIR := &cstrBuf{p: uintptr(unsafe.Pointer(&irz[0])), b: irz}
@@ -296,10 +311,9 @@ func (a *llvmAPI) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptL
 		a.disposeMessage.Call(verifyMsg)
 	}
 
-	// 1 = LLVMCodeGenFileTypeObject; 0 would emit assembly text.
-	rc, _, _ = a.targetMachineEmitToFile.Call(tm, mod, outC.ptr(), 1)
+	rc, _, _ = a.targetMachineEmitToFile.Call(tm, mod, outC.ptr(), uintptr(fileType))
 	if rc != 0 {
-		return fmt.Errorf("goa: LLVMTargetMachineEmitToFile(%s) failed", outPath)
+		return fmt.Errorf("goa: LLVMTargetMachineEmitToFile(%s) failed (fileType=%d)", outPath, fileType)
 	}
 	return nil
 }
@@ -399,6 +413,12 @@ func OpenLLVM() (*LLVM, error) {
 // CompileToObject compiles IR text to a COFF object at outPath.
 func (l *LLVM) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel) error {
 	return l.api.CompileToObject(ir, outPath, opt)
+}
+
+// CompileToAssembly lowers IR to native assembly text at outPath (the
+// AsmPrinter output). Used by `-fllvm -S`.
+func (l *LLVM) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel) error {
+	return l.api.CompileToAssembly(ir, outPath, opt)
 }
 
 // Version returns the linked library's version, for diagnostics.

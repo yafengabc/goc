@@ -197,6 +197,24 @@ func emitProgram(prog *Program, cfg buildCfg, isCC bool) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(asmPath), 0755); err != nil {
 		return "", err
 	}
+
+	// -S with the LLVM back end: the readable artifact is the native assembly
+	// the AsmPrinter emits (a .s file), not the entry stub that genWith writes
+	// once `claimed` covers every function -- that stub has no user code, so the
+	// native .asm path would produce a useless file. This is the LLVM analogue
+	// of gcc's "cc -S" .s output (the AsmPrinter is already initialised for the
+	// object path, so emitting assembly costs nothing extra).
+	if cfg.mode == "asm" && cfg.llvm {
+		asmOut := strings.TrimSuffix(asmPath, filepath.Ext(asmPath)) + ".s"
+		if err := emitIRAssembly(irText, asmOut, cfg.opt, cfg.linux); err != nil {
+			return "", err
+		}
+		if !isCC {
+			fmt.Printf("assembly written to %s\n", asmOut)
+		}
+		return "", nil
+	}
+
 	if err := os.WriteFile(asmPath, []byte(asm), 0644); err != nil {
 		return "", err
 	}
@@ -680,7 +698,8 @@ Options:
   run             compile to a temp dir, run with the given arguments;
                   the program's exit code is passed through
   -c              compile to an executable (no auto-run)
-  -S              emit assembly only
+  -S              emit the back end's textual output only (native .asm, or
+                  LLVM assembly .s when -fllvm is given); no linking
   -E              preprocess only, write the translation unit to stdout/-o
   -o <file>       output file (gcc semantics) or directory (legacy)
   -D<name>[=val]  predefine a macro (val defaults to 1)

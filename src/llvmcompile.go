@@ -84,3 +84,28 @@ func compileIR(ir string, opt int, linux bool) ([]byte, error) {
 	}
 	return b, nil
 }
+
+// emitIRAssembly lowers IR to native assembly text and writes it to outPath.
+// Used by `-fllvm -S`: the readable artifact is the AsmPrinter's output, not
+// the entry stub that genWith emits once `claimed` covers every function.
+func emitIRAssembly(ir string, outPath string, opt int, linux bool) error {
+	api, err := goa.OpenLLVM()
+	if err != nil {
+		return fmt.Errorf("-fllvm needs the LLVM shared library: %w", err)
+	}
+	if linux {
+		// The assembler follows the host target the library was built for; a
+		// Linux image would need an ELF triple that this build does not set up.
+		return fmt.Errorf("-fllvm -S is not implemented for the Linux target yet")
+	}
+	level := goa.LLVMOptDefault
+	if opt >= 3 {
+		level = goa.LLVMOptAggressive
+	} else if opt >= 1 {
+		level = goa.LLVMOptLess
+	}
+	if err := api.CompileToAssembly([]byte(ir), outPath, level); err != nil {
+		return fmt.Errorf("-fllvm: %w", err)
+	}
+	return nil
+}
