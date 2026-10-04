@@ -33,7 +33,7 @@ import (
 // tests, which exercise fragments without the runtime present). Its function table
 // is consulted for prototypes and for the reachability walk that decides which
 // runtime code has to be emitted.
-func translateProgram(prog *Program, lib *clibCProgram) (string, map[string]bool, error) {
+func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map[string]bool, error) {
 	m := newIRMod()
 	defined := map[string]bool{}
 	tr := &typeResolver{
@@ -123,10 +123,19 @@ func translateProgram(prog *Program, lib *clibCProgram) (string, map[string]bool
 		}
 		wanted = append(wanted, f)
 	}
-	// The runtime's own functions, in the order the library records, so the
-	// output is stable from one build to the next.
+	// The runtime's own functions: only the ones the program actually reaches.
+	// Emitting every function in the runtime (~380 of them) is what made the
+	// -fllvm binary 100k+ next to the native build's ~13; the native generator
+	// prunes by reachability (c.need fixed-point), and the IR front end must do
+	// the same or it ships a whole C library the program never calls.
+	// llvmRoots returns that reachable set, seeded from the program's own calls
+	// and the few helpers the entry stub names directly.
 	if lib != nil {
+		need := llvmRoots(prog, lib, linux)
 		for _, name := range lib.order {
+			if !need[name] {
+				continue
+			}
 			f := lib.funcs[name]
 			if f.Body == nil {
 				continue // a prototype, not a definition
@@ -163,6 +172,138 @@ func translateProgram(prog *Program, lib *clibCProgram) (string, map[string]bool
 		m.funcBodies = append(m.funcBodies, body)
 	}
 	return m.String(), defined, nil
+}
+
+// llvmRoots returns the set of C-runtime functions the IR front end must
+// compile in, found by a fixed-point reachability walk over the program and
+// the runtime's own bodies. It is the IR front end's counterpart of the
+// native generator's c.need closure: a runtime function is pulled in only
+// when something reachable actually calls it (or takes its address, which
+// counts as a use), plus the few helpers the entry stub names directly.
+//
+// Emitting the whole runtime (every one of its ~380 functions) is what made
+// the -fllvm binary 100k+ next to the native build's ~13; pruning to what the
+// program reaches brings it back in line.
+func llvmRoots(prog *Program, lib *clibCProgram, linux bool) map[string]bool {
+	need := map[string]bool{}
+	isLib := func(name string) bool {
+		f, ok := lib.funcs[name]
+		return ok && f.Body != nil
+	}
+	// 1. References in the user's own code: a direct call, or an identifier
+	//    used as a value (taking a runtime function's address, e.g.
+	//    "fp = memcpy;"). In both the definition has to be in this object.
+	for _, f := range prog.Funcs {
+		collectLibRefs(f.Body, func(name string) {
+			if isLib(name) {
+				need[name] = true
+			}
+		})
+	}
+	// 2. Entry-stub helpers. goa's own assembler still builds the entry stub,
+	//    and it calls into the runtime for argument parsing and process
+	//    termination; those names must exist in the LLVM object so the stub
+	//    resolves against it rather than going undefined.
+	need["__goclib_exit"] = true // stub terminator whenever the runtime is present
+	if !linux {
+		mainTakesArgs, gui, wide := false, false, false
+		for _, f := range prog.Funcs {
+			switch f.Name {
+			case "main":
+				mainTakesArgs = len(f.ParamTypes) >= 1
+			case "WinMain":
+				gui = true
+			case "wWinMain":
+				gui, wide = true, true
+			}
+		}
+		if mainTakesArgs {
+			need["__goclib_get_args"] = true
+		}
+		if gui {
+			if wide {
+				need["__goclib_lp_cmdline_w"] = true
+			} else {
+				need["__goclib_lp_cmdline_a"] = true
+			}
+		}
+	}
+	// 3. Fixed-point closure over the runtime's own bodies: any runtime
+	//    function reachable from the above pulls in the runtime functions it
+	//    calls in turn.
+	for {
+		changed := false
+		for name := range need {
+			f, ok := lib.funcs[name]
+			if !ok || f.Body == nil {
+				continue
+			}
+			collectLibRefs(f.Body, func(callee string) {
+				if isLib(callee) && !need[callee] {
+					need[callee] = true
+					changed = true
+				}
+			})
+		}
+		if !changed {
+			break
+		}
+	}
+	// 4. Full-exit upgrade, mirroring the native generator's needsFullExit:
+	//    if the program touched the stdio streams, registered atexit, or
+	//    called exit itself, the bare __goclib_exit is not enough -- the C
+	//    standard's atexit/flush chain is required, and that lives in exit.
+	for _, name := range [...]string{"__goclib_stdout", "__goclib_stderr", "atexit", "exit"} {
+		if need[name] {
+			if isLib("exit") && !need["exit"] {
+				need["exit"] = true
+				// One more pass so exit's own callees come in.
+				for {
+					changed := false
+					for en := range need {
+						ef, ok := lib.funcs[en]
+						if !ok || ef.Body == nil {
+							continue
+						}
+						collectLibRefs(ef.Body, func(callee string) {
+							if isLib(callee) && !need[callee] {
+								need[callee] = true
+								changed = true
+							}
+						})
+					}
+					if !changed {
+						break
+					}
+				}
+			}
+			break
+		}
+	}
+	return need
+}
+
+// collectLibRefs visits every expression in a function body and reports the
+// names of C-runtime functions it references: a direct call, or an identifier
+// used as a value that names a runtime function (taking its address). Indirect
+// calls contribute their target expression, so "fp = lib_fn; fp();" pulls
+// lib_fn in through the assignment.
+func collectLibRefs(body Stmt, fn func(string)) {
+	if body == nil {
+		return
+	}
+	walkStmts(body, func(s Stmt) {
+		for _, e := range stmtExprs(s) {
+			walkExpr(e, func(n Expr) {
+				switch x := n.(type) {
+				case *Call:
+					fn(x.Name)
+				case *Ident:
+					fn(x.Name)
+				}
+			})
+		}
+	})
 }
 
 // constInit lowers a global's initialiser to an LLVM constant.

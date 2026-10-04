@@ -38,7 +38,7 @@ func genLLVMProgram(prog *Program, linux bool, opt int) (string, map[string]bool
 		return "", nil, fmt.Errorf("-fllvm: the built-in C library for this target " +
 			"is unavailable; run without -fllvm to see why")
 	}
-	ir, claimed, err := translateProgram(prog, lib)
+	ir, claimed, err := translateProgram(prog, lib, linux)
 	if err != nil {
 		return "", nil, fmt.Errorf("-fllvm: generating IR: %w", err)
 	}
