@@ -83,19 +83,13 @@ func (e *irEmitter) eval(x Expr) val {
 }
 
 // cond evaluates a controlling expression and reduces it to i1.
-// vaArg lowers the va_arg builtin to LLVM's intrinsic.
+// vaArg lowers the va_arg builtin against goc's own va_list model.
 //
-// goc models a va_list as a flat cursor pointer, while LLVM's x86-64 va_list is
-// a structure holding register-save offsets and an overflow area. LLVM's
-// intrinsic is what knows that layout, so the front end hands it the cursor and
-// asks for the next value; reimplementing the layout here would be a second
-// opinion about where an argument lives, and the two would eventually disagree
-// about a program's arguments.
-// vaArg lowers va_arg(ap, T) against goc's own va_list, which is a flat cursor
-// pointer: every variable argument occupies one eight-byte slot, and reading one
-// advances the cursor by eight (see genVaArg, which does the same in
-// registers). That is the same model the native generator uses, so a variadic
-// function behaves identically whichever back end built it.
+// goc models a va_list as a flat cursor pointer: every variable argument
+// occupies one eight-byte slot, and reading one advances the cursor by eight
+// (see genVaArg, which does the same in registers). That is the same model the
+// native generator uses, so a variadic function behaves identically whichever
+// back end built it.
 //
 // LLVM's own va_arg does not fit here, and the difference is not cosmetic.
 // LLVM's va_list is a target-defined structure and va_arg is an *instruction*
@@ -105,109 +99,70 @@ func (e *irEmitter) eval(x Expr) val {
 // cursor here also keeps the two back ends agreeing on where an argument lives,
 // which is the whole reason goc models va_list as a plain char* rather than
 // deferring to a second, target-specific opinion.
-// On Windows x64 a va_list is a one-element array of
 //
-//	struct { unsigned gp_offset; unsigned fp_offset;
-//	         void *overflow_arg_area; void *reg_save_area; }
+// What does the intrinsic do, then? llvm.va_start on Windows x64 writes a
+// single pointer into the va_list: the address of the register save area the
+// caller built (general-purpose slots first, the overflow area past them), so
+// the cursor that va_start establishes is exactly goc's flat eight-byte cursor
+// and reading an argument means loading that cursor, loading the value, and
+// advancing the cursor by eight.
 //
-// and llvm.va_start fills that structure in, so reading an argument means
-// consulting those four fields: take it from the register save area while the
-// relevant offset is below the limit, and from the overflow area (advancing it)
-// once it is not. Both offsets and the overflow cursor are then updated in
-// place, which is what makes a second va_arg read the next argument.
-//
-// This has to agree with the va_start that created the list. An earlier version
-// walked a flat eight-byte cursor instead -- goc's own native model -- which
-// pairs with neither llvm.va_start nor the register save area the caller
-// actually built, so every variadic call that passed an argument read garbage:
-// printf("v=%d", x) crashed where printf("hi") did not.
-//
-// There is no vaarg *instruction* to fall back on either. LLVM spells it
-// "vaarg %ap, i32" and the ExpandVariadics pass lowers it, but the textual
-// parser no longer accepts the keyword, and the older "@llvm.va_arg(ptr, [i32,
-// i8*])" intrinsic call is rejected too ("expected number in address space").
-// Clang lowers va_arg in the frontend for the same reason; this is that
-// lowering, for the one ABI goc targets.
+// The Windows x64 "structure" view of a va_list ({ unsigned gp_offset; unsigned
+// fp_offset; void *overflow_arg_area; void *reg_save_area; }) is the layout
+// clang's SysV lowering writes -- llvm.va_start stores no such structure here.
+// An earlier version of this function consulted those four fields anyway, so
+// every field read garbage from the single stored pointer and every variadic
+// call that consumed an argument crashed: printf("v=%d", x) crashed where
+// printf("hi") did not.
 func (e *irEmitter) vaArg(n *VaArgExpr) val {
-	// A va_list is a char* in goc's front end but the 24-byte Windows x64
-	// structure everywhere else. vaListSlot sorts out which object is meant: a
-	// local `va_list ap;` gets storage with that layout, and one that arrived
-	// as a parameter is already a pointer to such a structure. Reading one
-	// level off is what made every argument come back as whatever the caller's
-	// frame happened to hold, so printf("%d", x) crashed where printf("hi") did
-	// not.
+	// Every va_list -- a local `va_list ap;` or one that arrived as a
+	// parameter -- is backed by a writable slot (vaListSlot returns its
+	// address), and llvm.va_start stores the cursor into that slot. The slot
+	// is what the cursor lives in; writing it back is what makes a second
+	// va_arg read the next argument.
 	ap := e.vaListSlot(n.Ap)
 	ty := n.Typ
 	if ty == nil {
 		ty = IntType()
 	}
 	lty := e.ty(ty)
-	isFP := lty == "double" || lty == "float"
 
-	// The four fields, in declaration order.
-	gpPtr := e.newTmp()
-	e.line("%s = getelementptr inbounds i8, ptr %s, i64 0", gpPtr, ap)
-	fpPtr := e.newTmp()
-	e.line("%s = getelementptr inbounds i8, ptr %s, i64 4", fpPtr, ap)
-	ovPtr := e.newTmp()
-	e.line("%s = getelementptr inbounds i8, ptr %s, i64 8", ovPtr, ap)
-	rsPtr := e.newTmp()
-	e.line("%s = getelementptr inbounds i8, ptr %s, i64 16", rsPtr, ap)
+	// What llvm.va_start actually fills in on Windows x64 is a single pointer:
+	// the address of the register save area the CALLER built, with every
+	// variadic argument occupying one eight-byte slot (general registers
+	// first, then the stack area past them). That is the flat-cursor model the
+	// native generator uses, so reading an argument means loading the cursor,
+	// loading the value, and advancing the cursor by eight. An earlier version
+	// consulted the 24-byte __va_list_tag structure instead (gp_offset,
+	// fp_offset, overflow_arg_area, reg_save_area) -- the layout clang's SysV
+	// lowering writes -- but llvm.va_start stores no such structure on
+	// Windows, so every field read garbage and every variadic call that
+	// consumed an argument crashed.
+	cur := e.newTmp()
+	e.line("%s = load ptr, ptr %s, align 8", cur, ap)
 
-	offAddr, offStep, offLimit := gpPtr, int64(8), int64(48)
-	if isFP {
-		// Floating arguments live in the second half of the save area, in
-		// sixteen-byte slots; the general-purpose half starts at 48.
-		offAddr, offStep, offLimit = fpPtr, 16, 176
-	}
-	off := e.newTmp()
-	e.line("%s = load i32, ptr %s, align 4", off, offAddr)
-	over := e.newTmp()
-	e.line("%s = load ptr, ptr %s, align 8", over, ovPtr)
-	reg := e.newTmp()
-	e.line("%s = load ptr, ptr %s, align 8", reg, rsPtr)
-
-	// While the offset is below the limit the argument is still in the register
-	// save area; past it, the rest is on the stack.
-	inReg := e.newTmp()
-	e.line("%s = icmp ult i32 %s, %d", inReg, off, offLimit)
-
-	fromReg := e.newTmp()
-	e.line("%s = getelementptr inbounds i8, ptr %s, i32 %s", fromReg, reg, off)
-	addr := e.newTmp()
-	e.line("%s = select i1 %s, ptr %s, ptr %s", addr, inReg, fromReg, over)
-
-	// Advance whichever cursor was used, and the offset to match.
-	offNext := e.newTmp()
-	e.line("%s = add i32 %s, %d", offNext, off, offStep)
-	overNext := e.newTmp()
-	e.line("%s = getelementptr inbounds i8, ptr %s, i64 %d", overNext, over, offStep)
-	newOff := e.newTmp()
-	e.line("%s = select i1 %s, i32 %s, i32 %s", newOff, inReg, offNext, off)
-	newOver := e.newTmp()
-	e.line("%s = select i1 %s, ptr %s, ptr %s", newOver, inReg, over, overNext)
-	e.line("store i32 %s, ptr %s, align 4", newOff, offAddr)
-	e.line("store ptr %s, ptr %s, align 8", newOver, ovPtr)
-
-	// The slot is eight bytes wide (sixteen for a double), so a narrow type is
-	// read at its own width from the same address.
+	// The slot is eight bytes wide, so a narrow type is read at its own width
+	// from the same address.
 	slot := e.newTmp()
 	switch lty {
 	case "i1":
 		raw := e.newTmp()
-		e.line("%s = load i8, ptr %s, align 1", raw, addr)
+		e.line("%s = load i8, ptr %s, align 1", raw, cur)
 		e.line("%s = trunc i8 %s to i1", slot, raw)
 	case "float":
 		bits := e.newTmp()
-		e.line("%s = load i32, ptr %s, align 4", bits, addr)
+		e.line("%s = load i32, ptr %s, align 4", bits, cur)
 		e.line("%s = bitcast i32 %s to float", slot, bits)
 	case "double":
 		bits := e.newTmp()
-		e.line("%s = load i64, ptr %s, align 8", bits, addr)
+		e.line("%s = load i64, ptr %s, align 8", bits, cur)
 		e.line("%s = bitcast i64 %s to double", slot, bits)
 	default:
-		e.line("%s = load %s, ptr %s, align %d", slot, lty, addr, alignOfIr(lty))
+		e.line("%s = load %s, ptr %s, align %d", slot, lty, cur, alignOfIr(lty))
 	}
+	next := e.newTmp()
+	e.line("%s = getelementptr inbounds i8, ptr %s, i64 8", next, cur)
+	e.line("store ptr %s, ptr %s, align 8", next, ap)
 	return val{op: slot, ty: ty}
 }
 
@@ -295,7 +250,14 @@ func (e *irEmitter) numLit(n *NumLit) val {
 }
 
 func (e *irEmitter) strLit(n *StrLit) val {
-	name := e.c.addString(bytesToBytes(n.Bytes))
+	// A C string literal carries a trailing NUL; the lexer keeps only the
+	// quoted bytes, so append the terminator here. Without it the literal is
+	// an unterminated [N x i8] and the runtime reads straight past its end
+	// into the next global (e.g. vfmt formatting "x" then walking into the
+	// "assertion \"%s\"..." template and hitting the %s branch).
+	b := bytesToBytes(n.Bytes)
+	b = append(b, 0)
+	name := e.c.addString(b)
 	t := e.newTmp()
 	e.line("%s = getelementptr inbounds i8, ptr @%s, i64 0", t, name)
 	// The literal's value is its address: a char array decays to a pointer.
@@ -313,13 +275,15 @@ func (e *irEmitter) ident(n *Ident) val {
 		return e.addressOf(n, ty)
 	}
 	// A va_list that va_start has already given its real storage reads as the
-	// address of that storage, not as a load from the ordinary eight-byte
-	// pointer slot. Without this the two disagreed about which object `ap` is:
-	// vfprintf was handed a pointer to a slot nothing had ever written, so
-	// every variadic call crashed while a program that merely linked printf
-	// ran fine.
+	// address of that storage -- the cursor the intrinsic wrote -- not as the
+	// address of the slot holding it. Without the load, vfprintf was handed the
+	// slot's address instead of the register save area, so it dereferenced one
+	// level short and every variadic call crashed while a program that merely
+	// linked printf ran fine.
 	if s, ok := e.vaSlots[n.Name]; ok {
-		return val{op: s, ty: PtrType(CharType())}
+		t := e.newTmp()
+		e.line("%s = load ptr, ptr %s, align 8", t, s)
+		return val{op: t, ty: PtrType(CharType())}
 	}
 	if uid, ok := e.tr.lookupUID(n.Name); ok {
 		slot := e.slotFor(uid, e.ty(ty))

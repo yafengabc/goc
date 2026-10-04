@@ -93,12 +93,12 @@ func (e *irEmitter) callExpr(n *Call) val {
 		if len(n.Args) == 0 {
 			return val{op: "0", ty: IntType()}
 		}
-		// The operand is always a local `va_list ap;`, and the object
-		// llvm.va_start fills in is the 24-byte Windows x64 va_list, not the
-		// eight bytes the `char *` typedef would give it. The local is
-		// therefore given its own correctly sized slot here rather than
-		// through slotFor; sharing the ordinary pointer slot is what made
-		// va_start scribble over the three locals that followed it.
+		// The operand is always a local `va_list ap;`. What llvm.va_start
+		// stores into it on Windows x64 is a single pointer -- the cursor into
+		// the caller's register save area -- so vaListSlot gives the local its
+		// own widened slot and the intrinsic writes through it. Sharing the
+		// ordinary pointer slot made va_start scribble over the locals that
+		// followed it.
 		ap := e.vaListSlot(n.Args[0])
 		e.c.noteIntrinsic("llvm.va_start", "void", []string{"ptr"})
 		e.line("call void @llvm.va_start(ptr %s)", ap)

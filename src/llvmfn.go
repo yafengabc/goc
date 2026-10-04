@@ -229,33 +229,36 @@ func (e *irEmitter) slotFor(uid int, ty string) string {
 // vaListTy is the storage a va_list needs on this target.
 //
 // goc declares va_list as `char *` (parser.go: typedefs["va_list"] = PtrType(CharType())),
-// which is eight bytes -- but the object llvm.va_start fills in is the Windows x64
-// va_list, a 24-byte structure of { unsigned gp_offset, fp_offset; void
-// *overflow_arg_area, *reg_save_area; }. Allocating eight bytes for it and then
-// calling va_start overwrites the three slots that follow, so the first
-// va_arg read returns whatever the caller's frame happened to hold and a
-// variadic call such as printf("%d", x) crashes where printf("hi") does not.
-//
-// The pointer typedef stays as it is -- it is what the rest of the front end
-// reasons about, and passing a va_list between functions passes this pointer.
-// Only the storage is widened, which is exactly what a real stdarg.h does when
-// __builtin_va_list is an array type.
+// which is eight bytes, and the intrinsic llvm.va_start stores exactly one
+// eight-byte pointer into it: the cursor into the caller's register save area.
+// The slot is still widened to 24 bytes so the intrinsic can never overwrite
+// the three locals that would otherwise follow an eight-byte object, whatever
+// a future target's va_start writes. The pointer typedef stays as it is -- it
+// is what the rest of the front end reasons about, and passing a va_list
+// between functions passes this pointer. Only the storage is widened, which is
+// exactly what a real stdarg.h does when __builtin_va_list is an array type.
 const vaListTy = "[3 x i64]"
 
-// vaListSlot returns the address of the va_list local named by x, giving it the
-// Windows x64 va_list layout rather than the eight bytes its `char *` typedef
-// would otherwise get. Every mention of the same variable -- va_start, each
-// va_arg, va_end -- must land on this one slot, so the mapping is kept by name
-// for the duration of the function.
+// vaListSlot returns the address of the object backing a va_list named by x.
+// Every mention of the same variable -- va_start, each va_arg, va_end -- must
+// land on this one slot, so the mapping is kept by name for the duration of the
+// function.
 //
-// A va_list that arrived as a parameter is already a pointer to such a
-// structure, so it has no local storage of its own and its value is returned.
+// A local `va_list ap;` gets a slot of its own, widened to the Windows x64
+// va_list layout so the intrinsic never scribbles past the eight bytes its
+// `char *` typedef would otherwise give it. A va_list that arrived as a
+// parameter is backed by the alloca bindParams created for it, so its address
+// is returned too: va_arg advances the cursor by writing back through it, and
+// returning a value instead would make every va_arg read the same slot.
 func (e *irEmitter) vaListSlot(x Expr) string {
 	id, ok := x.(*Ident)
 	if !ok {
 		return e.lvalue(x)
 	}
 	if e.paramNames[id.Name] {
+		if uid, ok := e.tr.lookupUID(id.Name); ok {
+			return e.slotFor(uid, "ptr")
+		}
 		return e.rvalue(x)
 	}
 	if e.vaSlots == nil {

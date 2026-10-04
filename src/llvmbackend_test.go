@@ -109,7 +109,7 @@ func TestLLVMBackendEndToEnd(t *testing.T) {
 			src: "void bsort(int a[],int n){for(int i=0;i<n-1;i++)for(int j=0;j<n-1-i;j++)\n" +
 				"if(a[j]>a[j+1]){int t=a[j];a[j]=a[j+1];a[j+1]=t;}}\n" +
 				"int main(void){int a[5]={5,3,1,4,2};bsort(a,5);return a[0]*100+a[4];}",
-			wantCode: 125, // first=1, last=5
+			wantCode: 105, // sorted {1,2,3,4,5}: first=1, last=5 → 1*100+5
 		},
 		{
 			name:     "pointer arithmetic",

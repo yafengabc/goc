@@ -107,35 +107,47 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 	}
 
 	// LLVM lowers a stack frame larger than a page into a call to the C
-	// runtime's stack-probe helper, ___chkstk_ms, passing the frame size in
-	// rcx. A goc image links no C runtime, so the reference has to resolve
+	// runtime's stack-probe helper, ___chkstk_ms, with the frame size in
+	// RAX. A goc image links no C runtime, so the reference has to resolve
 	// here or the link fails with "undefined symbol: ___chkstk_ms".
 	//
-	// The helper is the same loop the native generator inlines: walk down one
-	// page at a time, touching each so the guard page is committed, then give
-	// back the overshoot. r11 is used as the counter because the Windows ABI
-	// lists rcx as argument-only and r11 as volatile.
+	// LLVM's Win64 large-frame prologue is "mov eax,size; call ___chkstk_ms;
+	// sub rsp,rax": the helper must only touch the guard pages (probe) and
+	// leave both rsp and rax intact -- rsp for the caller's own sub rsp,rax,
+	// rax because it still holds the frame size for that sub. The earlier
+	// helpers either read rcx (which the caller never sets, so the probe
+	// walked the stack for a garbage size) or subtracted pages themselves
+	// (double allocation), both ending in STATUS_STACK_OVERFLOW (0xC00000FD).
+	// r10/r11 are volatile per the Windows ABI, so they are free scratch.
 	if _, ok := a.syms["___chkstk_ms"]; !ok {
 		if pad := align(text.cur, 16) - text.cur; pad > 0 {
 			padSection(text, pad)
 		}
 		start := text.cur
-		// mov r11, rcx
-		text.Data = append(text.Data, 0x49, 0x89, 0xC8)
-		text.cur += 3
+		// mov r11, rax ; mov r10, rsp
+		// (4C 8B D4 = mov r10,rsp; the 89 variant would be mov rsp,r10 and
+		// clobber the stack pointer with garbage r10 on entry.)
+		text.Data = append(text.Data, 0x49, 0x89, 0xC3, 0x4C, 0x8B, 0xD4)
+		text.cur += 6
 		loop := text.cur
-		// sub rsp, 4096 ; sub r11, 4096 ; mov rax, [rsp] ; jg loop
+		// loop: sub rsp,4096 ; mov [rsp],r11 ; sub r11,4096
+		// The probe block is 18 bytes (7 + 4 + 7); the cursor must advance by
+		// exactly the bytes appended or every symbol merged from the COFF
+		// object lands early -- the entry stub's call to main then jumps at the
+		// alignment byte in front of the function and faults immediately.
 		text.Data = append(text.Data,
-			0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00,
-			0x49, 0x81, 0xEB, 0x00, 0x10, 0x00, 0x00,
-			0x48, 0x8B, 0x04, 0x24,
-			0x7F, 0x85)
-		text.cur += 19
-		rel := int32(loop) - int32(text.cur+4)
-		text.Data = append(text.Data, byte(rel), byte(rel>>8), byte(rel>>16), byte(rel>>24))
-		text.cur += 4
-		// sub rsp, r11 ; ret
-		text.Data = append(text.Data, 0x4C, 0x29, 0xDC, 0xC3)
+			0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00, // sub rsp, 4096
+			0x4C, 0x89, 0x1C, 0x24, // mov [rsp], r11  (touch the page)
+			0x49, 0x81, 0xEB, 0x00, 0x10, 0x00, 0x00) // sub r11, 4096
+		text.cur += 18
+		// jg loop: short jump back to the probe block. The offset is relative
+		// to the instruction's end; it must be computed, not hard-coded -- a
+		// literal offset would land the jump outside the probe block.
+		rel8 := int8(loop - (text.cur + 2))
+		text.Data = append(text.Data, 0x7F, byte(rel8))
+		text.cur += 2
+		// mov rsp, r10 ; ret
+		text.Data = append(text.Data, 0x4C, 0x89, 0xD4, 0xC3)
 		text.cur += 4
 		a.syms["___chkstk_ms"] = symLoc{sect: sectionIndexOf(a, text), off: start}
 	}
@@ -241,6 +253,31 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 		a.syms[s.name] = symLoc{sect: sectOf[si], off: baseOf[si] + int(s.value)}
 	}
 
+	// --- import thunks ---
+	// The object's relative calls and jumps to imported functions (REL32
+	// against an undefined symbol) cannot target the IAT slot directly: the
+	// slot holds the function's address as DATA, and executing those bytes
+	// faults. Emit one jump thunk per import -- jmp [rip+rel32] to the IAT
+	// slot -- and route call/jmp fixups through it, the same shape MSVC links.
+	// Data references (lea/mov RIP-relative) keep naming the IAT slot, which
+	// is the correct address-of semantics. Generating a thunk for every
+	// import is a few bytes each and keeps the code simple.
+	if len(a.exts) > 0 {
+		for name := range a.exts {
+			if _, ok := a.syms["thunk:"+name]; ok {
+				continue
+			}
+			off := text.cur
+			// FF 25 <rel32>: jmp qword ptr [rip+disp]
+			text.Data = append(text.Data, 0xFF, 0x25, 0, 0, 0, 0)
+			text.cur += 6
+			a.fixups = append(a.fixups, Fixup{
+				sect: sectionIndexOf(a, text), off: off + 2, sym: "IAT:" + name,
+			})
+			a.syms["thunk:"+name] = symLoc{sect: sectionIndexOf(a, text), off: off}
+		}
+	}
+
 	// --- relocations ---
 	for i, cs := range o.secs {
 		if cs.relCount == 0 {
@@ -306,6 +343,23 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 				// the field's END -- so a literal reading of "S - P" lands four
 				// bytes past the target. ripAdj = 0 makes goa's
 				// "target - (base + off + size)" match what the CPU computes.
+				//
+				// A REL32 field whose target is an import is normally a call or
+				// jmp (opcode E8/E9) whose target must be CODE; pointing it at
+				// the IAT slot would execute address-table bytes and fault.
+				// Route those through the per-import jump thunk emitted above.
+				// Any other opcode is a data reference (lea/mov RIP-relative),
+				// which legitimately names the slot itself. The import check
+				// goes through a.exts rather than the key's prefix: an import
+				// that already satisfied a defining reference lands here under
+				// its bare name (definesSymbol), not as "IAT:...".
+				if off > 0 && off <= len(cs.data) {
+					if op := cs.data[off-1]; op == 0xE8 || op == 0xE9 {
+						if _, isImport := a.exts[sym.name]; isImport {
+							key = "thunk:" + sym.name
+						}
+					}
+				}
 				a.fixups = append(a.fixups, Fixup{
 					sect: sectOf[si], off: at, sym: key,
 				})
