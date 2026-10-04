@@ -69,3 +69,5 @@ tests/*/_build/
 # Perf-benchmark dir: keep only the .c sources, ignore built artifacts.
 bench/*
 !bench/*.c
+src/goa/zz_*.tmpl
+src/**/zz_*_test.go.tmpl
