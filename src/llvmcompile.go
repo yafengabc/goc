@@ -72,10 +72,8 @@ func compileIR(ir string, opt int, linux bool) ([]byte, error) {
 	level := goa.LLVMOptDefault
 	if opt >= 3 {
 		level = goa.LLVMOptAggressive
-	} else if opt >= 1 {
-		level = goa.LLVMOptLess
 	}
-	if err := api.CompileToObject([]byte(ir), obj, level); err != nil {
+	if err := api.CompileToObject([]byte(ir), obj, level, irPasses(opt)); err != nil {
 		return nil, fmt.Errorf("-fllvm: %w", err)
 	}
 	b, err := os.ReadFile(obj)
@@ -101,11 +99,56 @@ func emitIRAssembly(ir string, outPath string, opt int, linux bool) error {
 	level := goa.LLVMOptDefault
 	if opt >= 3 {
 		level = goa.LLVMOptAggressive
-	} else if opt >= 1 {
-		level = goa.LLVMOptLess
 	}
-	if err := api.CompileToAssembly([]byte(ir), outPath, level); err != nil {
+	if err := api.CompileToAssembly([]byte(ir), outPath, level, irPasses(opt)); err != nil {
 		return fmt.Errorf("-fllvm: %w", err)
 	}
 	return nil
+}
+
+// irPasses names the IR optimisation pipeline for a -O level:
+//
+//	opt 0  no -O      default<O1>   see below
+//	opt 1  -O/-Og/-O1 default<O1>
+//	opt 2  -Os/-Oz    default<Os>
+//	opt 3  -O2        default<O2>
+//	opt 4  -O3/-Ofast default<O3>
+//
+// Code generation alone does not optimise: LLVMTargetMachineEmitToFile lowers
+// whatever module it is handed, so with no pipeline every local stays in its
+// alloca and nothing is inlined however high -O is. The mapping also had an
+// inversion to undo: -O1 used to select LLVMOptLess, which is *lower* than the
+// LLVMOptDefault that no flag at all chose, so asking for optimisation made the
+// code worse.
+//
+// opt 0 runs a pipeline too, which is not what its name suggests, and the
+// reason is a correctness one rather than a speed one. With no pipeline LLVM
+// lowers the call exactly as written and omits the Windows x64 rule that a
+// floating-point argument to a variadic function is passed TWICE -- once in the
+// XMM register and once in the matching integer register -- because that
+// duplication is what lets the callee's va_start find the value in the register
+// save area. goc's va_list is a flat eight-byte cursor over exactly that area,
+// so without the duplicate a double handed to printf is silently lost:
+//
+//	printf("%f\n", 1.25)  ->  "d=0.000000" with no pipeline, "d=1.250000" with
+//	                          any pipeline. Measured: the unoptimised call site
+//	                          has no "movq %xmm1,%rdx"; O1/Os/O2 all do.
+//
+// A literal, unoptimised translation is therefore not merely slow here, it is
+// wrong, so -O0 buys the smallest pipeline instead of none. That costs nothing
+// in size either: the -O1 build of bench/bench2.c is 16896 bytes against 19968
+// for the unoptimised one.
+func irPasses(opt int) string {
+	switch {
+	case opt >= 4:
+		return "default<O3>"
+	case opt == 3:
+		return "default<O2>"
+	// -Os/-Oz ask for size, and LLVM has a pipeline for that. Sending them to
+	// default<O1> instead was not just wrong in spirit: O1 is a speed pipeline,
+	// so a size-optimised build came out no smaller than an ordinary one.
+	case opt == 2:
+		return "default<Os>"
+	}
+	return "default<O1>"
 }

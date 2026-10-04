@@ -70,6 +70,12 @@ type llvmAPI struct {
 	verifyModule                          *syscall.LazyProc
 	targetMachineEmitToFile               *syscall.LazyProc
 	disposeModule                         *syscall.LazyProc
+	createPassBuilderOptions              *syscall.LazyProc
+	disposePassBuilderOptions             *syscall.LazyProc
+	passBuilderSetVerifyEach              *syscall.LazyProc
+	runPasses                             *syscall.LazyProc
+	getErrorMessage                       *syscall.LazyProc
+	disposeErrorMessage                   *syscall.LazyProc
 }
 
 var (
@@ -166,6 +172,12 @@ func (a *llvmAPI) bind() error {
 		{"LLVMVerifyModule", &a.verifyModule},
 		{"LLVMTargetMachineEmitToFile", &a.targetMachineEmitToFile},
 		{"LLVMDisposeModule", &a.disposeModule},
+		{"LLVMCreatePassBuilderOptions", &a.createPassBuilderOptions},
+		{"LLVMDisposePassBuilderOptions", &a.disposePassBuilderOptions},
+		{"LLVMPassBuilderOptionsSetVerifyEach", &a.passBuilderSetVerifyEach},
+		{"LLVMRunPasses", &a.runPasses},
+		{"LLVMGetErrorMessage", &a.getErrorMessage},
+		{"LLVMDisposeErrorMessage", &a.disposeErrorMessage},
 	} {
 		p := a.dll.NewProc(e.name)
 		if err := p.Find(); err != nil {
@@ -205,8 +217,11 @@ func (a *llvmAPI) Version() (int, int, int) {
 // CompileToObject turns LLVM IR text into a COFF object file for the host
 // target. This is the whole LLVM side of the backend: everything after it is
 // goa's own assembler and image builder.
-func (a *llvmAPI) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel) error {
-	return a.compileToFile(ir, outPath, opt, 1) // 1 = LLVMCodeGenFileTypeObject
+//
+// passes names an IR optimisation pipeline ("default<O2>") or is "" to lower
+// the module exactly as the front end wrote it.
+func (a *llvmAPI) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
+	return a.compileToFile(ir, outPath, opt, passes, 1) // 1 = LLVMCodeGenFileTypeObject
 }
 
 // CompileToAssembly lowers LLVM IR to native assembly text (the AsmPrinter
@@ -214,13 +229,49 @@ func (a *llvmAPI) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptL
 // kind of textual artifact gcc's `cc -S` produces, only for the LLVM back end
 // instead of the native one. The file is not fed back to goa -- it is the
 // final artifact, exactly like the .asm a native `-S` build writes.
-func (a *llvmAPI) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel) error {
-	return a.compileToFile(ir, outPath, opt, 0) // 0 = LLVMCodeGenFileTypeAssembly
+func (a *llvmAPI) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
+	return a.compileToFile(ir, outPath, opt, passes, 0) // 0 = LLVMCodeGenFileTypeAssembly
+}
+
+// runPasses runs an IR optimisation pipeline over a module.
+//
+// This is the step that was missing for a long time: LLVMTargetMachineEmitToFile
+// only lowers a module to machine code, it does not optimise it, so the IR the
+// front end emitted reached the object unchanged -- every local stayed in its
+// alloca, nothing was inlined, and the -fllvm binary ran at about -O0 speed
+// whatever -O was asked for. LLVMRunPasses drives the real pass pipeline.
+func (a *llvmAPI) runIRPasses(mod, tm uintptr, pipeline string) error {
+	if pipeline == "" {
+		return nil
+	}
+	optv, _, _ := a.createPassBuilderOptions.Call()
+	if optv == 0 {
+		return fmt.Errorf("goa: LLVMCreatePassBuilderOptions failed")
+	}
+	defer a.disposePassBuilderOptions.Call(uintptr(optv))
+	passC := newCstr(pipeline)
+	errv, _, _ := a.runPasses.Call(mod, passC.ptr(), tm, uintptr(optv))
+	if errv != 0 {
+		return fmt.Errorf("goa: LLVMRunPasses(%q): %s", pipeline, a.errorText(uintptr(errv)))
+	}
+	return nil
+}
+
+// errorText renders an LLVMErrorRef. LLVMGetErrorMessage consumes the error, so
+// only the returned string has to be released.
+func (a *llvmAPI) errorText(err uintptr) string {
+	mv, _, _ := a.getErrorMessage.Call(err)
+	if mv == 0 {
+		return "unknown error"
+	}
+	s := goString(mv)
+	a.disposeErrorMessage.Call(mv)
+	return s
 }
 
 // compileToFile runs the shared IR->target lowering and emits either an object
 // (fileType 1) or assembly text (fileType 0) with LLVMTargetMachineEmitToFile.
-func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLevel, fileType int) error {
+func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, fileType int) error {
 	// A NUL-terminated copy: the C API takes a char* and reads to the end.
 	irz := append(append([]byte(nil), ir...), 0)
 	keepIR := &cstrBuf{p: uintptr(unsafe.Pointer(&irz[0])), b: irz}
@@ -309,6 +360,12 @@ func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLev
 	}
 	if verifyMsg != 0 {
 		a.disposeMessage.Call(verifyMsg)
+	}
+
+	// Optimise before emitting. This has to come after the module is given the
+	// target's data layout, or the pipeline reasons about the wrong ABI.
+	if err := a.runIRPasses(mod, tm, passes); err != nil {
+		return err
 	}
 
 	rc, _, _ = a.targetMachineEmitToFile.Call(tm, mod, outC.ptr(), uintptr(fileType))
@@ -410,15 +467,16 @@ func OpenLLVM() (*LLVM, error) {
 	return &LLVM{api: api}, nil
 }
 
-// CompileToObject compiles IR text to a COFF object at outPath.
-func (l *LLVM) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel) error {
-	return l.api.CompileToObject(ir, outPath, opt)
+// CompileToObject compiles IR text to a COFF object at outPath, after running
+// the named IR pipeline ("" for none).
+func (l *LLVM) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
+	return l.api.CompileToObject(ir, outPath, opt, passes)
 }
 
 // CompileToAssembly lowers IR to native assembly text at outPath (the
 // AsmPrinter output). Used by `-fllvm -S`.
-func (l *LLVM) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel) error {
-	return l.api.CompileToAssembly(ir, outPath, opt)
+func (l *LLVM) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
+	return l.api.CompileToAssembly(ir, outPath, opt, passes)
 }
 
 // Version returns the linked library's version, for diagnostics.
