@@ -344,6 +344,21 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 				// bytes past the target. ripAdj = 0 makes goa's
 				// "target - (base + off + size)" match what the CPU computes.
 				//
+				// A is NOT optional here, and dropping it is silent corruption
+				// rather than a visible error. COFF relocation records have no
+				// addend field: A lives in the field's own unrelocated bytes,
+				// so it has to be read out of the section before the patch
+				// overwrites it. LLVM uses that for every RIP-relative access
+				// to a member of a global -- "mov %rax, stdout_file+32(%rip)"
+				// carries A=32, "movq $1, stdin_file+8(%rip)" carries A=4 (the
+				// trailing imm32 is already folded in) -- and calls carry A=0.
+				// Leaving A out made every such store land on the symbol's base
+				// instead of the member: the stdio initialiser then wrote
+				// _writable/_base/_size/_off straight over _fd, so a FILE came
+				// up with _writable == 0 and every stdio write returned an
+				// error with nothing on the console -- while file I/O, which
+				// goes through a heap FILE set up field by field, kept working.
+				//
 				// A REL32 field whose target is an import is normally a call or
 				// jmp (opcode E8/E9) whose target must be CODE; pointing it at
 				// the IAT slot would execute address-table bytes and fault.
@@ -360,8 +375,9 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 						}
 					}
 				}
+				addend := rd32(cs.data, off)
 				a.fixups = append(a.fixups, Fixup{
-					sect: sectOf[si], off: at, sym: key,
+					sect: sectOf[si], off: at, sym: key, addend: addend,
 				})
 			case relAMD64Addr32NB:
 				// A relocation against a *section* symbol is how the Win64 unwind
