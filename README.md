@@ -59,6 +59,17 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 │   ├── lexer.go  parser.go  ast.go  types.go          #   词法 / 语法 / AST / 类型
 │   ├── check.go  print.go  ufcs.go                     #   语义检查、print/数组重写、UFCS
 │   └── go.mod
+├── src/common/                                     # 两后端共享（go 模块 goc/common）
+│   ├── preprocess.go                                     #   C 预处理器
+│   ├── translate.go                                      #   多翻译单元的读取/解析/合并
+│   ├── library.go  source.go                            #   goclib 的定位与编译
+│   ├── printfspec.go                                     #   printf 调用点特化
+│   └── link/                                             #   入口桩与全局数据发射
+├── src/gocl/                                        # LLVM 后端编译器（go 模块 gocl）
+│   ├── translate.go  function.go  statement.go          #   前端 AST → LLVM IR
+│   ├── expression.go  operator.go  call.go  types.go
+│   ├── module.go  compile.go  backend.go  util.go
+│   └── cmd/gocl/main.go                                 #   入口（bin/gocl.exe）
 ├── src/goc/                                        # 编译器主体（go 模块 goc）
 │   ├── codegen.go  cpp.go  multi.go  opt.go            #   自研 x86-64 代码生成
 │   ├── libfs.go                                        #   在磁盘上定位 goclib/（见下）
@@ -88,7 +99,7 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 ```
 
 `src/goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
-直接出 exe，不需要 goc。五个 Go 模块：`src/frontend`（前端，零依赖）、`src/goc`（编译器）、`src`（自包含入口）、`src/goa`（汇编器）、`tools`（验证），
+直接出 exe，不需要 goc。七个 Go 模块：`src/frontend`（前端，零依赖）、`src/common`（预处理器 + C 库 + 链接）、`src/goc`（自研 x86-64 后端）、`src/gocl`（LLVM 后端）、`src`（自包含入口）、`src/goa`（汇编器）、`tools`（验证），
 在 `src/goc/` 里跑 `go test ./...` 是看不到 goa 的单测的。
 
 ## Linux 目标

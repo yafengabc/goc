@@ -45,6 +45,13 @@ fi
 
 mkdir -p bin
 
+echo "== gocl (LLVM back end) =="
+# The second compiler: same front end, LLVM as the code generator. It needs
+# libLLVM at run time, so it cannot be part of the ordinary build the way goc is
+# -- the binary builds fine without the library and reports the missing library
+# when a program is compiled, which is where the failure is actually meaningful.
+(cd src/gocl && go build -trimpath -ldflags="-s -w" -o "../../bin/gocl$EXE" ./cmd/gocl)
+
 echo "== goc (self-contained) =="
 # The same compiler with the C library embedded: no goclib/ needed beside the
 # binary. goc itself reads the library from disk, which is what lets a
@@ -73,5 +80,5 @@ echo "== tools =="
 # and, when named cc, behaves like gcc (compile to an executable, no auto-run).
 cp -f "bin/goc$EXE" "bin/cc$EXE"
 
-echo "done: bin/goc$EXE, bin/goc-standalone$EXE, bin/cc$EXE, bin/goa$EXE,"
+echo "done: bin/goc$EXE, bin/gocl$EXE, bin/goc-standalone$EXE, bin/cc$EXE, bin/goa$EXE,"
 echo "      bin/elfcheck$EXE, bin/msgboxcheck$EXE"

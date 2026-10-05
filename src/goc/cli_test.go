@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"goc/common"
 )
 
 // TestParseArgsGccCompat checks that goc tolerates the gcc/clang flag soup it
@@ -98,11 +100,11 @@ func TestParseArgsOptLevels(t *testing.T) {
 
 // TestInjectDefines confirms -DNAME defaults to 1 and -DNAME=val keeps the val.
 func TestInjectDefines(t *testing.T) {
-	got := injectDefines("int x;\n", nil)
+	got := common.InjectDefines("int x;\n", nil)
 	if got != "int x;\n" {
 		t.Errorf("injectDefines with no defines changed source: %q", got)
 	}
-	got = injectDefines("int x;\n", []string{"FLAG", "N=42"})
+	got = common.InjectDefines("int x;\n", []string{"FLAG", "N=42"})
 	want := "#define FLAG 1\n#define N 42\nint x;\n"
 	if got != want {
 		t.Errorf("injectDefines =\n%q\nwant\n%q", got, want)

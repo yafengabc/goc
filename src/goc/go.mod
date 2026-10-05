@@ -3,9 +3,9 @@ module goc
 go 1.21
 
 require (
+	goa v0.0.0
 	goc/common v0.0.0
 	goc/frontend v0.0.0
-	goa v0.0.0
 )
 
 replace goc/common => ../common

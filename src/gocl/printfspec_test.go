@@ -226,12 +226,12 @@ func TestPrintfSpecShrinksBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	exe := filepath.Join(dir, "spec.exe")
-	cmd := exec.Command(exePath(t), "-fllvm", cPath, "-o", exe)
+	cmd := exec.Command(exePath(t), cPath, "-o", exe)
 	// The compiler writes scratch files through TMP; on Windows the child
 	// inherits nothing useful unless it is set explicitly.
 	cmd.Env = append(os.Environ(), "TMP="+dir, "TEMP="+dir, "TMPDIR="+dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("goc -fllvm failed: %v\n%s", err, out)
+		t.Fatalf("gocl failed: %v\n%s", err, out)
 	}
 	// The format has no conversion, so it specialises to a direct fwrite. If it
 	// did not, printf would drag in the float exponent machine and the binary
@@ -275,10 +275,10 @@ func TestUnwindSectionsStayOutOfImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	exe := filepath.Join(dir, "uw.exe")
-	cmd := exec.Command(exePath(t), "-fllvm", cPath, "-o", exe)
+	cmd := exec.Command(exePath(t), cPath, "-o", exe)
 	cmd.Env = append(os.Environ(), "TMP="+dir, "TEMP="+dir, "TMPDIR="+dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("goc -fllvm failed: %v\n%s", err, out)
+		t.Fatalf("gocl failed: %v\n%s", err, out)
 	}
 	img, err := os.ReadFile(exe)
 	if err != nil {
@@ -372,7 +372,7 @@ func TestPrimitivesShrinkUnderLLVM(t *testing.T) {
 		cmd := exec.Command(exePath(t), args...)
 		cmd.Env = append(os.Environ(), "TMP="+dir, "TEMP="+dir, "TMPDIR="+dir)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("goc %v failed: %v\n%s", extra, err, out)
+			t.Fatalf("gocl %v failed: %v\n%s", extra, err, out)
 		}
 		fi, err := os.Stat(exe)
 		if err != nil {

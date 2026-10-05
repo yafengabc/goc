@@ -14,6 +14,7 @@ require goc v0.0.0
 
 require (
 	goa v0.0.0 // indirect
+	goc/common v0.0.0 // indirect
 	goc/frontend v0.0.0 // indirect
 )
 
@@ -22,6 +23,8 @@ require (
 // error "malformed module path: missing dot in first path element" is what a
 // missing replace looks like, and it is the only symptom.
 replace goc => ./goc
+
+replace goc/common => ./common
 
 replace goc/frontend => ./frontend
 

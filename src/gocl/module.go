@@ -2,6 +2,7 @@ package gocl
 
 import (
 	"goc/frontend"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -79,6 +80,29 @@ func newIRMod() *irMod {
 
 // String returns the assembled module: type definitions, then globals, then
 // prototypes, then the function bodies.
+// Externals lists the globals this module declared but did not define, which
+// is exactly the set the entry stub has to give storage to.
+//
+// A global lands here when its initialiser is a relocation -- the address of
+// another global, or of a function -- because a COFF or ELF object cannot carry
+// a relocation in an initialiser without a fixup, and goa emits none. The
+// alternative would be a linker script; emitting the slot and letting the stub
+// write it at startup keeps the object self-contained.
+//
+// It matters that this set is small and specific. A global the module *does*
+// define must not be given storage by the stub as well: two definitions of one
+// symbol, and the program reads whichever the linker ordered first.
+func (m *irMod) Externals() []string {
+	var out []string
+	for _, g := range m.globals {
+		if g.external {
+			out = append(out, g.name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (m *irMod) String() string {
 	// The layout string is the x86-64 Windows one: i64 pointers, 16-byte
 	// alignment for aggregates, 80-bit x87 extended precision. It has to

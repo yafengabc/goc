@@ -49,8 +49,8 @@ func irFromSource(t *testing.T, src string) (string, map[string]bool) {
 		}
 	}
 	// No runtime is linked here: the fragments guard only the user-code surface
-	// the -fllvm build lowers. translateProgram(nil lib) emits exactly that.
-	ir, claimed, err := translateProgram(prog, nil, false)
+	// this compiler lowers. translateProgram(nil lib) emits exactly that.
+	ir, claimed, _, err := translateProgram(prog, nil, false)
 	if err != nil {
 		t.Fatalf("generate IR: %v", err)
 	}

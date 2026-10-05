@@ -33,17 +33,21 @@ import (
 //
 // What goa's own assembler still contributes is the entry stub, which is not C:
 // it sets up the process stack per the platform ABI before main runs.
-func genLLVMProgram(prog *frontend.Program, linux bool, opt int) (string, map[string]bool, error) {
+func TranslateProgram(prog *frontend.Program, linux bool, opt int) (string, map[string]bool, []string, error) {
 	lib := common.Store(linux)
 	if lib == nil {
-		return "", nil, fmt.Errorf("-fllvm: the built-in C library for this target " +
-			"is unavailable; run without -fllvm to see why")
+		libErr := common.Err
+		if libErr == nil {
+			libErr = fmt.Errorf("no C library was built for this target")
+		}
+		return "", nil, nil, fmt.Errorf("the built-in C library for this target "+
+			"is unavailable: %w", libErr)
 	}
-	ir, claimed, err := translateProgram(prog, lib, linux)
+	ir, claimed, externals, err := translateProgram(prog, lib, linux)
 	if err != nil {
-		return "", nil, fmt.Errorf("-fllvm: generating IR: %w", err)
+		return "", nil, nil, fmt.Errorf("generating IR: %w", err)
 	}
-	return ir, claimed, nil
+	return ir, claimed, externals, nil
 }
 
 // compileIR turns IR text into a COFF object with LLVM, ready to be merged into
@@ -52,17 +56,17 @@ func genLLVMProgram(prog *frontend.Program, linux bool, opt int) (string, map[st
 // The object goes to a temporary file because that is what LLVM's emitter takes;
 // a missing library is reported as such rather than being allowed to look like
 // a successful build.
-func compileIR(ir string, opt int, linux bool) ([]byte, error) {
+func CompileIR(ir string, opt int, linux bool) ([]byte, error) {
 	api, err := goa.OpenLLVM()
 	if err != nil {
-		return nil, fmt.Errorf("-fllvm needs the LLVM shared library: %w", err)
+		return nil, fmt.Errorf("gocl needs the LLVM shared library: %w", err)
 	}
 	if linux {
 		// The object format follows the target LLVM reports, and the linker
 		// half has to agree; an ELF build reaches this only once the ELF object
 		// path exists, so say so plainly instead of producing a PE-shaped
 		// object for a Linux image.
-		return nil, fmt.Errorf("-fllvm is not implemented for the Linux target yet")
+		return nil, fmt.Errorf("the LLVM back end does not emit ELF objects yet, so -target linux is not available")
 	}
 	dir, err := os.MkdirTemp("", "goc-llvm-")
 	if err != nil {
@@ -75,7 +79,7 @@ func compileIR(ir string, opt int, linux bool) ([]byte, error) {
 		level = goa.LLVMOptAggressive
 	}
 	if err := api.CompileToObject([]byte(ir), obj, level, irPasses(opt)); err != nil {
-		return nil, fmt.Errorf("-fllvm: %w", err)
+		return nil, fmt.Errorf("libLLVM: %w", err)
 	}
 	b, err := os.ReadFile(obj)
 	if err != nil {
@@ -85,24 +89,25 @@ func compileIR(ir string, opt int, linux bool) ([]byte, error) {
 }
 
 // emitIRAssembly lowers IR to native assembly text and writes it to outPath.
-// Used by `-fllvm -S`: the readable artifact is the AsmPrinter's output, not
+// Used by -dump-asm with the IR kept: the readable artifact is the
+// AsmPrinter's output, not
 // the entry stub that genWith emits once `claimed` covers every function.
 func emitIRAssembly(ir string, outPath string, opt int, linux bool) error {
 	api, err := goa.OpenLLVM()
 	if err != nil {
-		return fmt.Errorf("-fllvm needs the LLVM shared library: %w", err)
+		return fmt.Errorf("gocl needs the LLVM shared library: %w", err)
 	}
 	if linux {
 		// The assembler follows the host target the library was built for; a
 		// Linux image would need an ELF triple that this build does not set up.
-		return fmt.Errorf("-fllvm -S is not implemented for the Linux target yet")
+		return fmt.Errorf("the LLVM back end does not emit ELF objects yet, so -target linux is not available")
 	}
 	level := goa.LLVMOptDefault
 	if opt >= 3 {
 		level = goa.LLVMOptAggressive
 	}
 	if err := api.CompileToAssembly([]byte(ir), outPath, level, irPasses(opt)); err != nil {
-		return fmt.Errorf("-fllvm: %w", err)
+		return fmt.Errorf("libLLVM: %w", err)
 	}
 	return nil
 }

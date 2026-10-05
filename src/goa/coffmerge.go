@@ -81,6 +81,13 @@ func (a *Assembler) IngestCOFFBytes(src []byte) error {
 	return a.ingestParsedCOFF(o, src)
 }
 
+// refptrLoc is where an object's .refptr slot for an undefined data symbol
+// ended up: which merged section holds it, and at what offset.
+type refptrLoc struct {
+	sect int
+	off  int
+}
+
 // ingestParsedCOFF does the merge for an already-parsed object; src is the raw
 // file, needed because relocations are read from it.
 func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
@@ -153,6 +160,10 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 	}
 
 	// --- sections ---
+	// refptrFor records, for each undefined data symbol, the eight-byte slot
+	// the object put in .rdata to hold its address. See the .refptr note below.
+	refptrFor := map[string]refptrLoc{}
+
 	// sectOf maps a 1-based COFF section number to the goa section that received
 	// its bytes; baseOf records where inside that section they landed.
 	sectOf := make([]int, len(o.secs)+1)
@@ -160,6 +171,22 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 	for i, cs := range o.secs {
 		mapped, known := coffSectionMap[cs.name]
 		name := cs.name
+		if !known {
+			// A `.refptr` fragment belongs to .rdata. Win64 COFF puts a
+			// reference to undefined data in its own eight-byte section named
+			// after the symbol, because an object file has no data relocation
+			// and a RIP-relative displacement needs an address to point at.
+			// Giving the fragment a section of its own would leave the image
+			// without it -- the image builder emits the known sections -- and
+			// every reference through it would read zeroes.
+			if k := strings.LastIndex(cs.name, "$.refptr."); k >= 0 {
+				name = ".rdata"
+			}
+		}
+		if name != cs.name {
+			mapped = coffSectionMap[".rdata"]
+			known = true
+		}
 		if !known {
 			// An unfamiliar section (a COMDAT leftover, a CRT chunk). Give it a
 			// home instead of dropping data; read-only is the safe assumption.
@@ -185,6 +212,18 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 		}
 		if pad := align(gs.cur, want) - gs.cur; pad > 0 {
 			padSection(gs, pad)
+		}
+		// Win64 COFF has no data relocation: a reference to undefined data
+		// cannot be a RIP-relative displacement to the symbol, because there
+		// is no address to point at yet. LLVM's answer is a pointer slot in a
+		// section named `.rdata$.refptr.<name>`, holding the address once the
+		// host supplies the storage. The slot is filled in by the relocation
+		// pass below; what matters here is remembering which section holds it,
+		// so a reference to the undefined symbol can be resolved to the slot.
+		if k := strings.LastIndex(cs.name, "$.refptr."); k >= 0 {
+			refptrFor[cs.name[k+len("$.refptr."):]] = refptrLoc{
+				sect: sectionIndexOf(a, gs), off: gs.cur,
+			}
 		}
 		baseOf[i+1] = gs.cur
 		if mapped.bss {
@@ -224,6 +263,21 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 			}
 			if _, already := a.syms[s.name]; already {
 				continue // provided by the assembly we are merging into
+			}
+			// A data symbol the object declared but did not define, and for
+			// which it emitted a .refptr slot. Every reference the object made
+			// to this name is really a reference to that slot, so resolving the
+			// name to the slot is what makes the addresses come out right: the
+			// slot holds the address, and the host writes the address there.
+			//
+			// Without this the name resolves to nothing, and a RIP-relative
+			// reference to it encodes a displacement from wherever the section
+			// happens to start -- a valid instruction that reads the wrong
+			// bytes, which is why the failure is a crash rather than a link
+			// error.
+			if rp, ok := refptrFor[s.name]; ok {
+				a.syms[s.name] = symLoc{sect: rp.sect, off: rp.off}
+				continue
 			}
 			// __main is the module-initialiser stub a C runtime calls before
 			// main. goc does its own start-up (the entry stub assembles the

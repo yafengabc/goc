@@ -143,7 +143,7 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	src = []byte(injectDefines(string(src), cfg.defines))
+	src = []byte(common.InjectDefines(string(src), cfg.defines))
 
 	toks, err := common.PreprocessTarget(string(src), srcPath, cfg.linux, cfg.incDirs...)
 	if err != nil {
@@ -565,27 +565,6 @@ func parseArgs(args []string) (buildCfg, bool) {
 // injectDefines prepends `-D` macro definitions as real #define lines so the
 // preprocessor sees them before any user code. A bare `-DNAME` expands to 1,
 // matching gcc; `-DNAME=val` keeps the supplied value.
-func injectDefines(src string, defines []string) string {
-	if len(defines) == 0 {
-		return src
-	}
-	var b strings.Builder
-	for _, d := range defines {
-		if eq := strings.IndexByte(d, '='); eq >= 0 {
-			b.WriteString("#define ")
-			b.WriteString(d[:eq])
-			b.WriteByte(' ')
-			b.WriteString(d[eq+1:])
-			b.WriteByte('\n')
-		} else {
-			b.WriteString("#define ")
-			b.WriteString(d)
-			b.WriteString(" 1\n")
-		}
-	}
-	b.WriteString(src)
-	return b.String()
-}
 
 // outputPaths decides where the assembly and the final executable go.
 //

@@ -35,7 +35,7 @@ import (
 // tests, which exercise fragments without the runtime present). Its function table
 // is consulted for prototypes and for the reachability walk that decides which
 // runtime code has to be emitted.
-func translateProgram(prog *frontend.Program, lib *common.Program, linux bool) (string, map[string]bool, error) {
+func translateProgram(prog *frontend.Program, lib *common.Program, linux bool) (string, map[string]bool, []string, error) {
 	m := newIRMod()
 	defined := map[string]bool{}
 	tr := &typeResolver{
@@ -158,10 +158,12 @@ func translateProgram(prog *frontend.Program, lib *common.Program, linux bool) (
 	var wanted []*frontend.FuncDecl
 	for _, f := range prog.Funcs {
 		if !llvmEligible(f) {
-			return "", nil, fmt.Errorf(
-				"-fllvm: %s uses a construct the LLVM front end does not model yet "+
-					"(inline assembly, bit-fields or _BitInt); "+
-					"build without -fllvm for now", f.Name)
+			// Naming the constructs rather than a flag: the caller did not ask
+			// for a back end, gocl is the back end, so the only thing worth
+			// saying is which part of the language is not modelled yet.
+			return "", nil, nil, fmt.Errorf(
+				"%s uses a construct the LLVM front end does not model yet "+
+					"(inline assembly, bit-fields or _BitInt)", f.Name)
 		}
 		wanted = append(wanted, f)
 	}
@@ -195,9 +197,9 @@ func translateProgram(prog *frontend.Program, lib *common.Program, linux bool) (
 				continue // a prototype, not a definition
 			}
 			if !llvmEligible(f) {
-				return "", nil, fmt.Errorf(
-					"-fllvm: the C runtime function %s uses a construct the LLVM front "+
-						"end does not model yet; build without -fllvm for now", name)
+				return "", nil, nil, fmt.Errorf(
+					"the C runtime function %s uses a construct the LLVM front "+
+						"end does not model yet", name)
 			}
 			wanted = append(wanted, f)
 		}
@@ -221,11 +223,11 @@ func translateProgram(prog *frontend.Program, lib *common.Program, linux bool) (
 		// never re-defines it.
 		body, err := genIRFunc(tr, m, f)
 		if err != nil {
-			return "", nil, err
+			return "", nil, nil, err
 		}
 		m.funcBodies = append(m.funcBodies, body)
 	}
-	return m.String(), defined, nil
+	return m.String(), defined, m.Externals(), nil
 }
 
 // irNameTaken reports whether a global spelling is already in use by the
