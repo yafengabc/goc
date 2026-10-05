@@ -33,23 +33,23 @@ src/examples/*
 !src/examples/embed_data.txt
 !src/examples/*/embed_data.txt
 
-# Same rule for goa's own examples. src/goa/run_tests.sh assembles each example
+# Same rule for goa's own examples. goa/run_tests.sh assembles each example
 # where it lives: Windows .exe output is already caught by the *.exe rule above,
 # but the Linux ELF output has no suffix, so name it explicitly.
-src/goa/examples/linux/*
-!src/goa/examples/linux/*.asm
+cmd/goa/examples/linux/*
+!cmd/goa/examples/linux/*.asm
 
 # ...and the AT&T front end's test samples. These are LLVM AsmPrinter output
 # checked in as test *inputs*, not build products -- without them the breadth
-# test in src/goa/att_e2e_test.go skips and the front end loses its most
+# test in goa/att_e2e_test.go skips and the front end loses its most
 # valuable coverage. Only a handful are committed; tools/gen-att-samples.sh
 # regenerates the full corpus on demand, and the gitignore rule is what keeps
 # that regeneration from showing up as 70 untracked files.
-src/goa/testdata/att/*
-!src/goa/testdata/att/longmin.s
-!src/goa/testdata/att/intprint.s
-!src/goa/testdata/att/print_thin.s
-!src/goa/testdata/att/variadic.s
+cmd/goa/testdata/att/*
+!cmd/goa/testdata/att/longmin.s
+!cmd/goa/testdata/att/intprint.s
+!cmd/goa/testdata/att/print_thin.s
+!cmd/goa/testdata/att/variadic.s
 
 # goclib/*.c and goclib/*.def are embedded into goc with go:embed (via the
 # patterns in src/codegen.go), so they are source, not build products -- and
@@ -81,5 +81,5 @@ tests/*/_build/
 # Perf-benchmark dir: keep only the .c sources, ignore built artifacts.
 bench/*
 !bench/*.c
-src/goa/zz_*.tmpl
+cmd/goa/zz_*.tmpl
 src/**/zz_*_test.go.tmpl

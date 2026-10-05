@@ -16,17 +16,48 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// findUp walks up from the package directory looking for a file under bin/,
+// and returns its path. Both helpers below need it and both used to hardcode a
+// ".." count, which the move from src/ to cmd/goc/ silently invalidated -- the
+// failure was a test that reported "no libLLVM configured" rather than a wrong
+// path, so nothing pointed at the real cause.
+//
+// Dir() per level, not filepath.Join(dir, ".."): Join cleans the ".." away and
+// returns the same directory, so the loop would never climb.
+func findUp(t *testing.T, name string) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for dir, i := wd, 0; i < 6; i++ {
+		p := filepath.Join(dir, "bin", name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
 
 // llvmAvailable reports whether a -fllvm build can run here.
 func llvmAvailable(t *testing.T) bool {
 	t.Helper()
 	if os.Getenv("GOC_LLVM_DLL") == "" {
-		if _, err := filepath.Abs(filepath.Join("..", "..", "bin", "libLLVM.dll")); err != nil {
-			return false
+		dll := "libLLVM.dll"
+		if runtime.GOOS != "windows" {
+			dll = "libLLVM.so"
 		}
+		return findUp(t, dll) != ""
 	}
 	return true
 }
@@ -73,12 +104,16 @@ func exePath(t *testing.T) string {
 	if p := os.Getenv("GOC_TEST_EXE"); p != "" {
 		return p
 	}
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
+	exe := "goc.exe"
+	if runtime.GOOS != "windows" {
+		exe = "goc"
 	}
-	// wd is <repo>/src
-	return filepath.Join(wd, "..", "bin", "goc.exe")
+	if p := findUp(t, exe); p != "" {
+		return p
+	}
+	wd, _ := os.Getwd()
+	t.Fatalf("no bin/%s found above %s; run `bash build.sh` first", exe, wd)
+	return ""
 }
 
 func TestLLVMBackendEndToEnd(t *testing.T) {

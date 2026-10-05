@@ -32,7 +32,7 @@ go build -trimpath -ldflags="-s -w" -o goa.exe ./cmd/goa || { echo "BUILD FAILED
 # override; without it this leg is skipped loudly.
 find_ucrun() {
     if [ -n "${UCRUN:-}" ] && [ -f "$UCRUN" ]; then echo "$UCRUN"; return 0; fi
-    for c in ../../bin/ucrun.exe ../bin/ucrun.exe bin/ucrun.exe; do
+    for c in ../../bin/ucrun.exe bin/ucrun.exe; do
         if [ -f "$c" ]; then echo "$c"; return 0; fi
     done
     if command -v ucrun.exe >/dev/null 2>&1; then command -v ucrun.exe; return 0; fi

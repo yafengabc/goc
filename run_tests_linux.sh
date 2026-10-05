@@ -27,7 +27,7 @@ mkdir -p bin
 (cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc .) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
-(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }
+(cd cmd/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }
 
 # Fresh output dir: goc -o bin/goc-out writes every .asm/ELF here, keeping
 # src/examples/ pristine (only the .c files live there).
@@ -97,10 +97,10 @@ echo "-----------------------------"
 echo "pass=$pass fail=$fail"
 
 echo "== goa: linux examples, run on the real kernel =="
-for asm in src/goa/examples/linux/*.asm; do
+for asm in goa/examples/linux/*.asm; do
     name="$(basename "$asm" .asm)"
-    exp="src/goa/expected/linux_$name.txt"
-    bin="src/goa/examples/linux/$name"
+    exp="goa/expected/linux_$name.txt"
+    bin="goa/examples/linux/$name"
 
     if [ ! -f "$exp" ]; then
         echo "SKIP  linux/$name  (no expected/linux_$name.txt)"

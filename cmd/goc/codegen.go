@@ -1,7 +1,6 @@
 package main
 
 import (
-	"embed"
 	"fmt"
 	"math"
 	"regexp"
@@ -328,9 +327,11 @@ var externLinux = map[string]bool{
 // goc compiles at start-up exactly like a user program, once per target.
 // Functions land in the output only when a program actually calls them (plus
 // their transitive callees), so a hello-world does not pay for malloc.
-
-//go:embed goclib/*.c
-var goclibCFS embed.FS
+//
+// It is read from disk rather than embedded, so goc and the library can be
+// separate projects; see libfs.go for the search order and for what that costs
+// (goc.exe is no longer self-contained).
+var goclibCFS = libFS()
 
 func init() {
 	// Compile the built-in C library for both targets. A failure is reported
@@ -343,7 +344,7 @@ func init() {
 }
 
 // ---------------------------------------------------------------------------
-// goclib in C: the embedded library is compiled by goc itself
+// goclib in C: the library is compiled by goc itself
 // ---------------------------------------------------------------------------
 //
 // goclib.c (plus the headers it includes) is a plain C translation unit that
@@ -374,7 +375,7 @@ var (
 )
 
 // Diagnostic runtime (compile-time optional via `goc -rtdiag`). When enabled,
-// a second copy of the embedded C library is compiled with GOC_RTDIAG defined,
+// a second copy of the C library is compiled with GOC_RTDIAG defined,
 // so goclib's malloc/free/calloc/realloc wrappers and the allocation tracker
 // in rt.c activate. The two targets are compiled independently so a failure
 // on one does not block the other.
@@ -479,7 +480,7 @@ func clibCStore(linux bool) *clibCProgram {
 	return clibCWin
 }
 
-// buildClibC compiles the embedded goclib sources into a Program for one
+// buildClibC compiles the on-disk goclib sources into a Program for one
 // target. The umbrella header goes first (its includes pull in the standard
 // headers, so definitions placed there are collected too), then the .c files
 // in name order. The library has no main(), so that one checker diagnostic is

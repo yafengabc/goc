@@ -71,12 +71,12 @@ func main() {
 	os.MkdirAll(filepath.Join(repoRoot, "bin"), 0o755)
 
 	fmt.Println("== building goc ==")
-	if err := buildTool("src", "bin/goc.exe"); err != nil {
+	if err := buildTool("cmd/goc", "bin/goc.exe"); err != nil {
 		fmt.Println("BUILD FAILED:", err)
 		os.Exit(1)
 	}
 	fmt.Println("== building goa ==")
-	if err := buildTool("src/goa", "bin/goa.exe"); err != nil {
+	if err := buildTool("cmd/goa", "bin/goa.exe"); err != nil {
 		fmt.Println("GOA BUILD FAILED:", err)
 		os.Exit(1)
 	}
@@ -117,14 +117,14 @@ func main() {
 		{"linux target -Os", func() (string, int, int, int) {
 			return runLeg("-linux-os", "Os/linux/", true, []string{"-Os"}, ucrunExe)
 		}},
-		{"goa examples (via src/goa/run_tests.sh)", func() (string, int, int, int) {
+		{"goa examples (via cmd/goa/run_tests.sh)", func() (string, int, int, int) {
 			return runGoa(ucrunExe)
 		}},
-		{"unit tests: src", func() (string, int, int, int) {
-			return runUnit("src")
+		{"unit tests: cmd/goc", func() (string, int, int, int) {
+			return runUnit("cmd/goc")
 		}},
-		{"unit tests: src/goa", func() (string, int, int, int) {
-			return runUnit("src/goa")
+		{"unit tests: goa", func() (string, int, int, int) {
+			return runUnit("cmd/goa")
 		}},
 		{"unit tests: tools", func() (string, int, int, int) {
 			return runUnit("tools")
@@ -312,7 +312,7 @@ func runLeg(dirSuffix, label string, targetLinux bool, flags []string, ucrunExe 
 	return sb.String(), pass, fail, 0
 }
 
-// runGoa shells out to src/goa/run_tests.sh (which assembles each goa example,
+// runGoa shells out to goa/run_tests.sh (which assembles each goa example,
 // runs it natively on Windows, and under QEMU on Linux). We reuse it rather
 // than grow a second copy here.
 func runGoa(ucrunExe string) (string, int, int, int) {
@@ -328,7 +328,7 @@ func runGoa(ucrunExe string) (string, int, int, int) {
 	if err != nil {
 		bash = "bash"
 	}
-	out, serr, rc, _ := runCmd(repoRoot, env, bash, filepath.Join(repoRoot, "src", "goa", "run_tests.sh"))
+	out, serr, rc, _ := runCmd(repoRoot, env, bash, filepath.Join(repoRoot, "cmd", "goa", "run_tests.sh"))
 	report := string(out) + string(serr)
 	if rc == 0 {
 		return report + "ok    goa examples suite\n", 1, 0, 0
@@ -540,7 +540,7 @@ func resolveRoot(explicit string) (string, error) {
 	for {
 		nd := nativePath(dir)
 		if dirExists(filepath.Join(nd, "run_tests.sh")) &&
-			dirExists(filepath.Join(nd, "src", "main.go")) {
+			dirExists(filepath.Join(nd, "cmd", "goc", "main.go")) {
 			return nd, nil
 		}
 		parent := filepath.Dir(nd)

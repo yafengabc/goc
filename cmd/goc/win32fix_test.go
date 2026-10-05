@@ -2,18 +2,24 @@ package main
 
 import (
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
 
 // readGoclib reads a goclib header from the source tree for source-level checks.
+// readGoclib reads a file out of the C library, through the same lookup the
+// compiler itself uses. Reading it by the relative path "goclib/<name>" would
+// work only from the directory that happens to contain the library, which is
+// exactly the assumption the move to cmd/goc broke -- and it would keep
+// breaking as the layout changes again. Going through findGoclibRoot also means
+// these tests exercise the real search order, so a library that moved and
+// stopped being found fails here rather than silently skipping the assertions.
 func readGoclib(t *testing.T, name string) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("goclib", name))
+	b, err := goclibHeaders.ReadFile("goclib/" + name)
 	if err != nil {
-		t.Fatalf("read %s: %v", name, err)
+		t.Fatalf("read %s: %v (GOCLIB_PATH=%q)", name, err, os.Getenv(goclibRootEnv))
 	}
 	return string(b)
 }

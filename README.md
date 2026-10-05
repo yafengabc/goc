@@ -32,34 +32,46 @@ syscall（`write` / `read` / `brk` / `exit_group`）。两头都没有 msvcrt / 
 ## 下载与发布
 
 GitHub Release 由 `v*` tag 触发，产出版本化 zip（如
-`goc-v0.0.1-windows-x86_64.zip` 与 `goc-v0.0.1-linux-x86_64.zip`）。zip 里是
-**开箱即用**的工具链目录：解压后 `goc.exe` 会去找自己**旁边**的 `goa.exe`
-（Linux 同理，找旁边的 `goa`），所以 zip 内的文件名不带版本号——版本在
-zip 文件名和 Release 的 tag 上。Windows zip 含 `goc.exe` / `cc.exe` /
-`goa.exe`，Linux zip 含 `goc` / `goa`，均附 `README.md` / `LICENSE`，另有一份
-`SHA256SUMS.txt` 校验所有资产。goc 自带汇编器（goa 已编译进二进制），所以
-zip 里那份独立 `goa` 只是给手写汇编用的，goc 编译 C 不再需要它。
+`goc-v0.0.1-windows-x86_64.zip` 与 `goc-v0.0.1-linux-x86_64.zip`）。
+
+zip 里是**开箱即用**的工具链目录，但**必须整目录一起解压**：`goc.exe` 在运行时
+要从磁盘读 C 标准库源码（`goclib/`），只拷走 exe 会立刻失败并给出
+「cannot find the goclib C library」——它不静默出错，但也编不了任何东西。
+goc 自带汇编器（goa 已编译进二进制），所以 zip 里那份独立 `goa` 只是给手写
+汇编用的，goc 编译 C 不再需要它。
+
+查找顺序见 `cmd/goc/libfs.go`：`GOCLIB_PATH` 环境变量 → exe 旁边的目录 →
+exe 的上级目录 → 当前工作目录及其各级上级。所以 zip 里的目录结构是固定的，
+不要只取单个文件；想让多个编译器共用一份库，设 `GOCLIB_PATH` 指向它即可。
+
+Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
+`goc` / `goa` / `goclib/`，均附 `README.md` / `LICENSE`，另有一份
+`SHA256SUMS.txt` 校验所有资产。
 
 ## 目录结构
 
 ```
 .
-├── src/                                                # 编译器源码（go 模块 goc）
+├── cmd/goc/                                            # 编译器源码（go 模块 goc）
 │   ├── lexer.go  parser.go  ast.go  types.go  headers.go
 │   ├── check.go  codegen.go  cpp.go  main.go
-│   ├── goa/                                            # goa：汇编器（独立 go 模块）
-│   │   ├── asm.go  pe.go  elf.go  main.go              #   Intel 语法子集 -> PE32+ / ELF64
-│   │   ├── examples/  expected/  run_tests.sh          #   goa 的用例与 golden
-│   │   └── README.md                                   #   汇编器自己的文档
-│   ├── goclib/                                         # 自带的 C 库（见下「goclib」一节）
-│   │   ├── os.c                                        #   5 个平台原语，唯一碰 OS 的文件
-│   │   ├── stdio.c  stdlib.c  string.c  ctype.c        #   45 个库函数
-│   │   ├── goclib.h                                    #   伞头
-│   │   ├── stddef.h  stdarg.h  stdio.h  stdlib.h       #   内置标准头（可被 #include）
-│   │   │   string.h  ctype.h
-│   │   ├── windows.h  windef.h  winbase.h  wingdi.h  winuser.h
-│   │   └── README.md                                   #   库的实现机制
-│   └── examples/*.c  expected/*.txt                    # goc 的用例与 golden
+│   ├── libfs.go                                        #   在磁盘上定位 goclib/（见下）
+│   └── llvm*.go                                        #   LLVM 后端（-fllvm）
+├── goclib/                                             # 自带的 C 库（go 模块 goc 与 gocl 共用）
+│   ├── os.c                                            #   5 个平台原语，唯一碰 OS 的文件
+│   ├── stdio.c  stdlib.c  string.c  ctype.c            #   45 个库函数
+│   ├── goclib.h                                        #   伞头
+│   ├── stddef.h  stdarg.h  stdio.h  stdlib.h           #   内置标准头（可被 #include）
+│   │   string.h  ctype.h
+│   ├── windows.h  windef.h  winbase.h  wingdi.h  winuser.h
+│   └── README.md                                       #   库的实现机制
+├── goa/                                                # goa：汇编器（独立 go 模块）
+│   ├── asm.go  pe.go  elf.go  main.go                  #   Intel 语法子集 -> PE32+ / ELF64
+│   ├── examples/  expected/  run_tests.sh              #   用例与 golden
+│   └── README.md                                       #   汇编器自己的文档
+├── src/                                                # 回归套件的数据（gocregress 的输入）
+│   ├── examples/*.c  expected/*.txt                    #   goc 的用例与 golden
+│   └── examples/multi/                                 #   多文件链接用例
 ├── tools/                                              # 验证工具（独立 go 模块）
 │   ├── elfcheck                                        #   ELF 结构校验（不再解释执行）
 │   ├── msgboxcheck                                     #   驱动 GUI 对话框并断言
@@ -69,8 +81,8 @@ zip 里那份独立 `goa` 只是给手写汇编用的，goc 编译 C 不再需�
 └── .github/workflows/ci.yml                            # CI：Linux 原生端到端 + Windows 端到端
 ```
 
-`src/goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
-直接出 exe，不需要 goc。同理 `src/`、`src/goa/`、`tools/` 是**三个** Go 模块，
+`goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
+直接出 exe，不需要 goc。同理 `cmd/goc/`、`goa/`、`tools/` 是**三个** Go 模块，
 在 `src/` 里跑 `go test ./...` 是看不到 goa 的单测的。
 
 ## Linux 目标
@@ -291,7 +303,7 @@ Windows 下变参从 rdx 起、栈上在 `[rbp+48]`；Linux 下从 rsi 起、栈
 bash build.sh                       # 构建 goc / goa / elfcheck / msgboxcheck
 bash run_tests.sh                   # 本机全量（见下）
 bash run_tests_linux.sh             # 在真 Linux 上直接 exec ELF（CI 的 Ubuntu job 跑它）
-cd src/goa && bash run_tests.sh     # 只跑汇编器自己的用例
+cd goa && bash run_tests.sh           # 只跑汇编器自己的用例
 ```
 
 `bash run_tests.sh` 一次做八件事，最后一律汇总 `pass=N fail=M`，非零 fail 退出码非 0：
@@ -307,9 +319,9 @@ cd src/goa && bash run_tests.sh     # 只跑汇编器自己的用例
    `elfcheck --structure-only` 校验结构，再由 `tools/ucrun.py` 在 Unicorn（QEMU TCG）
    里执行，与**同一份** golden 比对。依赖 Win32 DLL 的 3 个例子跳过。没有 unicorn
    时这一对腿整段跳过（见下）
-5. **委托 `src/goa/run_tests.sh`**：11 个 Windows 例子 + 3 个 Linux 例子 + 1 个 GUI
+5. **委托 `goa/run_tests.sh`**：11 个 Windows 例子 + 3 个 Linux 例子 + 1 个 GUI
    （`msgboxcheck` 真的去点对话框的「是」）
-6. **三个 Go module 各自跑单测**：src 87 项、src/goa 33 项
+6. **三个 Go module 各自跑单测**：cmd/goc、goa、tools 各跑 `go test ./...`
 
 本机（Windows 11 + MSYS2 的 Python 带 unicorn 2.1.4）现状 **`pass=253 fail=0`**。
 
@@ -409,7 +421,7 @@ printf 版本要 40477 字节。
 差的大头是 CRT 启动代码和整个 printf 家族。goc 侧**按需发射**：程序实际调用到的
 函数（及其传递闭包）才进产物，只用 `print` 的程序不会背上 printf 的 512 字节输出
 缓冲；`phase1.c` 的 ELF 只有 4030 字节。汇编器自己的产物更小，
-`src/goa/examples/hello.exe` 是 **1536 字节**（做法见 `src/goa/README.md` 的「输出
+`goa/examples/hello.exe` 是 **1536 字节**（做法见 `goa/README.md` 的「输出
 体积」一节）。
 
 ## 许可

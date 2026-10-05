@@ -4,9 +4,15 @@
 #
 #   bash build.sh
 #
-# Layout: compiler source lives in src/ (module goc) with goa/ (module goa)
-# and goclib/ beside it; every binary is emitted into ./bin so goc and goa
-# stay siblings (findGoa looks next to the goc binary first).
+# Layout: compiler source lives in cmd/goc/ (module goc) with goclib/ beside
+# it, and the assembler in goa/ (module goa); every binary is emitted into
+# ./bin so goc and goa stay siblings (findGoa looks next to the goc binary
+# first).
+#
+# cmd/goc/goclib has to travel with the compiler: //go:embed resolves its
+# pattern relative to the package directory, so a goclib left behind in src/
+# would silently drop the whole C library from the binary -- a link error
+# naming printf, not a build error.
 
 set -euo pipefail
 
@@ -39,10 +45,10 @@ fi
 mkdir -p bin
 
 echo "== goc =="
-(cd src && go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "../bin/goc$EXE" .)
+(cd cmd/goc && go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "../../bin/goc$EXE" .)
 
 echo "== goa =="
-(cd src/goa && go build -trimpath -ldflags="-s -w" -o "../../bin/goa$EXE" ./cmd/goa)
+(cd cmd/goa && go build -trimpath -ldflags="-s -w" -o "../../bin/goa$EXE" ./cmd/goa)
 
 echo "== tools =="
 (cd tools && go build -o "../bin/elfcheck$EXE"    ./elfcheck)

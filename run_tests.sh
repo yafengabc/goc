@@ -35,7 +35,7 @@ echo "== building goc =="
 (cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc.exe .) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
-(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa.exe ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }
+(cd cmd/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa.exe ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }
 
 # elfcheck verifies the ELF *structure* (headers, segments, entry). It no longer
 # decides whether the program's output is right -- the Linux binaries below are
@@ -226,13 +226,13 @@ run_unit() {  # <mod> <logfile>
     fi
 }
 
-# run_goa: the goa assembler example suite (src/goa/run_tests.sh) covers the
+# run_goa: the goa assembler example suite (goa/run_tests.sh) covers the
 # Windows examples natively, the GUI one through msgboxcheck, and the Linux
 # ones under QEMU. Run it rather than growing a second copy here -- it already
 # reports exit codes separately from stdout, which catches a crash that
 # happens to print the right prefix.
 run_goa() {
-    if UCRUN="${UCRUN:-}" bash src/goa/run_tests.sh; then
+    if UCRUN="${UCRUN:-}" bash goa/run_tests.sh; then
         echo "ok    goa examples suite"
         echo "LEGSTATS pass=1 fail=0"
     else
@@ -263,7 +263,7 @@ if [ "${GOC_PARALLEL:-0}" = "1" ]; then
     run_linux_leg "-os" "Os/"  -Os >/tmp/leg_linos.log  2>&1 & p5=$!
     run_goa                     >/tmp/leg_goa.log    2>&1 & p6=$!
     run_unit src        /tmp/unit_src.log    >/tmp/leg_unit_src.log  2>&1 & p7=$!
-    run_unit src/goa    /tmp/unit_goa.log    >/tmp/leg_unit_goa.log  2>&1 & p8=$!
+    run_unit goa    /tmp/unit_goa.log    >/tmp/leg_unit_goa.log  2>&1 & p8=$!
     run_unit tools      /tmp/unit_tools.log  >/tmp/leg_unit_tools.log 2>&1 & p9=$!
 
     rc=0
@@ -278,7 +278,7 @@ if [ "${GOC_PARALLEL:-0}" = "1" ]; then
     echo "== linux target -O0 (ELF64 under QEMU/Unicorn) =="; cat /tmp/leg_lin0.log
     echo "== linux target -O1 ==";                        cat /tmp/leg_lino1.log
     echo "== linux target -Os ==";                        cat /tmp/leg_linos.log
-    echo "== goa examples (via src/goa/run_tests.sh) =="; cat /tmp/leg_goa.log
+    echo "== goa examples (via cmd/goa/run_tests.sh) =="; cat /tmp/leg_goa.log
     echo "== unit tests (all three modules) ==";          cat /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log
 
     aggregate /tmp/leg_win0.log /tmp/leg_wino1.log /tmp/leg_winos.log \
@@ -299,11 +299,11 @@ else
     run_win_leg "-os" "Os/" -Os | tee /tmp/leg_winos.log
     echo "== linux target -Os =="
     run_linux_leg "-os" "Os/" -Os | tee /tmp/leg_linos.log
-    echo "== goa examples (via src/goa/run_tests.sh) =="
+    echo "== goa examples (via cmd/goa/run_tests.sh) =="
     run_goa | tee /tmp/leg_goa.log
     echo "== unit tests (all three modules) =="
     run_unit src     /tmp/unit_src.log   | tee /tmp/leg_unit_src.log
-    run_unit src/goa /tmp/unit_goa.log   | tee /tmp/leg_unit_goa.log
+    run_unit goa /tmp/unit_goa.log   | tee /tmp/leg_unit_goa.log
     run_unit tools   /tmp/unit_tools.log | tee /tmp/leg_unit_tools.log
     aggregate /tmp/leg_win0.log /tmp/leg_wino1.log /tmp/leg_winos.log \
               /tmp/leg_lin0.log /tmp/leg_lino1.log /tmp/leg_linos.log \

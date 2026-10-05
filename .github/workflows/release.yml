@@ -32,7 +32,7 @@ jobs:
         run: |
           V="$(git describe --tags --always)"
           (cd src && GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=$V" -o ../bin/goc-linux .)
-          (cd src/goa && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../../bin/goa-linux .)
+          (cd cmd/goa && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../../bin/goa-linux .)
           ls -l bin/
 
       - name: package + checksums
