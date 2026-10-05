@@ -232,6 +232,12 @@ func (a *Assembler) BuildPE(outPath string) error {
 	if text == nil || len(text.Data) == 0 {
 		return fmt.Errorf("no code in .text section")
 	}
+	// LLVM calls the CRT's stack probe for any frame over one page, so the
+	// image has to carry one. Emitted before the fixups run because its own
+	// backward jump is a fixup like any other.
+	if err := a.emitChkstk(); err != nil {
+		return err
+	}
 	rdata := a.sectionByName(".rdata")
 	data := a.sectionByName(".data")
 
@@ -332,8 +338,14 @@ func (a *Assembler) BuildPE(outPath string) error {
 		if !ok {
 			return fmt.Errorf("undefined symbol referenced: %s", f.sym)
 		}
+		var t2 int
+		if f.sym2 != "" {
+			if t2, ok = symRVA[f.sym2]; !ok {
+				return fmt.Errorf("undefined symbol referenced: %s", f.sym2)
+			}
+		}
 		s := a.sections[f.sect]
-		if err := applyFixup(s, f, t, symBase[s.Name]); err != nil {
+		if err := applyFixup(s, f, t, t2, symBase[s.Name]); err != nil {
 			return err
 		}
 	}

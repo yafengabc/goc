@@ -133,6 +133,20 @@ func stripATTComment(ln string) string {
 			inStr = c
 		case '#':
 			return ln[:i]
+		case ';':
+			// Some GAS dialects -- and plenty of hand-written assembly --
+			// use ';' where x86 GAS uses '#'. LLVM emits '#', so this is not
+			// needed for the machine-generated path, but accepting it costs
+			// nothing and turns a silently mis-parsed line (the trailing text
+			// would be read as more operands) into a comment.
+			//
+			// A ';' *inside* a string is data, and one that opens a `.def`
+			// statement is GAS's own terminator, so the character is only
+			// treated as a comment marker at the start of a line or after
+			// whitespace.
+			if i == 0 || ln[i-1] == ' ' || ln[i-1] == '\t' {
+				return ln[:i]
+			}
 		case '/':
 			if i+1 < len(ln) && ln[i+1] == '/' {
 				return ln[:i]
@@ -187,6 +201,19 @@ func (s *attState) line(a *Assembler, ln string, lineNo int) error {
 	head := fields[0]
 	if strings.HasPrefix(head, ".") {
 		return s.directive(a, head, strings.TrimSpace(ln[len(head):]), ln)
+	}
+	// goa's own dialect spells the section and export directives without a
+	// leading dot (`section .text`, `global main`), and an entry stub written
+	// for AssembleATT naturally uses that spelling. Accepting both costs one
+	// lookup and removes a trap: without it `section .rdata,"dr"` falls
+	// through to the instruction path, where the attribute string is mistaken
+	// for operands and a section named `"dr"` appears out of nowhere.
+	//
+	// `extern` is not listed because pass 1 already consumed every line
+	// starting with it, before anything reaches here.
+	switch head {
+	case "section", "global", "globl":
+		return s.directive(a, "."+head, strings.TrimSpace(ln[len(head):]), ln)
 	}
 
 	// A real instruction: translate into goa's syntax and reuse the encoder.
@@ -291,9 +318,19 @@ func (s *attState) directive(a *Assembler, name, rest, ln string) error {
 		}
 		return nil
 	case ".globl", ".global":
-		// `.globl name` exports a symbol. goa treats every defined label as
-		// global already, so there is nothing to record; the DLL binding for
-		// an *undefined* symbol comes from the extern table instead.
+		// `.globl name` exports a symbol, which goa already does for every
+		// label it defines, and the DLL binding for an *undefined* symbol
+		// comes from the extern table rather than from here.
+		//
+		// It also carries goa's own meaning: `global name` is how a source
+		// nominates the program entry point, and an entry stub assembled
+		// through AssembleATT needs that. LLVM never emits `.globl _start`
+		// (it produces relocatable objects), so honouring the directive costs
+		// nothing on the machine-generated path and makes hand-written stubs
+		// behave the way the rest of goa does.
+		if name := strings.TrimSpace(rest); name != "" {
+			a.entry = strings.TrimSuffix(strings.Fields(name)[0], ":")
+		}
 		return nil
 	case ".local", ".protected", ".hidden", ".weak", ".private":
 		return nil
@@ -304,10 +341,22 @@ func (s *attState) directive(a *Assembler, name, rest, ln string) error {
 		// .rdata,"dr"`. Only the name matters here -- goa decides
 		// writability from which section it is, and the flags are advisory
 		// metadata LLVM derives from the same knowledge.
+		//
+		// The cut is on the double quote alone, and the separator in front of
+		// it has to go with it. Trimming a character *set* that happens to
+		// include the CR of a CRLF line ending would tear ".rdata" into
+		// "dr", silently creating a section by that name -- and since a
+		// fresh section is what an unknown name falls back to, the file
+		// would still assemble, just into the wrong layout.
+		//
+		// ".rdata" alone would be no better: the name goes into the section
+		// table verbatim, and an entry called ".rdata," is what actually
+		// ends up there.
 		nm := strings.TrimSpace(rest)
-		if q := strings.IndexAny(nm, "\","); q >= 0 {
-			nm = strings.TrimSpace(nm[:q])
+		if q := strings.IndexByte(nm, '"'); q >= 0 {
+			nm = nm[:q]
 		}
+		nm = strings.TrimSpace(strings.TrimRight(nm, ","))
 		return attNamedSection(a, nm)
 	case ".text":
 		return attSection(a, ".text", true, false)
@@ -410,6 +459,12 @@ func (e *attSEH) observe(goaLn string) {
 // base section -- the suffix exists to let the linker discard or fold the
 // group, which a whole-program assembler has no use for.
 func attNamedSection(a *Assembler, name string) error {
+	// The attribute list is separated by a comma (`.section .rdata,"dr"`), and
+	// a name that still carries one would land in the section table verbatim.
+	// Trimming here as well as at the call site keeps the guarantee local: no
+	// matter which path a section name arrives by, it cannot smuggle a
+	// separator through into the image.
+	name = strings.TrimSpace(strings.TrimRight(strings.TrimSpace(name), ","))
 	if name == "" {
 		return nil
 	}
@@ -498,6 +553,20 @@ func attDataDD(a *Assembler, rest string) error {
 			a.emitInt32(int32(float32bits(f)))
 			continue
 		}
+		// A label difference: `.long .LBB29_14-.LJTI29_0`. This is a switch's
+		// jump table, where each entry records how far its case target sits
+		// from the table's own base. The two labels are typically in different
+		// sections, so the value is not knowable until both are placed -- it
+		// needs a relocation against the pair, which Fixup.sym2 carries.
+		if lhs, rhs, ok := attSplitSymDiff(tok); ok {
+			off := a.curOff()
+			a.emitInt32(0)
+			a.fixups = append(a.fixups, Fixup{
+				sect: a.cur, off: off,
+				sym: a.qualify(lhs), sym2: a.qualify(rhs),
+			})
+			continue
+		}
 		off := a.curOff()
 		a.emitInt32(0)
 		a.fixups = append(a.fixups, Fixup{
@@ -505,6 +574,27 @@ func attDataDD(a *Assembler, rest string) error {
 		})
 	}
 	return nil
+}
+
+// attSplitSymDiff recognises a two-symbol difference and returns the two names.
+//
+// The minus sign is the only thing separating the operands, so the split is
+// unambiguous: neither an x86 nor an LLVM-generated label name may contain
+// one. The case that matters is a switch jump table, where the right-hand side
+// is the table's base label; the linker turns the pair into a real offset once
+// both addresses are known.
+func attSplitSymDiff(tok string) (lhs, rhs string, ok bool) {
+	// Scan from the right so a leading '-' (a negative constant) is not
+	// mistaken for the separator.
+	i := strings.LastIndex(tok, "-")
+	if i <= 0 || i == len(tok)-1 {
+		return "", "", false
+	}
+	lhs, rhs = tok[:i], tok[i+1:]
+	if !isSymName(lhs) || !isSymName(rhs) {
+		return "", "", false
+	}
+	return lhs, rhs, true
 }
 
 func attDataDW(a *Assembler, rest string) error {

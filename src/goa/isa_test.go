@@ -505,7 +505,7 @@ func TestShortJumps(t *testing.T) {
 				t.Fatalf("symbol %q not defined", f.sym)
 			}
 			// Resolve the way both backends do, then compare the final bytes.
-			if err := applyFixup(a.sections[f.sect], f, loc.off, 0); err != nil {
+			if err := applyFixup(a.sections[f.sect], f, loc.off, 0, 0); err != nil {
 				t.Fatalf("applyFixup: %v", err)
 			}
 			checkBytes(t, c.name, textOf(a), c.want)
@@ -524,7 +524,7 @@ func TestShortJumpRange(t *testing.T) {
 	f := a.fixups[0]
 	loc := a.syms[f.sym]
 	s := a.sections[f.sect]
-	if err := applyFixup(s, f, loc.off, 0); err == nil {
+	if err := applyFixup(s, f, loc.off, 0, 0); err == nil {
 		t.Fatalf("expected out-of-range error, got disp byte 0x%02x", s.Data[f.off])
 	}
 }
@@ -541,7 +541,7 @@ func TestRel32Unaffected(t *testing.T) {
 		t.Errorf("plain `jmp label` must stay rel32, got short")
 	}
 	loc := a.syms[f.sym]
-	if err := applyFixup(a.sections[f.sect], f, loc.off, 0); err != nil {
+	if err := applyFixup(a.sections[f.sect], f, loc.off, 0, 0); err != nil {
 		t.Fatalf("applyFixup: %v", err)
 	}
 	// E9 rel32 landing on the ret two bytes later

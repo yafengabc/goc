@@ -131,8 +131,14 @@ func (a *Assembler) BuildELF(outPath string) error {
 		if !ok {
 			return fmt.Errorf("undefined symbol referenced: %s", f.sym)
 		}
+		var t2 int
+		if f.sym2 != "" {
+			if t2, ok = symVA[f.sym2]; !ok {
+				return fmt.Errorf("undefined symbol referenced: %s", f.sym2)
+			}
+		}
 		s := a.sections[f.sect]
-		if err := applyFixup(s, f, t, elfBase+secOff[s]); err != nil {
+		if err := applyFixup(s, f, t, t2, elfBase+secOff[s]); err != nil {
 			return err
 		}
 	}

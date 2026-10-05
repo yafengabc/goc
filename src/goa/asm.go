@@ -103,6 +103,19 @@ type Fixup struct {
 	// while a data pointer (ADDR64) is dereferenced directly and so has to carry
 	// the full address.
 	virtual bool
+	// sym2 names a second symbol whose address is *subtracted* from the
+	// first's. It exists for one shape of code: a switch's jump table, which
+	// LLVM emits as a table of label differences --
+	//
+	//	.long	.LBB29_14-.LJTI29_0
+	//
+	// meaning "the offset of this case's target from the table's own base".
+	// The two labels are usually in different sections (the targets in .text,
+	// the table in .rdata), so the value cannot be reduced at assembly time;
+	// it only becomes a number once both addresses are known. The relocation
+	// is really REL32 against a *pair*, which no single-symbol field can
+	// express, so the subtraction is carried here and applied by the linker.
+	sym2 string
 }
 
 type Assembler struct {
@@ -456,7 +469,11 @@ func (a *Assembler) fixupShort(off int, sym string) {
 // resolved address of f.sym and `base` the address of the section holding the
 // displacement field; the CPU measures both rel32 and rel8 from the byte that
 // follows the displacement (plus any instruction trailer in ripAdj).
-func applyFixup(s *Section, f Fixup, target, base int) error {
+// applyFixup patches one recorded relocation into place. target is the resolved
+// address of f.sym; sym2, when non-empty, is the address subtracted from it for
+// the label-difference form (see Fixup.sym2); base is the address of the section
+// holding the field.
+func applyFixup(s *Section, f Fixup, target, sym2, base int) error {
 	size := 4
 	switch {
 	case f.short:
@@ -481,6 +498,18 @@ func applyFixup(s *Section, f Fixup, target, base int) error {
 		}
 		for i := 0; i < size; i++ {
 			s.Data[f.off+i] = byte(addr >> (8 * i))
+		}
+		return nil
+	}
+	if f.sym2 != "" {
+		// A jump-table entry: the field wants (sym - sym2), not
+		// "sym relative to wherever the field sits". The two live in different
+		// sections, so the usual displacement arithmetic is meaningless here --
+		// the value is an offset into the table, which happens to be what
+		// `base + i*4` lands on because the table's own base is sym2.
+		diff := int32(target - sym2)
+		for i := 0; i < size; i++ {
+			s.Data[f.off+i] = byte(diff >> (8 * i))
 		}
 		return nil
 	}
