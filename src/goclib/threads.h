@@ -6,8 +6,9 @@
  *
  * This header used to declare the opaque types and none of the functions, so
  * every thrd_/mtx_/cnd_ call was a clean "unknown function" error. The real
- * thing is now in goclib/threads.c and works on both platforms, though the
- * two get there by different routes:
+ * thing is now in goclib/threads.c (threads, cnd, tss, call_once) and
+ * goclib/mtx.c (the mutex), and works on both platforms, though the two get
+ * there by different routes:
  *
  *   Windows  CreateThread for thrd_t, CRITICAL_SECTION for mtx_t,
  *            CONDITION_VARIABLE for cnd_t, the Tls* family for tss_t and

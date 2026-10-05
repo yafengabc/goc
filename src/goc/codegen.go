@@ -97,9 +97,21 @@ type CG struct {
 	// for the function currently being generated; c.staticList accumulates every
 	// static local across all functions so emitAssembly can lay them out in
 	// .data. staticSeq gives each a unique label.
-	staticVars map[string]string
-	staticList []staticEmit
-	staticSeq  int
+	//
+	// c.staticScopes gives static locals real block scoping. A flat
+	// name->label map cannot express it: two blocks each declaring
+	// `static const char *srcs[]` would both read whichever was declared last,
+	// because codegen resolves names as it walks the statements. The stack runs
+	// in lockstep with c.scopes, so lookupStatic walks it innermost-first and a
+	// binding disappears from view exactly when its block does.
+	staticVars   map[string]string // label per source name, for emission
+	staticScopes []map[string]string
+	// staticLabelOf maps a static local's declaration line to the label the
+	// frame-layout pre-pass minted for it, so genStmt can bind the name to that
+	// exact object when it reaches the declaration in source order.
+	staticLabelOf map[int]string
+	staticList    []staticEmit
+	staticSeq     int
 	// Thread-local storage: _Thread_local variables live in a dedicated .tls
 	// section (one instance per thread). c.tlsVars maps a source name to its
 	// layout; c.tlsList collects every TLS declaration (global or static local)
@@ -1844,7 +1856,7 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 		// bare frontend.Ident evaluations (i.e. loadVar), and this branch must not leak
 		// an earlier load's flag into the caller.
 		c.resPtr = false
-		if lab, ok2 := c.staticVars[n.Name]; ok2 {
+		if lab, ok2 := c.lookupStatic(n.Name); ok2 {
 			if _, isTLS := c.tlsVars[n.Name]; !isTLS {
 				return c.loadGlobal(lab, c.globalTyp[lab])
 			}
@@ -1856,7 +1868,7 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 			}
 			return c.resTyp, nil
 		}
-		if lab, ok2 := c.staticVars[n.Name]; ok2 {
+		if lab, ok2 := c.lookupStatic(n.Name); ok2 {
 			// Static local: loaded from its .data label, exactly like a
 			// true global.
 			return c.loadGlobal(lab, c.globalTyp[lab])
@@ -2443,6 +2455,208 @@ func (c *CG) truncTo(aw int, signed bool) {
 			c.emit("mov eax, eax")
 		}
 	}
+}
+
+// genAtomicBuiltin lowers one of the <stdatomic.h> builtins (see
+// frontend.LookupAtomicBuiltin). The fetch family and atomic_exchange return
+// the value the object held BEFORE the update -- the one thing a C expression
+// cannot produce, because the read and the write have to be indivisible.
+func (c *CG) genAtomicBuiltin(n *frontend.Call, ab frontend.AtomicBuiltin) (frontend.CType, error) {
+	if ab.CAS {
+		return c.genAtomicCAS(n)
+	}
+	return c.genAtomicFetch(n, ab.Op)
+}
+
+// atomicPointee returns the integer (or _Bool) type the first argument of an
+// atomic builtin points at, or nil when the argument is not such a pointer.
+// The width of the locked access comes from here and never from the operand:
+// atomic_fetch_add on an _Atomic char must not touch the seven bytes after it.
+func (c *CG) atomicPointee(e frontend.Expr) *frontend.Type {
+	pt := c.exprType(e)
+	if pt == nil || !pt.IsPtr() || pt.Elem == nil {
+		return nil
+	}
+	et := pt.Elem
+	if et.Kind != frontend.KInt && et.Kind != frontend.KBool {
+		return nil
+	}
+	return et
+}
+
+// atomicWidth reports the locked-access width for an atomic object type, or 0
+// when the width has no single-instruction atomic form.
+func (c *CG) atomicWidth(et *frontend.Type) int {
+	aw := c.typeWidth(et)
+	if aw == 1 || aw == 2 || aw == 4 || aw == 8 {
+		return aw
+	}
+	return 0
+}
+
+func (c *CG) genAtomicFetch(n *frontend.Call, op string) (frontend.CType, error) {
+	if len(n.Args) != 2 {
+		return frontend.TInt, fmt.Errorf("%s: expected 2 arguments, got %d", n.Name, len(n.Args))
+	}
+	et := c.atomicPointee(n.Args[0])
+	if et == nil {
+		return frontend.TInt, fmt.Errorf("%s: first argument must be a pointer to an _Atomic integer", n.Name)
+	}
+	aw := c.atomicWidth(et)
+	if aw == 0 {
+		return frontend.TInt, fmt.Errorf("%s: no atomic instruction for an object of width %d", n.Name, c.typeWidth(et))
+	}
+	wn := map[int]string{1: "byte", 2: "word", 4: "dword", 8: "qword"}[aw]
+	acc := map[int]string{1: "al", 2: "ax", 4: "eax", 8: "rax"}[aw]
+	des := map[int]string{1: "r11b", 2: "r11w", 4: "r11d", 8: "r11"}[aw]
+	signed := et.Kind == frontend.KInt && et.Signed
+	entry := c.tmpDepth
+	defer func() { c.tmpDepth = entry }()
+
+	// The address is evaluated once, before the operand, so evaluating the
+	// operand cannot disturb it.
+	if _, err := c.genExprT(n.Args[0]); err != nil {
+		return frontend.TInt, err
+	}
+	c.tmpDepth++
+	addrSlot := c.tmpSlot(c.tmpDepth)
+	c.emit("mov [rbp%+d], rax", addrSlot)
+	if _, err := c.genExprT(n.Args[1]); err != nil {
+		return frontend.TInt, err
+	}
+	if err := c.ensureType(frontend.TInt); err != nil {
+		return frontend.TInt, err
+	}
+	c.tmpDepth++
+	valSlot := c.tmpSlot(c.tmpDepth)
+	c.emit("mov [rbp%+d], rax", valSlot)
+
+	switch op {
+	case "+", "-":
+		// LOCK XADD is a fetch-and-add: memory becomes old+operand and the
+		// register comes away with old, which is exactly what fetch_add and
+		// fetch_sub return.
+		c.emit("mov r10, [rbp%+d]", addrSlot)
+		c.emit("mov %s, [rbp%+d]", acc, valSlot)
+		if op == "-" {
+			c.emit("neg %s", acc)
+		}
+		c.emit("lock xadd %s [r10], %s", wn, acc)
+		c.widenFrom(aw, signed)
+	case "":
+		// atomic_exchange: XCHG against a memory operand carries the bus lock
+		// implicitly, and leaves the previous contents in the register. goa
+		// spells it with the register first.
+		c.emit("mov r10, [rbp%+d]", addrSlot)
+		c.emit("mov %s, [rbp%+d]", acc, valSlot)
+		c.emit("xchg %s, %s [r10]", acc, wn)
+		c.widenFrom(aw, signed)
+	default:
+		// &, | and ^ have no single atomic instruction. CMPXCHG stores the
+		// combined value only while memory still holds the value it was
+		// computed from, so a concurrent update is detected (ZF cleared) and
+		// retried instead of being silently lost.
+		c.tmpDepth++
+		oldSlot := c.tmpSlot(c.tmpDepth)
+		newSlot := c.tmpSlot(c.tmpDepth + 1)
+		top := c.newLabel("atomic_fetch")
+		c.line(top + ":\n")
+		c.emit("mov r10, [rbp%+d]", addrSlot)
+		c.emit("mov %s, %s [r10]", acc, wn)
+		c.widenFrom(aw, signed)
+		c.emit("mov [rbp%+d], rax", oldSlot)
+		bin := &frontend.Binary{Op: op,
+			L: &frontend.TmpLoad{Slot: oldSlot, Typ: et},
+			R: &frontend.TmpLoad{Slot: valSlot, Typ: et}}
+		if _, err := c.genBinary(bin); err != nil {
+			return frontend.TInt, err
+		}
+		if err := c.ensureType(frontend.TInt); err != nil {
+			return frontend.TInt, err
+		}
+		c.truncTo(aw, signed)
+		c.emit("mov [rbp%+d], rax", newSlot)
+		c.emit("mov r10, [rbp%+d]", addrSlot)
+		c.emit("mov %s, [rbp%+d]", acc, oldSlot)
+		c.emit("mov %s, [rbp%+d]", des, newSlot)
+		c.emit("lock cmpxchg %s [r10], %s", wn, des)
+		c.emit("jne %s", top)
+		c.emit("mov rax, [rbp%+d]", oldSlot)
+	}
+	c.resTyp = frontend.TInt
+	c.resSigned = signed
+	c.resW = c.semWOf(et)
+	if c.resW == 4 {
+		c.canonInt(signed)
+	}
+	return frontend.TInt, nil
+}
+
+// genAtomicCAS lowers atomic_compare_exchange_strong/weak, which goc spells
+// the same way because it emits no spurious failure: (object, expected,
+// desired) -> true when *object equalled *expected and now holds desired,
+// false otherwise -- in which case *expected receives the value observed.
+func (c *CG) genAtomicCAS(n *frontend.Call) (frontend.CType, error) {
+	if len(n.Args) != 3 {
+		return frontend.TInt, fmt.Errorf("%s: expected 3 arguments, got %d", n.Name, len(n.Args))
+	}
+	et := c.atomicPointee(n.Args[0])
+	if et == nil {
+		return frontend.TInt, fmt.Errorf("%s: first argument must be a pointer to an _Atomic integer", n.Name)
+	}
+	aw := c.atomicWidth(et)
+	if aw == 0 {
+		return frontend.TInt, fmt.Errorf("%s: no atomic instruction for an object of width %d", n.Name, c.typeWidth(et))
+	}
+	wn := map[int]string{1: "byte", 2: "word", 4: "dword", 8: "qword"}[aw]
+	acc := map[int]string{1: "al", 2: "ax", 4: "eax", 8: "rax"}[aw]
+	des := map[int]string{1: "r11b", 2: "r11w", 4: "r11d", 8: "r11"}[aw]
+	entry := c.tmpDepth
+	defer func() { c.tmpDepth = entry }()
+
+	if _, err := c.genExprT(n.Args[0]); err != nil {
+		return frontend.TInt, err
+	}
+	c.tmpDepth++
+	addrSlot := c.tmpSlot(c.tmpDepth)
+	c.emit("mov [rbp%+d], rax", addrSlot)
+	if _, err := c.genExprT(n.Args[1]); err != nil {
+		return frontend.TInt, err
+	}
+	c.tmpDepth++
+	expSlot := c.tmpSlot(c.tmpDepth)
+	c.emit("mov [rbp%+d], rax", expSlot)
+	if _, err := c.genExprT(n.Args[2]); err != nil {
+		return frontend.TInt, err
+	}
+	if err := c.ensureType(frontend.TInt); err != nil {
+		return frontend.TInt, err
+	}
+	c.tmpDepth++
+	valSlot := c.tmpSlot(c.tmpDepth)
+	c.emit("mov [rbp%+d], rax", valSlot)
+
+	// CMPXCHG wants the expected value in the accumulator and the desired
+	// value in a general register; on failure it reloads the accumulator with
+	// the value it observed, which is what *expected has to receive.
+	c.emit("mov r11, [rbp%+d]", expSlot)
+	c.emit("mov %s, %s [r11]", acc, wn)
+	c.emit("mov r10, [rbp%+d]", addrSlot)
+	c.emit("mov %s, [rbp%+d]", des, valSlot)
+	c.emit("lock cmpxchg %s [r10], %s", wn, des)
+	ok := c.newLabel("cas_ok")
+	c.emit("je %s", ok)
+	c.emit("mov r11, [rbp%+d]", expSlot)
+	c.emit("mov %s [r11], %s", wn, acc)
+	c.line(ok + ":\n")
+	// No flag-setting instruction separates the branch from here, so ZF still
+	// reports the outcome of the exchange.
+	c.emit("sete al")
+	c.emit("movzx rax, al")
+	c.resTyp = frontend.TInt
+	c.resSigned = false
+	c.resW = 4
+	return frontend.TInt, nil
 }
 
 // An _Atomic lvalue is the exception: see genAtomicCompound.
@@ -4826,13 +5040,44 @@ func (c *CG) findAddressTaken(f *frontend.FuncDecl) map[string]bool {
 
 // --- block-scoped variable resolution -------------------------------------
 // pushScope opens a fresh (empty) lexical scope for declarations.
-func (c *CG) pushScope() { c.scopes = append(c.scopes, map[string]int{}) }
+func (c *CG) pushScope() {
+	c.scopes = append(c.scopes, map[string]int{})
+	c.staticScopes = append(c.staticScopes, map[string]string{})
+}
+
+// bindStatic records a static local's label in the innermost block. The
+// function's outermost scope is pushed before any statement is generated, but
+// a declaration reached from a path that has not pushed yet still needs a
+// place to live, so an empty stack is tolerated rather than indexed blindly.
+func (c *CG) bindStatic(name, lab string) {
+	if len(c.staticScopes) == 0 {
+		c.staticScopes = append(c.staticScopes, map[string]string{})
+	}
+	c.staticScopes[len(c.staticScopes)-1][name] = lab
+}
 
 // popScope discards the innermost lexical scope.
 func (c *CG) popScope() {
 	if len(c.scopes) > 0 {
 		c.scopes = c.scopes[:len(c.scopes)-1]
 	}
+	if len(c.staticScopes) > 0 {
+		c.staticScopes = c.staticScopes[:len(c.staticScopes)-1]
+	}
+}
+
+// lookupStatic resolves a static local by name through the block scopes,
+// innermost first, mirroring lookupVar. Returns "" when the name is not a
+// visible static local. Falling back to the flat c.staticVars would defeat
+// block scoping: a name bound in a block that has already been left must not
+// resolve, and two blocks may bind the same name to different labels.
+func (c *CG) lookupStatic(name string) (string, bool) {
+	for i := len(c.staticScopes) - 1; i >= 0; i-- {
+		if lab, ok := c.staticScopes[i][name]; ok {
+			return lab, true
+		}
+	}
+	return "", false
 }
 
 // declareVar registers name -> a fresh uid holding info in the current
@@ -4870,8 +5115,10 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 	// pointer before any declareVar consults the flag (loadVar/slot layouts
 	// depend on varInfo.ptr).
 	c.ptrCapable = c.analyzePtrCapable(f)
-	c.pushScope()                      // function / parameter scope (scope 0)
 	c.staticVars = map[string]string{} // fresh per function: static-local names do not leak across functions
+	c.staticLabelOf = map[int]string{} // likewise per function
+	c.staticScopes = nil               // must precede pushScope, which seeds the stack
+	c.pushScope()                      // function / parameter scope (scope 0)
 	c.curRet = f.Ret
 	c.curParam = f.ParamTypes
 	c.sretSlot = 0
@@ -4936,14 +5183,24 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 			} else if n.Storage == "static" {
 				// Static local: lives in .data under a unique label, persists
 				// across calls, and is initialised once at load time. No frame
-				// slot is allocated; loadVar/genLValue resolve it via
-				// c.staticVars.
+				// slot is allocated.
+				//
+				// This pass runs BEFORE any statement is generated, and it walks
+				// the whole function body, so the name cannot be bound here: two
+				// sibling blocks that both declare `static int v` would end up
+				// with a single binding and the earlier block would read the
+				// later one's object. What this pass does is mint a unique LABEL
+				// and queue the emitter entry; the name -> label binding happens
+				// in genStmt's DeclStmt case, where the scope stack is current
+				// and the binding therefore lands in the block that declared it.
 				lab := fmt.Sprintf("G_st%d_%s", c.staticSeq, n.Name)
 				c.staticSeq++
 				c.globals[lab] = true
 				c.globalLab[lab] = lab
 				c.globalTyp[lab] = n.Typ
-				c.staticVars[n.Name] = lab
+				// recorded by DeclStmt's line number so genStmt can recover the
+				// label this pass minted for the very same declaration
+				c.staticLabelOf[n.Line] = lab
 				c.staticList = append(c.staticList, staticEmit{lab: lab, d: n})
 			} else if n.Storage == "extern" {
 				// Extern local: a reference to a file-scope global of the same
@@ -5598,7 +5855,18 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 		// Static locals are initialised once at load time in .data, and extern
 		// locals have no storage of their own; neither needs run-time
 		// initialisation, so skip the frame-storing code below.
-		if n.Storage == "static" || n.Storage == "extern" {
+		if n.Storage == "static" {
+			// Bind the name HERE rather than in the frame-layout pre-pass: this
+			// statement is reached while its own block's scope is current, so
+			// the binding lands in the right place and two blocks declaring the
+			// same name get separate bindings. The label itself was already
+			// minted (and the .data entry queued) by the pre-pass.
+			if lab, ok := c.staticLabelOf[n.Line]; ok {
+				c.bindStatic(n.Name, lab)
+			}
+			return nil
+		}
+		if n.Storage == "extern" {
 			return nil
 		}
 		// Register this declaration into the current (innermost) lexical
@@ -6703,7 +6971,7 @@ func (c *CG) genLValue(e frontend.Expr) error {
 		// File-scope names. A static local shadows a same-named TLS global
 		// within its function, but a static thread-local local still needs the
 		// segment reach (also registered in tlsVars).
-		if lab, ok2 := c.staticVars[n.Name]; ok2 {
+		if lab, ok2 := c.lookupStatic(n.Name); ok2 {
 			if _, isTLS := c.tlsVars[n.Name]; !isTLS {
 				c.emit("lea r10, [rip+%s]", lab)
 				return nil
@@ -6717,7 +6985,7 @@ func (c *CG) genLValue(e frontend.Expr) error {
 			}
 			return nil
 		}
-		if lab, ok2 := c.staticVars[n.Name]; ok2 {
+		if lab, ok2 := c.lookupStatic(n.Name); ok2 {
 			// Address of a static local: rip-relative lea into .data.
 			c.emit("lea r10, [rip+%s]", lab)
 			return nil
@@ -6872,14 +7140,23 @@ func (c *CG) genLValue(e frontend.Expr) error {
 					c.loadVar(vi) // rax = pointer value
 					c.emit("mov r10, rax")
 				}
-			} else if lab, ok3 := c.staticVars[id.Name]; ok3 {
+			} else if lab, ok3 := c.lookupStatic(id.Name); ok3 {
 				if _, isTLS := c.tlsVars[id.Name]; !isTLS {
-					// Static-local array: rip-relative lea of element 0.
-					gt := c.globalTyp[lab]
-					if gt == nil || !gt.IsArray() {
-						return fmt.Errorf("cannot index non-array static local %q", id.Name)
+					/* A static local or a global is reached by its ADDRESS only
+					 * when it is an array (element 0 decays to the object's
+					 * address). For a scalar the index applies to the scalar's
+					 * VALUE, so a pointer has to be loaded first -- `lea` on the
+					 * slot would hand back the 8-byte slot, not the string it
+					 * points at. Automatic variables above do exactly this with
+					 * loadVar; a static must do the same by hand. The declared
+					 * type of a static local is recorded under its label in
+					 * globalTyp (see the static-local branch of genFunc). */
+					st := c.globalTyp[lab]
+					if st != nil && !st.IsArray() && st.Kind == frontend.KPtr {
+						c.emit("mov r10, [rip+%s]", lab)
+					} else {
+						c.emit("lea r10, [rip+%s]", lab)
 					}
-					c.emit("lea r10, [rip+%s]", lab)
 				} else if err := c.genTLSAddr(id.Name); err != nil {
 					return err
 				}
@@ -6889,13 +7166,15 @@ func (c *CG) genLValue(e frontend.Expr) error {
 					return err
 				}
 			} else if c.globals[id.Name] {
-				// Global array: rip-relative lea of element 0.
-				gt := c.globalTyp[id.Name]
-				if gt == nil || !gt.IsArray() {
-					return fmt.Errorf("cannot index non-array global %q", id.Name)
-				}
+				/* Same reasoning for a file-scope object. */
 				c.useLibGlobal(id.Name)
-				c.emit("lea r10, [rip+%s]", c.globalLab[id.Name])
+				glab := c.globalLab[id.Name]
+				gt := c.globalTyp[id.Name]
+				if gt != nil && !gt.IsArray() && gt.Kind == frontend.KPtr {
+					c.emit("mov r10, [rip+%s]", glab)
+				} else {
+					c.emit("lea r10, [rip+%s]", glab)
+				}
 			} else {
 				return fmt.Errorf("undefined variable %q", id.Name)
 			}
@@ -7088,7 +7367,7 @@ func (c *CG) elemClassOf(e frontend.Expr) frontend.CType {
 		if !ok {
 			// A static local shadows a same-named global; its type lives
 			// under its .data label, not the source name.
-			if lab, ok2 := c.staticVars[n.Name]; ok2 {
+			if lab, ok2 := c.lookupStatic(n.Name); ok2 {
 				if gt := c.globalTyp[lab]; gt != nil {
 					if gt.Kind == frontend.KDouble {
 						return frontend.TDouble
@@ -7126,6 +7405,17 @@ func (c *CG) elemClassOf(e frontend.Expr) frontend.CType {
 		}
 		return frontend.TInt
 	case *frontend.Unary:
+		if n.Op == "&" {
+			// Mirror elemWidthOf: *(&d) on a double is a double element and
+			// has to load through xmm0, not through rax.
+			if t := c.exprType(n.E); t != nil {
+				if (t.IsPtr() || t.IsArray()) && t.Elem != nil {
+					return t.Elem.Class()
+				}
+				return t.Class()
+			}
+			return frontend.TInt
+		}
 		if n.Op == "*" {
 			return c.elemClassOf(n.E)
 		}
@@ -7258,7 +7548,7 @@ func (c *CG) exprType(e frontend.Expr) *frontend.Type {
 		}
 		// A static local's type is registered under its .data label, not its
 		// source name (which may even collide with a file-scope global).
-		if lab, ok := c.staticVars[n.Name]; ok {
+		if lab, ok := c.lookupStatic(n.Name); ok {
 			return c.globalTyp[lab]
 		}
 		// A function designator decays to a pointer to that function.
@@ -7435,7 +7725,7 @@ func (c *CG) elemWidthOf(e frontend.Expr) int {
 		if !ok {
 			// A static local shadows a same-named global; its type lives
 			// under its .data label, not the source name.
-			if lab, ok2 := c.staticVars[n.Name]; ok2 {
+			if lab, ok2 := c.lookupStatic(n.Name); ok2 {
 				gt := c.globalTyp[lab]
 				if gt == nil {
 					return 8
@@ -7459,6 +7749,19 @@ func (c *CG) elemWidthOf(e frontend.Expr) int {
 		}
 		return c.typeWidth(vi.typ)
 	case *frontend.Unary:
+		if n.Op == "&" {
+			// *(&x) -- the shape every "atomic_load(&x)"-style macro expands
+			// to -- reads x itself, so the pointee of &x is x's own type.
+			// Falling through to the 8-byte default made *(&s.c) on a char
+			// member read three neighbours as well (67305985 instead of 1).
+			if t := c.exprType(n.E); t != nil {
+				if (t.IsPtr() || t.IsArray()) && t.Elem != nil {
+					return c.typeWidth(t.Elem)
+				}
+				return c.typeWidth(t)
+			}
+			return 8
+		}
 		if n.Op == "*" {
 			// The stride when subscripting *p: the width of what p points at.
 			// If p points at an array (int (*)[N]), then (*p)[i] steps by that
@@ -8280,7 +8583,7 @@ func (c *CG) lvalueWidth(e frontend.Expr) int {
 		}
 		// A static local shadows a same-named global; its type lives under
 		// its .data label, not the source name.
-		if lab, ok2 := c.staticVars[id.Name]; ok2 {
+		if lab, ok2 := c.lookupStatic(id.Name); ok2 {
 			if gt := c.globalTyp[lab]; gt != nil {
 				if gt.IsPtr() {
 					return 8
@@ -8328,7 +8631,7 @@ func (c *CG) lvalueClass(e frontend.Expr) frontend.CType {
 		}
 		// A static local shadows a same-named global; its type lives under
 		// its .data label, not the source name.
-		if lab, ok2 := c.staticVars[id.Name]; ok2 {
+		if lab, ok2 := c.lookupStatic(id.Name); ok2 {
 			if gt := c.globalTyp[lab]; gt != nil {
 				return gt.Class()
 			}
@@ -9307,6 +9610,14 @@ func (c *CG) genCallExpr(n *frontend.Call) (frontend.CType, error) {
 		}
 		c.resTyp = frontend.TInt
 		return frontend.TInt, nil
+	}
+	// The <stdatomic.h> fetch family, atomic_exchange and the
+	// compare-exchange form: each is one locked instruction, so they are
+	// builtins rather than goclib calls (see frontend/atomic.go).
+	if _, user := c.funcs[n.Name]; !user {
+		if ab, ok := frontend.LookupAtomicBuiltin(n.Name); ok {
+			return c.genAtomicBuiltin(n, ab)
+		}
 	}
 	// Constant-format printf specialisation, in two steps. A format string
 	// literal with no '%' and no extra arguments turns the format engine into a

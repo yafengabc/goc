@@ -5,7 +5,9 @@
  *             and a boolean-logic combination. Batch H gave goc stdbool/stdnoreturn/
  *             uchar/threads headers that this mingw gcc lacks, so those are NOT
  *             probed (goc's inventory is now strictly richer; see C23_STATUS).
- *             <stdbit.h> is absent on both and stands in as the "missing" probe.
+ *             <stdmchar.h> (C23 mchar/char8_t) is absent on both and stands in as
+ *             the "missing" probe. <stdbit.h>/<stdckdint.h> used to serve that role
+ *             but goc grew both on 2026-10-05, so probing them would now diverge.
  *             __has_include may only appear inside a preprocessing directive, so
  *             each result is expanded into an integer macro.
  * Status:     PASS (batch H, 2026-10-02: goc vs gcc -std=c2x 6/6 identical)
@@ -31,10 +33,10 @@
 #  define HI_MISSING 0
 #endif
 
-#if __has_include(<stdbit.h>)
-#  define HI_STDBIT 1
+#if __has_include(<stdmchar.h>)
+#  define HI_MCHAR 1
 #else
-#  define HI_STDBIT 0
+#  define HI_MCHAR 0
 #endif
 
 #if __has_include("stdio.h")
@@ -65,8 +67,8 @@ int main(void) {
     if (HI_MISSING == 0) passed++;
 
     ++total;
-    printf("case%d: __has_include(<stdbit.h>) = %d (want 0)\n", total, HI_STDBIT);
-    if (HI_STDBIT == 0) passed++;
+    printf("case%d: __has_include(<stdmchar.h>) = %d (want 0)\n", total, HI_MCHAR);
+    if (HI_MCHAR == 0) passed++;
 
     ++total;
     printf("case%d: __has_include(\"stdio.h\") = %d (want 1)\n", total, HI_QSTDIO);

@@ -27,9 +27,11 @@
  *            and wakes anyone futex-waiting on it, which is what thrd_join
  *            waits for.
  *
- * mtx_* is deliberately NOT defined here. The mutex is owned by a separate
- * implementation; this file only calls mtx_lock/mtx_unlock/mtx_trylock where
- * cnd_wait has to release and reacquire one.
+ * mtx_* lives in mtx.c -- a separate translation unit, because goclib compiles
+ * each .c on its own and the mutex needs the same per-target shape (a Win32
+ * CRITICAL_SECTION vs a futex word) the rest of this file uses. This file only
+ * calls mtx_lock/mtx_unlock/mtx_trylock where cnd_wait has to release and
+ * reacquire one.
  *
  * Known limits, documented rather than silently wrong:
  *
@@ -49,7 +51,7 @@
  *     unsafe. Threads that do not allocate are unaffected, which is why the
  *     example sticks to printf.
  *
- *   - mtx_* is not implemented here (see the note above); cnd_wait calls it.
+ *   - mtx_* lives in mtx.c (see the note above); cnd_wait calls it.
  * ========================================================================== */
 
 /* -----------------------------------------------------------------------------

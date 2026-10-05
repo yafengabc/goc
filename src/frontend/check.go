@@ -1108,6 +1108,13 @@ func (c *checker) checkCall(n *Call, fn *FuncDecl) *Type {
 			return c.rewritePrint(n, fn)
 		}
 	}
+	// The <stdatomic.h> fetch family: see src/frontend/atomic.go. Each of them
+	// is one locked instruction, so it is a builtin rather than a goclib call.
+	if _, user := c.funcs[n.Name]; !user {
+		if ab, ok := LookupAtomicBuiltin(n.Name); ok {
+			return c.checkAtomicBuiltin(n, fn, ab)
+		}
+	}
 	// A local variable holding a function pointer shadows a same-named
 	// function (C block scoping hides file-scope names, function names
 	// included): "fp(x)" through such a variable is an indirect call.

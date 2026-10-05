@@ -142,3 +142,79 @@ func TestUnaryMinusKeepsFloatingType(t *testing.T) {
 		t.Errorf("_Generic(-2.0): chose arm %d, want 1 (double)", got)
 	}
 }
+
+// TestAtomicBuiltins pins the type-checking rules of the <stdatomic.h> builtins
+// declared in src/frontend/atomic.go. The fetch family and atomic_exchange
+// return the object's plain value type -- the atomic flag is stripped, so a
+// fetch on an _Atomic char yields char, not int -- and atomic_compare_exchange_*
+// returns _Bool. A first argument that is not a pointer to an atomic integer is
+// rejected. The names are the raw __goc_atomic_* builtins (no <stdatomic.h>
+// macro expansion), which is exactly what the checker recognises.
+func TestAtomicBuiltins(t *testing.T) {
+	// atomicBuiltinChoice checks a _Generic over one of the builtins and
+	// reports which association index was selected, plus any diagnostics.
+	atomicBuiltinChoice := func(t *testing.T, ctrl, arms string) (int, []error) {
+		t.Helper()
+		src := "int main(void){ _Atomic int a; _Atomic int b; " +
+			"_Atomic signed char c; " +
+			"return _Generic(" + ctrl + ", " + arms + "); }"
+		toks, err := Lex(src)
+		if err != nil {
+			t.Fatalf("lex %q: %v", ctrl, err)
+		}
+		prog, err := Parse(toks)
+		if err != nil {
+			t.Fatalf("parse %q: %v", ctrl, err)
+		}
+		errs := Check(prog)
+		got := -1
+		WalkStmts(prog.Funcs[0].Body, func(s Stmt) {
+			rs, ok := s.(*ReturnStmt)
+			if !ok || rs.E == nil {
+				return
+			}
+			if g, ok := rs.E.(*GenericExpr); ok {
+				got = g.ChosenIdx
+			}
+		})
+		return got, errs
+	}
+
+	// The fetch family returns the object's value type (int for _Atomic int),
+	// never an atomic lvalue.
+	if got, errs := atomicBuiltinChoice(t, "__goc_atomic_fetch_add(&a, 1)", "int: 0, _Bool: 1, default: 2"); got != 0 || len(errs) != 0 {
+		t.Errorf("fetch_add: chose arm %d (errs=%v), want 0 (int)", got, errs)
+	}
+	for _, op := range []string{"__goc_atomic_fetch_sub", "__goc_atomic_fetch_and",
+		"__goc_atomic_fetch_or", "__goc_atomic_fetch_xor"} {
+		if got, errs := atomicBuiltinChoice(t, op+"(&a, 1)", "int: 0, _Bool: 1, default: 2"); got != 0 || len(errs) != 0 {
+			t.Errorf("%s: chose arm %d (errs=%v), want 0 (int)", op, got, errs)
+		}
+	}
+	// atomic_exchange likewise returns the value type.
+	if got, errs := atomicBuiltinChoice(t, "__goc_atomic_exchange(&a, 1)", "int: 0, _Bool: 1, default: 2"); got != 0 || len(errs) != 0 {
+		t.Errorf("exchange: chose arm %d (errs=%v), want 0 (int)", got, errs)
+	}
+	// compare-exchange returns _Bool.
+	if got, errs := atomicBuiltinChoice(t, "__goc_atomic_compare_exchange(&a, &b, 1)", "_Bool: 0, int: 1, default: 2"); got != 0 || len(errs) != 0 {
+		t.Errorf("compare_exchange: chose arm %d (errs=%v), want 0 (_Bool)", got, errs)
+	}
+	// Narrow object: fetch on _Atomic signed char yields char, not int.
+	if got, errs := atomicBuiltinChoice(t, "__goc_atomic_fetch_add(&c, 1)", "signed char: 0, int: 1, default: 2"); got != 0 || len(errs) != 0 {
+		t.Errorf("narrow fetch_add: chose arm %d (errs=%v), want 0 (signed char)", got, errs)
+	}
+
+	// A non-pointer first argument must be rejected with a diagnostic.
+	src := "int main(void){ int x; __goc_atomic_fetch_add(x, 1); return 0; }"
+	toks, err := Lex(src)
+	if err != nil {
+		t.Fatalf("lex error case: %v", err)
+	}
+	prog, err := Parse(toks)
+	if err != nil {
+		t.Fatalf("parse error case: %v", err)
+	}
+	if errs := Check(prog); len(errs) == 0 {
+		t.Errorf("expected a diagnostic for a non-pointer first argument, got none")
+	}
+}

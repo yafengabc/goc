@@ -13,10 +13,14 @@
  * memory_order argument is accepted and ignored (there is no reordering
  * barrier to emit -- this is a single-threaded code model with atomic RMW).
  *
- * Not provided yet: atomic_fetch_add and the rest of the fetch_* family,
- * atomic_exchange and atomic_compare_exchange_*. They each need either a
- * compiler builtin or inline asm, and goclib is deliberately pure C (the
- * LLVM backend cannot translate inline asm). They are the next step.
+ * The fetch_* family, atomic_exchange and the compare-exchange forms are
+ * compiler builtins (see src/frontend/atomic.go): each is a single locked
+ * instruction that also reports the value the object held before the update,
+ * and no C expression can do both halves indivisibly. Every back end lowers
+ * them itself -- the native one to LOCK XADD / XCHG / CMPXCHG, the LLVM one
+ * to atomicrmw / cmpxchg. The width of the locked access comes from the
+ * object, never from the operand, so one macro serves atomic_char as well as
+ * atomic_llong.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -71,5 +75,35 @@ typedef enum memory_order {
 #define atomic_store(p, v)                atomic_store_explicit(p, v, memory_order_seq_cst)
 #define atomic_load_explicit(p, mo)       (*(p))
 #define atomic_load(p)                    atomic_load_explicit(p, memory_order_seq_cst)
+
+/* The fetch family: result is the value the object held BEFORE the update. */
+#define atomic_fetch_add(p, v) __goc_atomic_fetch_add(p, v)
+#define atomic_fetch_sub(p, v) __goc_atomic_fetch_sub(p, v)
+#define atomic_fetch_and(p, v) __goc_atomic_fetch_and(p, v)
+#define atomic_fetch_or(p, v)  __goc_atomic_fetch_or(p, v)
+#define atomic_fetch_xor(p, v) __goc_atomic_fetch_xor(p, v)
+#define atomic_exchange(p, v)  __goc_atomic_exchange(p, v)
+
+#define atomic_fetch_add_explicit(p, v, mo) atomic_fetch_add(p, v)
+#define atomic_fetch_sub_explicit(p, v, mo) atomic_fetch_sub(p, v)
+#define atomic_fetch_and_explicit(p, v, mo) atomic_fetch_and(p, v)
+#define atomic_fetch_or_explicit(p, v, mo)  atomic_fetch_or(p, v)
+#define atomic_fetch_xor_explicit(p, v, mo) atomic_fetch_xor(p, v)
+#define atomic_exchange_explicit(p, v, mo)  atomic_exchange(p, v)
+
+/* atomic_compare_exchange_strong(object, expected, desired): stores desired
+ * into *object when *object equals *expected and reports success; otherwise
+ * it writes the value it observed into *expected. goc emits no spurious
+ * failure, so the _weak form is the same operation. The _explicit forms take
+ * two memory orders (success and failure) and ignore them.
+ */
+#define atomic_compare_exchange_strong(p, e, d) \
+    __goc_atomic_compare_exchange(p, e, d)
+#define atomic_compare_exchange_weak(p, e, d) \
+    __goc_atomic_compare_exchange(p, e, d)
+#define atomic_compare_exchange_strong_explicit(p, e, d, sm, fm) \
+    __goc_atomic_compare_exchange(p, e, d)
+#define atomic_compare_exchange_weak_explicit(p, e, d, sm, fm) \
+    __goc_atomic_compare_exchange(p, e, d)
 
 #endif /* GOC_STDATOMIC_H */
