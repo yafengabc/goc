@@ -1,6 +1,7 @@
-package main
+package compiler
 
 import (
+	"goc/frontend"
 	"strings"
 	"testing"
 )
@@ -9,7 +10,7 @@ import (
 // compound assignment. The parser used to desugar "E1 op= E2" into
 // "E1 = E1 op E2", duplicating the lvalue: in "a[i++] += 10" the index
 // expression ran twice and i was incremented twice (goc exited 212 where gcc
-// exits 1121). The fix keeps the operator on AssignExpr and lets codegen park
+// exits 1121). The fix keeps the operator on frontend.AssignExpr and lets codegen park
 // the lvalue address/value, so i++ must fire exactly once.
 func TestCompoundAssignEvalOnce(t *testing.T) {
 	src := `int main(){
@@ -109,8 +110,8 @@ func TestIfDivideByZeroErrors(t *testing.T) {
 }
 
 // TestVarTypesResetAcrossTUs pins the per-translation-unit reset of the
-// parse-time variable-type table. varTypes was not cleared in Parse (unlike
-// typedefs/structs/enumConsts), so a name declared in one TU stayed
+// parse-time variable-type table. varTypes was not cleared in frontend.Parse (unlike
+// typedefs/structs/frontend.EnumConsts), so a name declared in one TU stayed
 // resolvable in the next: the built-in library TUs run before the user's, and
 // a name collision made _Alignof/typeof silently pick up a stale type.
 func TestVarTypesResetAcrossTUs(t *testing.T) {
@@ -118,14 +119,14 @@ func TestVarTypesResetAcrossTUs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TU1 preprocess: %v", err)
 	}
-	if _, err := Parse(toks1); err != nil {
+	if _, err := frontend.Parse(toks1); err != nil {
 		t.Fatalf("TU1 parse: %v", err)
 	}
 	toks2, err := Preprocess("int main(){ return _Alignof(v); }", "b.c")
 	if err != nil {
 		t.Fatalf("TU2 preprocess: %v", err)
 	}
-	if _, err := Parse(toks2); err == nil {
+	if _, err := frontend.Parse(toks2); err == nil {
 		t.Errorf("v declared only in TU1 must not resolve in TU2; _Alignof(v) should fail to parse")
 	}
 }

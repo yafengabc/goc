@@ -1,6 +1,9 @@
-package main
+package compiler
 
-import "strings"
+import (
+	"goc/frontend"
+	"strings"
+)
 
 // Constant-format printf specialisation, shared by both back ends.
 //
@@ -43,7 +46,7 @@ type printfQueries struct {
 // call-graph prune work. A run-time "try lite, fall back to vfmt" probe would
 // leave vfmt reachable and nothing would be pruned; rejecting the call instead
 // leaves the program correct through the ordinary printf, just larger.
-func specializePrintfCall(n *Call, q printfQueries) *Call {
+func specializePrintfCall(n *frontend.Call, q printfQueries) *frontend.Call {
 	if q.userDefines == nil || q.shadowedByVar == nil {
 		return nil
 	}
@@ -59,7 +62,7 @@ func specializePrintfCall(n *Call, q printfQueries) *Call {
 	if len(n.Args) < fmtIdx+1 {
 		return nil
 	}
-	lit, ok := n.Args[fmtIdx].(*StrLit)
+	lit, ok := n.Args[fmtIdx].(*frontend.StrLit)
 	if !ok {
 		return nil // a run-time format string proves nothing at compile time
 	}
@@ -74,14 +77,14 @@ func specializePrintfCall(n *Call, q printfQueries) *Call {
 		if len(n.Args) != fmtIdx+1 {
 			return nil
 		}
-		stream := Expr(&Call{Name: "__goclib_stdout"})
+		stream := frontend.Expr(&frontend.Call{Name: "__goclib_stdout"})
 		if fmtIdx == 1 {
 			stream = n.Args[0]
 		}
-		return &Call{Name: "fwrite", Args: []Expr{
+		return &frontend.Call{Name: "fwrite", Args: []frontend.Expr{
 			lit,
-			&NumLit{Val: 1, Kind: TInt},
-			&NumLit{Val: int64(len(lit.Bytes)), Kind: TInt},
+			&frontend.NumLit{Val: 1, Kind: frontend.TInt},
+			&frontend.NumLit{Val: int64(len(lit.Bytes)), Kind: frontend.TInt},
 			stream,
 		}}
 	}
@@ -97,7 +100,7 @@ func specializePrintfCall(n *Call, q printfQueries) *Call {
 	if q.userDefines(target) || q.shadowedByVar(target) {
 		return nil
 	}
-	args := make([]Expr, 0, len(n.Args))
+	args := make([]frontend.Expr, 0, len(n.Args))
 	args = append(args, n.Args...)
-	return &Call{Name: target, Args: args}
+	return &frontend.Call{Name: target, Args: args}
 }

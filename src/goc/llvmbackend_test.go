@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // End-to-end tests for the -fllvm back end: a C file goes in, an executable that
 // computes the right answer comes out.

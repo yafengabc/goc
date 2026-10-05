@@ -1,4 +1,4 @@
-package main
+package frontend
 
 // print: a Python-style print builtin, lowered to printf at check time.
 //

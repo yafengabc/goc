@@ -1,4 +1,4 @@
-// Package main -- loop analysis for the optimisation passes.
+// loop analysis for the optimisation passes.
 //
 // goc's instruction stream is a flat []Inst with labels marking branch
 // targets. Before we can do strength reduction or loop-invariant code motion
@@ -11,7 +11,7 @@
 // It is pure analysis: it never rewrites the stream, so it can be unit-tested
 // in isolation and slotted into the -O2 pipeline (A-1 strength reduction,
 // A-2 LICM) without touching codegen first.
-package main
+package compiler
 
 import (
 	"regexp"

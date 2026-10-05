@@ -2,7 +2,7 @@
 // instruction fixtures (the marked-pair rules, flag discipline, slot/register
 // canonicality) plus one end-to-end compile asserting the marker survives
 // inlineCalls.
-package main
+package compiler
 
 import (
 	"strings"

@@ -8,7 +8,7 @@
 // register-cached index variable straight from its callee-save home instead of
 // spilling and reloading it. Both are exercised on fixtures, plus one
 // end-to-end compile for F2.
-package main
+package compiler
 
 import (
 	"strings"

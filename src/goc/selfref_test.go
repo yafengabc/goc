@@ -1,6 +1,9 @@
-package main
+package compiler
 
-import "testing"
+import (
+	"goc/frontend"
+	"testing"
+)
 
 // genAsmErr runs the frontend and reports the first check/gen error, or "" when
 // the program is well formed. Used by the negative cases.
@@ -10,11 +13,11 @@ func genAsmErr(t *testing.T, src string) string {
 	if err != nil {
 		return "preprocess: " + err.Error()
 	}
-	prog, err := Parse(toks)
+	prog, err := frontend.Parse(toks)
 	if err != nil {
 		return "parse: " + err.Error()
 	}
-	if errs := Check(prog); len(errs) > 0 {
+	if errs := frontend.Check(prog); len(errs) > 0 {
 		return errs[0].Error()
 	}
 	if _, err := Gen(prog, false, 0, false); err != nil {
@@ -66,11 +69,11 @@ func TestSelfRefStillCatchesRedefinition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preprocess: %v", err)
 	}
-	prog, err := Parse(toks)
+	prog, err := frontend.Parse(toks)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	errs := Check(prog)
+	errs := frontend.Check(prog)
 	if len(errs) != 1 {
 		t.Fatalf("want exactly 1 redefinition error, got %d: %v", len(errs), errs)
 	}

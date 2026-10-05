@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // Building the IR for a whole program.
 //
@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"goc/frontend"
 	"strconv"
 	"strings"
 )
@@ -33,12 +34,12 @@ import (
 // tests, which exercise fragments without the runtime present). Its function table
 // is consulted for prototypes and for the reachability walk that decides which
 // runtime code has to be emitted.
-func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map[string]bool, error) {
+func translateProgram(prog *frontend.Program, lib *clibCProgram, linux bool) (string, map[string]bool, error) {
 	m := newIRMod()
 	defined := map[string]bool{}
 	tr := &typeResolver{
-		funcDefs:   map[string]*FuncDecl{},
-		globalTyp:  map[string]*Type{},
+		funcDefs:   map[string]*frontend.FuncDecl{},
+		globalTyp:  map[string]*frontend.Type{},
 		staticVars: map[string]string{},
 		lib:        lib,
 	}
@@ -153,7 +154,7 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 	// --- functions ---
 	// The order does not matter: LLVM resolves calls to definitions that appear
 	// later, because every call names its argument types explicitly.
-	var wanted []*FuncDecl
+	var wanted []*frontend.FuncDecl
 	for _, f := range prog.Funcs {
 		if !llvmEligible(f) {
 			return "", nil, fmt.Errorf(
@@ -228,7 +229,7 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 
 // irNameTaken reports whether a global spelling is already in use by the
 // program or by the C runtime, so a rename cannot land on a second collision.
-func irNameTaken(prog *Program, lib *clibCProgram, name string) bool {
+func irNameTaken(prog *frontend.Program, lib *clibCProgram, name string) bool {
 	for _, g := range prog.Globals {
 		if g.Name == name {
 			return true
@@ -254,7 +255,7 @@ func irNameTaken(prog *Program, lib *clibCProgram, name string) bool {
 // Emitting the whole runtime (every one of its ~380 functions) is what made
 // the -fllvm binary 100k+ next to the native build's ~13; pruning to what the
 // program reaches brings it back in line.
-func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) (map[string]bool, map[string]bool) {
+func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeResolver) (map[string]bool, map[string]bool) {
 	need := map[string]bool{}
 	isLib := func(name string) bool {
 		f, ok := lib.funcs[name]
@@ -301,11 +302,11 @@ func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) (
 	// second, plain walk over the same tree would reinstate the name the
 	// rewrite just removed.
 	for _, f := range prog.Funcs {
-		walkStmts(f.Body, func(s Stmt) {
+		frontend.WalkStmts(f.Body, func(s frontend.Stmt) {
 			for _, e := range stmtExprs(s) {
-				walkExpr(e, func(n Expr) {
+				walkExpr(e, func(n frontend.Expr) {
 					switch x := n.(type) {
-					case *Call:
+					case *frontend.Call:
 						if repl := specializePrintfCall(x, q); repl != nil {
 							markReachable(repl.Name)
 							// The rewrite introduces references of its own.
@@ -319,7 +320,7 @@ func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) (
 							return
 						}
 						markReachable(x.Name)
-					case *Ident:
+					case *frontend.Ident:
 						markReachable(x.Name)
 						markGlobal(x.Name)
 					}
@@ -479,17 +480,17 @@ func (m *irMod) emitLibGlobals(lib *clibCProgram, need map[string]bool) {
 // used as a value that names a runtime function (taking its address). Indirect
 // calls contribute their target expression, so "fp = lib_fn; fp();" pulls
 // lib_fn in through the assignment.
-func collectLibRefs(body Stmt, fn func(string)) {
+func collectLibRefs(body frontend.Stmt, fn func(string)) {
 	if body == nil {
 		return
 	}
-	walkStmts(body, func(s Stmt) {
+	frontend.WalkStmts(body, func(s frontend.Stmt) {
 		for _, e := range stmtExprs(s) {
-			walkExpr(e, func(n Expr) {
+			walkExpr(e, func(n frontend.Expr) {
 				switch x := n.(type) {
-				case *Call:
+				case *frontend.Call:
 					fn(x.Name)
-				case *Ident:
+				case *frontend.Ident:
 					fn(x.Name)
 				}
 			})
@@ -506,7 +507,7 @@ func collectLibRefs(body Stmt, fn func(string)) {
 // declares it external. That keeps a construct this front end cannot yet
 // constant-fold compiling, at the cost of a second owner for that one symbol;
 // the alternative, emitting a wrong constant, would be far worse.
-func (m *irMod) constInit(e Expr, t *Type) (string, bool) {
+func (m *irMod) constInit(e frontend.Expr, t *frontend.Type) (string, bool) {
 	return m.constInitAt(e, t, true)
 }
 
@@ -517,26 +518,26 @@ func (m *irMod) constInit(e Expr, t *Type) (string, bool) {
 // it is nested inside a struct or array -- "[2 x i8] c\"ab\"" -- but at the top
 // level the type has already been written, and repeating it yields
 // "@tzname = global [2 x ptr] [2 x ptr][...]", which LLVM rejects outright
-// ("expected type"). Structs and scalars are unaffected: "{ ... }" carries no
+// ("expected type"). frontend.Structs and scalars are unaffected: "{ ... }" carries no
 // prefix in either position.
-func (m *irMod) constInitAt(e Expr, t *Type, top bool) (string, bool) {
+func (m *irMod) constInitAt(e frontend.Expr, t *frontend.Type, top bool) (string, bool) {
 	if e == nil {
 		return "zeroinitializer", true
 	}
-	if bi, ok := e.(*BraceInit); ok {
+	if bi, ok := e.(*frontend.BraceInit); ok {
 		return m.constAggregate(bi, t, top)
 	}
-	if sl, ok := e.(*StrLit); ok {
+	if sl, ok := e.(*frontend.StrLit); ok {
 		return m.constString(sl.Bytes, t)
 	}
-	if n, ok := e.(*NumLit); ok {
+	if n, ok := e.(*frontend.NumLit); ok {
 		return m.constScalar(n, t)
 	}
 	// A cast of a constant folds away rather than becoming a runtime value.
-	if c, ok := e.(*CastExpr); ok && c.Typ != nil {
+	if c, ok := e.(*frontend.CastExpr); ok && c.Typ != nil {
 		return m.constInitAt(c.E, c.Typ, top)
 	}
-	if u, ok := e.(*Unary); ok && (u.Op == "-" || u.Op == "+") {
+	if u, ok := e.(*frontend.Unary); ok && (u.Op == "-" || u.Op == "+") {
 		v, ok2 := m.constInitAt(u.E, t, false)
 		if !ok2 {
 			return "", false
@@ -563,18 +564,18 @@ func negateConst(v string) string {
 	return "-" + v
 }
 
-func (m *irMod) constScalar(n *NumLit, t *Type) (string, bool) {
-	// Kind == TDouble is what marks a literal as floating point at all.
+func (m *irMod) constScalar(n *frontend.NumLit, t *frontend.Type) (string, bool) {
+	// Kind == frontend.TDouble is what marks a literal as floating point at all.
 	// IsFloat only says WHICH width -- "1.5f" is float, "1.5" is double -- so
 	// testing it alone sent a plain double literal down the integer path and
 	// emitted "double 0" for "3.14159".
-	if n.Kind == TDouble {
+	if n.Kind == frontend.TDouble {
 		// LLVM spells FP constants in the 16-digit double form even for
 		// float, and rejects one the type cannot hold exactly: a float
 		// constant is therefore the bit pattern of the double that the float
 		// widens to, not the 8-digit float pattern (which it refuses).
 		bits := f64bits(n.Fval)
-		if n.IsFloat || (t != nil && t.Kind == KFloat) {
+		if n.IsFloat || (t != nil && t.Kind == frontend.KFloat) {
 			bits = f64bits(float64(float32(n.Fval)))
 		}
 		return fmt.Sprintf("0x%016x", bits), true
@@ -587,7 +588,7 @@ func (m *irMod) constScalar(n *NumLit, t *Type) (string, bool) {
 	// A narrow type keeps only the low bits of the value, which is what C says a
 	// conversion to that type does.
 	v := n.Val
-	if t != nil && t.Kind == KInt {
+	if t != nil && t.Kind == frontend.KInt {
 		switch t.Width {
 		case 1:
 			v = int64(int8(v))
@@ -599,29 +600,29 @@ func (m *irMod) constScalar(n *NumLit, t *Type) (string, bool) {
 	}
 	// A zero integer constant in pointer position is a null pointer; "ptr 0"
 	// is not a thing LLVM accepts.
-	if v == 0 && t != nil && (t.Kind == KPtr || t.Kind == KFunc) {
+	if v == 0 && t != nil && (t.Kind == frontend.KPtr || t.Kind == frontend.KFunc) {
 		return "null", true
 	}
 	return strconv.FormatInt(v, 10), true
 }
 
-func (m *irMod) constString(b []byte, t *Type) (string, bool) {
+func (m *irMod) constString(b []byte, t *frontend.Type) (string, bool) {
 	// A char array is initialised by copying the bytes; a char pointer takes the
 	// address of a private copy of them.
-	if t == nil || t.Kind == KArr {
+	if t == nil || t.Kind == frontend.KArr {
 		n := t.Len
 		if n <= 0 {
 			n = len(b) + 1
 		}
 		body := cStringN(b, n)
 		name := m.internConst(body, "["+strconv.Itoa(n)+" x i8]")
-		if t != nil && t.Kind == KArr {
+		if t != nil && t.Kind == frontend.KArr {
 			return body, true
 		}
 		return "getelementptr inbounds ([" + strconv.Itoa(n) +
 			" x i8], ptr @" + name + ", i64 0, i64 0)", true
 	}
-	if t.Kind == KPtr {
+	if t.Kind == frontend.KPtr {
 		name := m.internConst(cStringN(b, len(b)+1), "["+strconv.Itoa(len(b)+1)+" x i8]")
 		return "getelementptr inbounds ([" + strconv.Itoa(len(b)+1) +
 			" x i8], ptr @" + name + ", i64 0, i64 0)", true
@@ -637,14 +638,14 @@ func (m *irMod) constString(b []byte, t *Type) (string, bool) {
 // line already has the aggregate's own type written -- so an element without one
 // is read as the start of a type and the module is rejected with "expected
 // type". See constInitAt for what `top` means.
-func (m *irMod) constAggregate(b *BraceInit, t *Type, top bool) (string, bool) {
+func (m *irMod) constAggregate(b *frontend.BraceInit, t *frontend.Type, top bool) (string, bool) {
 	if t == nil {
 		return "", false
 	}
 	switch t.Kind {
-	case KArr:
+	case frontend.KArr:
 		parts := make([]string, 0, t.Len)
-		byIdx := map[int]Expr{}
+		byIdx := map[int]frontend.Expr{}
 		order := []int{}
 		for _, el := range b.Elems {
 			idx := len(order)
@@ -675,10 +676,10 @@ func (m *irMod) constAggregate(b *BraceInit, t *Type, top bool) (string, bool) {
 			return body, true
 		}
 		return "[" + strconv.Itoa(t.Len) + " x " + m.llirType(t.Elem) + "]" + body, true
-	case KStruct, KUnion:
+	case frontend.KStruct, frontend.KUnion:
 		parts := make([]string, 0, len(t.Members))
 		for i, mem := range t.Members {
-			if t.Kind == KUnion && i > 0 {
+			if t.Kind == frontend.KUnion && i > 0 {
 				break // C initialises only the first member of a union
 			}
 			if i < len(b.Elems) && b.Elems[i].E != nil {
@@ -693,7 +694,7 @@ func (m *irMod) constAggregate(b *BraceInit, t *Type, top bool) (string, bool) {
 		}
 		// The union's extra bytes are a member the C source never names, so
 		// append them here to match the type (see unionLayout).
-		if t.Kind == KUnion {
+		if t.Kind == frontend.KUnion {
 			if _, pad := unionLayout(t); pad > 0 {
 				parts = append(parts, "["+strconv.Itoa(pad)+" x i8] zeroinitializer")
 			}
@@ -718,7 +719,7 @@ func (m *irMod) constAggregate(b *BraceInit, t *Type, top bool) (string, bool) {
 // an aggregate, or the reader takes the value for a type. A value that is
 // already a compound constant, or a string literal (which is typed by its own
 // c"..." form only when its type is stated), is passed through.
-func (m *irMod) typedInAggregate(v string, t *Type) string {
+func (m *irMod) typedInAggregate(v string, t *frontend.Type) string {
 	if v == "" {
 		return v
 	}
@@ -735,39 +736,39 @@ func (m *irMod) typedInAggregate(v string, t *Type) string {
 		return m.llirType(t) + " " + v
 	}
 	switch t.Kind {
-	case KStruct, KUnion:
+	case frontend.KStruct, frontend.KUnion:
 		// A nested aggregate is spelled "<type> { ... }". A bare "{ ... }" is
 		// taken for the enclosing body and the reader reports "expected '}' at
 		// end of struct" -- and flattening it out ("{i32 1, i32 2, i32 3,
 		// i32 4}") is rejected as having the wrong number of elements.
 		return m.llirType(t) + " " + v
-	case KArr:
+	case frontend.KArr:
 		return v // "[N x T] ..." already carries its type
-	case KPtr, KFunc:
+	case frontend.KPtr, frontend.KFunc:
 		// Everything here needs the prefix, including null: "ptr null" and
 		// "ptr getelementptr(...)" are accepted, while a bare null is read as
 		// the start of a type ("expected type").
 		return "ptr " + v
 	}
-	if t.Kind == KInt && (v == "true" || v == "false") {
+	if t.Kind == frontend.KInt && (v == "true" || v == "false") {
 		return "i1 " + v
 	}
 	return m.llirType(t) + " " + v
 }
 
 // zeroOf renders a zero value of a type, for an element the initialiser skips.
-func (m *irMod) zeroOf(t *Type) string {
+func (m *irMod) zeroOf(t *frontend.Type) string {
 	if t == nil {
 		return "0"
 	}
 	switch t.Kind {
-	case KFloat:
+	case frontend.KFloat:
 		return "0.0"
-	case KDouble:
+	case frontend.KDouble:
 		return "0.0"
-	case KArr, KStruct, KUnion:
+	case frontend.KArr, frontend.KStruct, frontend.KUnion:
 		return "zeroinitializer"
-	case KPtr, KFunc:
+	case frontend.KPtr, frontend.KFunc:
 		return "null"
 	}
 	return "0"

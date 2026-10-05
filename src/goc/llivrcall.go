@@ -1,15 +1,18 @@
-package main
+package compiler
 
 // Calls, subscripting, member access and address-of.
 
-import "strings"
+import (
+	"goc/frontend"
+	"strings"
+)
 
 // lvalue renders an expression that must be an address, and returns it. This is
 // the "genLValue" of the assembly path: everything that can appear on the left
 // of an assignment or under & goes through here.
-func (e *irEmitter) lvalue(x Expr) string {
+func (e *irEmitter) lvalue(x frontend.Expr) string {
 	switch n := x.(type) {
-	case *Ident:
+	case *frontend.Ident:
 		ty := e.tr.exprType(n)
 		if uid, ok := e.tr.lookupUID(n.Name); ok {
 			return e.slotFor(uid, e.ty(ty))
@@ -20,16 +23,16 @@ func (e *irEmitter) lvalue(x Expr) string {
 		// A name with no storage is an enum constant; it is not addressable,
 		// but the caller only gets here for something the checker accepted.
 		return "null"
-	case *Unary:
+	case *frontend.Unary:
 		if n.Op == "*" {
 			// Dereferencing: the operand already evaluated to the address.
 			return e.rvalue(n.E)
 		}
-	case *Index:
+	case *frontend.Index:
 		base, idx := e.indexOperands(n)
 		// A[i] is *(a + i); the element address is what is wanted.
 		ety := e.tr.exprType(n)
-		esz := sizeOf(ety)
+		esz := frontend.Sizeof(ety)
 		if esz == 0 {
 			esz = 1
 		}
@@ -45,11 +48,11 @@ func (e *irEmitter) lvalue(x Expr) string {
 		r := e.newTmp()
 		e.line("%s = inttoptr i64 %s to ptr", r, sum)
 		return r
-	case *MemberExpr:
+	case *frontend.MemberExpr:
 		return e.memberAddr(n)
-	case *CastExpr:
+	case *frontend.CastExpr:
 		return e.lvalue(n.E)
-	case *CompoundLit:
+	case *frontend.CompoundLit:
 		return e.compoundLit(n).op
 	}
 	// Anything else is not an lvalue; evaluating it is the best that can be done
@@ -59,33 +62,33 @@ func (e *irEmitter) lvalue(x Expr) string {
 
 // addressOf yields the address of an lvalue as a value, which is what an array
 // decays to.
-func (e *irEmitter) addressOf(x Expr, t *Type) val {
+func (e *irEmitter) addressOf(x frontend.Expr, t *frontend.Type) val {
 	p := e.lvalue(x)
-	return val{op: p, ty: PtrType(t.Elem)}
+	return val{op: p, ty: frontend.PtrType(t.Elem)}
 }
 
-// indexOperands evaluates the base and the subscript of an Index, applying C's
+// indexOperands evaluates the base and the subscript of an frontend.Index, applying C's
 // array-to-pointer decay. It returns the base as an address and the index as an
 // i64.
-func (e *irEmitter) indexOperands(n *Index) (string, string) {
+func (e *irEmitter) indexOperands(n *frontend.Index) (string, string) {
 	bty := e.tr.exprType(n.Base)
 	// A real array decays: the base is its address, not a load of it.
-	if bty != nil && bty.Kind == KArr {
+	if bty != nil && bty.Kind == frontend.KArr {
 		return e.lvalue(n.Base), e.indexValue(n.Idx)
 	}
 	return e.rvalue(n.Base), e.indexValue(n.Idx)
 }
 
-func (e *irEmitter) indexValue(x Expr) string {
+func (e *irEmitter) indexValue(x frontend.Expr) string {
 	v := e.eval(x)
-	return e.convert(v.op, v.ty, &Type{Kind: KInt, Width: 8})
+	return e.convert(v.op, v.ty, &frontend.Type{Kind: frontend.KInt, Width: 8})
 }
 
 // --- calls ------------------------------------------------------------------
 
 // callExpr lowers a direct call. Arguments are converted to the parameter types
 // the front end resolved, because IR will not convert them.
-func (e *irEmitter) callExpr(n *Call) val {
+func (e *irEmitter) callExpr(n *frontend.Call) val {
 	// The same constant-format specialisation the native generator applies in
 	// genCallExpr, from the one shared decision (see printfspec.go). Without
 	// it a hello-world drags in the whole float exponent machine: printf
@@ -104,7 +107,7 @@ func (e *irEmitter) callExpr(n *Call) val {
 	switch n.Name {
 	case "va_start":
 		if len(n.Args) == 0 {
-			return val{op: "0", ty: IntType()}
+			return val{op: "0", ty: frontend.IntType()}
 		}
 		// The operand is always a local `va_list ap;`. What llvm.va_start
 		// stores into it on Windows x64 is a single pointer -- the cursor into
@@ -115,24 +118,24 @@ func (e *irEmitter) callExpr(n *Call) val {
 		ap := e.vaListSlot(n.Args[0])
 		e.c.noteIntrinsic("llvm.va_start", "void", []string{"ptr"})
 		e.line("call void @llvm.va_start(ptr %s)", ap)
-		return val{op: "0", ty: IntType()}
+		return val{op: "0", ty: frontend.IntType()}
 	case "va_end":
 		if len(n.Args) == 0 {
-			return val{op: "0", ty: IntType()}
+			return val{op: "0", ty: frontend.IntType()}
 		}
 		ap := e.vaListSlot(n.Args[0])
 		e.c.noteIntrinsic("llvm.va_end", "void", []string{"ptr"})
 		e.line("call void @llvm.va_end(ptr %s)", ap)
-		return val{op: "0", ty: IntType()}
+		return val{op: "0", ty: frontend.IntType()}
 	}
-	// A call through a function-pointer VARIABLE arrives here as a Call naming
+	// A call through a function-pointer VARIABLE arrives here as a frontend.Call naming
 	// the variable, not the function it points at. Emitting "call i32 @fn" for
 	// a local such as "void (*fn)(void)" produces a reference to a symbol that
 	// does not exist, and the link ends with "undefined symbol: fn". When the
 	// name resolves to a pointer to function rather than to a function, lower
 	// it as the indirect call it is.
 	if _, _, ok := e.tr.fnPtrVar(n.Name); ok {
-		return e.indirectCall(&IndirectCall{Fn: &Ident{Name: n.Name}, Args: n.Args})
+		return e.indirectCall(&frontend.IndirectCall{Fn: &frontend.Ident{Name: n.Name}, Args: n.Args})
 	}
 	// Resolve through the front end so a prototype supplies the parameter
 	// types; without one the arguments keep their own types.
@@ -165,7 +168,7 @@ func (e *irEmitter) callExpr(n *Call) val {
 	call := e.newTmp()
 	if rs == "void" {
 		e.line("call void @%s(%s)", n.Name, argText)
-		return val{op: "", ty: VoidType()}
+		return val{op: "", ty: frontend.VoidType()}
 	}
 	e.line("%s = call %s @%s(%s)", call, rs, n.Name, argText)
 	return val{op: call, ty: rty}
@@ -188,18 +191,18 @@ func (e *irEmitter) printfQueries() printfQueries {
 }
 
 // calleeSig finds a callee's declared signature.
-func (e *irEmitter) calleeSig(name string, nargs int) ([]*Type, *Type) {
+func (e *irEmitter) calleeSig(name string, nargs int) ([]*frontend.Type, *frontend.Type) {
 	if p, ok := e.tr.calleeParams(name); ok {
 		ret := e.tr.calleeRet(name)
 		return p, ret
 	}
 	// No declaration in sight: treat every argument as an int, which is the
 	// common case and keeps the module valid for the linker to check.
-	ps := make([]*Type, nargs)
+	ps := make([]*frontend.Type, nargs)
 	for i := range ps {
-		ps[i] = IntType()
+		ps[i] = frontend.IntType()
 	}
-	return ps, IntType()
+	return ps, frontend.IntType()
 }
 
 // defaultPromote applies the default argument promotions: a char or short
@@ -209,18 +212,18 @@ func (e *irEmitter) defaultPromote(v val) val {
 		return v
 	}
 	switch v.ty.Kind {
-	case KFloat:
-		return val{op: e.convert(v.op, v.ty, DoubleType()), ty: DoubleType()}
-	case KInt:
+	case frontend.KFloat:
+		return val{op: e.convert(v.op, v.ty, frontend.DoubleType()), ty: frontend.DoubleType()}
+	case frontend.KInt:
 		if v.ty.Width < 4 {
-			return val{op: e.convert(v.op, v.ty, IntType()), ty: IntType()}
+			return val{op: e.convert(v.op, v.ty, frontend.IntType()), ty: frontend.IntType()}
 		}
 	}
 	return v
 }
 
 // indirectCall lowers a call through a computed callee.
-func (e *irEmitter) indirectCall(n *IndirectCall) val {
+func (e *irEmitter) indirectCall(n *frontend.IndirectCall) val {
 	if n.UFCS != nil {
 		// A method call resolved by the checker: the receiver is prepended and
 		// the function is called directly.
@@ -239,13 +242,13 @@ func (e *irEmitter) indirectCall(n *IndirectCall) val {
 	}
 	t := e.newTmp()
 	e.line("%s = call i32 %s(%s)", t, fn, argText)
-	return val{op: t, ty: IntType()}
+	return val{op: t, ty: frontend.IntType()}
 }
 
 // --- members ----------------------------------------------------------------
 
 // memberAddr returns the address of a struct member.
-func (e *irEmitter) memberAddr(n *MemberExpr) string {
+func (e *irEmitter) memberAddr(n *frontend.MemberExpr) string {
 	sty := e.tr.exprType(n.Base)
 	// In the arrow form the base is already a pointer to the struct; in the dot
 	// form it is the struct itself, whose address is taken.
@@ -267,7 +270,7 @@ func (e *irEmitter) memberAddr(n *MemberExpr) string {
 	return r
 }
 
-func (e *irEmitter) member(n *MemberExpr) val {
+func (e *irEmitter) member(n *frontend.MemberExpr) val {
 	ty := e.tr.exprType(n)
 	p := e.memberAddr(n)
 	return e.load(p, ty)

@@ -1,7 +1,7 @@
-// Package main: optimisation passes that are kept out of codegen.go
+// Optimisation passes that are kept out of codegen.go
 // (which is already very large). T1.6 / T1.4 live here, each with an
 // independent switch and unit tests.
-package main
+package compiler
 
 import (
 	"strconv"
@@ -753,7 +753,7 @@ func copyElim(insts []Inst) []Inst {
 			out = append(out, in)
 			continue
 		}
-		// Block boundaries.
+		// frontend.Block boundaries.
 		if pl.op == "call" || pl.op == "ret" || pl.op == "leave" ||
 			pl.op == "push" || pl.op == "pop" || pl.op == "loop" ||
 			strings.HasPrefix(pl.op, "j") {
@@ -779,7 +779,7 @@ func copyElim(insts []Inst) []Inst {
 					out = append(out, in)
 					continue
 				}
-				// --- Block-local deletion (B version) ---
+				// --- frontend.Block-local deletion (B version) ---
 				// Scan the whole basic block: every mov consumer of D (X,D /
 				// [s],D) before the first rewrite of D is substituted to read
 				// the root directly and the mov is deleted. Any non-mov read

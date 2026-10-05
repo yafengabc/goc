@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // livenessDSE is the control-flow-aware replacement surface for dead-store
 // elimination. The linear deadStores pass only sees a straight window: any

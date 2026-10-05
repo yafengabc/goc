@@ -71,17 +71,17 @@ func main() {
 	os.MkdirAll(filepath.Join(repoRoot, "bin"), 0o755)
 
 	fmt.Println("== building goc ==")
-	if err := buildTool("src/goc", "bin/goc.exe"); err != nil {
+	if err := buildTool("src/goc", "bin/goc.exe", "./cmd/goc"); err != nil {
 		fmt.Println("BUILD FAILED:", err)
 		os.Exit(1)
 	}
 	fmt.Println("== building goa ==")
-	if err := buildTool("src/goa", "bin/goa.exe"); err != nil {
+	if err := buildTool("src/goa", "bin/goa.exe", "./cmd/goa"); err != nil {
 		fmt.Println("GOA BUILD FAILED:", err)
 		os.Exit(1)
 	}
 	fmt.Println("== building elfcheck ==")
-	if err := buildTool("tools/elfcheck", "bin/elfcheck.exe"); err != nil {
+	if err := buildTool("tools", "bin/elfcheck.exe", "./elfcheck"); err != nil {
 		fmt.Println("ELFCHECK BUILD FAILED:", err)
 		os.Exit(1)
 	}
@@ -357,10 +357,16 @@ func runUnit(mod string) (string, int, int, int) {
 // helpers
 // ---------------------------------------------------------------------------
 
-func buildTool(dir, out string) error {
+// buildTool builds one module's command into out. The package argument is the
+// command's directory relative to the module root, and it is not always ".":
+// src/goc is a library package (package compiler) whose main lives in
+// cmd/goc, so building "." there produces a Go archive -- a file that starts
+// with "!<arch>" -- and every later compile then fails with a shell-level
+// "syntax error near unexpected token" that says nothing about the compiler.
+func buildTool(dir, out, pkg string) error {
 	env := childEnv()
 	_, stderr, rc, err := runCmd(filepath.Join(repoRoot, dir), env, "go",
-		"build", "-trimpath", "-ldflags=-s -w", "-o", filepath.Join(repoRoot, out), ".")
+		"build", "-trimpath", "-ldflags=-s -w", "-o", filepath.Join(repoRoot, out), pkg)
 	if err != nil {
 		return err
 	}

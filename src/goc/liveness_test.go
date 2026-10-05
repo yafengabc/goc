@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // Tests for the CFG-based dead-store elimination. Each case is a tiny
 // hand-written instruction stream in the exact shapes goc emits; the pass

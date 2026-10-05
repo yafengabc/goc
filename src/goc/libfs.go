@@ -1,4 +1,4 @@
-package main
+package compiler
 
 import (
 	"fmt"
@@ -43,15 +43,21 @@ import (
 // goclibRootEnv names the environment variable that overrides the search.
 const goclibRootEnv = "GOCLIB_PATH"
 
-// sourceFS is the subset of embed.FS the library loader uses: ReadFile and
-// ReadDir, with a directory entry carrying just a name and an IsDir flag.
-// Declaring it here rather than against *os.DirFS is what keeps the call sites
-// unchanged -- they were written for embed.FS and they still work.
+// libSource is where the C library comes from. Two implementations satisfy it:
+// sourceFS below, which reads a goclib/ directory from disk, and the embed.FS
+// an entry point injects so its binary needs nothing beside it.
 //
-// Errors are the ones os.ReadFile and os.ReadDir return, so the existing
-// "an unavailable <header> is skipped rather than fatal" logic in the
-// preprocessor keeps working untouched: it tests err == nil, and a missing
-// file on disk is indistinguishable from a missing file in the embed.
+// The interface is deliberately narrow -- read one file, list one directory --
+// and its ReadDir returns names, not fs.DirEntry. That is what lets an
+// embed.FS satisfy it without a wrapper: embed.FS's directory entries and the
+// disk ones are different types, and normalising to a name list is the point
+// at which they become interchangeable.
+//
+// Errors keep the shape the callers already handle: the preprocessor skips an
+// unavailable header rather than failing, and it does that by testing
+// err == nil. A missing file on disk and a missing file in an embed are
+// indistinguishable there, which is the behaviour we want.
+// sourceFS reads the library from a directory on disk.
 type sourceFS struct {
 	// root is the directory that holds goclib/. A path handed to ReadFile is
 	// joined onto it, so callers keep passing "goclib/<name>".
@@ -71,19 +77,11 @@ func (f sourceFS) ReadFile(name string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(f.root, filepath.FromSlash(name)))
 }
 
-// dirEntry mirrors fs.DirEntry for the two fields the loader reads.
-type dirEntry struct {
-	name  string
-	isDir bool
-}
-
-func (e dirEntry) Name() string { return e.name }
-func (e dirEntry) IsDir() bool  { return e.isDir }
-
-// ReadDir lists one directory, sorted by name. embed.FS sorts; matching that
-// keeps the library's compilation order -- and therefore the order its
-// definitions reach the symbol table -- independent of the file system.
-func (f sourceFS) ReadDir(name string) ([]dirEntry, error) {
+// ReadDir lists the .c and .h files in one library directory, sorted. The sort
+// is not cosmetic: it fixes the order the library's sources are compiled in,
+// and therefore the order their definitions reach the symbol table, so the
+// output does not depend on how the file system happens to enumerate.
+func (f sourceFS) ReadDir(name string) ([]string, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -91,11 +89,17 @@ func (f sourceFS) ReadDir(name string) ([]dirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]dirEntry, 0, len(ents))
+	out := make([]string, 0, len(ents))
 	for _, e := range ents {
-		out = append(out, dirEntry{name: e.Name(), isDir: e.IsDir()})
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasSuffix(n, ".c") || strings.HasSuffix(n, ".h") {
+			out = append(out, n)
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -219,11 +223,34 @@ func findGoclibRoot() (string, error) {
 		goclibRootEnv)
 }
 
-// libFS opens the library, or returns a filesystem whose every call fails with
-// the reason. The loader checks the error once, so a missing library is
+// The library's two sources, declared together because they are two
+// implementations of one idea. goclibCFS and goclibHeaders always hold the same
+// value; they are two names so the call sites read as "the .c files" and "the
+// headers", the way the code generator and the preprocessor think about them.
+//
+// libSource is an interface rather than embed.FS so the on-disk implementation
+// satisfies it too. embed.FS could not be used directly: its ReadDir returns
+// []fs.DirEntry, so a wrapper would need the same adaptation anyway.
+// Normalising to a sorted list of names is where the two become
+// interchangeable.
+type libSource interface {
+	// ReadFile reads one library file, named as in embed.FS: a slash-separated
+	// path relative to the library root, so "goclib/stdio.h".
+	ReadFile(name string) ([]byte, error)
+	// ReadDir lists the .c and .h files in one library directory, sorted.
+	ReadDir(name string) ([]string, error)
+}
+
+var (
+	goclibCFS     libSource
+	goclibHeaders libSource
+)
+
+// diskLib opens the on-disk library, or returns a source whose every call fails
+// with the reason. The loader checks the error once, so a missing library is
 // reported once with an actionable message instead of as a read error on an
 // unrelated header deep inside the front end.
-func libFS() sourceFS {
+func diskLib() libSource {
 	root, err := findGoclibRoot()
 	if err != nil {
 		return sourceFS{err: err}

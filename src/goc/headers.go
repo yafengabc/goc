@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // System headers goc ships with the compiler. They live as real header files
 // under goclib/ (stddef.h, stdarg.h, stdio.h, stdlib.h, string.h) and are
@@ -12,5 +12,5 @@ package main
 // the internal umbrella header that includes the standard headers and the
 // __goclib_* platform primitives for goclib/goclib.c.
 //
-// Read from disk, like goclibCFS; see libfs.go.
-var goclibHeaders = libFS()
+// Read from disk by default, or from whatever SetLibrary installed; see
+// libfs.go for the search order.

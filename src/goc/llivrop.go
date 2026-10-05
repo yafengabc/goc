@@ -1,17 +1,20 @@
-package main
+package compiler
 
 // Operators, calls and aggregates, in LLVM IR.
 
-import "strconv"
+import (
+	"goc/frontend"
+	"strconv"
+)
 
 // --- unary ------------------------------------------------------------------
 
-func (e *irEmitter) unary(n *Unary) val {
+func (e *irEmitter) unary(n *frontend.Unary) val {
 	ty := e.tr.exprType(n)
 	switch n.Op {
 	case "&":
 		// The address of an lvalue: genLValue already produces one.
-		return val{op: e.lvalue(n.E), ty: PtrType(ty)}
+		return val{op: e.lvalue(n.E), ty: frontend.PtrType(ty)}
 	case "*":
 		p := e.rvalue(n.E)
 		return e.load(p, ty)
@@ -50,7 +53,7 @@ func (e *irEmitter) unary(n *Unary) val {
 // implies. Both operands are brought to a common type first: the usual
 // arithmetic conversions for arithmetic operators, and pointer scaling for "+"
 // and "-" on a pointer.
-func (e *irEmitter) binary(n *Binary) val {
+func (e *irEmitter) binary(n *frontend.Binary) val {
 	lty := e.tr.exprType(n.L)
 	rty := e.tr.exprType(n.R)
 
@@ -66,15 +69,15 @@ func (e *irEmitter) binary(n *Binary) val {
 
 	// Pointer arithmetic: p + i scales the integer by the pointee's size.
 	if n.Op == "+" || n.Op == "-" {
-		if lty != nil && lty.Kind == KPtr && rty != nil && rty.Kind == KInt {
+		if lty != nil && lty.Kind == frontend.KPtr && rty != nil && rty.Kind == frontend.KInt {
 			return e.ptrAdd(l, r, lty, n.Op == "-")
 		}
-		if rty != nil && rty.Kind == KPtr && lty != nil && lty.Kind == KInt && n.Op == "+" {
+		if rty != nil && rty.Kind == frontend.KPtr && lty != nil && lty.Kind == frontend.KInt && n.Op == "+" {
 			return e.ptrAdd(r, l, rty, false)
 		}
 		// ptr - ptr yields a count of elements, not of bytes.
-		if n.Op == "-" && lty != nil && rty != nil && lty.Kind == KPtr && rty.Kind == KPtr {
-			esz := sizeOf(lty.Elem)
+		if n.Op == "-" && lty != nil && rty != nil && lty.Kind == frontend.KPtr && rty.Kind == frontend.KPtr {
+			esz := frontend.Sizeof(lty.Elem)
 			if esz == 0 {
 				esz = 1
 			}
@@ -88,7 +91,7 @@ func (e *irEmitter) binary(n *Binary) val {
 			// this target. Tagging the result as int (i32) while the value is i64
 			// made a later widening pass emit "sext i32 %v to i64" against an
 			// already-64-bit operand.
-			ptrdiff := &Type{Kind: KInt, Width: 8, Signed: true}
+			ptrdiff := &frontend.Type{Kind: frontend.KInt, Width: 8, Signed: true}
 			if esz == 1 {
 				return val{op: d, ty: ptrdiff}
 			}
@@ -112,7 +115,7 @@ func (e *irEmitter) binary(n *Binary) val {
 		}
 		// LLVM requires the shift amount to share the value's width, so a count
 		// of a different integer width is converted to it before the shift.
-		if r.ty != nil && opTy != nil && r.ty.Kind == KInt && opTy.Kind == KInt && r.ty.Width != opTy.Width {
+		if r.ty != nil && opTy != nil && r.ty.Kind == frontend.KInt && opTy.Kind == frontend.KInt && r.ty.Width != opTy.Width {
 			ri = e.convert(ri, r.ty, opTy)
 		}
 		t := e.newTmp()
@@ -171,7 +174,7 @@ func (e *irEmitter) binary(n *Binary) val {
 			}
 			e.line("%s = icmp %s %s %s, %s", t, cmp, e.ty(ct), li, ri)
 		}
-		// A comparison is i1 in IR. Tagging it KBool -- which goc's front end
+		// A comparison is i1 in IR. Tagging it frontend.KBool -- which goc's front end
 		// already treats as a one-byte boolean -- is what stops a later
 		// controlling expression from trying to compare it against zero.
 		return val{op: t, ty: boolIr()}
@@ -185,8 +188,8 @@ func (e *irEmitter) binary(n *Binary) val {
 // and must pass through untouched. Emitting ptrtoint against an integer, as the
 // old nil-treating branch did for constants, is rejected by LLVM ("ptrtoint ptr
 // 63" -- 63 is not a pointer).
-func (e *irEmitter) toInt(v val, t *Type) string {
-	if v.ty != nil && v.ty.Kind == KPtr {
+func (e *irEmitter) toInt(v val, t *frontend.Type) string {
+	if v.ty != nil && v.ty.Kind == frontend.KPtr {
 		c := e.newTmp()
 		e.line("%s = ptrtoint ptr %s to i64", c, v.op)
 		return c
@@ -194,8 +197,8 @@ func (e *irEmitter) toInt(v val, t *Type) string {
 	return v.op
 }
 
-func (e *irEmitter) ptrAdd(p val, i val, pt *Type, sub bool) val {
-	esz := sizeOf(pt.Elem)
+func (e *irEmitter) ptrAdd(p val, i val, pt *frontend.Type, sub bool) val {
+	esz := frontend.Sizeof(pt.Elem)
 	if esz == 0 {
 		esz = 1
 	}
@@ -232,11 +235,11 @@ func (e *irEmitter) ptrAdd(p val, i val, pt *Type, sub bool) val {
 func (e *irEmitter) toI64(v val) string {
 	if v.ty != nil {
 		switch v.ty.Kind {
-		case KPtr:
+		case frontend.KPtr:
 			c := e.newTmp()
 			e.line("%s = ptrtoint ptr %s to i64", c, v.op)
 			return c
-		case KInt:
+		case frontend.KInt:
 			if v.ty.Width*8 == 64 {
 				return v.op
 			}
@@ -254,7 +257,7 @@ func (e *irEmitter) toI64(v val) string {
 
 // usualArith applies C's usual arithmetic conversions and returns the common
 // type together with the two operands converted to it.
-func (e *irEmitter) usualArith(l, r val, lty, rty *Type) (*Type, string, string) {
+func (e *irEmitter) usualArith(l, r val, lty, rty *frontend.Type) (*frontend.Type, string, string) {
 	ct := arithCommon(lty, rty)
 	if ct == nil {
 		return lty, l.op, r.op
@@ -265,24 +268,24 @@ func (e *irEmitter) usualArith(l, r val, lty, rty *Type) (*Type, string, string)
 // arithCommon is C's usual arithmetic conversion: the higher rank wins, a
 // float beats an integer of any width, and two same-width integers take the
 // unsigned one.
-func arithCommon(a, b *Type) *Type {
+func arithCommon(a, b *frontend.Type) *frontend.Type {
 	if a == nil {
 		return b
 	}
 	if b == nil {
 		return a
 	}
-	if a.Kind == KDouble || b.Kind == KDouble {
-		return DoubleType()
+	if a.Kind == frontend.KDouble || b.Kind == frontend.KDouble {
+		return frontend.DoubleType()
 	}
-	if a.Kind == KFloat || b.Kind == KFloat {
-		return FloatType()
+	if a.Kind == frontend.KFloat || b.Kind == frontend.KFloat {
+		return frontend.FloatType()
 	}
 	// A pointer operand makes the whole expression a pointer.
-	if a.Kind == KPtr {
+	if a.Kind == frontend.KPtr {
 		return a
 	}
-	if b.Kind == KPtr {
+	if b.Kind == frontend.KPtr {
 		return b
 	}
 	if a.Width > b.Width {
@@ -302,7 +305,7 @@ func arithCommon(a, b *Type) *Type {
 
 // logical lowers && and ||, which short-circuit and therefore cannot be built
 // from the eager binary path.
-func (e *irEmitter) logical(n *Binary, lty, rty *Type) val {
+func (e *irEmitter) logical(n *frontend.Binary, lty, rty *frontend.Type) val {
 	rhs := e.newLabel()
 	done := e.newLabel()
 	// Evaluating the left operand may itself be a short-circuit expression,
@@ -345,13 +348,13 @@ func (e *irEmitter) logical(n *Binary, lty, rty *Type) val {
 
 // --- assignment -------------------------------------------------------------
 
-func (e *irEmitter) assignStmt(n *AssignStmt) {
+func (e *irEmitter) assignStmt(n *frontend.AssignStmt) {
 	p := e.lvalue(n.Lhs)
 	v := e.eval(n.Rhs)
 	e.store(p, e.coerce(v, e.tr.exprType(n.Lhs)))
 }
 
-func (e *irEmitter) assignExpr(n *AssignExpr) val {
+func (e *irEmitter) assignExpr(n *frontend.AssignExpr) val {
 	t := e.tr.exprType(n.Lhs)
 	if n.Op == "" {
 		p := e.lvalue(n.Lhs)
@@ -369,13 +372,13 @@ func (e *irEmitter) assignExpr(n *AssignExpr) val {
 	var res val
 	switch n.Op {
 	case "+":
-		if cur.ty != nil && cur.ty.Kind == KPtr {
+		if cur.ty != nil && cur.ty.Kind == frontend.KPtr {
 			res = e.ptrAdd(cur, rhs, cur.ty, false)
 		} else {
 			res = e.arith(cur, rhs, "add", cur.ty)
 		}
 	case "-":
-		if cur.ty != nil && cur.ty.Kind == KPtr {
+		if cur.ty != nil && cur.ty.Kind == frontend.KPtr {
 			res = e.ptrAdd(cur, rhs, cur.ty, true)
 		} else {
 			res = e.arith(cur, rhs, "sub", cur.ty)
@@ -418,7 +421,7 @@ func (e *irEmitter) assignExpr(n *AssignExpr) val {
 // has to be converted explicitly. An integer constant is rewritten as the
 // equivalent float constant, which keeps the common "x + 1" on a float down to
 // a single instruction; an integer value gets a sitofp/uitofp.
-func (e *irEmitter) foperand(v val, t *Type) val {
+func (e *irEmitter) foperand(v val, t *frontend.Type) val {
 	if v.ty == nil || isFloatTy(v.ty) {
 		return v
 	}
@@ -464,7 +467,7 @@ func llirBin(op string) string {
 	return op
 }
 
-func (e *irEmitter) arith(a, b val, op string, t *Type) val {
+func (e *irEmitter) arith(a, b val, op string, t *frontend.Type) val {
 	r := e.newTmp()
 	if isFloatTy(t) {
 		a, b = e.foperand(a, t), e.foperand(b, t)
@@ -499,20 +502,20 @@ func (e *irEmitter) arith(a, b val, op string, t *Type) val {
 
 // --- inc/dec ----------------------------------------------------------------
 
-func (e *irEmitter) incDec(n *IncDecExpr) val {
+func (e *irEmitter) incDec(n *frontend.IncDecExpr) val {
 	t := e.tr.exprType(n.E)
 	p := e.lvalue(n.E)
 	old := e.load(p, t)
-	one := val{op: "1", ty: IntType()}
+	one := val{op: "1", ty: frontend.IntType()}
 	step := "add"
 	if n.Op == "--" {
 		step = "sub"
 	}
 	var next val
-	if t != nil && t.Kind == KPtr {
+	if t != nil && t.Kind == frontend.KPtr {
 		next = e.ptrAdd(old, one, t, n.Op == "--")
 	} else {
-		ct := arithCommon(t, IntType())
+		ct := arithCommon(t, frontend.IntType())
 		ctv := e.coerce(old, ct)
 		next = e.coerce(e.arith(ctv, one, step, ct), t)
 	}
@@ -525,7 +528,7 @@ func (e *irEmitter) incDec(n *IncDecExpr) val {
 
 // --- casts and conditionals -------------------------------------------------
 
-func (e *irEmitter) cast(n *CastExpr) val {
+func (e *irEmitter) cast(n *frontend.CastExpr) val {
 	v := e.eval(n.E)
 	if n.Typ == nil {
 		return v
@@ -535,13 +538,13 @@ func (e *irEmitter) cast(n *CastExpr) val {
 	// would ask for a "load void" off the operand's address, which LLVM rejects
 	// ("void type only allowed for function results"). The operand is still
 	// evaluated, for its side effects.
-	if n.Typ.Kind == KVoid {
-		return val{op: "0", ty: IntType()}
+	if n.Typ.Kind == frontend.KVoid {
+		return val{op: "0", ty: frontend.IntType()}
 	}
 	return val{op: e.convert(v.op, v.ty, n.Typ), ty: n.Typ}
 }
 
-func (e *irEmitter) condExpr(n *CondExpr) val {
+func (e *irEmitter) condExpr(n *frontend.CondExpr) val {
 	c := e.cond(n.Cond)
 	thenL := e.newLabel()
 	elseL := e.newLabel()
@@ -558,8 +561,8 @@ func (e *irEmitter) condExpr(n *CondExpr) val {
 	// An array arm is already a pointer to its first element, so the phi names
 	// a pointer type. Naming the array type instead asked for a
 	// "phi [1 x i8]" over pointer operands, which has no valid form.
-	if ct != nil && ct.Kind == KArr {
-		ct = PtrType(ct.Elem)
+	if ct != nil && ct.Kind == frontend.KArr {
+		ct = frontend.PtrType(ct.Elem)
 	}
 	e.term("br i1 %s, label %%%s, label %%%s", c, thenL, elseL)
 
@@ -597,7 +600,7 @@ func (e *irEmitter) currentBlock(fallback string) string {
 }
 
 // compoundLit materialises a C99 compound literal and yields its address.
-func (e *irEmitter) compoundLit(n *CompoundLit) val {
+func (e *irEmitter) compoundLit(n *frontend.CompoundLit) val {
 	ty := n.Typ
 	tyStr := e.ty(ty)
 	slot := e.newTmp()

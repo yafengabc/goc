@@ -8,7 +8,7 @@
 // at build time), and builds outside a git tree report "dev". versionInfo()
 // is assembled at runtime so it can also carry the revision, date and a
 // clean/dirty marker -- none of which exist as a single string in the binary.
-package main
+package compiler
 
 import (
 	"runtime/debug"

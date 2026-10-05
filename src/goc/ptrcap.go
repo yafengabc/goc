@@ -1,4 +1,6 @@
-package main
+package compiler
+
+import "goc/frontend"
 
 // ptrcap.go -- T1.6 C4: ptrCapable analysis.
 //
@@ -23,16 +25,16 @@ package main
 // pointer-returning function, comparing with a pointer, or being used as a
 // subscript/dereference/-> base.
 
-func isIntVar(t *Type) bool {
-	return t != nil && t.Kind == KInt && t.Width == 4
+func isIntVar(t *frontend.Type) bool {
+	return t != nil && t.Kind == frontend.KInt && t.Width == 4
 }
 
-// isPtrLike reports whether t is a pointer-valued type: KPtr, a function
-// designator (decays to KPtr), or an array (decays to a pointer in value
-// contexts). String literals carry PtrType(CharType()) so they already hit
-// KPtr.
-func isPtrLike(t *Type) bool {
-	return t != nil && (t.Kind == KPtr || t.IsFunc() || t.IsArray())
+// isPtrLike reports whether t is a pointer-valued type: frontend.KPtr, a function
+// designator (decays to frontend.KPtr), or an array (decays to a pointer in value
+// contexts). String literals carry frontend.PtrType(frontend.CharType()) so they already hit
+// frontend.KPtr.
+func isPtrLike(t *frontend.Type) bool {
+	return t != nil && (t.Kind == frontend.KPtr || t.IsFunc() || t.IsArray())
 }
 
 func isCmpOp(op string) bool {
@@ -53,7 +55,7 @@ func isCmpOp(op string) bool {
 // A nil (undeterminable) type counts as a plain int: an unresolvable source
 // is far more likely an ordinary integer than a pointer, and the asymmetry
 // of this analysis makes a false mark much more damaging than a missed one.
-func isPlainIntSrc(t *Type) bool {
+func isPlainIntSrc(t *frontend.Type) bool {
 	if t == nil {
 		return true
 	}
@@ -70,7 +72,7 @@ func isPlainIntSrc(t *Type) bool {
 // declaration collected in walk order, later declarations shadowing earlier
 // ones) plus the global/function tables -- CG.exprType cannot be used here
 // because the emission scopes are not built yet.
-func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
+func (c *CG) analyzePtrCapable(f *frontend.FuncDecl) map[string]bool {
 	pc := map[string]bool{}
 	// dirty records the variables that also receive an ordinary integer
 	// value. It is a separate set (rather than deleting from pc during the
@@ -78,7 +80,7 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 	// be seeded from a pointer early and reassigned from an int later, or the
 	// other way round.
 	dirty := map[string]bool{}
-	vt := map[string]*Type{}
+	vt := map[string]*frontend.Type{}
 	for i, p := range f.Params {
 		if i < len(f.ParamTypes) {
 			vt[p] = f.ParamTypes[i]
@@ -86,38 +88,38 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 	}
 	// Collect every local declaration (nested blocks included; a later
 	// declaration with the same name shadows for the expression walk).
-	var collect func(Stmt)
-	collect = func(s Stmt) {
+	var collect func(frontend.Stmt)
+	collect = func(s frontend.Stmt) {
 		switch n := s.(type) {
-		case *Block:
+		case *frontend.Block:
 			for _, st := range n.Stmts {
 				collect(st)
 			}
-		case *DeclList:
+		case *frontend.DeclList:
 			for _, d := range n.Decls {
 				collect(d)
 			}
-		case *DeclStmt:
+		case *frontend.DeclStmt:
 			if n.Storage == "" || n.Storage == "auto" || n.Storage == "register" {
 				vt[n.Name] = n.Typ
 			}
-		case *IfStmt:
+		case *frontend.IfStmt:
 			collect(n.Then)
 			if n.Else != nil {
 				collect(n.Else)
 			}
-		case *WhileStmt:
+		case *frontend.WhileStmt:
 			collect(n.Body)
-		case *DoWhileStmt:
+		case *frontend.DoWhileStmt:
 			collect(n.Body)
-		case *ForStmt:
+		case *frontend.ForStmt:
 			if n.Init != nil {
 				collect(n.Init)
 			}
 			collect(n.Body)
-		case *SwitchStmt:
+		case *frontend.SwitchStmt:
 			collect(n.Body)
-		case *LabelStmt:
+		case *frontend.LabelStmt:
 			collect(n.Stmt)
 		}
 	}
@@ -126,13 +128,13 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 	}
 
 	// pcTypeOf is the analysis' own static type lookup. It mirrors the shapes
-	// CG.exprType handles, but resolves Ident through vt. nil means "cannot
+	// CG.exprType handles, but resolves frontend.Ident through vt. nil means "cannot
 	// determine" -- the rules treat nil as non-pointer (a missed mark is
 	// acceptable for pathological programs).
-	var pcTypeOf func(Expr) *Type
-	pcTypeOf = func(e Expr) *Type {
+	var pcTypeOf func(frontend.Expr) *frontend.Type
+	pcTypeOf = func(e frontend.Expr) *frontend.Type {
 		switch n := e.(type) {
-		case *Ident:
+		case *frontend.Ident:
 			if t, ok := vt[n.Name]; ok {
 				return t
 			}
@@ -140,24 +142,24 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 				return t
 			}
 			if fd, ok := c.funcDefs[n.Name]; ok {
-				return PtrType(FuncType(fd.Ret, fd.ParamTypes))
+				return frontend.PtrType(frontend.FuncType(fd.Ret, fd.ParamTypes))
 			}
 			return nil
-		case *StrLit:
-			return PtrType(CharType())
-		case *NumLit:
-			return IntType()
-		case *Unary:
+		case *frontend.StrLit:
+			return frontend.PtrType(frontend.CharType())
+		case *frontend.NumLit:
+			return frontend.IntType()
+		case *frontend.Unary:
 			switch n.Op {
 			case "&":
 				if t := pcTypeOf(n.E); t != nil {
 					if t.IsFunc() {
-						return PtrType(t)
+						return frontend.PtrType(t)
 					}
 					if t.IsPtr() && t.Elem != nil && t.Elem.IsFunc() {
 						return t
 					}
-					return PtrType(t)
+					return frontend.PtrType(t)
 				}
 				return nil
 			case "*":
@@ -168,20 +170,20 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 			case "-", "~":
 				return pcTypeOf(n.E)
 			case "!":
-				return IntType()
+				return frontend.IntType()
 			}
 			return nil
-		case *CastExpr:
+		case *frontend.CastExpr:
 			if n.Typ != nil {
 				return n.Typ
 			}
 			return nil
-		case *Index:
+		case *frontend.Index:
 			if t := pcTypeOf(n.Base); t != nil && (t.IsPtr() || t.IsArray()) {
 				return t.Elem
 			}
 			return nil
-		case *Binary:
+		case *frontend.Binary:
 			lt, rt := pcTypeOf(n.L), pcTypeOf(n.R)
 			if isPtrLike(lt) || isPtrLike(rt) {
 				if n.Op == "+" || n.Op == "-" {
@@ -191,10 +193,10 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 					return rt
 				}
 				// comparisons and non-arithmetic pointer ops yield int
-				return IntType()
+				return frontend.IntType()
 			}
 			return nil // pure arithmetic: not pointer-typed
-		case *MemberExpr:
+		case *frontend.MemberExpr:
 			if n.Arrow {
 				if t := pcTypeOf(n.Base); t != nil && t.IsPtr() && t.Elem != nil {
 					return t.Elem
@@ -204,42 +206,42 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 			// x.member on a struct value: member offset lookup is not worth the
 			// machinery here; nil is conservative (missed marks are acceptable).
 			return nil
-		case *Call:
+		case *frontend.Call:
 			if fd, ok := c.funcDefs[n.Name]; ok {
 				return fd.Ret
 			}
 			return nil
-		case *CondExpr:
+		case *frontend.CondExpr:
 			if t := pcTypeOf(n.Then); t != nil {
 				return t
 			}
 			return pcTypeOf(n.Else)
-		case *CommaExpr:
+		case *frontend.CommaExpr:
 			return pcTypeOf(n.Right)
-		case *CompoundLit:
+		case *frontend.CompoundLit:
 			return n.Typ
-		case *VaArgExpr:
+		case *frontend.VaArgExpr:
 			if n.Typ != nil {
 				return n.Typ
 			}
 			return nil
-		case *SizeofExpr:
-			return IntType()
-		case *GenericExpr:
+		case *frontend.SizeofExpr:
+			return frontend.IntType()
+		case *frontend.GenericExpr:
 			if n.Chosen != nil {
 				return pcTypeOf(n.Chosen)
 			}
 			return nil
-		case *TmpLoad:
+		case *frontend.TmpLoad:
 			return n.Typ
 		}
 		return nil
 	}
 
 	// markVar marks e as ptrCapable when e is an int-typed variable reference.
-	var markVar func(Expr)
-	markVar = func(e Expr) {
-		if id, ok := e.(*Ident); ok {
+	var markVar func(frontend.Expr)
+	markVar = func(e frontend.Expr) {
+		if id, ok := e.(*frontend.Ident); ok {
 			if t, ok := vt[id.Name]; ok && isIntVar(t) {
 				pc[id.Name] = true
 			}
@@ -247,15 +249,15 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 	}
 
 	// walkExpr applies the expression-level rules and recurses.
-	var walkExpr func(Expr)
-	walkExpr = func(e Expr) {
+	var walkExpr func(frontend.Expr)
+	walkExpr = func(e frontend.Expr) {
 		switch n := e.(type) {
-		case *Unary:
+		case *frontend.Unary:
 			if n.Op == "*" {
 				markVar(n.E) // rule 6: dereferenced as a pointer
 			}
 			walkExpr(n.E)
-		case *Binary:
+		case *frontend.Binary:
 			if isCmpOp(n.Op) {
 				lt, rt := pcTypeOf(n.L), pcTypeOf(n.R)
 				if isPtrLike(lt) {
@@ -267,15 +269,15 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 			}
 			walkExpr(n.L)
 			walkExpr(n.R)
-		case *AssignExpr:
+		case *frontend.AssignExpr:
 			// plain is false for a compound assignment ("v += 1"): that is
 			// pointer arithmetic on an existing pointer value, so it must NOT
 			// clear the mark even though the right operand is a plain int.
-			apply := func(lhs, rhs Expr, plain bool) {
+			apply := func(lhs, rhs frontend.Expr, plain bool) {
 				if isPtrLike(pcTypeOf(lhs)) {
 					markVar(rhs) // rule 4: stored into a pointer lvalue
 				}
-				if id, ok := lhs.(*Ident); ok {
+				if id, ok := lhs.(*frontend.Ident); ok {
 					if t, ok := vt[id.Name]; ok && isIntVar(t) {
 						if isPtrLike(pcTypeOf(rhs)) {
 							pc[id.Name] = true // rule 1: pointer value stored into an int var
@@ -288,18 +290,18 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 			apply(n.Lhs, n.Rhs, n.Op == "")
 			walkExpr(n.Lhs)
 			walkExpr(n.Rhs)
-		case *CastExpr:
+		case *frontend.CastExpr:
 			walkExpr(n.E)
-		case *Index:
+		case *frontend.Index:
 			markVar(n.Base) // rule 6: used as a subscript base
 			walkExpr(n.Base)
 			walkExpr(n.Idx)
-		case *MemberExpr:
+		case *frontend.MemberExpr:
 			if n.Arrow {
 				markVar(n.Base) // rule 6: -> base
 			}
 			walkExpr(n.Base)
-		case *Call:
+		case *frontend.Call:
 			if fd, ok := c.funcDefs[n.Name]; ok {
 				for i, a := range n.Args {
 					if i < len(fd.ParamTypes) && isPtrLike(fd.ParamTypes[i]) {
@@ -310,7 +312,7 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 			for _, a := range n.Args {
 				walkExpr(a)
 			}
-		case *IndirectCall:
+		case *frontend.IndirectCall:
 			if n.UFCS != nil {
 				walkExpr(n.UFCS)
 			}
@@ -318,22 +320,22 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 			for _, a := range n.Args {
 				walkExpr(a)
 			}
-		case *CondExpr:
+		case *frontend.CondExpr:
 			walkExpr(n.Cond)
 			walkExpr(n.Then)
 			walkExpr(n.Else)
-		case *IncDecExpr:
+		case *frontend.IncDecExpr:
 			walkExpr(n.E)
-		case *CommaExpr:
+		case *frontend.CommaExpr:
 			walkExpr(n.Left)
 			walkExpr(n.Right)
-		case *VaArgExpr:
+		case *frontend.VaArgExpr:
 			walkExpr(n.Ap)
-		case *SizeofExpr:
+		case *frontend.SizeofExpr:
 			if n.E != nil {
 				walkExpr(n.E)
 			}
-		case *GenericExpr:
+		case *frontend.GenericExpr:
 			walkExpr(n.Control)
 			for _, a := range n.Assocs {
 				walkExpr(a.E)
@@ -343,18 +345,18 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 
 	// walk applies the statement-level rules (initialisers, assignments,
 	// returns) and descends into blocks/loops.
-	var walk func(Stmt)
-	walk = func(s Stmt) {
+	var walk func(frontend.Stmt)
+	walk = func(s frontend.Stmt) {
 		switch n := s.(type) {
-		case *Block:
+		case *frontend.Block:
 			for _, st := range n.Stmts {
 				walk(st)
 			}
-		case *DeclList:
+		case *frontend.DeclList:
 			for _, d := range n.Decls {
 				walk(d)
 			}
-		case *DeclStmt:
+		case *frontend.DeclStmt:
 			if n.Init != nil {
 				if t, ok := vt[n.Name]; ok && isIntVar(t) {
 					if isPtrLike(pcTypeOf(n.Init)) {
@@ -365,11 +367,11 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 				}
 				walkExpr(n.Init)
 			}
-		case *AssignStmt:
+		case *frontend.AssignStmt:
 			if isPtrLike(pcTypeOf(n.Lhs)) {
 				markVar(n.Rhs) // rule 4: stored into a pointer lvalue
 			}
-			if id, ok := n.Lhs.(*Ident); ok {
+			if id, ok := n.Lhs.(*frontend.Ident); ok {
 				if t, ok := vt[id.Name]; ok && isIntVar(t) {
 					if isPtrLike(pcTypeOf(n.Rhs)) {
 						pc[id.Name] = true // rule 1
@@ -380,28 +382,28 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 			}
 			walkExpr(n.Lhs)
 			walkExpr(n.Rhs)
-		case *ExprStmt:
+		case *frontend.ExprStmt:
 			walkExpr(n.E)
-		case *ReturnStmt:
+		case *frontend.ReturnStmt:
 			if n.E != nil {
 				if isPtrLike(f.Ret) {
 					markVar(n.E) // rule 3: returned from a pointer-returning function
 				}
 				walkExpr(n.E)
 			}
-		case *IfStmt:
+		case *frontend.IfStmt:
 			walkExpr(n.Cond)
 			walk(n.Then)
 			if n.Else != nil {
 				walk(n.Else)
 			}
-		case *WhileStmt:
+		case *frontend.WhileStmt:
 			walkExpr(n.Cond)
 			walk(n.Body)
-		case *DoWhileStmt:
+		case *frontend.DoWhileStmt:
 			walk(n.Body)
 			walkExpr(n.Cond)
-		case *ForStmt:
+		case *frontend.ForStmt:
 			if n.Init != nil {
 				walk(n.Init)
 			}
@@ -412,10 +414,10 @@ func (c *CG) analyzePtrCapable(f *FuncDecl) map[string]bool {
 				walkExpr(n.Post)
 			}
 			walk(n.Body)
-		case *SwitchStmt:
+		case *frontend.SwitchStmt:
 			walkExpr(n.Src)
 			walk(n.Body)
-		case *LabelStmt:
+		case *frontend.LabelStmt:
 			walk(n.Stmt)
 		}
 	}

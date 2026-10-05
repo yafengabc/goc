@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // Test-side driver for the IR back end.
 //
@@ -9,6 +9,7 @@ package main
 // the ones that need LLVM skip themselves when it is absent.
 
 import (
+	"goc/frontend"
 	"os"
 	"strings"
 	"testing"
@@ -27,14 +28,14 @@ func irFromSource(t *testing.T, src string) (string, map[string]bool) {
 	if err != nil {
 		t.Fatalf("preprocess: %v", err)
 	}
-	prog, err := Parse(toks)
+	prog, err := frontend.Parse(toks)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	// These are fragments, not whole programs, so the "no main()" diagnostic --
 	// which only matters for a complete translation unit -- is expected here.
 	// Every other diagnostic is a real problem.
-	if errs := Check(prog); len(errs) > 0 {
+	if errs := frontend.Check(prog); len(errs) > 0 {
 		var b strings.Builder
 		for _, e := range errs {
 			if strings.Contains(e.Error(), "program has no main()") {
@@ -310,7 +311,7 @@ func TestIREligibilityIsConservative(t *testing.T) {
 			if err != nil {
 				t.Skipf("preprocess: %v", err)
 			}
-			prog, err := Parse(toks)
+			prog, err := frontend.Parse(toks)
 			if err != nil {
 				t.Skipf("parse: %v", err)
 			}

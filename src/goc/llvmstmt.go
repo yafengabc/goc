@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // Statements and expressions, in LLVM IR.
 //
@@ -13,60 +13,63 @@ package main
 // the current block closed, so appending the next statement simply opens a fresh
 // block. That is what e.line does when it sees e.closed.
 
-import "strings"
+import (
+	"goc/frontend"
+	"strings"
+)
 
 // --- statements -------------------------------------------------------------
 
-func (e *irEmitter) stmt(s Stmt) {
+func (e *irEmitter) stmt(s frontend.Stmt) {
 	switch n := s.(type) {
 	case nil:
 		return
-	case *Block:
+	case *frontend.Block:
 		e.tr.pushScope()
 		for _, x := range n.Stmts {
 			e.stmt(x)
 		}
 		e.tr.popScope()
-	case *DeclList:
+	case *frontend.DeclList:
 		for _, d := range n.Decls {
 			e.stmt(d)
 		}
-	case *DeclStmt:
+	case *frontend.DeclStmt:
 		e.localDecl(n)
-	case *ExprStmt:
+	case *frontend.ExprStmt:
 		e.discard(n.E)
-	case *ReturnStmt:
+	case *frontend.ReturnStmt:
 		e.doReturn(n)
-	case *IfStmt:
+	case *frontend.IfStmt:
 		e.doIf(n)
-	case *WhileStmt:
+	case *frontend.WhileStmt:
 		e.doWhile(n)
-	case *DoWhileStmt:
+	case *frontend.DoWhileStmt:
 		e.doDoWhile(n)
-	case *ForStmt:
+	case *frontend.ForStmt:
 		e.doFor(n)
-	case *BreakStmt:
+	case *frontend.BreakStmt:
 		if n := len(e.breakTo); n > 0 {
 			e.term("br label %%%s", e.breakTo[n-1])
 		}
-	case *ContinueStmt:
+	case *frontend.ContinueStmt:
 		if n := len(e.continueTo); n > 0 {
 			e.term("br label %%%s", e.continueTo[n-1])
 		}
-	case *LabelStmt:
+	case *frontend.LabelStmt:
 		e.doLabel(n)
-	case *GotoStmt:
+	case *frontend.GotoStmt:
 		e.doGoto(n)
-	case *SwitchStmt:
+	case *frontend.SwitchStmt:
 		e.doSwitch(n)
-	case *AsmStmt:
+	case *frontend.AsmStmt:
 		// Inline assembly is goa assembler text with no IR equivalent; the
 		// eligibility check keeps such functions off this path.
 	}
 }
 
 // localDecl gives a local its stack slot and runs the initialiser.
-func (e *irEmitter) localDecl(d *DeclStmt) {
+func (e *irEmitter) localDecl(d *frontend.DeclStmt) {
 	if d.Name == "" {
 		return // a bare "struct S;" declares nothing
 	}
@@ -79,7 +82,7 @@ func (e *irEmitter) localDecl(d *DeclStmt) {
 	slot := e.slotFor(uid, lty)
 	e.tr.declUID[d] = uid
 	if d.Init != nil {
-		if bi, ok := d.Init.(*BraceInit); ok {
+		if bi, ok := d.Init.(*frontend.BraceInit); ok {
 			e.storeBrace(bi, ty, slot)
 			return
 		}
@@ -87,7 +90,7 @@ func (e *irEmitter) localDecl(d *DeclStmt) {
 		// initialising a char pointer stores the address. goc's parser already
 		// built the right node for each case, but they arrive here as the same
 		// expression, so the target type decides.
-		if sl, ok := d.Init.(*StrLit); ok && ty.Kind == KArr {
+		if sl, ok := d.Init.(*frontend.StrLit); ok && ty.Kind == frontend.KArr {
 			e.storeString(sl, ty, slot)
 			return
 		}
@@ -97,7 +100,7 @@ func (e *irEmitter) localDecl(d *DeclStmt) {
 }
 
 // doReturn emits a return, converting the value to the function's return type.
-func (e *irEmitter) doReturn(n *ReturnStmt) {
+func (e *irEmitter) doReturn(n *frontend.ReturnStmt) {
 	if n.E == nil || e.retTy == "void" {
 		e.term("ret void")
 		return
@@ -115,7 +118,7 @@ func (e *irEmitter) doReturn(n *ReturnStmt) {
 
 // doIf lowers `if (c) A else B`. The condition is materialised into a
 // temporary first so the comparison is not repeated in each arm.
-func (e *irEmitter) doIf(n *IfStmt) {
+func (e *irEmitter) doIf(n *frontend.IfStmt) {
 	cond := e.cond(n.Cond)
 	thenL := e.newLabel()
 	doneL := e.newLabel()
@@ -141,7 +144,7 @@ func (e *irEmitter) doIf(n *IfStmt) {
 }
 
 // doWhile lowers `while (c) B`, testing before each iteration.
-func (e *irEmitter) doWhile(n *WhileStmt) {
+func (e *irEmitter) doWhile(n *frontend.WhileStmt) {
 	testL := e.newLabel()
 	bodyL := e.newLabel()
 	doneL := e.newLabel()
@@ -166,7 +169,7 @@ func (e *irEmitter) doWhile(n *WhileStmt) {
 
 // doDoWhile lowers `do B while (c)`, running the body before the first test and
 // sending continue to the condition rather than to the top of the body.
-func (e *irEmitter) doDoWhile(n *DoWhileStmt) {
+func (e *irEmitter) doDoWhile(n *frontend.DoWhileStmt) {
 	bodyL := e.newLabel()
 	testL := e.newLabel()
 	doneL := e.newLabel()
@@ -192,7 +195,7 @@ func (e *irEmitter) doDoWhile(n *DoWhileStmt) {
 // doFor lowers the three-clause `for`. The initialiser runs once, the condition
 // is tested before each iteration, and the post expression runs at the bottom --
 // so `continue` has to reach the post expression, not the top.
-func (e *irEmitter) doFor(n *ForStmt) {
+func (e *irEmitter) doFor(n *frontend.ForStmt) {
 	e.tr.pushScope()
 	defer e.tr.popScope()
 	if n.Init != nil {
@@ -235,7 +238,7 @@ func (e *irEmitter) doFor(n *ForStmt) {
 // doSwitch lowers a switch. C allows fall-through, and keeping the case labels
 // as ordinary blocks preserves that for free: control simply runs on into the
 // next one.
-func (e *irEmitter) doSwitch(n *SwitchStmt) {
+func (e *irEmitter) doSwitch(n *frontend.SwitchStmt) {
 	sv := e.rvalue(n.Src)
 	sty := e.tr.exprType(n.Src)
 	// LLVM's switch takes an i32. A conversion is needed only when the
@@ -246,7 +249,7 @@ func (e *irEmitter) doSwitch(n *SwitchStmt) {
 	// uses the operand directly; a copy would need a real instruction, and a
 	// bare "%t = %t" is not one.
 	if e.ty(sty) != "i32" {
-		sv = e.convert(sv, sty, IntType())
+		sv = e.convert(sv, sty, frontend.IntType())
 	}
 
 	doneL := e.newLabel()
@@ -258,7 +261,7 @@ func (e *irEmitter) doSwitch(n *SwitchStmt) {
 	e.tr.pushScope()
 	for _, st := range n.Body.Stmts {
 		switch c := st.(type) {
-		case *CaseStmt:
+		case *frontend.CaseStmt:
 			// A case label applies to the statements that follow it, up to the
 			// next case or default. The block it opens is created here so the
 			// switch can name it before the body has been walked.
@@ -268,7 +271,7 @@ func (e *irEmitter) doSwitch(n *SwitchStmt) {
 			// case -- which showed up as a default arm's statements being
 			// emitted under another arm's label.
 			cur = len(cases) - 1
-		case *DefaultStmt:
+		case *frontend.DefaultStmt:
 			// A default arm is a branch target like any other, and it keeps
 			// its own statements: they belong to the default block, not to
 			// whichever case happens to precede it.
@@ -282,7 +285,7 @@ func (e *irEmitter) doSwitch(n *SwitchStmt) {
 			if cases[cur].stmt == nil {
 				cases[cur].stmt = st
 			} else {
-				cases[cur].stmt = &Block{Stmts: []Stmt{cases[cur].stmt, st}}
+				cases[cur].stmt = &frontend.Block{Stmts: []frontend.Stmt{cases[cur].stmt, st}}
 			}
 		}
 	}
@@ -322,7 +325,7 @@ func (e *irEmitter) doSwitch(n *SwitchStmt) {
 type switchCase struct {
 	val  int
 	l    string
-	stmt Stmt
+	stmt frontend.Stmt
 }
 
 func caseArms(cases []switchCase) string {
@@ -340,7 +343,7 @@ func caseArms(cases []switchCase) string {
 }
 
 // doLabel attaches a C label to the block that follows it.
-func (e *irEmitter) doLabel(n *LabelStmt) {
+func (e *irEmitter) doLabel(n *frontend.LabelStmt) {
 	e.pendingLabels = append(e.pendingLabels, n.Name)
 	e.stmt(n.Stmt)
 }

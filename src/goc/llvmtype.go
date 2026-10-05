@@ -1,4 +1,6 @@
-package main
+package compiler
+
+import "goc/frontend"
 
 // typeResolver answers "what type is this expression" and "where does this
 // name live", and it belongs to neither back end.
@@ -15,8 +17,8 @@ type typeResolver struct {
 
 	// Tables used only when cg == nil (the IR path). When cg != nil the
 	// resolver reads the equivalent maps off cg instead.
-	funcDefs   map[string]*FuncDecl
-	globalTyp  map[string]*Type
+	funcDefs   map[string]*frontend.FuncDecl
+	globalTyp  map[string]*frontend.Type
 	staticVars map[string]string
 	lib        *clibCProgram
 
@@ -32,14 +34,14 @@ type typeResolver struct {
 	scopes  []map[string]int
 	varEnts map[int]varInfo
 	varUID  int
-	declUID map[*DeclStmt]int
+	declUID map[*frontend.DeclStmt]int
 }
 
 // --- dispatch helpers -------------------------------------------------------
 // When cg is present the resolver reads the assembly generator's live tables;
 // otherwise it reads the ones built for the IR path.
 
-func (tr *typeResolver) funcDef(name string) (*FuncDecl, bool) {
+func (tr *typeResolver) funcDef(name string) (*frontend.FuncDecl, bool) {
 	if tr.cg != nil {
 		f, ok := tr.cg.funcDefs[name]
 		return f, ok
@@ -48,7 +50,7 @@ func (tr *typeResolver) funcDef(name string) (*FuncDecl, bool) {
 	return f, ok
 }
 
-func (tr *typeResolver) globalType(name string) (*Type, bool) {
+func (tr *typeResolver) globalType(name string) (*frontend.Type, bool) {
 	if tr.cg != nil {
 		t, ok := tr.cg.globalTyp[name]
 		return t, ok
@@ -73,12 +75,12 @@ func (tr *typeResolver) isFuncName(name string) bool {
 // fnPtrTy is the type a function designator decays to: a pointer to the
 // function's own type. The parameter list is carried over so the pointer type
 // matches the declaration, which is what lets the indirect call type-check.
-func (e *irEmitter) fnPtrTy(name string) *Type {
+func (e *irEmitter) fnPtrTy(name string) *frontend.Type {
 	f, ok := e.tr.funcDef(name)
 	if !ok || f == nil {
-		return PtrType(IntType())
+		return frontend.PtrType(frontend.IntType())
 	}
-	return PtrType(FuncType(f.Ret, f.ParamTypes))
+	return frontend.PtrType(frontend.FuncType(f.Ret, f.ParamTypes))
 }
 
 func (tr *typeResolver) staticLabel(name string) (string, bool) {
@@ -90,7 +92,7 @@ func (tr *typeResolver) staticLabel(name string) (string, bool) {
 	return l, ok
 }
 
-func (tr *typeResolver) libFunc(name string) (*FuncDecl, bool) {
+func (tr *typeResolver) libFunc(name string) (*frontend.FuncDecl, bool) {
 	if tr.cg != nil {
 		if lib := clibCStore(tr.cg.linux); lib != nil {
 			if f, ok := lib.funcs[name]; ok {
@@ -199,48 +201,48 @@ func (tr *typeResolver) resetScope() {
 	tr.varEnts = map[int]varInfo{}
 	tr.scopes = nil
 	tr.varUID = 0
-	tr.declUID = map[*DeclStmt]int{}
+	tr.declUID = map[*frontend.DeclStmt]int{}
 }
 
 // --- type analysis ----------------------------------------------------------
 
-func (tr *typeResolver) exprType(e Expr) *Type {
+func (tr *typeResolver) exprType(e frontend.Expr) *frontend.Type {
 	switch n := e.(type) {
-	case *NumLit:
+	case *frontend.NumLit:
 		// A literal's own type, which decides whether the arithmetic around it
-		// is floating or integral. Kind == TDouble marks it floating and IsFloat
+		// is floating or integral. Kind == frontend.TDouble marks it floating and IsFloat
 		// picks the width; without this an expression like "1.0 / 0.0" -- the
 		// INFINITY macro -- reported no type at all, so the division was
 		// emitted as an integer one.
 		if n.BigWords != nil {
-			return &Type{Kind: KBitInt, Bits: n.BigBits, Signed: n.BigSigned}
+			return &frontend.Type{Kind: frontend.KBitInt, Bits: n.BigBits, Signed: n.BigSigned}
 		}
-		if n.Kind == TDouble {
+		if n.Kind == frontend.TDouble {
 			if n.IsFloat {
-				return FloatType()
+				return frontend.FloatType()
 			}
-			return DoubleType()
+			return frontend.DoubleType()
 		}
 		if n.Wide {
-			return WCharType()
+			return frontend.WCharType()
 		}
 		return numLitType(n)
-	case *StrLit:
+	case *frontend.StrLit:
 		// A string literal is an array of char, which decays to a pointer when
 		// it is used as a value.
-		return &Type{Kind: KArr, Elem: &Type{Kind: KInt, Width: 1, Signed: true}}
-	case *CompoundLit:
+		return &frontend.Type{Kind: frontend.KArr, Elem: &frontend.Type{Kind: frontend.KInt, Width: 1, Signed: true}}
+	case *frontend.CompoundLit:
 		// The unnamed object's own declared type (arrays included: callers
 		// decide between value-address and decay handling).
 		return n.Typ
-	case *GenericExpr:
+	case *frontend.GenericExpr:
 		// The selection's type is the type of the chosen branch (the
 		// controlling expression's own type is irrelevant after the pick).
 		if n.Chosen != nil {
 			return tr.exprType(n.Chosen)
 		}
 		return nil
-	case *Ident:
+	case *frontend.Ident:
 		if vi, ok := tr.lookupVar(n.Name); ok {
 			return vi.typ
 		}
@@ -253,16 +255,16 @@ func (tr *typeResolver) exprType(e Expr) *Type {
 		}
 		// A function designator decays to a pointer to that function.
 		if fd, ok := tr.funcDef(n.Name); ok {
-			ft := FuncType(fd.Ret, fd.ParamTypes)
+			ft := frontend.FuncType(fd.Ret, fd.ParamTypes)
 			ft.Variadic = fd.Variadic
-			return PtrType(ft)
+			return frontend.PtrType(ft)
 		}
 		if gt, ok := tr.globalType(n.Name); ok {
 			return gt
 		}
 		return nil
-	case *Unary:
-		// Unary '-' and '~' keep the operand's (promoted) type; this matters
+	case *frontend.Unary:
+		// frontend.Unary '-' and '~' keep the operand's (promoted) type; this matters
 		// for width-sensitive nesting such as "~x | y" or "z = ~mask", where a
 		// nil here would make an enclosing operator pick the wrong width.
 		if n.Op == "-" || n.Op == "~" {
@@ -277,49 +279,49 @@ func (tr *typeResolver) exprType(e Expr) *Type {
 			// "&x" is a pointer to x's type.
 			if t := tr.exprType(n.E); t != nil {
 				if t.IsFunc() {
-					return PtrType(t)
+					return frontend.PtrType(t)
 				}
 				if t.IsPtr() && t.Elem != nil && t.Elem.IsFunc() {
 					return t
 				}
-				return PtrType(t)
+				return frontend.PtrType(t)
 			}
 		}
-	case *Index:
+	case *frontend.Index:
 		if t := tr.exprType(n.Base); t != nil {
 			if t.IsPtr() || t.IsArray() {
 				return t.Elem
 			}
 		}
-	case *Binary:
+	case *frontend.Binary:
 		// Pointer arithmetic keeps a pointer type, so "(p + 1) - base" is
 		// still pointer-minus-pointer.
 		return tr.binaryType(n)
-	case *AssignExpr:
+	case *frontend.AssignExpr:
 		// An assignment yields the left operand's value, and its type is the
 		// left operand's type -- "(*d++ = *src++) != 0" compares a char against
 		// zero, and reading the type from anywhere else made the comparison
 		// i32 against a one-byte load.
 		return tr.exprType(n.Lhs)
-	case *AssignStmt:
+	case *frontend.AssignStmt:
 		return tr.exprType(n.Lhs)
-	case *CondExpr:
+	case *frontend.CondExpr:
 		// A ternary yields the common type of its two arms, after the usual
 		// conversions. Without this the arm types were invisible, so an
 		// enclosing operator saw no type and fell back to the default width:
 		// "(y >= 0 ? y : y - 399) / 400" divided an i64 phi by an i32.
 		return arithCommon(tr.exprType(n.Then), tr.exprType(n.Else))
-	case *IncDecExpr:
+	case *frontend.IncDecExpr:
 		return tr.exprType(n.E)
-	case *TmpLoad:
+	case *frontend.TmpLoad:
 		// Internal node produced only by genCompoundAssign: the type is the
 		// parked lvalue's static type.
 		return n.Typ
-	case *MemberExpr:
+	case *frontend.MemberExpr:
 		return tr.memberType(n.Base, n.Name)
-	case *CastExpr:
+	case *frontend.CastExpr:
 		return n.Typ
-	case *Call:
+	case *frontend.Call:
 		// A call's type is the callee's declared return type (nil for
 		// goclib / extern calls, which return int). This is how struct-
 		// returning calls are recognised at argument / assignment / return
@@ -333,7 +335,7 @@ func (tr *typeResolver) exprType(e Expr) *Type {
 			return ft.Ret
 		}
 		return nil
-	case *IndirectCall:
+	case *frontend.IndirectCall:
 		// A UFCS method call types like the direct call it was rewritten to.
 		if n.UFCS != nil {
 			if fd, ok := tr.funcDef(n.UFCS.Name); ok {
@@ -341,7 +343,7 @@ func (tr *typeResolver) exprType(e Expr) *Type {
 			}
 			return nil
 		}
-		if ft := funcTypeOf(tr.exprType(n.Fn)); ft != nil {
+		if ft := frontend.FuncTypeOf(tr.exprType(n.Fn)); ft != nil {
 			return ft.Ret
 		}
 		return nil
@@ -350,14 +352,14 @@ func (tr *typeResolver) exprType(e Expr) *Type {
 }
 
 // memberType resolves the type of a struct/union member access.
-func (tr *typeResolver) memberType(base Expr, name string) *Type {
+func (tr *typeResolver) memberType(base frontend.Expr, name string) *frontend.Type {
 	t := tr.exprType(base)
 	// "->" on an array-typed base is legal C too: it decays to a pointer, so
 	// "buffer->field" addresses element 0. Both spellings unwrap to the elem.
-	if t != nil && (t.Kind == KPtr || t.Kind == KArr) && t.Elem != nil {
+	if t != nil && (t.Kind == frontend.KPtr || t.Kind == frontend.KArr) && t.Elem != nil {
 		t = t.Elem
 	}
-	if t == nil || (t.Kind != KStruct && t.Kind != KUnion) {
+	if t == nil || (t.Kind != frontend.KStruct && t.Kind != frontend.KUnion) {
 		return nil
 	}
 	for _, m := range t.Members {
@@ -377,22 +379,22 @@ func (tr *typeResolver) memberType(base Expr, name string) *Type {
 // a&b) therefore resolves to the usual arithmetic common type, not nil -- a nil
 // here makes an enclosing operator pick the wrong width and emit, say, an i32
 // sdiv against an i64 operand.
-func (tr *typeResolver) binaryType(n *Binary) *Type {
+func (tr *typeResolver) binaryType(n *frontend.Binary) *frontend.Type {
 	lt := tr.exprType(n.L)
 	rt := tr.exprType(n.R)
-	if isBig(lt) || isBig(rt) {
+	if frontend.IsBig(lt) || frontend.IsBig(rt) {
 		switch n.Op {
 		case "+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^":
-			if (lt == nil || lt.IsIntClass() || isBig(lt)) && (rt == nil || rt.IsIntClass() || isBig(rt)) {
+			if (lt == nil || lt.IsIntClass() || frontend.IsBig(lt)) && (rt == nil || rt.IsIntClass() || frontend.IsBig(rt)) {
 				lt2 := lt
 				if lt2 == nil {
-					lt2 = IntType()
+					lt2 = frontend.IntType()
 				}
 				rt2 := rt
 				if rt2 == nil {
-					rt2 = IntType()
+					rt2 = frontend.IntType()
 				}
-				return bigArithResult(n.Op, lt2, rt2)
+				return frontend.BigArithResult(n.Op, lt2, rt2)
 			}
 		}
 		return nil
@@ -401,7 +403,7 @@ func (tr *typeResolver) binaryType(n *Binary) *Type {
 	case "&&", "||":
 		// Logical operators yield int in C; the IR path short-circuits them,
 		// but a surrounding expression still needs a width to resolve against.
-		return IntType()
+		return frontend.IntType()
 	case "==", "!=", "<", ">", "<=", ">=":
 		// A comparison's result is i1, but its operands share the usual
 		// arithmetic common type; that is the width-sensitive operand type a
@@ -412,19 +414,19 @@ func (tr *typeResolver) binaryType(n *Binary) *Type {
 			if n.Op == "-" {
 				// ptrdiff_t: 64 bits on this target, like the value the
 				// emitter produces for the difference.
-				return &Type{Kind: KInt, Width: 8, Signed: true}
+				return &frontend.Type{Kind: frontend.KInt, Width: 8, Signed: true}
 			}
 			return nil
 		}
 		if lt != nil && (lt.IsPtr() || lt.IsArray()) && (rt == nil || (!rt.IsPtr() && !rt.IsArray())) {
 			if lt.IsArray() && lt.Elem != nil {
-				return PtrType(lt.Elem)
+				return frontend.PtrType(lt.Elem)
 			}
 			return lt
 		}
 		if rt != nil && (rt.IsPtr() || rt.IsArray()) && (lt == nil || (!lt.IsPtr() && !lt.IsArray())) {
 			if rt.IsArray() && rt.Elem != nil {
-				return PtrType(rt.Elem)
+				return frontend.PtrType(rt.Elem)
 			}
 			return rt
 		}
@@ -443,15 +445,15 @@ func (tr *typeResolver) binaryType(n *Binary) *Type {
 
 // memberOffset resolves the byte offset of a struct member within its struct,
 // walking the same path the checker uses.
-func (tr *typeResolver) memberOffset(n *MemberExpr, sty *Type) (int, bool) {
+func (tr *typeResolver) memberOffset(n *frontend.MemberExpr, sty *frontend.Type) (int, bool) {
 	st := sty
 	if n.Arrow {
-		if st == nil || st.Kind != KPtr || st.Elem == nil {
+		if st == nil || st.Kind != frontend.KPtr || st.Elem == nil {
 			return 0, false
 		}
 		st = st.Elem
 	}
-	if st == nil || (st.Kind != KStruct && st.Kind != KUnion) {
+	if st == nil || (st.Kind != frontend.KStruct && st.Kind != frontend.KUnion) {
 		return 0, false
 	}
 	for _, mem := range st.Members {
@@ -467,7 +469,7 @@ func (tr *typeResolver) memberOffset(n *MemberExpr, sty *Type) (int, bool) {
 
 // calleeParams returns the declared parameter types of a function, whether it
 // is defined in this program or supplied by the C runtime.
-func (tr *typeResolver) calleeParams(name string) ([]*Type, bool) {
+func (tr *typeResolver) calleeParams(name string) ([]*frontend.Type, bool) {
 	if fd, ok := tr.funcDef(name); ok {
 		return fd.ParamTypes, true
 	}
@@ -478,20 +480,20 @@ func (tr *typeResolver) calleeParams(name string) ([]*Type, bool) {
 }
 
 // calleeRet returns a function's declared return type.
-func (tr *typeResolver) calleeRet(name string) *Type {
+func (tr *typeResolver) calleeRet(name string) *frontend.Type {
 	if fd, ok := tr.funcDef(name); ok {
 		return fd.Ret
 	}
 	if fd, ok := tr.libFunc(name); ok {
 		return fd.Ret
 	}
-	return IntType()
+	return frontend.IntType()
 }
 
 // constValue resolves a name with no storage to an integer constant, which is
 // what an enum member looks like by the time code generation runs.
 func (tr *typeResolver) constValue(name string) (int64, bool) {
-	if v, ok := enumConsts[name]; ok {
+	if v, ok := frontend.EnumConsts[name]; ok {
 		return v, true
 	}
 	return 0, false
@@ -499,15 +501,15 @@ func (tr *typeResolver) constValue(name string) (int64, bool) {
 
 // fnPtrVar reports whether name denotes a function-pointer variable (or
 // global), returning its function type.
-func (tr *typeResolver) fnPtrVar(name string) (Expr, *Type, bool) {
+func (tr *typeResolver) fnPtrVar(name string) (frontend.Expr, *frontend.Type, bool) {
 	if vi, ok := tr.lookupVar(name); ok {
-		if ft := funcTypeOf(vi.typ); ft != nil {
-			return &Ident{Name: name}, ft, true
+		if ft := frontend.FuncTypeOf(vi.typ); ft != nil {
+			return &frontend.Ident{Name: name}, ft, true
 		}
 	}
 	if gt, ok := tr.globalType(name); ok {
-		if ft := funcTypeOf(gt); ft != nil {
-			return &Ident{Name: name}, ft, true
+		if ft := frontend.FuncTypeOf(gt); ft != nil {
+			return &frontend.Ident{Name: name}, ft, true
 		}
 	}
 	return nil, nil, false

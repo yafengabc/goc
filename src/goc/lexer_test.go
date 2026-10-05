@@ -1,22 +1,25 @@
-package main
+package compiler
 
-import "testing"
+import (
+	"goc/frontend"
+	"testing"
+)
 
-// numOf lexes src and returns the Num field of the first TNum token, along
+// numOf lexes src and returns the Num field of the first frontend.TNum token, along
 // with the token's text. Lexing the full source keeps the path identical to
 // real compilation (hex/dec/suffix handling included).
 func numOf(t *testing.T, src string) (int64, string) {
 	t.Helper()
-	toks, err := Lex(src)
+	toks, err := frontend.Lex(src)
 	if err != nil {
-		t.Fatalf("Lex(%q) error: %v", src, err)
+		t.Fatalf("frontend.Lex(%q) error: %v", src, err)
 	}
 	for _, tok := range toks {
-		if tok.Kind == TNum {
+		if tok.Kind == frontend.TNum {
 			return tok.Num, tok.Text
 		}
 	}
-	t.Fatalf("Lex(%q): no numeric token found", src)
+	t.Fatalf("frontend.Lex(%q): no numeric token found", src)
 	return 0, ""
 }
 
@@ -112,13 +115,13 @@ func TestLexCharEscapeControls(t *testing.T) {
 func TestLexStringEscapeControls(t *testing.T) {
 	// The same escape table drives string literals, and a string body has to
 	// produce the identical bytes.
-	toks, err := Lex(`"\b\f\a\v\n\t\r\\\"\0"`)
+	toks, err := frontend.Lex(`"\b\f\a\v\n\t\r\\\"\0"`)
 	if err != nil {
-		t.Fatalf("Lex error: %v", err)
+		t.Fatalf("frontend.Lex error: %v", err)
 	}
 	want := []byte{8, 12, 7, 11, 10, 9, 13, '\\', '"', 0}
 	for _, tok := range toks {
-		if tok.Kind != TStr {
+		if tok.Kind != frontend.TStr {
 			continue
 		}
 		if len(tok.Str) != len(want) {
@@ -155,17 +158,17 @@ func TestLexOctalLiteral(t *testing.T) {
 		}
 	}
 	// Suffix flags are still recorded on an octal literal.
-	toks, _ := Lex("010U")
+	toks, _ := frontend.Lex("010U")
 	for _, tok := range toks {
-		if tok.Kind == TNum {
+		if tok.Kind == frontend.TNum {
 			if tok.Num != 8 || !tok.IsUnsig {
 				t.Errorf("010U = %d unsig=%v, want 8 true", tok.Num, tok.IsUnsig)
 			}
 		}
 	}
-	toks, _ = Lex("010L")
+	toks, _ = frontend.Lex("010L")
 	for _, tok := range toks {
-		if tok.Kind == TNum {
+		if tok.Kind == frontend.TNum {
 			if tok.Num != 8 || !tok.IsLong {
 				t.Errorf("010L = %d long=%v, want 8 true", tok.Num, tok.IsLong)
 			}
@@ -177,14 +180,14 @@ func TestLexOctalInvalidDigitRejected(t *testing.T) {
 	// An 8 or 9 directly after a leading zero is an invalid octal constant
 	// (gcc rejects); goc must not silently read it as decimal.
 	for _, bad := range []string{"018", "019", "0778"} {
-		if _, err := Lex(bad); err == nil {
-			t.Errorf("Lex(%q) should reject as invalid octal digit", bad)
+		if _, err := frontend.Lex(bad); err == nil {
+			t.Errorf("frontend.Lex(%q) should reject as invalid octal digit", bad)
 		}
 	}
 	// A trailing-dot float still reads its digits as decimal, not octal.
-	toks, _ := Lex("010.5")
+	toks, _ := frontend.Lex("010.5")
 	for _, tok := range toks {
-		if tok.Kind == TNum && tok.IsDbl {
+		if tok.Kind == frontend.TNum && tok.IsDbl {
 			if tok.Fval != 10.5 {
 				t.Errorf("010.5 = %v, want 10.5 (float, decimal)", tok.Fval)
 			}
@@ -195,13 +198,13 @@ func TestLexOctalInvalidDigitRejected(t *testing.T) {
 func TestLexStringUCN(t *testing.T) {
 	// \u00e9 must decode to the UTF-8 encoding of U+00E9 (0xC3 0xA9), not
 	// the literal characters u00e9 (the backslash used to be swallowed).
-	toks, err := Lex(`"\u00e9"`)
+	toks, err := frontend.Lex(`"\u00e9"`)
 	if err != nil {
-		t.Fatalf("Lex error: %v", err)
+		t.Fatalf("frontend.Lex error: %v", err)
 	}
 	want := []byte{0xC3, 0xA9}
 	for _, tok := range toks {
-		if tok.Kind == TStr {
+		if tok.Kind == frontend.TStr {
 			if len(tok.Str) != len(want) || tok.Str[0] != want[0] || tok.Str[1] != want[1] {
 				t.Fatalf("string u00e9 = % x, want % x", tok.Str, want)
 			}
@@ -234,13 +237,13 @@ func TestLexCharOctalHexEscape(t *testing.T) {
 }
 
 func TestLexStringOctalHexEscape(t *testing.T) {
-	toks, err := Lex(`"a\101b\x41"`)
+	toks, err := frontend.Lex(`"a\101b\x41"`)
 	if err != nil {
-		t.Fatalf("Lex error: %v", err)
+		t.Fatalf("frontend.Lex error: %v", err)
 	}
 	want := []byte{'a', 65, 'b', 65}
 	for _, tok := range toks {
-		if tok.Kind == TStr {
+		if tok.Kind == frontend.TStr {
 			if len(tok.Str) != len(want) {
 				t.Fatalf("bytes %v, want %v", tok.Str, want)
 			}
@@ -258,7 +261,7 @@ func TestLexStringOctalHexEscape(t *testing.T) {
 func TestLexHexEscapeNoDigitRejected(t *testing.T) {
 	// \x with no hex digit is a clean error (gcc: "'\x' used with no
 	// following hex digits"), not a silent byte.
-	if _, err := Lex(`"\x"`); err == nil {
+	if _, err := frontend.Lex(`"\x"`); err == nil {
 		t.Error(`"\x" should reject (no hex digits)`)
 	}
 }
@@ -275,13 +278,13 @@ func TestLexLeadingDotFloat(t *testing.T) {
 		{".1'2", 0.12},
 	}
 	for _, c := range cases {
-		toks, err := Lex(c.src)
+		toks, err := frontend.Lex(c.src)
 		if err != nil {
-			t.Fatalf("Lex(%q) error: %v", c.src, err)
+			t.Fatalf("frontend.Lex(%q) error: %v", c.src, err)
 		}
 		found := false
 		for _, tok := range toks {
-			if tok.Kind == TNum && tok.IsDbl {
+			if tok.Kind == frontend.TNum && tok.IsDbl {
 				found = true
 				if tok.Fval != c.want {
 					t.Errorf("%s = %v, want %v", c.src, tok.Fval, c.want)
@@ -293,10 +296,10 @@ func TestLexLeadingDotFloat(t *testing.T) {
 		}
 	}
 	// .5f records the float (narrowing) flag.
-	toks, _ := Lex(".5f")
+	toks, _ := frontend.Lex(".5f")
 	found := false
 	for _, tok := range toks {
-		if tok.Kind == TNum && tok.IsDbl {
+		if tok.Kind == frontend.TNum && tok.IsDbl {
 			found = true
 			if !tok.IsFloat {
 				t.Error(".5f should be a float constant")

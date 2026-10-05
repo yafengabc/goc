@@ -1,4 +1,6 @@
-package main
+package compiler
+
+import "goc/frontend"
 
 // Expressions, in LLVM IR.
 //
@@ -12,74 +14,74 @@ package main
 // val is an expression's result: either a register holding a value, or a
 // constant. Instructions are emitted as a side effect.
 type val struct {
-	op string // an operand: "%t3", "42", "null"
-	ty *Type  // the C type of the value
+	op string         // an operand: "%t3", "42", "null"
+	ty *frontend.Type // the C type of the value
 }
 
 // rvalue evaluates an expression to a value.
-func (e *irEmitter) rvalue(x Expr) string {
+func (e *irEmitter) rvalue(x frontend.Expr) string {
 	v := e.eval(x)
 	return v.op
 }
 
 // eval is rvalue with the type attached.
-func (e *irEmitter) eval(x Expr) val {
+func (e *irEmitter) eval(x frontend.Expr) val {
 	switch n := x.(type) {
 	case nil:
-		return val{op: "0", ty: IntType()}
-	case *NumLit:
+		return val{op: "0", ty: frontend.IntType()}
+	case *frontend.NumLit:
 		return e.numLit(n)
-	case *StrLit:
+	case *frontend.StrLit:
 		return e.strLit(n)
-	case *Ident:
+	case *frontend.Ident:
 		return e.ident(n)
-	case *Unary:
+	case *frontend.Unary:
 		return e.unary(n)
-	case *Binary:
+	case *frontend.Binary:
 		return e.binary(n)
-	case *AssignExpr:
+	case *frontend.AssignExpr:
 		return e.assignExpr(n)
-	case *AssignStmt:
+	case *frontend.AssignStmt:
 		e.assignStmt(n)
-		return val{op: "0", ty: IntType()}
-	case *Call:
+		return val{op: "0", ty: frontend.IntType()}
+	case *frontend.Call:
 		return e.callExpr(n)
-	case *IndirectCall:
+	case *frontend.IndirectCall:
 		return e.indirectCall(n)
-	case *Index:
+	case *frontend.Index:
 		return e.load(e.lvalue(n), e.tr.exprType(n))
-	case *MemberExpr:
+	case *frontend.MemberExpr:
 		return e.member(n)
-	case *CastExpr:
+	case *frontend.CastExpr:
 		return e.cast(n)
-	case *VaArgExpr:
+	case *frontend.VaArgExpr:
 		return e.vaArg(n)
-	case *IncDecExpr:
+	case *frontend.IncDecExpr:
 		return e.incDec(n)
-	case *CondExpr:
+	case *frontend.CondExpr:
 		return e.condExpr(n)
-	case *CommaExpr:
+	case *frontend.CommaExpr:
 		e.discard(n.Left)
 		return e.eval(n.Right)
-	case *SizeofExpr:
+	case *frontend.SizeofExpr:
 		t := n.Typ
 		if t == nil && n.E != nil {
 			t = e.tr.exprType(n.E)
 		}
-		return val{op: itoa(sizeOf(t)), ty: UnsignedType()}
-	case *CompoundLit:
+		return val{op: itoa(frontend.Sizeof(t)), ty: frontend.UnsignedType()}
+	case *frontend.CompoundLit:
 		return e.compoundLit(n)
-	case *GenericExpr:
+	case *frontend.GenericExpr:
 		if n.Chosen != nil {
 			return e.eval(n.Chosen)
 		}
-		return val{op: "0", ty: IntType()}
-	case *TmpLoad:
+		return val{op: "0", ty: frontend.IntType()}
+	case *frontend.TmpLoad:
 		// A temporary the native path parks in a frame slot; the IR path has
 		// no such slots, so the node never appears here.
 		return val{op: "0", ty: n.Typ}
 	}
-	return val{op: "0", ty: IntType()}
+	return val{op: "0", ty: frontend.IntType()}
 }
 
 // cond evaluates a controlling expression and reduces it to i1.
@@ -114,7 +116,7 @@ func (e *irEmitter) eval(x Expr) val {
 // every field read garbage from the single stored pointer and every variadic
 // call that consumed an argument crashed: printf("v=%d", x) crashed where
 // printf("hi") did not.
-func (e *irEmitter) vaArg(n *VaArgExpr) val {
+func (e *irEmitter) vaArg(n *frontend.VaArgExpr) val {
 	// Every va_list -- a local `va_list ap;` or one that arrived as a
 	// parameter -- is backed by a writable slot (vaListSlot returns its
 	// address), and llvm.va_start stores the cursor into that slot. The slot
@@ -123,7 +125,7 @@ func (e *irEmitter) vaArg(n *VaArgExpr) val {
 	ap := e.vaListSlot(n.Ap)
 	ty := n.Typ
 	if ty == nil {
-		ty = IntType()
+		ty = frontend.IntType()
 	}
 	lty := e.ty(ty)
 
@@ -166,7 +168,7 @@ func (e *irEmitter) vaArg(n *VaArgExpr) val {
 	return val{op: slot, ty: ty}
 }
 
-func (e *irEmitter) cond(x Expr) string {
+func (e *irEmitter) cond(x frontend.Expr) string {
 	if x == nil {
 		return "true"
 	}
@@ -178,7 +180,7 @@ func (e *irEmitter) cond(x Expr) string {
 	if ty == "i1" {
 		return v.op
 	}
-	if v.ty != nil && (v.ty.Kind == KFloat || v.ty.Kind == KDouble) {
+	if v.ty != nil && (v.ty.Kind == frontend.KFloat || v.ty.Kind == frontend.KDouble) {
 		t := e.newTmp()
 		e.line("%s = fcmp une %s %s, 0.0", t, ty, v.op)
 		return t
@@ -195,20 +197,20 @@ func (e *irEmitter) cond(x Expr) string {
 }
 
 // discard evaluates an expression for its effects only.
-func (e *irEmitter) discard(x Expr) {
+func (e *irEmitter) discard(x frontend.Expr) {
 	switch n := x.(type) {
 	case nil:
 		return
-	case *Call:
+	case *frontend.Call:
 		e.callExpr(n)
-	case *IndirectCall:
+	case *frontend.IndirectCall:
 		e.indirectCall(n)
-	case *CommaExpr:
+	case *frontend.CommaExpr:
 		e.discard(n.Left)
 		e.discard(n.Right)
-	case *AssignExpr:
+	case *frontend.AssignExpr:
 		e.assignExpr(n)
-	case *AssignStmt:
+	case *frontend.AssignStmt:
 		e.assignStmt(n)
 	default:
 		// A pure expression needs no code; the operand it produced is unused.
@@ -218,14 +220,14 @@ func (e *irEmitter) discard(x Expr) {
 
 // --- leaves -----------------------------------------------------------------
 
-func (e *irEmitter) numLit(n *NumLit) val {
-	// Kind == TDouble marks the literal as floating point; IsFloat then only
+func (e *irEmitter) numLit(n *frontend.NumLit) val {
+	// Kind == frontend.TDouble marks the literal as floating point; IsFloat then only
 	// says whether it is float or double ("1.5f" versus "1.5"). Testing IsFloat
 	// alone made every unsuffixed literal -- "1.0", "0.0", and so the NAN and
 	// INFINITY macros -- look like an integer, so a division of them was
 	// emitted as "sdiv i32 0, 0" and the surrounding double arithmetic lost its
 	// type.
-	if n.Kind == TDouble {
+	if n.Kind == frontend.TDouble {
 		// A float literal lives in an i32 on this path (the same choice the
 		// native generator makes), so it is written as a bit pattern.
 		t := e.newTmp()
@@ -247,15 +249,15 @@ func (e *irEmitter) numLit(n *NumLit) val {
 		// such functions on the native path, but rendering the low word keeps
 		// the module valid if one ever arrives.
 		if len(n.BigWords) > 0 {
-			return val{op: itoa64(int64(n.BigWords[0])), ty: &Type{Kind: KBitInt, Bits: n.BigBits}}
+			return val{op: itoa64(int64(n.BigWords[0])), ty: &frontend.Type{Kind: frontend.KBitInt, Bits: n.BigBits}}
 		}
-		return val{op: "0", ty: &Type{Kind: KBitInt, Bits: n.BigBits}}
+		return val{op: "0", ty: &frontend.Type{Kind: frontend.KBitInt, Bits: n.BigBits}}
 	}
 	ty := numLitType(n)
 	return val{op: itoa64(n.Val), ty: ty}
 }
 
-func (e *irEmitter) strLit(n *StrLit) val {
+func (e *irEmitter) strLit(n *frontend.StrLit) val {
 	// A C string literal carries a trailing NUL; the lexer keeps only the
 	// quoted bytes, so append the terminator here. Without it the literal is
 	// an unterminated [N x i8] and the runtime reads straight past its end
@@ -267,17 +269,17 @@ func (e *irEmitter) strLit(n *StrLit) val {
 	t := e.newTmp()
 	e.line("%s = getelementptr inbounds i8, ptr @%s, i64 0", t, name)
 	// The literal's value is its address: a char array decays to a pointer.
-	return val{op: t, ty: PtrType(CharType())}
+	return val{op: t, ty: frontend.PtrType(frontend.CharType())}
 }
 
-func (e *irEmitter) ident(n *Ident) val {
+func (e *irEmitter) ident(n *frontend.Ident) val {
 	ty := e.tr.exprType(n)
 	// A local is a slot; a global is a symbol. Both are addresses, and the
 	// value is a load from it -- except for an array, which decays to its
 	// address. Deciding that here rather than at every use is what C means by
 	// "an array is converted to a pointer", and it is why a[j] on an array
 	// parameter does not try to load the whole array as a value.
-	if ty != nil && ty.Kind == KArr {
+	if ty != nil && ty.Kind == frontend.KArr {
 		return e.addressOf(n, ty)
 	}
 	// A va_list that va_start has already given its real storage reads as the
@@ -289,15 +291,15 @@ func (e *irEmitter) ident(n *Ident) val {
 	if s, ok := e.vaSlots[n.Name]; ok {
 		t := e.newTmp()
 		e.line("%s = load ptr, ptr %s, align 8", t, s)
-		return val{op: t, ty: PtrType(CharType())}
+		return val{op: t, ty: frontend.PtrType(frontend.CharType())}
 	}
 	if uid, ok := e.tr.lookupUID(n.Name); ok {
 		slot := e.slotFor(uid, e.ty(ty))
 		return e.load(slot, ty)
 	}
 	if sym := e.c.globalSym(n.Name); sym != "" {
-		if ty != nil && ty.Kind == KArr {
-			return val{op: "@" + sym, ty: PtrType(ty.Elem)}
+		if ty != nil && ty.Kind == frontend.KArr {
+			return val{op: "@" + sym, ty: frontend.PtrType(ty.Elem)}
 		}
 		return e.load("@"+sym, ty)
 	}
@@ -317,7 +319,7 @@ func (e *irEmitter) ident(n *Ident) val {
 	// `printf_lite_with(vfmt_i, ...)` took the program down: the formatter was
 	// handed a null function pointer and called through it.
 	if e.tr.isFuncName(n.Name) {
-		return val{op: "@" + n.Name, ty: PtrType(e.fnPtrTy(n.Name))}
+		return val{op: "@" + n.Name, ty: frontend.PtrType(e.fnPtrTy(n.Name))}
 	}
 	// A name with no storage at all. The checker's own view is that this can
 	// only be reached when the operand is an integer (an enum member whose
@@ -329,21 +331,21 @@ func (e *irEmitter) ident(n *Ident) val {
 }
 
 // zeroLiteral renders the zero value of a type as an operand of that type.
-func (e *irEmitter) zeroLiteral(t *Type) string {
+func (e *irEmitter) zeroLiteral(t *frontend.Type) string {
 	if t == nil {
 		return "0"
 	}
 	switch t.Kind {
-	case KPtr, KFunc, KArr, KStruct, KUnion:
+	case frontend.KPtr, frontend.KFunc, frontend.KArr, frontend.KStruct, frontend.KUnion:
 		return "null"
-	case KFloat, KDouble:
+	case frontend.KFloat, frontend.KDouble:
 		return "0.0"
 	}
 	return "0"
 }
 
 // load reads a value of type t from the address p.
-func (e *irEmitter) load(p string, t *Type) val {
+func (e *irEmitter) load(p string, t *frontend.Type) val {
 	ty := e.ty(t)
 	v := e.newTmp()
 	e.line("%s = load %s, ptr %s, align %d", v, ty, p, alignOfIr(ty))

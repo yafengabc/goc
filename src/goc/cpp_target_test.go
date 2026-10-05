@@ -1,6 +1,7 @@
-package main
+package compiler
 
 import (
+	"goc/frontend"
 	"strings"
 	"testing"
 )
@@ -24,7 +25,7 @@ func TestPlatformBranchSelection(t *testing.T) {
 		}
 		var texts []string
 		for _, tk := range toks {
-			if tk.Kind == TEOF {
+			if tk.Kind == frontend.TEOF {
 				continue
 			}
 			texts = append(texts, tk.Text)

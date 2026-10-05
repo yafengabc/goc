@@ -52,11 +52,18 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 
 ```
 .
-├── src/goc/                                        # 编译器源码（go 模块 goc）
-│   ├── lexer.go  parser.go  ast.go  types.go  headers.go
-│   ├── check.go  codegen.go  cpp.go  main.go
+├── src/                                            # 自包含入口（go 模块 goc/selfcontained）
+│   ├── main.go                                        #   embed goclib/，产出单文件编译器
+│   └── go.mod
+├── src/frontend/                                   # C 前端（go 模块 goc/frontend，零依赖）
+│   ├── lexer.go  parser.go  ast.go  types.go          #   词法 / 语法 / AST / 类型
+│   ├── check.go  print.go  ufcs.go                     #   语义检查、print/数组重写、UFCS
+│   └── go.mod
+├── src/goc/                                        # 编译器主体（go 模块 goc）
+│   ├── codegen.go  cpp.go  multi.go  opt.go            #   自研 x86-64 代码生成
 │   ├── libfs.go                                        #   在磁盘上定位 goclib/（见下）
-│   └── llvm*.go                                        #   LLVM 后端（-fllvm）
+│   ├── llvm*.go                                        #   LLVM 后端（-fllvm）
+│   └── cmd/goc/main.go                                 #   薄入口：package compiler 的 main
 ├── goclib/                                             # 自带的 C 库（go 模块 goc 与 gocl 共用）
 │   ├── os.c                                            #   5 个平台原语，唯一碰 OS 的文件
 │   ├── stdio.c  stdlib.c  string.c  ctype.c            #   45 个库函数
@@ -71,17 +78,17 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 │   └── README.md                                       #   汇编器自己的文档
 ├── src/examples/  src/expected/                      # goc 回归套件的数据（gocregress 的输入）
 │   └── examples/multi/                                 #   多文件链接用例
-├── tools/                                              # 验证工具（独立 go 模块）
+├── tools/                                              # 验证工具（go 模块 tools）
 │   ├── elfcheck                                        #   ELF 结构校验（不再解释执行）
 │   ├── msgboxcheck                                     #   驱动 GUI 对话框并断言
 │   └── ucrun.py  peun.py                               #   ELF / PE 的 Unicorn(QEMU) 运行器
-├── bin/                                                # 构建产物（goc / goa / elfcheck / msgboxcheck / goc-out）
+├── bin/                                                # 产物（goc / goc-standalone / goa / ...）
 ├── build.sh  run_tests.sh  run_tests_linux.sh          # 构建 / 测试（本机 / Linux 真内核）
 └── .github/workflows/ci.yml                            # CI：Linux 原生端到端 + Windows 端到端
 ```
 
 `src/goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
-直接出 exe，不需要 goc。同理 `src/goc/`、`src/goa/`、`tools/` 是**三个** Go 模块，
+直接出 exe，不需要 goc。五个 Go 模块：`src/frontend`（前端，零依赖）、`src/goc`（编译器）、`src`（自包含入口）、`src/goa`（汇编器）、`tools`（验证），
 在 `src/goc/` 里跑 `go test ./...` 是看不到 goa 的单测的。
 
 ## Linux 目标

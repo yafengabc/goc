@@ -1,12 +1,12 @@
-package main
+package compiler
 
 // Multi-translation-unit builds.
 //
-// goc has no separate linking stage: one Program is compiled into one
+// goc has no separate linking stage: one frontend.Program is compiled into one
 // executable. `goc a.c b.c` therefore parses each file as its own translation
-// unit (its own macros, typedefs, struct tags and enumerators -- Parse resets
+// unit (its own macros, typedefs, struct tags and enumerators -- frontend.Parse resets
 // those tables, so nothing leaks between files), merges the resulting
-// declarations into a single Program, and type-checks/generates that once.
+// declarations into a single frontend.Program, and type-checks/generates that once.
 //
 // Two consequences are handled explicitly here:
 //
@@ -20,11 +20,12 @@ package main
 //     happens on an actual clash, so the common case leaves the AST untouched.
 //
 // Only the enumerator table needs care: enumerators live in one package-level
-// map that Check and Gen consult, so each unit's enumerators are snapshotted
-// and merged back after the last Parse (which clears the table).
+// map that frontend.Check and Gen consult, so each unit's enumerators are snapshotted
+// and merged back after the last frontend.Parse (which clears the table).
 
 import (
 	"fmt"
+	"goc/frontend"
 	"os"
 	"reflect"
 	"strings"
@@ -33,8 +34,8 @@ import (
 // parsedUnit is one .c file after preprocessing and parsing.
 type parsedUnit struct {
 	path string
-	prog *Program
-	// enums holds the enumerators this unit declared; Parse clears the global
+	prog *frontend.Program
+	// enums holds the enumerators this unit declared; frontend.Parse clears the global
 	// table before every unit, so the values are collected here and merged
 	// back once all units are parsed.
 	enums map[string]int64
@@ -72,31 +73,31 @@ func buildMulti(cfg buildCfg, isCC bool) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		// Parse resets typedefs/structs/enumConsts on entry, giving this file
+		// frontend.Parse resets typedefs/structs/frontend.EnumConsts on entry, giving this file
 		// a clean type namespace; it also leaves behind *this* file's
-		// enumerators, which we snapshot before the next Parse wipes them.
-		prog, err := Parse(toks)
+		// enumerators, which we snapshot before the next frontend.Parse wipes them.
+		prog, err := frontend.Parse(toks)
 		if err != nil {
 			return "", fmt.Errorf("%s: parse error: %w", path, err)
 		}
 		u := &parsedUnit{path: path, prog: prog, enums: map[string]int64{}}
-		for k, v := range enumConsts {
+		for k, v := range frontend.EnumConsts {
 			u.enums[k] = v
 		}
 		units = append(units, u)
 	}
 
-	// Restore every unit's enumerators: Check (identifier resolution,
+	// Restore every unit's enumerators: frontend.Check (identifier resolution,
 	// case-label constants) and Gen (constant folding) read the global table.
-	for k := range enumConsts {
-		delete(enumConsts, k)
+	for k := range frontend.EnumConsts {
+		delete(frontend.EnumConsts, k)
 	}
 	for _, u := range units {
 		for k, v := range u.enums {
-			if old, dup := enumConsts[k]; dup && old != v {
+			if old, dup := frontend.EnumConsts[k]; dup && old != v {
 				return "", fmt.Errorf("%s: enumerator %q is also defined with a different value in another file", u.path, k)
 			}
-			enumConsts[k] = v
+			frontend.EnumConsts[k] = v
 		}
 	}
 
@@ -109,7 +110,7 @@ func buildMulti(cfg buildCfg, isCC bool) (string, error) {
 
 // preprocessFile reads one source file, injects -D macros and runs the
 // target-aware preprocessor over it.
-func preprocessFile(cfg buildCfg, path string) ([]Token, error) {
+func preprocessFile(cfg buildCfg, path string) ([]frontend.Token, error) {
 	src, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -131,9 +132,9 @@ type unitSym struct {
 	path   string
 }
 
-// mergeUnits merges the parsed translation units into one Program, renaming
+// mergeUnits merges the parsed translation units into one frontend.Program, renaming
 // clashing static symbols and rejecting duplicate external definitions.
-func mergeUnits(units []*parsedUnit) (*Program, error) {
+func mergeUnits(units []*parsedUnit) (*frontend.Program, error) {
 	// 1. Collect every file-scope definition, grouped by name.
 	defs := map[string][]unitSym{}
 	for i, u := range units {
@@ -172,7 +173,7 @@ func mergeUnits(units []*parsedUnit) (*Program, error) {
 			byUnit[s.unit] = true
 		}
 		if len(byUnit) < 2 {
-			// The same file defines the name twice. Check catches a repeated
+			// The same file defines the name twice. frontend.Check catches a repeated
 			// global ("redefinition in the same scope") but not a repeated
 			// function, which would silently emit the label twice -- e.g.
 			// `goc a.c a.c`.
@@ -199,10 +200,10 @@ func mergeUnits(units []*parsedUnit) (*Program, error) {
 	}
 
 	// 3. Apply the renames (declaration + every reference) and merge.
-	merged := &Program{}
-	globals := map[string]*DeclStmt{}
+	merged := &frontend.Program{}
+	globals := map[string]*frontend.DeclStmt{}
 	var globalOrder []string
-	protos := map[string]*FuncDecl{}
+	protos := map[string]*frontend.FuncDecl{}
 	for i, u := range units {
 		if len(renames[i]) > 0 {
 			renameInProgram(u.prog, renames[i])
@@ -264,10 +265,10 @@ func uniqueRename(name string, unit int, defs map[string][]unitSym) string {
 }
 
 // renameInProgram renames file-scope symbols throughout one unit's AST: the
-// declarations themselves and every Ident that refers to them. The walk is
+// declarations themselves and every frontend.Ident that refers to them. The walk is
 // reflection-based so it cannot silently miss a node type (an unhandled node
 // shape would be a missed rename, which is a wrong-reference bug).
-func renameInProgram(prog *Program, renames map[string]string) {
+func renameInProgram(prog *frontend.Program, renames map[string]string) {
 	if len(renames) == 0 {
 		return
 	}
@@ -307,28 +308,28 @@ func renameReflect(v reflect.Value, renames map[string]string) {
 		}
 		if v.CanInterface() {
 			switch x := v.Interface().(type) {
-			case *Ident:
+			case *frontend.Ident:
 				if nn, ok := renames[x.Name]; ok {
 					x.Name = nn
 				}
 				return
-			case *Call:
-				// A direct call names its callee as a string, not an *Ident.
-				// (An indirect call goes through IndirectCall.Fn/UFCS and is
+			case *frontend.Call:
+				// A direct call names its callee as a string, not an *frontend.Ident.
+				// (An indirect call goes through frontend.IndirectCall.Fn/UFCS and is
 				// reached by the ordinary walk.)
 				if nn, ok := renames[x.Name]; ok {
 					x.Name = nn
 				}
-			case *Type:
+			case *frontend.Type:
 				return // types carry tags and member names, never symbols
-			case Type:
+			case frontend.Type:
 				return
 			}
 		}
 		renameReflect(v.Elem(), renames)
 	case reflect.Struct:
 		if v.CanInterface() {
-			if _, ok := v.Interface().(Type); ok {
+			if _, ok := v.Interface().(frontend.Type); ok {
 				return
 			}
 		}

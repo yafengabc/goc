@@ -256,6 +256,53 @@ for _, f := range prog.Funcs {
 
 ---
 
+## 5b. 阶段二已完成（2026-10-05）
+
+实际落地与原计划有三处偏差，都是实测逼出来的：
+
+**1. 前端是 6357 行而非 5807。** 多出的两个文件（`print.go` 264 行、`ufcs.go` 286 行）
+一开始被当成后端留在原地，搬移时才发现 `check.go` 依赖它们的三个方法
+（`checker.arrayMethodHint` / `rewritePrint` / `tryUFCS`）。它们是 checker 的方法、
+纯类型辅助，没有一行代码生成 —— 按**语义归属**而不是文件位置判断，才是对的分法。
+
+**2. 后端需要 88 个前端符号，不是 68 个。** 「首字母大写」漏掉了 `const` 块里的
+`Kind` 族（`KInt`/`KBool`/`KPtr`…11 个）与 `CType` 族（`TInt`/`TDouble`…），
+以及 token kind（`TEOF`/`TIdent`…）。收集规则要扫 const/var 块内部。
+
+**3. 三个符号必须排除在转换之外**：`structs` / `typedefs` / `keywords` 在后端常被
+用作**结构体字段名**。加前缀会把 `structs map[string]bool` 变成
+`frontend.Structs map[...]` —— 不报错，直接不解析。这类冲突靠正则无法判定，
+只能靠编译反馈逐个排除。
+
+**关于「一个目录只能有一个 main」的实测**：`goc.go` / `goa.go` / `gocl.go` 放同一目录
+会得到 `main redeclared in this block`，**一个 exe 都出不来**。所以 `gocl` 必须是
+独立目录（与 `src/goc` 同级），这是语言规则不是设计取舍。
+
+### 已达成的结构
+
+```
+src/frontend/     module goc/frontend      6357 行，**零依赖**（连 goa 都不 import）
+src/goc/          module goc                package compiler（可 import）
+  cmd/goc/main.go                           薄入口，os.Exit(compiler.Main(...))
+src/              module goc/selfcontained   main.go embed goclib/ → 6.4M 单文件
+src/goa/          module goa                package goa（可 import）+ cmd/goa
+```
+
+`src/main.go` 这个自包含入口是**阶段三 gocl 的工作模板**：它证明了
+「package compiler + SetLibrary(embed) + 薄 main」这条路径可行，
+gocl 要做的只是把代码生成换成 LLVM、去掉自研 codegen。
+
+### 库加载必须惰性（真 bug，值得单列）
+
+`SetLibrary` 最初写成「换源 + 把 `libLoad` 置空」，结果**库永远不编译**，
+症状是 `codegen error: unknown function "ExitProcess"`。
+
+根因是 Go 的初始化顺序：**被导入包的 `init()` 先于导入者执行**。若库在
+`package compiler` 的 `init()` 里编译，入口包的注入一定来得太晚。
+正确做法是 `sync.Once` 惰性加载 + `Main()` 开头 `ensureLib()` ——
+`ensureLib` 还必须放在 `Main` 最前面，因为预处理器解析 `#include <stdio.h>`
+时就要读库，晚了就是 cpp.go 里的空指针而不是一条诊断。
+
 ## 6. 建议的第一步
 
 **做阶段一（脚手架）+ 阶段二（抽 frontend），跑通后再谈 gocl。**

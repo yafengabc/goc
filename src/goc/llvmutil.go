@@ -1,10 +1,11 @@
-package main
+package compiler
 
 // Helpers shared by the IR expression and statement generators: literal
 // classification, numeric conversions, string constants and the small type
 // predicates the emitters ask for.
 
 import (
+	"goc/frontend"
 	"math"
 	"strconv"
 )
@@ -16,18 +17,18 @@ func f32bits(f float64) uint32 { return math.Float32bits(float32(f)) }
 
 // floatOrDouble picks the C type a floating literal has: an unsuffixed literal
 // is a double, an "f" suffixed one a float.
-func floatOrDouble(n *NumLit) *Type {
+func floatOrDouble(n *frontend.NumLit) *frontend.Type {
 	// IsFloat is the "f" suffix: it picks float, and everything else that
 	// reached here is a double.
 	if n.IsFloat {
-		return FloatType()
+		return frontend.FloatType()
 	}
-	return DoubleType()
+	return frontend.DoubleType()
 }
 
 // numLitType gives an integer literal its C type, which the suffix and the
 // value's magnitude together decide.
-func numLitType(n *NumLit) *Type {
+func numLitType(n *frontend.NumLit) *frontend.Type {
 	w := 4
 	switch {
 	case n.Long:
@@ -38,7 +39,7 @@ func numLitType(n *NumLit) *Type {
 	if !n.Long && !n.Unsig && n.Val > 0x7fffffff {
 		w = 8 // a value too large for int promotes to long
 	}
-	t := &Type{Kind: KInt, Width: w, Signed: !n.Unsig}
+	t := &frontend.Type{Kind: frontend.KInt, Width: w, Signed: !n.Unsig}
 	return t
 }
 
@@ -54,13 +55,13 @@ func bytesToBytes(b []byte) []byte { return b }
 // is already rendered as text, and the two share the pointer cases below --
 // having them drift apart is how a `trunc ptr to i32` reaches LLVM, which it
 // rejects because no such cast exists.
-func (e *irEmitter) convert(op string, from, to *Type) string {
+func (e *irEmitter) convert(op string, from, to *frontend.Type) string {
 	// An array target decays the same way an array source does. A string
 	// literal is a char array whose value is already a pointer to its first
 	// element, so asking to convert it "to [1 x i8]" asked for a bitcast of a
 	// pointer to an array, which has no valid opcode in LLVM.
-	if to != nil && to.Kind == KArr {
-		to = PtrType(to.Elem)
+	if to != nil && to.Kind == frontend.KArr {
+		to = frontend.PtrType(to.Elem)
 	}
 	// Integer <-> floating point is a value conversion, not a reinterpretation,
 	// and it has to be done here rather than in convertTo because the signedness
@@ -72,8 +73,8 @@ func (e *irEmitter) convert(op string, from, to *Type) string {
 	// silently evaluated to 0. LLVM has opcodes for both directions.
 	if isFloatTy(from) != isFloatTy(to) {
 		ff, tf := isFloatTy(from), isFloatTy(to)
-		intTy := func(t *Type) bool {
-			return t != nil && (t.Kind == KInt || t.Kind == KBool)
+		intTy := func(t *frontend.Type) bool {
+			return t != nil && (t.Kind == frontend.KInt || t.Kind == frontend.KBool)
 		}
 		if tf && intTy(from) {
 			v := e.newTmp()
@@ -97,37 +98,37 @@ func (e *irEmitter) convert(op string, from, to *Type) string {
 	return e.convertTo(op, from, e.ty(to))
 }
 
-func floatBits(t *Type) (int, bool) {
+func floatBits(t *frontend.Type) (int, bool) {
 	if t == nil {
 		return 0, false
 	}
-	if t.Kind == KFloat {
+	if t.Kind == frontend.KFloat {
 		return 32, true
 	}
-	if t.Kind == KDouble {
+	if t.Kind == frontend.KDouble {
 		return 64, true
 	}
 	return 0, false
 }
 
-func isFloatTy(t *Type) bool {
+func isFloatTy(t *frontend.Type) bool {
 	_, ok := floatBits(t)
 	return ok
 }
 
 // widthOf returns a type's width in bits, counting pointers as 64.
-func widthOf(t *Type) int {
+func widthOf(t *frontend.Type) int {
 	if t == nil {
 		return 32
 	}
 	switch t.Kind {
-	case KInt, KBool:
+	case frontend.KInt, frontend.KBool:
 		return t.Width * 8
-	case KFloat:
+	case frontend.KFloat:
 		return 32
-	case KDouble:
+	case frontend.KDouble:
 		return 64
-	case KPtr, KFunc, KArr:
+	case frontend.KPtr, frontend.KFunc, frontend.KArr:
 		return 64
 	}
 	return 64
@@ -147,32 +148,32 @@ func (e *irEmitter) scratchSlot(n int) string {
 }
 
 // storeBrace writes a braced initialiser into an object of type t at address p.
-func (e *irEmitter) storeBrace(b *BraceInit, t *Type, p string) {
+func (e *irEmitter) storeBrace(b *frontend.BraceInit, t *frontend.Type, p string) {
 	e.storeInit(b, t, p, 0)
 }
 
 // storeInit writes the elements of b into the aggregate at p, starting at
 // byte offset off within it.
-func (e *irEmitter) storeInit(b *BraceInit, t *Type, p string, off int) {
+func (e *irEmitter) storeInit(b *frontend.BraceInit, t *frontend.Type, p string, off int) {
 	if b == nil || t == nil {
 		return
 	}
 	switch t.Kind {
-	case KArr:
-		esz := sizeOf(t.Elem)
+	case frontend.KArr:
+		esz := frontend.Sizeof(t.Elem)
 		for i, el := range b.Elems {
 			idx := i
 			if el.DesigIdx >= 0 {
 				idx = el.DesigIdx
 			}
 			slot := e.gep(p, esz, int64(idx))
-			if nested, ok := el.E.(*BraceInit); ok {
+			if nested, ok := el.E.(*frontend.BraceInit); ok {
 				e.storeInit(nested, t.Elem, slot, 0)
 				continue
 			}
 			e.storeScalar(slot, el.E, t.Elem)
 		}
-	case KStruct, KUnion:
+	case frontend.KStruct, frontend.KUnion:
 		for i, el := range b.Elems {
 			if i >= len(t.Members) {
 				break
@@ -190,7 +191,7 @@ func (e *irEmitter) storeInit(b *BraceInit, t *Type, p string, off int) {
 				continue
 			}
 			slot := e.gep(p, 1, int64(mem.Offset))
-			if nested, ok := el.E.(*BraceInit); ok {
+			if nested, ok := el.E.(*frontend.BraceInit); ok {
 				e.storeInit(nested, mem.Type, slot, 0)
 				continue
 			}
@@ -206,11 +207,11 @@ func (e *irEmitter) storeInit(b *BraceInit, t *Type, p string, off int) {
 }
 
 // storeScalar evaluates e and stores it into the object of type t at p.
-func (e *irEmitter) storeScalar(p string, x Expr, t *Type) {
+func (e *irEmitter) storeScalar(p string, x frontend.Expr, t *frontend.Type) {
 	if x == nil {
 		return
 	}
-	if nested, ok := x.(*BraceInit); ok {
+	if nested, ok := x.(*frontend.BraceInit); ok {
 		e.storeInit(nested, t, p, 0)
 		return
 	}
@@ -219,7 +220,7 @@ func (e *irEmitter) storeScalar(p string, x Expr, t *Type) {
 }
 
 // coerce converts a value to a target type where the assignment requires it.
-func (e *irEmitter) coerce(v val, to *Type) val {
+func (e *irEmitter) coerce(v val, to *frontend.Type) val {
 	if to == nil || v.ty == nil {
 		return v
 	}
@@ -239,7 +240,7 @@ func (e *irEmitter) gep(p string, esz int, idx int64) string {
 // storeString copies a string literal's bytes into a char array. A C initialiser
 // of the form `char s[] = "x"` copies; assigning the same literal to a char*
 // takes its address instead, and the two are different instructions.
-func (e *irEmitter) storeString(sl *StrLit, t *Type, slot string) {
+func (e *irEmitter) storeString(sl *frontend.StrLit, t *frontend.Type, slot string) {
 	n := t.Len
 	if n <= 0 {
 		n = len(sl.Bytes) + 1

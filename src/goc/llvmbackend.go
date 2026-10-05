@@ -1,4 +1,6 @@
-package main
+package compiler
+
+import "goc/frontend"
 
 // Driving the LLVM backend: deciding what goes down the IR path, and linking it
 // into one executable.
@@ -19,7 +21,7 @@ package main
 // _BitInt are the two: LLVM has no direct model for either, and goc's own
 // generator already implements both, so sending those functions there is both
 // simpler and more faithful.
-func llvmEligible(f *FuncDecl) bool {
+func llvmEligible(f *frontend.FuncDecl) bool {
 	if f == nil || f.Body == nil {
 		return false
 	}
@@ -40,13 +42,13 @@ func llvmEligible(f *FuncDecl) bool {
 }
 
 // usesUnsupportedLLVM walks a body for the constructs the front end skips.
-func usesUnsupportedLLVM(s Stmt) bool {
+func usesUnsupportedLLVM(s frontend.Stmt) bool {
 	found := false
-	walkStmts(s, func(x Stmt) {
+	frontend.WalkStmts(s, func(x frontend.Stmt) {
 		switch n := x.(type) {
-		case *AsmStmt:
+		case *frontend.AsmStmt:
 			found = true
-		case *DeclStmt:
+		case *frontend.DeclStmt:
 			if n.Typ != nil && typUnsupported(n.Typ) {
 				found = true
 			}
@@ -60,22 +62,22 @@ func usesUnsupportedLLVM(s Stmt) bool {
 	// struct type knows. The checker is not run here, so the walk looks the
 	// member up by name in whatever struct type the base expression has.
 	ok := true
-	walkStmts(s, func(x Stmt) {
-		walkExprsIn(x, func(e Expr) {
+	frontend.WalkStmts(s, func(x frontend.Stmt) {
+		walkExprsIn(x, func(e frontend.Expr) {
 			switch n := e.(type) {
-			case *MemberExpr:
+			case *frontend.MemberExpr:
 				if memberIsBitField(n) {
 					ok = false
 				}
-			case *DeclStmt:
+			case *frontend.DeclStmt:
 				if n.Typ != nil && typUnsupported(n.Typ) {
 					ok = false
 				}
-			case *CastExpr:
+			case *frontend.CastExpr:
 				if n.Typ != nil && typUnsupported(n.Typ) {
 					ok = false
 				}
-			case *SizeofExpr:
+			case *frontend.SizeofExpr:
 				if n.Typ != nil && typUnsupported(n.Typ) {
 					ok = false
 				}
@@ -97,8 +99,8 @@ func usesUnsupportedLLVM(s Stmt) bool {
 // over-approximates, and deliberately so -- routing a function to the native
 // generator costs a little speed, while sending a bit-field to a front end that
 // cannot model it would compile it wrongly.
-func memberIsBitField(n *MemberExpr) bool {
-	for _, t := range structs {
+func memberIsBitField(n *frontend.MemberExpr) bool {
+	for _, t := range frontend.Structs() {
 		for _, m := range t.Members {
 			if m.Name == n.Name && m.BitWidth > 0 {
 				return true
@@ -110,17 +112,17 @@ func memberIsBitField(n *MemberExpr) bool {
 
 // typUnsupported reports whether a type has a feature the IR front end does not
 // model yet.
-func typUnsupported(t *Type) bool {
+func typUnsupported(t *frontend.Type) bool {
 	if t == nil {
 		return false
 	}
-	if t.Kind == KBitInt {
+	if t.Kind == frontend.KBitInt {
 		return true
 	}
-	if t.Kind == KArr {
+	if t.Kind == frontend.KArr {
 		return typUnsupported(t.Elem)
 	}
-	if t.Kind == KStruct || t.Kind == KUnion {
+	if t.Kind == frontend.KStruct || t.Kind == frontend.KUnion {
 		for _, mem := range t.Members {
 			if typUnsupported(mem.Type) {
 				return true
@@ -135,8 +137,8 @@ func typUnsupported(t *Type) bool {
 }
 
 // walkExprsIn calls fn for every expression reachable from a statement.
-func walkExprsIn(s Stmt, fn func(Expr)) {
-	walkStmts(s, func(x Stmt) {
+func walkExprsIn(s frontend.Stmt, fn func(frontend.Expr)) {
+	frontend.WalkStmts(s, func(x frontend.Stmt) {
 		for _, e := range stmtExprs(x) {
 			walkExpr(e, fn)
 		}
@@ -144,26 +146,26 @@ func walkExprsIn(s Stmt, fn func(Expr)) {
 }
 
 // stmtExprs returns the expressions a statement directly contains.
-func stmtExprs(s Stmt) []Expr {
+func stmtExprs(s frontend.Stmt) []frontend.Expr {
 	switch n := s.(type) {
-	case *DeclStmt:
-		return []Expr{n.Init}
-	case *AssignStmt:
-		return []Expr{n.Lhs, n.Rhs}
-	case *ExprStmt:
-		return []Expr{n.E}
-	case *ReturnStmt:
-		return []Expr{n.E}
-	case *IfStmt:
-		return []Expr{n.Cond}
-	case *WhileStmt:
-		return []Expr{n.Cond}
-	case *DoWhileStmt:
-		return []Expr{n.Cond}
-	case *SwitchStmt:
-		return []Expr{n.Src}
-	case *ForStmt:
-		out := []Expr{n.Cond, n.Post}
+	case *frontend.DeclStmt:
+		return []frontend.Expr{n.Init}
+	case *frontend.AssignStmt:
+		return []frontend.Expr{n.Lhs, n.Rhs}
+	case *frontend.ExprStmt:
+		return []frontend.Expr{n.E}
+	case *frontend.ReturnStmt:
+		return []frontend.Expr{n.E}
+	case *frontend.IfStmt:
+		return []frontend.Expr{n.Cond}
+	case *frontend.WhileStmt:
+		return []frontend.Expr{n.Cond}
+	case *frontend.DoWhileStmt:
+		return []frontend.Expr{n.Cond}
+	case *frontend.SwitchStmt:
+		return []frontend.Expr{n.Src}
+	case *frontend.ForStmt:
+		out := []frontend.Expr{n.Cond, n.Post}
 		if e := firstExprOf(n.Init); e != nil {
 			out = append(out, e)
 		}
@@ -172,7 +174,7 @@ func stmtExprs(s Stmt) []Expr {
 	return nil
 }
 
-func firstExprOf(s Stmt) Expr {
+func firstExprOf(s frontend.Stmt) frontend.Expr {
 	if s == nil {
 		return nil
 	}
@@ -183,46 +185,46 @@ func firstExprOf(s Stmt) Expr {
 }
 
 // walkExpr calls fn for e and every sub-expression.
-func walkExpr(e Expr, fn func(Expr)) {
+func walkExpr(e frontend.Expr, fn func(frontend.Expr)) {
 	if e == nil {
 		return
 	}
 	fn(e)
 	switch n := e.(type) {
-	case *Call:
+	case *frontend.Call:
 		for _, a := range n.Args {
 			walkExpr(a, fn)
 		}
-	case *IndirectCall:
+	case *frontend.IndirectCall:
 		walkExpr(n.Fn, fn)
 		for _, a := range n.Args {
 			walkExpr(a, fn)
 		}
-	case *Unary:
+	case *frontend.Unary:
 		walkExpr(n.E, fn)
-	case *Binary:
+	case *frontend.Binary:
 		walkExpr(n.L, fn)
 		walkExpr(n.R, fn)
-	case *AssignExpr:
+	case *frontend.AssignExpr:
 		walkExpr(n.Lhs, fn)
 		walkExpr(n.Rhs, fn)
-	case *CommaExpr:
+	case *frontend.CommaExpr:
 		walkExpr(n.Left, fn)
 		walkExpr(n.Right, fn)
-	case *Index:
+	case *frontend.Index:
 		walkExpr(n.Base, fn)
 		walkExpr(n.Idx, fn)
-	case *CondExpr:
+	case *frontend.CondExpr:
 		walkExpr(n.Cond, fn)
 		walkExpr(n.Then, fn)
 		walkExpr(n.Else, fn)
-	case *CastExpr:
+	case *frontend.CastExpr:
 		walkExpr(n.E, fn)
-	case *IncDecExpr:
+	case *frontend.IncDecExpr:
 		walkExpr(n.E, fn)
-	case *MemberExpr:
+	case *frontend.MemberExpr:
 		walkExpr(n.Base, fn)
-	case *VaArgExpr:
+	case *frontend.VaArgExpr:
 		walkExpr(n.Ap, fn)
 	}
 }

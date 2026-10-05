@@ -1,4 +1,4 @@
-package main
+package frontend
 
 // AST node definitions for the tiny C subset understood by goc.
 

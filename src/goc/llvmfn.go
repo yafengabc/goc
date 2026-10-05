@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // The LLVM IR back end: a pure AST -> IR translator with no code-generator
 // coupling.
@@ -15,6 +15,7 @@ package main
 
 import (
 	"fmt"
+	"goc/frontend"
 	"strings"
 )
 
@@ -116,12 +117,12 @@ func (e *irEmitter) blockLabel(l string) {
 	e.pendingLabels = nil
 }
 
-func (e *irEmitter) ty(t *Type) string { return e.c.llirType(t) }
+func (e *irEmitter) ty(t *frontend.Type) string { return e.c.llirType(t) }
 
 // --- function ---------------------------------------------------------------
 
 // genIRFunc renders one C function as an LLVM IR definition.
-func genIRFunc(tr *typeResolver, m *irMod, f *FuncDecl) (string, error) {
+func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error) {
 	e := &irEmitter{
 		c:          m,
 		tr:         tr,
@@ -187,14 +188,14 @@ func genIRFunc(tr *typeResolver, m *irMod, f *FuncDecl) (string, error) {
 // bindParams turns the C parameters into LLVM block arguments and local slots.
 // A parameter also gets an alloca because C allows its address to be taken;
 // LLVM's mem2reg pass removes the slot again when nothing does.
-func (e *irEmitter) bindParams(f *FuncDecl) []string {
+func (e *irEmitter) bindParams(f *frontend.FuncDecl) []string {
 	var out []string
 	for i, pt := range f.ParamTypes {
 		// A parameter declared as an array is a pointer: the caller passes the
 		// address, and treating the slot as the whole array would load it as a
 		// value and pass an [N x i32] where a pointer belongs.
-		if pt != nil && pt.Kind == KArr {
-			pt = PtrType(pt.Elem)
+		if pt != nil && pt.Kind == frontend.KArr {
+			pt = frontend.PtrType(pt.Elem)
 		}
 		ty := e.ty(pt)
 		name := "%p" + itoa(i)
@@ -228,7 +229,7 @@ func (e *irEmitter) slotFor(uid int, ty string) string {
 
 // vaListTy is the storage a va_list needs on this target.
 //
-// goc declares va_list as `char *` (parser.go: typedefs["va_list"] = PtrType(CharType())),
+// goc declares va_list as `char *` (parser.go: typedefs["va_list"] = frontend.PtrType(frontend.CharType())),
 // which is eight bytes, and the intrinsic llvm.va_start stores exactly one
 // eight-byte pointer into it: the cursor into the caller's register save area.
 // The slot is still widened to 24 bytes so the intrinsic can never overwrite
@@ -250,8 +251,8 @@ const vaListTy = "[3 x i64]"
 // parameter is backed by the alloca bindParams created for it, so its address
 // is returned too: va_arg advances the cursor by writing back through it, and
 // returning a value instead would make every va_arg read the same slot.
-func (e *irEmitter) vaListSlot(x Expr) string {
-	id, ok := x.(*Ident)
+func (e *irEmitter) vaListSlot(x frontend.Expr) string {
+	id, ok := x.(*frontend.Ident)
 	if !ok {
 		return e.lvalue(x)
 	}

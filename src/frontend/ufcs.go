@@ -1,4 +1,4 @@
-package main
+package frontend
 
 // UFCS: uniform function call syntax for struct methods, Go/Nim style.
 //

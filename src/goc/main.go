@@ -1,15 +1,15 @@
-package main
+package compiler
 
 import (
 	"errors"
 	"fmt"
+	"goa"
+	"goc/frontend"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-
-	"goa"
 )
 
 // goc: a tiny C compiler.
@@ -49,25 +49,41 @@ import (
 // Since 2026-10-02 plain `goc file.c` also compiles without auto-running
 // (use `goc run file.c` to execute), so the `cc`/`cc.exe` personality no
 // longer differs from the default: both just emit the executable.
-func main() {
-	if len(os.Args) > 1 && os.Args[1] == "run" {
-		runCmd(os.Args[2:])
-		return // runCmd always exits
+// Main is the compiler's command line, as a library entry point. It takes the
+// arguments a command would get and returns the process exit code instead of
+// calling os.Exit, so an embedding program -- one that embeds the C library to
+// produce a self-contained binary -- can run it and decide what to do next.
+//
+// Every os.Exit in this function was a decision the caller could reasonably
+// make differently: a build tool driving several compiles wants a diagnostic
+// and a continue, not a dead process. Errors reach the caller as
+// (code, message) rather than as a printed line.
+func Main(args []string) int {
+	// The C library has to be compiled before anything is preprocessed: the
+	// preprocessor resolves `#include <stdio.h>` out of it, so a nil library
+	// here is a nil dereference in the middle of cpp.go rather than a
+	// diagnostic. The load itself is lazy (see codegen.go) so that an entry
+	// point can install its own library first; this call is what makes the
+	// default path safe.
+	ensureLib()
+
+	if len(args) > 1 && args[0] == "run" {
+		return runCmd(args[1:])
 	}
 
-	cfg, isCC := parseArgs(os.Args[1:])
+	cfg, isCC := parseArgs(args)
 
 	if len(cfg.inputs) == 0 {
 		fmt.Fprintln(os.Stderr, "goc: no input files")
-		os.Exit(1)
+		return 1
 	}
 	outPath, err := buildProgram(cfg, isCC)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
 	if outPath == "" || cfg.mode != "run" {
-		return
+		return 0
 	}
 
 	if cfg.linux {
@@ -76,7 +92,7 @@ func main() {
 		if !isCC {
 			fmt.Println("(ELF binary: run it on Linux)")
 		}
-		return
+		return 0
 	}
 
 	abs, err := filepath.Abs(outPath)
@@ -89,10 +105,12 @@ func main() {
 	if err := rcmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			fmt.Printf("(program exited with code %d)\n", ee.ExitCode())
-		} else {
-			fmt.Fprintln(os.Stderr, "run failed:", err)
+			return ee.ExitCode()
 		}
+		fmt.Fprintln(os.Stderr, "run failed:", err)
+		return 1
 	}
+	return 0
 }
 
 // buildProgram runs the preprocess -> parse -> check -> gen -> goa pipeline
@@ -148,7 +166,7 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 		return "", nil
 	}
 
-	prog, err := Parse(toks)
+	prog, err := frontend.Parse(toks)
 	if err != nil {
 		return "", fmt.Errorf("parse error: %w", err)
 	}
@@ -159,8 +177,8 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 // program, generate assembly, and hand it to goa. Shared by the single-file
 // path and the multi-file one (which parses each .c separately and merges the
 // translation units before calling this).
-func emitProgram(prog *Program, cfg buildCfg, isCC bool) (string, error) {
-	if errs := Check(prog); len(errs) > 0 {
+func emitProgram(prog *frontend.Program, cfg buildCfg, isCC bool) (string, error) {
+	if errs := frontend.Check(prog); len(errs) > 0 {
 		var b strings.Builder
 		b.WriteString("type error(s):")
 		for _, e := range errs {
@@ -349,12 +367,15 @@ func isCSource(p string) bool {
 // The program's own argc/argv come from the OS (Windows rebuilds them from
 // GetCommandLineA, Linux reads [rsp] at entry), so exec-ing with progArgs is
 // all the forwarding needed.
-func runCmd(args []string) {
+// runCmd implements `goc run`: compile into a temporary directory, execute the
+// result with the remaining arguments, and pass its exit status through. The
+// return value is the process exit code, for the same reason Main returns one.
+func runCmd(args []string) int {
 	buildArgs, inputs, progArgs := splitRunArgs(args)
 	if len(inputs) == 0 {
 		fmt.Fprintln(os.Stderr, "goc run: no input files")
 		fmt.Fprintln(os.Stderr, "usage: goc run [-O*] [-Dname[=val]] [-Idir] file.c [file2.c...] [args...]")
-		os.Exit(1)
+		return 1
 	}
 
 	cfg, _ := parseArgs(buildArgs)
@@ -362,13 +383,13 @@ func runCmd(args []string) {
 	cfg.mode = "compile" // the run below is runCmd's job
 	if cfg.linux {
 		fmt.Fprintln(os.Stderr, "goc run: cannot execute a Linux ELF on this host (drop -target linux, or use -c and run it on Linux)")
-		os.Exit(1)
+		return 1
 	}
 
 	tmp, err := os.MkdirTemp("", "goc-run-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "goc run:", err)
-		os.Exit(1)
+		return 1
 	}
 	defer os.RemoveAll(tmp)
 	cfg.outFile = tmp
@@ -406,7 +427,7 @@ func runCmd(args []string) {
 			code = 1
 		}
 	}()
-	os.Exit(code)
+	return code
 }
 
 // buildCfg holds the result of parsing the command line.

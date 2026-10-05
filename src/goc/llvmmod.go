@@ -1,6 +1,7 @@
-package main
+package compiler
 
 import (
+	"goc/frontend"
 	"strconv"
 	"strings"
 )
@@ -17,8 +18,8 @@ import (
 
 // irMod accumulates one LLVM IR module.
 type irMod struct {
-	structs map[string]bool  // struct type names already defined
-	structN map[*Type]string // C struct type -> LLVM name
+	structs map[string]bool           // struct type names already defined
+	structN map[*frontend.Type]string // C struct type -> LLVM name
 	seq     int
 
 	globals []irGlobal
@@ -35,7 +36,7 @@ type irMod struct {
 	// extSig de-duplicates external declarations by name and arity.
 	extSig map[string]bool
 	// extRet remembers a declared return type per external.
-	extRet map[string]*Type
+	extRet map[string]*frontend.Type
 	// strings interns string constants, mapping their contents to a global.
 	strings map[string]string
 	// consts interns every folded constant by its rendered form, so two globals
@@ -65,11 +66,11 @@ type irGlobal struct {
 func newIRMod() *irMod {
 	m := &irMod{
 		structs: map[string]bool{},
-		structN: map[*Type]string{},
+		structN: map[*frontend.Type]string{},
 		protos:  map[string]bool{},
 		defined: map[string]bool{},
 		extSig:  map[string]bool{},
-		extRet:  map[string]*Type{},
+		extRet:  map[string]*frontend.Type{},
 		strings: map[string]string{},
 		consts:  map[string]string{},
 	}
@@ -133,26 +134,26 @@ func (m *irMod) String() string {
 // rides in an i32, matching what the native code generator does, so a value
 // means the same thing on both paths.
 // boolIr is the IR type of a value that is already a condition.
-func boolIr() *Type { return &Type{Kind: KBool} }
+func boolIr() *frontend.Type { return &frontend.Type{Kind: frontend.KBool} }
 
-func (m *irMod) llirType(t *Type) string {
+func (m *irMod) llirType(t *frontend.Type) string {
 	if t == nil {
 		return "i32"
 	}
 	switch t.Kind {
-	case KVoid:
+	case frontend.KVoid:
 		return "void"
-	case KBool:
+	case frontend.KBool:
 		// C's _Bool is a byte, but the IR front end uses this type for the
 		// result of a comparison and for a reduced controlling expression,
 		// which LLVM models as i1. A _Bool stored to memory is written through
 		// an i8 slot by the store path, so nothing else depends on this.
 		return "i1"
-	case KBitInt:
+	case frontend.KBitInt:
 		// Not modelled as a distinct type. goc's own generator handles these
 		// and the caller keeps such functions off this path.
 		return "i64"
-	case KInt:
+	case frontend.KInt:
 		switch t.Width {
 		case 1:
 			return "i8"
@@ -163,15 +164,15 @@ func (m *irMod) llirType(t *Type) string {
 		default:
 			return "i32"
 		}
-	case KFloat:
+	case frontend.KFloat:
 		return "float"
-	case KDouble:
+	case frontend.KDouble:
 		return "double"
-	case KPtr, KFunc:
+	case frontend.KPtr, frontend.KFunc:
 		return "ptr"
-	case KArr:
+	case frontend.KArr:
 		return "[" + itoa(lenOfTy(t)) + " x " + m.llirType(t.Elem) + "]"
-	case KStruct, KUnion:
+	case frontend.KStruct, frontend.KUnion:
 		return "%" + m.structName(t)
 	}
 	return "i32"
@@ -222,7 +223,7 @@ func alignOfLlir(ty string) int {
 // structName defines the LLVM type for a struct or union on first use and
 // returns its name. A tagged struct uses its tag so the IR stays readable; an
 // anonymous one is numbered, since nothing else can name it.
-func (m *irMod) structName(t *Type) string {
+func (m *irMod) structName(t *frontend.Type) string {
 	if n, ok := m.structN[t]; ok {
 		return n
 	}
@@ -230,7 +231,7 @@ func (m *irMod) structName(t *Type) string {
 	if t.Tag != "" {
 		base = sanitize(t.Tag)
 	}
-	// Structs can refer to one another, so reserve the name before recursing.
+	// frontend.Structs can refer to one another, so reserve the name before recursing.
 	name := base
 	if _, taken := m.structs[name]; taken {
 		m.seq++
@@ -240,7 +241,7 @@ func (m *irMod) structName(t *Type) string {
 	m.structs[name] = true
 
 	var body string
-	if t.Kind == KUnion {
+	if t.Kind == frontend.KUnion {
 		// A union is as wide as its widest member, and its first member
 		// already occupies that width -- only the remainder, if any, needs an
 		// explicit pad. Adding the whole width on top of the member doubled
@@ -282,14 +283,14 @@ func (m *irMod) structName(t *Type) string {
 // number of extra bytes needed to reach the union's C size. The type emitter
 // and the constant initialiser both go through this so they cannot disagree
 // about how many members a union has.
-func unionLayout(t *Type) (first *Type, pad int) {
+func unionLayout(t *frontend.Type) (first *frontend.Type, pad int) {
 	if len(t.Members) == 0 {
 		return nil, 0
 	}
 	first = t.Members[0].Type
-	wide := sizeOf(first)
+	wide := frontend.Sizeof(first)
 	for _, mem := range t.Members[1:] {
-		if s := sizeOf(mem.Type); s > wide {
+		if s := frontend.Sizeof(mem.Type); s > wide {
 			wide = s
 		}
 	}
@@ -300,7 +301,7 @@ func unionLayout(t *Type) (first *Type, pad int) {
 	if size > wide {
 		wide = size
 	}
-	if pad = wide - sizeOf(first); pad < 0 {
+	if pad = wide - frontend.Sizeof(first); pad < 0 {
 		pad = 0
 	}
 	return first, pad
@@ -369,7 +370,7 @@ func sanitize(s string) string {
 }
 
 // lenOfTy returns the element count of an array type, or 1.
-func lenOfTy(t *Type) int {
+func lenOfTy(t *frontend.Type) int {
 	if t.Len <= 0 {
 		return 1
 	}
@@ -382,7 +383,7 @@ func lenOfTy(t *Type) int {
 // runtime and the entry stub come from goa's own assembler, so their bodies
 // arrive through the other half of the link; all that is needed here is a
 // declaration with the right shape.
-func (m *irMod) noteExtern(name string, ret *Type, params []*Type) {
+func (m *irMod) noteExtern(name string, ret *frontend.Type, params []*frontend.Type) {
 	// The return type is recorded on every call, not only the ones that need a
 	// `declare` line: callExpr reads it back through externRet to type the
 	// `call` instruction, and that has to be void for a void function however
@@ -434,17 +435,17 @@ func (m *irMod) noteIntrinsic(name, ret string, params []string) {
 
 // externRet reports the return type a previous noteExtern recorded, defaulting
 // to int so a call whose prototype was never seen still type-checks.
-func (m *irMod) externRet(name string) *Type {
+func (m *irMod) externRet(name string) *frontend.Type {
 	if t, ok := m.extRet[name]; ok {
 		return t
 	}
-	return IntType()
+	return frontend.IntType()
 }
 
 // setExternRet records a declared return type.
-func (m *irMod) setExternRet(name string, t *Type) {
+func (m *irMod) setExternRet(name string, t *frontend.Type) {
 	if m.extRet == nil {
-		m.extRet = map[string]*Type{}
+		m.extRet = map[string]*frontend.Type{}
 	}
 	m.extRet[name] = t
 }
@@ -507,14 +508,14 @@ func cString(b []byte) string {
 // convertTo converts a value to a named LLVM type. It is the counterpart of
 // convert for the places where the target is already rendered as text -- a
 // function's return type, for instance.
-func (e *irEmitter) convertTo(op string, from *Type, toIR string) string {
+func (e *irEmitter) convertTo(op string, from *frontend.Type, toIR string) string {
 	// An array operand has already decayed to a pointer to its first element by
 	// the time it is a value. Converting from the array type itself renders
 	// "[256 x i8]", which is not what the value is: the operand is the slot's
 	// address. Reading it as an array produced "bitcast [256 x i8] %p to ptr"
 	// against a pointer, which LLVM rejects.
-	if from != nil && from.Kind == KArr {
-		from = PtrType(from.Elem)
+	if from != nil && from.Kind == frontend.KArr {
+		from = frontend.PtrType(from.Elem)
 	}
 	f := e.ty(from)
 	if f == toIR {
@@ -601,7 +602,7 @@ func irIntWidth(ty string) int {
 // doGoto branches to a C label. A backward target is already known; a forward
 // one is not, so the branch is written through a placeholder and patched once
 // the label has been seen.
-func (e *irEmitter) doGoto(n *GotoStmt) {
+func (e *irEmitter) doGoto(n *frontend.GotoStmt) {
 	if l, ok := e.userLabels[n.Label]; ok {
 		e.term("br label %%%s", l)
 		return

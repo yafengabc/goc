@@ -1,6 +1,9 @@
-package main
+package compiler
 
-import "testing"
+import (
+	"goc/frontend"
+	"testing"
+)
 
 // checkSrc runs the full front-end pipeline (preprocess -> parse -> type
 // check) and returns the diagnostics, for use by the tests below.
@@ -10,11 +13,11 @@ func checkSrc(t *testing.T, src string) []error {
 	if err != nil {
 		t.Fatalf("preprocess failed: %v", err)
 	}
-	prog, err := Parse(toks)
+	prog, err := frontend.Parse(toks)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
-	return Check(prog)
+	return frontend.Check(prog)
 }
 
 func TestCheckValidPointerArray(t *testing.T) {

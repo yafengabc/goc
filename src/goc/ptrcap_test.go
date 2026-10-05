@@ -1,4 +1,4 @@
-package main
+package compiler
 
 import (
 	"strings"
@@ -112,5 +112,5 @@ func TestC4ReassignedFromIntDropsMark(t *testing.T) {
 // correct. That is the documented known-remainder of T1.6 (design doc 3.1:
 // "int arithmetic on a pointer-in-int truncates, no regression"). The analysis
 // still must not clear the mark there -- see the `plain` argument of the
-// AssignExpr rule in ptrcap.go -- but the emitted code is 32-bit either way,
+// frontend.AssignExpr rule in ptrcap.go -- but the emitted code is 32-bit either way,
 // so it is deliberately not asserted here.

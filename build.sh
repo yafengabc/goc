@@ -4,8 +4,9 @@
 #
 #   bash build.sh
 #
-# Layout: compiler source lives in goc/ (module goc) with goclib/ beside
-# it, and the assembler in goa/ (module goa); every binary is emitted into
+# Layout: the C front end is src/frontend (module goc/frontend), the native
+# code generator is src/goc (module goc), the assembler is src/goa (module
+# goa), and the C library is src/goclib; every binary is emitted into
 # ./bin so goc and goa stay siblings (findGoa looks next to the goc binary
 # first).
 #
@@ -44,8 +45,21 @@ fi
 
 mkdir -p bin
 
+echo "== goc (self-contained) =="
+# The same compiler with the C library embedded: no goclib/ needed beside the
+# binary. goc itself reads the library from disk, which is what lets a
+# developer edit it without rebuilding the compiler.
+(cd src && go build -trimpath -ldflags="-s -w" -o "../bin/goc-standalone$EXE" .)
+
+echo "== goc/frontend =="
+# The front end is a library; building it is just a compile check, which is
+# worth doing on its own so a front-end error is not reported as a goc build
+# failure. The separate module also means goc and (later) gocl can require it
+# without depending on each other.
+(cd src/frontend && go build ./...)
+
 echo "== goc =="
-(cd src/goc && go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "../../bin/goc$EXE" .)
+(cd src/goc && go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "../../bin/goc$EXE" ./cmd/goc)
 
 echo "== goa =="
 (cd src/goa && go build -trimpath -ldflags="-s -w" -o "../../bin/goa$EXE" ./cmd/goa)
@@ -59,4 +73,5 @@ echo "== tools =="
 # and, when named cc, behaves like gcc (compile to an executable, no auto-run).
 cp -f "bin/goc$EXE" "bin/cc$EXE"
 
-echo "done: bin/goc$EXE, bin/cc$EXE, bin/goa$EXE, bin/elfcheck$EXE, bin/msgboxcheck$EXE"
+echo "done: bin/goc$EXE, bin/goc-standalone$EXE, bin/cc$EXE, bin/goa$EXE,"
+echo "      bin/elfcheck$EXE, bin/msgboxcheck$EXE"

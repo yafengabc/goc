@@ -1,6 +1,7 @@
-package main
+package compiler
 
 import (
+	"goc/frontend"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,9 +9,9 @@ import (
 )
 
 // spell renders a token the way a human would read it, for assertions.
-func spell(tok Token) string {
+func spell(tok frontend.Token) string {
 	switch tok.Kind {
-	case TStr:
+	case frontend.TStr:
 		return "\"" + string(tok.Str) + "\""
 	default:
 		return tok.Text
@@ -18,7 +19,7 @@ func spell(tok Token) string {
 }
 
 // pptext preprocesses src (as if from file "test.c") and returns the space-
-// joined spellings of every token up to TEOF. This isolates the preprocessor
+// joined spellings of every token up to frontend.TEOF. This isolates the preprocessor
 // from the rest of the compiler, so it can be tested without assembling.
 func pptext(t *testing.T, src string) string {
 	t.Helper()
@@ -28,7 +29,7 @@ func pptext(t *testing.T, src string) string {
 	}
 	var parts []string
 	for _, tok := range toks {
-		if tok.Kind == TEOF {
+		if tok.Kind == frontend.TEOF {
 			break
 		}
 		parts = append(parts, spell(tok))
@@ -148,7 +149,7 @@ func TestIncludeLocal(t *testing.T) {
 	}
 	var parts []string
 	for _, tok := range toks {
-		if tok.Kind == TEOF {
+		if tok.Kind == frontend.TEOF {
 			break
 		}
 		parts = append(parts, spell(tok))
@@ -211,7 +212,7 @@ func TestLineDirectiveDoesNotLeakIntoIncludes(t *testing.T) {
 	}
 	var parts []string
 	for _, tok := range toks {
-		if tok.Kind == TEOF {
+		if tok.Kind == frontend.TEOF {
 			break
 		}
 		parts = append(parts, spell(tok))
@@ -320,5 +321,56 @@ func TestHasCAttributeGuard(t *testing.T) {
 	want := "int a ; int d ;"
 	if got != want {
 		t.Fatalf("__has_c_attribute guard:\n got %q\nwant %q", got, want)
+	}
+}
+
+// TestLibraryIgnoresDiskHeaders pins the isolation the C library needs.
+//
+// The library's own sources include <stdio.h> and friends by name. If those
+// resolved against the user's include path, a program shipping its own
+// stdio.h -- in the working directory or via -I -- would replace the runtime's
+// header, and goclib would then fail to compile against itself. The symptom is
+// badly attributed: the error names a library source ("goclib/file.c: line
+// 234: expected type specifier, got \"FILE\"") and says nothing about the
+// header the user shadowed.
+func TestLibraryIgnoresDiskHeaders(t *testing.T) {
+	dir := t.TempDir()
+	// A stdio.h in the working directory, which is what resolveInclude searches
+	// first for a quoted include and what -I adds to the angled list.
+	shadow := "extern int not_the_real_stdio;\n"
+	if err := os.WriteFile(filepath.Join(dir, "stdio.h"), []byte(shadow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(wd)
+
+	// The library's view: no disk header may be visible.
+	if _, err := PreprocessLibrary("#include <stdio.h>\nint x;\n", "goclib/probe.c", false); err != nil {
+		t.Errorf("PreprocessLibrary must fall back to the built-in stdio.h, got: %v", err)
+	}
+
+	// The user's view: the shadowing header is what they asked for, so their
+	// own translation unit sees it. This is the half that must NOT change --
+	// "external headers first" is the documented order, and this test failing
+	// on this line would mean the isolation leaked into user code.
+	toks, err := Preprocess("#include <stdio.h>\nint x;\n", filepath.Join(dir, "user.c"))
+	if err != nil {
+		t.Fatalf("Preprocess failed: %v", err)
+	}
+	var sawShadow bool
+	for _, tok := range toks {
+		if tok.Text == "not_the_real_stdio" {
+			sawShadow = true
+		}
+	}
+	if !sawShadow {
+		t.Error("user code did not pick up the header from the working " +
+			"directory; external headers must take priority over the built-in ones")
 	}
 }

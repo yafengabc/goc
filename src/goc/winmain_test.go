@@ -1,6 +1,7 @@
-package main
+package compiler
 
 import (
+	"goc/frontend"
 	"strings"
 	"testing"
 )
@@ -13,11 +14,11 @@ func genAsmGUI(t *testing.T, src string) string {
 	if err != nil {
 		t.Fatalf("preprocess: %v", err)
 	}
-	prog, err := Parse(toks)
+	prog, err := frontend.Parse(toks)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if errs := Check(prog); len(errs) > 0 {
+	if errs := frontend.Check(prog); len(errs) > 0 {
 		t.Fatalf("type check: %v", errs)
 	}
 	asm, err := Gen(prog, false, 0, true)

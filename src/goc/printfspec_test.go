@@ -1,6 +1,7 @@
-package main
+package compiler
 
 import (
+	"goc/frontend"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,57 +25,57 @@ func TestSpecializePrintfCall(t *testing.T) {
 	}
 	cases := []struct {
 		name string
-		call *Call
+		call *frontend.Call
 		want string // "" means no rewrite
 	}{
 		{
 			name: "no conversion becomes fwrite",
-			call: &Call{Name: "printf", Args: []Expr{&StrLit{Bytes: []byte("hi\n")}}},
+			call: &frontend.Call{Name: "printf", Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("hi\n")}}},
 			want: "fwrite",
 		},
 		{
 			name: "integers become the lite formatter",
-			call: &Call{Name: "printf", Args: []Expr{&StrLit{Bytes: []byte("%d items\n")},
-				&NumLit{Val: 3, Kind: TInt}}},
+			call: &frontend.Call{Name: "printf", Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("%d items\n")},
+				&frontend.NumLit{Val: 3, Kind: frontend.TInt}}},
 			want: "__goclib_printf_lite",
 		},
 		{
 			name: "a float picks the _f entry, keeping the integer-only one out",
-			call: &Call{Name: "printf", Args: []Expr{&StrLit{Bytes: []byte("%f")},
-				&NumLit{Val: 1, Kind: TInt}}},
+			call: &frontend.Call{Name: "printf", Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("%f")},
+				&frontend.NumLit{Val: 1, Kind: frontend.TInt}}},
 			want: "__goclib_printf_lite_f",
 		},
 		{
 			name: "fprintf without conversions becomes fwrite on that stream",
-			call: &Call{Name: "fprintf", Args: []Expr{&Ident{Name: "logf"},
-				&StrLit{Bytes: []byte("raw\n")}}},
+			call: &frontend.Call{Name: "fprintf", Args: []frontend.Expr{&frontend.Ident{Name: "logf"},
+				&frontend.StrLit{Bytes: []byte("raw\n")}}},
 			want: "fwrite",
 		},
 		// A width needs vfmt's field machinery, which is exactly what the
 		// specialisation exists to avoid pulling in.
-		{name: "width is not lite", call: &Call{Name: "printf",
-			Args: []Expr{&StrLit{Bytes: []byte("%5d")}, &NumLit{Val: 1, Kind: TInt}}}},
-		{name: "precision is not lite", call: &Call{Name: "printf",
-			Args: []Expr{&StrLit{Bytes: []byte("%.2f")}, &NumLit{Val: 1, Kind: TInt}}}},
-		{name: "%e needs the exponent estimator", call: &Call{Name: "printf",
-			Args: []Expr{&StrLit{Bytes: []byte("%e")}, &NumLit{Val: 1, Kind: TInt}}}},
-		{name: "%p is not lite", call: &Call{Name: "printf",
-			Args: []Expr{&StrLit{Bytes: []byte("%p")}, &NumLit{Val: 1, Kind: TInt}}}},
-		{name: "%s alone is lite", call: &Call{Name: "printf",
-			Args: []Expr{&StrLit{Bytes: []byte("%s")}, &StrLit{Bytes: []byte("x")}}},
+		{name: "width is not lite", call: &frontend.Call{Name: "printf",
+			Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("%5d")}, &frontend.NumLit{Val: 1, Kind: frontend.TInt}}}},
+		{name: "precision is not lite", call: &frontend.Call{Name: "printf",
+			Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("%.2f")}, &frontend.NumLit{Val: 1, Kind: frontend.TInt}}}},
+		{name: "%e needs the exponent estimator", call: &frontend.Call{Name: "printf",
+			Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("%e")}, &frontend.NumLit{Val: 1, Kind: frontend.TInt}}}},
+		{name: "%p is not lite", call: &frontend.Call{Name: "printf",
+			Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("%p")}, &frontend.NumLit{Val: 1, Kind: frontend.TInt}}}},
+		{name: "%s alone is lite", call: &frontend.Call{Name: "printf",
+			Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("%s")}, &frontend.StrLit{Bytes: []byte("x")}}},
 			want: "__goclib_printf_lite"},
 		// A run-time format string proves nothing at compile time.
-		{name: "a variable format is left alone", call: &Call{Name: "printf",
-			Args: []Expr{&Ident{Name: "fmt"}}}},
+		{name: "a variable format is left alone", call: &frontend.Call{Name: "printf",
+			Args: []frontend.Expr{&frontend.Ident{Name: "fmt"}}}},
 		// Dropping extra arguments would lose their evaluation.
-		{name: "extra arguments to a plain format are left alone", call: &Call{Name: "printf",
-			Args: []Expr{&StrLit{Bytes: []byte("hi\n")}, &NumLit{Val: 1, Kind: TInt}}}},
+		{name: "extra arguments to a plain format are left alone", call: &frontend.Call{Name: "printf",
+			Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("hi\n")}, &frontend.NumLit{Val: 1, Kind: frontend.TInt}}}},
 		// The lite formatters write to stdout; there is no fprintf equivalent.
-		{name: "fprintf with conversions is left alone", call: &Call{Name: "fprintf",
-			Args: []Expr{&Ident{Name: "logf"}, &StrLit{Bytes: []byte("%d")},
-				&NumLit{Val: 1, Kind: TInt}}}},
-		{name: "another function is not ours", call: &Call{Name: "puts",
-			Args: []Expr{&StrLit{Bytes: []byte("hi\n")}}}},
+		{name: "fprintf with conversions is left alone", call: &frontend.Call{Name: "fprintf",
+			Args: []frontend.Expr{&frontend.Ident{Name: "logf"}, &frontend.StrLit{Bytes: []byte("%d")},
+				&frontend.NumLit{Val: 1, Kind: frontend.TInt}}}},
+		{name: "another function is not ours", call: &frontend.Call{Name: "puts",
+			Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("hi\n")}}}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -98,7 +99,7 @@ func TestSpecializePrintfCall(t *testing.T) {
 // A program that defines its own fwrite must keep it: the rewrite exists to
 // call the C library's, and binding to the program's would be silently wrong.
 func TestSpecializePrintfCallRespectsShadowing(t *testing.T) {
-	call := &Call{Name: "printf", Args: []Expr{&StrLit{Bytes: []byte("hi\n")}}}
+	call := &frontend.Call{Name: "printf", Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("hi\n")}}}
 	t.Run("a program-defined fwrite blocks it", func(t *testing.T) {
 		q := printfQueries{
 			userDefines:   func(n string) bool { return n == "fwrite" },
@@ -118,8 +119,8 @@ func TestSpecializePrintfCallRespectsShadowing(t *testing.T) {
 		}
 	})
 	t.Run("a program-defined lite entry blocks it", func(t *testing.T) {
-		lite := &Call{Name: "printf", Args: []Expr{&StrLit{Bytes: []byte("%d")},
-			&NumLit{Val: 1, Kind: TInt}}}
+		lite := &frontend.Call{Name: "printf", Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("%d")},
+			&frontend.NumLit{Val: 1, Kind: frontend.TInt}}}
 		q := printfQueries{
 			userDefines:   func(n string) bool { return n == "__goclib_printf_lite" },
 			shadowedByVar: func(string) bool { return false },
@@ -142,8 +143,8 @@ func TestSpecializePrintfCallRespectsShadowing(t *testing.T) {
 // prune has to learn about them. This checks the shape: a rewritten fwrite call
 // must come with both names.
 func TestPrintfSpecAddsItsOwnReferences(t *testing.T) {
-	lit := &StrLit{Bytes: []byte("hi\n")}
-	got := specializePrintfCall(&Call{Name: "printf", Args: []Expr{lit}}, printfQueries{
+	lit := &frontend.StrLit{Bytes: []byte("hi\n")}
+	got := specializePrintfCall(&frontend.Call{Name: "printf", Args: []frontend.Expr{lit}}, printfQueries{
 		userDefines:   func(string) bool { return false },
 		shadowedByVar: func(string) bool { return false },
 	})
@@ -155,13 +156,13 @@ func TestPrintfSpecAddsItsOwnReferences(t *testing.T) {
 	if len(got.Args) != 4 {
 		t.Fatalf("fwrite call has %d args, want 4", len(got.Args))
 	}
-	acc, ok := got.Args[3].(*Call)
+	acc, ok := got.Args[3].(*frontend.Call)
 	if !ok || acc.Name != "__goclib_stdout" {
 		t.Fatalf("stream argument is %#v, want a __goclib_stdout() call", got.Args[3])
 	}
 	// Size and count have to be the literal's byte length, or fwrite would
 	// write the wrong number of bytes.
-	num, ok := got.Args[2].(*NumLit)
+	num, ok := got.Args[2].(*frontend.NumLit)
 	if !ok || num.Val != int64(len(lit.Bytes)) {
 		t.Fatalf("size argument is %#v, want %d", got.Args[2], len(lit.Bytes))
 	}

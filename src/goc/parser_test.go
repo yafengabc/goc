@@ -1,16 +1,19 @@
-package main
+package compiler
 
-import "testing"
+import (
+	"goc/frontend"
+	"testing"
+)
 
 // parseSrc runs preprocess -> parse and returns the program, so tests can
 // inspect the types the parser built rather than just whether it failed.
-func parseSrc(t *testing.T, src string) *Program {
+func parseSrc(t *testing.T, src string) *frontend.Program {
 	t.Helper()
 	toks, err := Preprocess(src, "test.c")
 	if err != nil {
 		t.Fatalf("preprocess failed: %v", err)
 	}
-	prog, err := Parse(toks)
+	prog, err := frontend.Parse(toks)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -44,7 +47,7 @@ func TestParseMultiDimArrayOrder(t *testing.T) {
 	if inner.Len != 3 {
 		t.Errorf("inner dimension: got %d, want 3", inner.Len)
 	}
-	if inner.Elem == nil || inner.Elem.Kind != KInt {
+	if inner.Elem == nil || inner.Elem.Kind != frontend.KInt {
 		t.Errorf("expected the innermost element to be int, got %v", inner.Elem)
 	}
 }
@@ -65,7 +68,7 @@ func TestParseThreeDimArrayOrder(t *testing.T) {
 	if l3 == nil || !l3.IsArray() || l3.Len != 4 {
 		t.Fatalf("third dimension: got %v, want len 4", l3)
 	}
-	if l3.Elem == nil || l3.Elem.Kind != KInt {
+	if l3.Elem == nil || l3.Elem.Kind != frontend.KInt {
 		t.Errorf("expected int elements, got %v", l3.Elem)
 	}
 }

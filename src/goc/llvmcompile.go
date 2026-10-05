@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // Driving the LLVM back end from a build.
 //
@@ -13,10 +13,10 @@ package main
 
 import (
 	"fmt"
+	"goa"
+	"goc/frontend"
 	"os"
 	"path/filepath"
-
-	"goa"
 )
 
 // genLLVMProgram produces the IR for a whole program -- the user's functions
@@ -32,7 +32,7 @@ import (
 //
 // What goa's own assembler still contributes is the entry stub, which is not C:
 // it sets up the process stack per the platform ABI before main runs.
-func genLLVMProgram(prog *Program, linux bool, opt int) (string, map[string]bool, error) {
+func genLLVMProgram(prog *frontend.Program, linux bool, opt int) (string, map[string]bool, error) {
 	lib := clibCStore(linux)
 	if lib == nil {
 		return "", nil, fmt.Errorf("-fllvm: the built-in C library for this target " +

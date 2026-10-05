@@ -1,6 +1,7 @@
-package main
+package compiler
 
 import (
+	"goc/frontend"
 	"strings"
 	"testing"
 )
@@ -47,11 +48,11 @@ func genAsmOpt(t *testing.T, src string, opt int) string {
 	if err != nil {
 		t.Fatalf("preprocess: %v", err)
 	}
-	prog, err := Parse(toks)
+	prog, err := frontend.Parse(toks)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if errs := Check(prog); len(errs) > 0 {
+	if errs := frontend.Check(prog); len(errs) > 0 {
 		t.Fatalf("type check: %v", errs)
 	}
 	asm, err := Gen(prog, false, opt, false)
@@ -109,7 +110,7 @@ func bindTestCG() *CG {
 		scopes: []map[string]int{
 			{"x": 0, "arg": 1, "rv": 2},
 		},
-		declUID: map[*DeclStmt]int{},
+		declUID: map[*frontend.DeclStmt]int{},
 		globalLab: map[string]string{
 			"g":  "G_g",
 			"st": "G_st3_st",
@@ -678,7 +679,7 @@ int main(){
 }
 
 // TestAsmBlockCapture pins the lexer's __asm block collection: the raw text
-// between the braces (and only that) becomes a TAsm token, whitespace between
+// between the braces (and only that) becomes a frontend.TAsm token, whitespace between
 // the keyword and '{' is tolerated, and the statement after the closing '}'
 // must NOT be swallowed into the block.
 func TestAsmBlockCapture(t *testing.T) {
@@ -689,32 +690,32 @@ func TestAsmBlockCapture(t *testing.T) {
   }
   return 0;
 }`
-	toks, err := Lex(src)
+	toks, err := frontend.Lex(src)
 	if err != nil {
 		t.Fatalf("lex: %v", err)
 	}
-	// Token 0: 'int' keyword, then 'f', '(' , ')', '{', then TKeyword __asm,
-	// then TAsm, then 'return' ...
+	// frontend.Token 0: 'int' keyword, then 'f', '(' , ')', '{', then frontend.TKeyword __asm,
+	// then frontend.TAsm, then 'return' ...
 	asm := -1
 	for i, tk := range toks {
-		if tk.Kind == TAsm {
+		if tk.Kind == frontend.TAsm {
 			asm = i
 			break
 		}
 	}
 	if asm < 0 {
-		t.Fatalf("no TAsm token in %+v", toks)
+		t.Fatalf("no frontend.TAsm token in %+v", toks)
 	}
 	block := toks[asm].Text
 	if !strings.Contains(block, "mov eax, 1") || !strings.Contains(block, "nop") {
-		t.Errorf("TAsm text %q should contain the block body", block)
+		t.Errorf("frontend.TAsm text %q should contain the block body", block)
 	}
 	if strings.Contains(block, "return") {
-		t.Errorf("TAsm text %q swallowed the statement after the block", block)
+		t.Errorf("frontend.TAsm text %q swallowed the statement after the block", block)
 	}
-	// The next token after TAsm must be the 'return' keyword on a later line.
+	// The next token after frontend.TAsm must be the 'return' keyword on a later line.
 	if asm+1 >= len(toks) || toks[asm+1].Text != "return" {
-		t.Errorf("token after TAsm = %+v, want the return keyword", toks[asm+1])
+		t.Errorf("token after frontend.TAsm = %+v, want the return keyword", toks[asm+1])
 	}
 }
 
@@ -985,7 +986,7 @@ int main(){
 		t.Errorf("*(char *)p did not emit a 1-byte load: %q", asm)
 	}
 	// double deref through a cast: must take the double path (movsd) even
-	// though elemClassOf used to report TInt for cast expressions.
+	// though elemClassOf used to report frontend.TInt for cast expressions.
 	asm = genAsm(t, `double a[1] = {1.5};
 int main(){
   double v;
@@ -1071,7 +1072,7 @@ int main(){
 }
 
 func TestBinaryTypePtrArith(t *testing.T) {
-	// exprType had no *Binary branch, so the result of pointer arithmetic was
+	// exprType had no *frontend.Binary branch, so the result of pointer arithmetic was
 	// typed nil. "(p + 1) - base" then classified its left operand as an
 	// integer, took genBinary's "integer - pointer" swap path and produced the
 	// negated difference. cJSON's parse_string bounds-checks every escape
@@ -1125,7 +1126,7 @@ func TestSizeofCompoundLiteralArray(t *testing.T) {
 
 func TestStringLiteralSubscript(t *testing.T) {
 	// P0.8: "hello"[0] must load one byte (char element), not a whole quadword
-	// from the string address. elemWidthOf had no StrLit case and defaulted
+	// from the string address. elemWidthOf had no frontend.StrLit case and defaulted
 	// the load to 8 bytes of neighbouring memory.
 	asm := genAsm(t, `int main(){ return "hello"[0]; }`)
 	if !strings.Contains(asm, "mov al, [r10]") {

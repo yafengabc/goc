@@ -1,4 +1,4 @@
-package main
+package compiler
 
 import (
 	"strings"
@@ -188,7 +188,7 @@ func TestPrintLongThin(t *testing.T) {
 }
 
 // A plain (negated) integer literal whose magnitude exceeds 32 bits is a long
-// literal per C's literal typing, but the checker types every NumLit as int.
+// literal per C's literal typing, but the checker types every frontend.NumLit as int.
 // The thin print dispatch must widen by value (T1.6 C3) or the call lowers to
 // int_print and the callee reads only the truncated low 32 bits.
 func TestPrintLiteralLongThin(t *testing.T) {

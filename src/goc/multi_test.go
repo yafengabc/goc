@@ -1,4 +1,4 @@
-package main
+package compiler
 
 // Tests for the multi-translation-unit build (src/multi.go).
 
@@ -54,7 +54,7 @@ int main(void){ return a_helper(1) + twice(1) + buf[0] + shared_counter; }
 `)
 	asm := buildUnits(t, a, b)
 	// Both statics are emitted, renamed apart, and each call site was
-	// rewritten (a call names its callee as a string, not an Ident -- a
+	// rewritten (a call names its callee as a string, not an frontend.Ident -- a
 	// rename walk that misses that shape leaves a call to the wrong file's
 	// function, or to a symbol that does not exist).
 	for _, want := range []string{"twice__tu0:", "twice__tu1:", "call twice__tu0", "call twice__tu1"} {

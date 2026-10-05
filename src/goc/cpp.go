@@ -1,9 +1,9 @@
-package main
+package compiler
 
 // cpp.go — the C preprocessor for goc.
 //
-// It runs on the token stream produced by Lex (where '#' is a real token) and
-// returns a fully-expanded token stream that Parse can consume. The design is
+// It runs on the token stream produced by frontend.Lex (where '#' is a real token) and
+// returns a fully-expanded token stream that frontend.Parse can consume. The design is
 // token-based (not text-based), so macro arguments, '#' stringisation and '##'
 // pasting are handled on real tokens rather than by string hacking.
 //
@@ -21,13 +21,14 @@ package main
 //   - predefined macros __FILE__, __LINE__, __goc__
 //   - backslash line continuations inside macro definitions (and in any file,
 //     main source or #include -- spliceContinuations runs per file in process)
-//   - // and /* */ comments (stripped by Lex)
+//   - // and /* */ comments (stripped by frontend.Lex)
 //
 // Things deliberately left for a later stage: #pragma beyond ignoring it,
 // and most of the hosted-header ecosystem.
 
 import (
 	"fmt"
+	"goc/frontend"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,7 +42,7 @@ type Macro struct {
 	Params     []string // nil/empty for object-like; for variadic includes "__VA_ARGS__"
 	IsFunc     bool
 	IsVariadic bool
-	Body       []Token
+	Body       []frontend.Token
 }
 
 // condFrame tracks one #if/#else chain.
@@ -54,11 +55,25 @@ type condFrame struct {
 // Preprocessor holds the expandable state shared across a translation unit,
 // including files pulled in by #include.
 type Preprocessor struct {
-	macros     map[string]*Macro
-	inExpand   map[string]bool // macro names currently being expanded (recursion guard)
-	condStack  []condFrame
-	searchDirs []string
-	baseDir    string
+	// builtinOnly confines header resolution to the built-in library, skipping
+	// every disk candidate. The C library itself is compiled with it set.
+	//
+	// Without it, a user who ships their own stdio.h in the working directory
+	// -- or points -I at a directory containing one -- replaces the runtime's
+	// header, and goclib then fails to compile against itself: file.c reaches
+	// for FILE, does not find it, and the error names a library source rather
+	// than the header the user shadowed. A real compiler has the same
+	// isolation, under different spelling: the implementation's own sources
+	// are never searched against the user's include path.
+	//
+	// Only the library sets it. User code resolves headers exactly as before,
+	// so an override still works for the program being compiled.
+	builtinOnly bool
+	macros      map[string]*Macro
+	inExpand    map[string]bool // macro names currently being expanded (recursion guard)
+	condStack   []condFrame
+	searchDirs  []string
+	baseDir     string
 	// #line state: a logical file name (empty = the real source file) and the
 	// offset such that logicalLine = physicalLine + lineDelta. Reset per file
 	// in process, so a #line inside an #include cannot leak into the includer.
@@ -81,7 +96,7 @@ type Preprocessor struct {
 // Preprocess runs the full preprocessing pipeline on src (already read from
 // filename) and returns the expanded token stream. The target platform
 // defaults to Windows; PreprocessTarget selects it explicitly.
-func Preprocess(src, filename string) ([]Token, error) {
+func Preprocess(src, filename string) ([]frontend.Token, error) {
 	return PreprocessTarget(src, filename, false)
 }
 
@@ -90,21 +105,38 @@ func Preprocess(src, filename string) ([]Token, error) {
 // Windows x64 backend, __linux__ (and __linux) for the ELF backend -- so
 // library sources and user programs can write portable
 // "#if defined(_WIN32) ... #else ... #endif" branches.
-func PreprocessTarget(src, filename string, linux bool, incDirs ...string) ([]Token, error) {
+func PreprocessTarget(src, filename string, linux bool, incDirs ...string) ([]frontend.Token, error) {
+	return preprocess(src, filename, linux, false, incDirs...)
+}
+
+// PreprocessLibrary preprocesses one of the C library's own sources. It differs
+// from PreprocessTarget in exactly one way: no header outside the built-in
+// library can be reached. See Preprocessor.builtinOnly.
+//
+// It resolves the library first, so calling it before the first compile is
+// safe -- a caller that reaches it directly, rather than through buildClibC,
+// would otherwise dereference a nil source.
+func PreprocessLibrary(src, filename string, linux bool) ([]frontend.Token, error) {
+	defaultLib()
+	return preprocess(src, filename, linux, true)
+}
+
+func preprocess(src, filename string, linux, builtinOnly bool, incDirs ...string) ([]frontend.Token, error) {
 	src = spliceContinuations(src)
 	p := &Preprocessor{
-		macros:     map[string]*Macro{},
-		inExpand:   map[string]bool{},
-		searchDirs: []string{},
+		macros:      map[string]*Macro{},
+		inExpand:    map[string]bool{},
+		searchDirs:  []string{},
+		builtinOnly: builtinOnly,
 	}
 	// Platform macros, mirroring what real compilers predefine: object-like
 	// macros with body "1", visible to #ifdef, defined() and plain expansion.
 	if linux {
-		p.macros["__linux__"] = &Macro{Name: "__linux__", Body: []Token{tokNum(1, 0)}}
-		p.macros["__linux"] = &Macro{Name: "__linux", Body: []Token{tokNum(1, 0)}}
+		p.macros["__linux__"] = &Macro{Name: "__linux__", Body: []frontend.Token{tokNum(1, 0)}}
+		p.macros["__linux"] = &Macro{Name: "__linux", Body: []frontend.Token{tokNum(1, 0)}}
 	} else {
-		p.macros["_WIN32"] = &Macro{Name: "_WIN32", Body: []Token{tokNum(1, 0)}}
-		p.macros["_WIN64"] = &Macro{Name: "_WIN64", Body: []Token{tokNum(1, 0)}}
+		p.macros["_WIN32"] = &Macro{Name: "_WIN32", Body: []frontend.Token{tokNum(1, 0)}}
+		p.macros["_WIN64"] = &Macro{Name: "_WIN64", Body: []frontend.Token{tokNum(1, 0)}}
 	}
 	// Standard predefined macros (C99 6.10.8 / C23 6.11). goc is a single-mode
 	// compiler that accepts C89 through C23 source; __STDC_VERSION__ reports the
@@ -112,11 +144,11 @@ func PreprocessTarget(src, filename string, linux bool, incDirs ...string) ([]To
 	// visibility of C23-only declarations in goclib headers. __DATE__/__TIME__
 	// are snapshotted once per compilation, mirroring real compilers.
 	now := time.Now()
-	p.macros["__STDC__"] = &Macro{Name: "__STDC__", Body: []Token{tokNum(1, 0)}}
-	p.macros["__STDC_HOSTED__"] = &Macro{Name: "__STDC_HOSTED__", Body: []Token{tokNum(1, 0)}}
-	p.macros["__STDC_VERSION__"] = &Macro{Name: "__STDC_VERSION__", Body: []Token{tokNum(202311, 0)}}
-	p.macros["__DATE__"] = &Macro{Name: "__DATE__", Body: []Token{tokStr(now.Format("Jan _2 2006"), 0)}}
-	p.macros["__TIME__"] = &Macro{Name: "__TIME__", Body: []Token{tokStr(now.Format("15:04:05"), 0)}}
+	p.macros["__STDC__"] = &Macro{Name: "__STDC__", Body: []frontend.Token{tokNum(1, 0)}}
+	p.macros["__STDC_HOSTED__"] = &Macro{Name: "__STDC_HOSTED__", Body: []frontend.Token{tokNum(1, 0)}}
+	p.macros["__STDC_VERSION__"] = &Macro{Name: "__STDC_VERSION__", Body: []frontend.Token{tokNum(202311, 0)}}
+	p.macros["__DATE__"] = &Macro{Name: "__DATE__", Body: []frontend.Token{tokStr(now.Format("Jan _2 2006"), 0)}}
+	p.macros["__TIME__"] = &Macro{Name: "__TIME__", Body: []frontend.Token{tokStr(now.Format("15:04:05"), 0)}}
 	// Vendor extension keywords that real-world headers use but that carry no
 	// meaning for goc's code generator. They are predefined as macros that
 	// expand to nothing, so a declaration such as
@@ -146,7 +178,7 @@ func PreprocessTarget(src, filename string, linux bool, incDirs ...string) ([]To
 // whether a token was preceded by whitespace); line markers ("# 1 \"file\"")
 // are intentionally omitted. That is enough for shell-level compatibility and
 // for feeding the output back to goc, not for byte-exact gcc reproduction.
-func SerializeTokens(toks []Token) string {
+func SerializeTokens(toks []frontend.Token) string {
 	var b strings.Builder
 	for _, t := range toks {
 		s := tokenText(t)
@@ -159,17 +191,17 @@ func SerializeTokens(toks []Token) string {
 }
 
 // tokenText renders one token as the C text it represents.
-func tokenText(t Token) string {
+func tokenText(t frontend.Token) string {
 	switch t.Kind {
-	case TStr:
+	case frontend.TStr:
 		return cEscape(t.Str)
-	case TNum:
+	case frontend.TNum:
 		if t.IsChar {
 			return charLiteral(t.Num)
 		}
 		return t.Text // original numeric/character text is preserved verbatim
 	default:
-		return t.Text // TIdent, TKeyword, TPunct all carry their source text
+		return t.Text // frontend.TIdent, frontend.TKeyword, frontend.TPunct all carry their source text
 	}
 }
 
@@ -262,7 +294,7 @@ func spliceContinuations(src string) string {
 // src is run through spliceContinuations here, not just at the Preprocess
 // entry point, so that a file pulled in by #include gets its backslash-newline
 // pairs removed too (phase 2 must apply to every file, not just the main one).
-func (p *Preprocessor) process(src, filename string) ([]Token, error) {
+func (p *Preprocessor) process(src, filename string) ([]frontend.Token, error) {
 	src = spliceContinuations(src)
 	save := p.condStack
 	saveFile := p.logicalFile
@@ -276,7 +308,7 @@ func (p *Preprocessor) process(src, filename string) ([]Token, error) {
 		p.lineDelta = saveDelta
 	}()
 
-	raw, err := Lex(src)
+	raw, err := frontend.Lex(src)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %v", filename, err)
 	}
@@ -300,16 +332,16 @@ func (p *Preprocessor) active() bool {
 
 // scan walks the raw token stream, expands identifiers that are macros, and
 // handles directives.
-func (p *Preprocessor) scan(raw []Token, filename string) ([]Token, error) {
-	var out []Token
+func (p *Preprocessor) scan(raw []frontend.Token, filename string) ([]frontend.Token, error) {
+	var out []frontend.Token
 	i := 0
 	n := len(raw)
 	for i < n {
 		t := raw[i]
-		if t.Kind == TEOF {
+		if t.Kind == frontend.TEOF {
 			break
 		}
-		if t.Kind == TPunct && t.Text == "#" && isDirectiveStart(raw, i) {
+		if t.Kind == frontend.TPunct && t.Text == "#" && isDirectiveStart(raw, i) {
 			hashLine := t.Line
 			i++ // consume '#'
 			if i >= n {
@@ -317,7 +349,7 @@ func (p *Preprocessor) scan(raw []Token, filename string) ([]Token, error) {
 			}
 			name := raw[i].Text
 			i++ // consume directive name
-			var rest []Token
+			var rest []frontend.Token
 			for i < n && raw[i].Line == hashLine {
 				rest = append(rest, raw[i])
 				i++
@@ -338,13 +370,13 @@ func (p *Preprocessor) scan(raw []Token, filename string) ([]Token, error) {
 		out = append(out, e...)
 		i = ni
 	}
-	out = append(out, Token{Kind: TEOF, Line: 0})
+	out = append(out, frontend.Token{Kind: frontend.TEOF, Line: 0})
 	return out, nil
 }
 
 // isDirectiveStart reports whether the '#' at index i begins a directive: it
 // must be the first non-blank token on its line.
-func isDirectiveStart(raw []Token, i int) bool {
+func isDirectiveStart(raw []frontend.Token, i int) bool {
 	if raw[i].Text != "#" {
 		return false
 	}
@@ -356,7 +388,7 @@ func isDirectiveStart(raw []Token, i int) bool {
 
 // execDirective runs one directive and returns any tokens it produces (only
 // #include produces tokens).
-func (p *Preprocessor) execDirective(name string, rest []Token, line int, filename string) ([]Token, error) {
+func (p *Preprocessor) execDirective(name string, rest []frontend.Token, line int, filename string) ([]frontend.Token, error) {
 	// GNU extension: "# 100 \"file\"" is the same as "#line 100 \"file\"".
 	if isAllDigits(name) {
 		n, _ := strconv.ParseInt(name, 10, 64)
@@ -421,7 +453,7 @@ func (p *Preprocessor) execDirective(name string, rest []Token, line int, filena
 		if !p.active() {
 			return nil, nil
 		}
-		if len(rest) == 0 || rest[0].Kind != TNum {
+		if len(rest) == 0 || rest[0].Kind != frontend.TNum {
 			return nil, fmt.Errorf("%s:%d: #line needs a line number", p.logicalFileName(filename), p.logicalLine(line))
 		}
 		return p.doLine(rest[0].Num, rest[1:], line, filename)
@@ -468,7 +500,7 @@ func (p *Preprocessor) logicalFileName(filename string) string {
 // doLine implements #line N ["file"]: from the next source line on, __LINE__
 // reports N+1 for the line after the directive, and __FILE__ (if given) the
 // new name. Applies only when the branch is active.
-func (p *Preprocessor) doLine(n int64, rest []Token, line int, filename string) ([]Token, error) {
+func (p *Preprocessor) doLine(n int64, rest []frontend.Token, line int, filename string) ([]frontend.Token, error) {
 	if !p.active() {
 		return nil, nil
 	}
@@ -478,14 +510,14 @@ func (p *Preprocessor) doLine(n int64, rest []Token, line int, filename string) 
 	// The directive sits on physical line `line`; the next physical line is
 	// logically N+1, so the offset is N - line.
 	p.lineDelta = int(n) - line
-	if len(rest) > 0 && rest[0].Kind == TStr {
+	if len(rest) > 0 && rest[0].Kind == frontend.TStr {
 		p.logicalFile = string(rest[0].Str)
 	}
 	return nil, nil
 }
 
 // macroDefined handles #ifdef / #ifndef, both "X" and "(X)" forms.
-func (p *Preprocessor) macroDefined(rest []Token) bool {
+func (p *Preprocessor) macroDefined(rest []frontend.Token) bool {
 	if len(rest) == 0 {
 		return false
 	}
@@ -500,13 +532,13 @@ func (p *Preprocessor) macroDefined(rest []Token) bool {
 // tokensText renders a token slice as a single space-separated string, for use
 // in diagnostics such as #warning messages. String literals carry their content
 // in .Str (mirroring doLine), not .Text.
-func tokensText(ts []Token) string {
+func tokensText(ts []frontend.Token) string {
 	s := ""
 	for i, t := range ts {
 		if i > 0 {
 			s += " "
 		}
-		if t.Kind == TStr {
+		if t.Kind == frontend.TStr {
 			s += string(t.Str)
 		} else {
 			s += t.Text
@@ -578,7 +610,7 @@ func (p *Preprocessor) doElifBool(cond bool) {
 
 // doDefine parses a #define directive from its body tokens (everything after
 // "define").
-func (p *Preprocessor) doDefine(rest []Token) {
+func (p *Preprocessor) doDefine(rest []frontend.Token) {
 	if len(rest) == 0 {
 		return
 	}
@@ -598,7 +630,7 @@ func (p *Preprocessor) doDefine(rest []Token) {
 				}
 				continue
 			}
-			if rest[i].Kind == TIdent {
+			if rest[i].Kind == frontend.TIdent {
 				m.Params = append(m.Params, rest[i].Text)
 			}
 			i++
@@ -618,14 +650,14 @@ func (p *Preprocessor) doDefine(rest []Token) {
 }
 
 // doInclude resolves and expands an #include.
-func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error) {
+func (p *Preprocessor) doInclude(rest []frontend.Token, filename string) ([]frontend.Token, error) {
 	if len(rest) == 0 {
 		return nil, fmt.Errorf("%s: #include needs a filename", filename)
 	}
 	t := rest[0]
 	var path string
 	angled := false
-	if t.Kind == TStr {
+	if t.Kind == frontend.TStr {
 		path = string(t.Str)
 	} else if t.Text == "<" {
 		var sb strings.Builder
@@ -656,7 +688,7 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 			if perr != nil {
 				return nil, perr
 			}
-			if len(inc) > 0 && inc[len(inc)-1].Kind == TEOF {
+			if len(inc) > 0 && inc[len(inc)-1].Kind == frontend.TEOF {
 				inc = inc[:len(inc)-1]
 			}
 			return inc, nil
@@ -667,7 +699,7 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 				if perr != nil {
 					return nil, perr
 				}
-				if len(inc) > 0 && inc[len(inc)-1].Kind == TEOF {
+				if len(inc) > 0 && inc[len(inc)-1].Kind == frontend.TEOF {
 					inc = inc[:len(inc)-1]
 				}
 				return inc, nil
@@ -687,9 +719,9 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 	if err != nil {
 		return nil, err
 	}
-	// Drop the trailing TEOF that process() appends; the includer's scan owns
+	// Drop the trailing frontend.TEOF that process() appends; the includer's scan owns
 	// its own terminator.
-	if len(inc) > 0 && inc[len(inc)-1].Kind == TEOF {
+	if len(inc) > 0 && inc[len(inc)-1].Kind == frontend.TEOF {
 		inc = inc[:len(inc)-1]
 	}
 	return inc, nil
@@ -701,7 +733,7 @@ func (p *Preprocessor) doInclude(rest []Token, filename string) ([]Token, error)
 // embed parameters, or replaced by if_empty(...) when the file is empty. The
 // produced tokens are spliced into the stream wherever an initializer list is
 // expected.
-func (p *Preprocessor) doEmbed(rest []Token, filename string) ([]Token, error) {
+func (p *Preprocessor) doEmbed(rest []frontend.Token, filename string) ([]frontend.Token, error) {
 	if len(rest) == 0 {
 		return nil, fmt.Errorf("%s: #embed needs a filename", filename)
 	}
@@ -709,7 +741,7 @@ func (p *Preprocessor) doEmbed(rest []Token, filename string) ([]Token, error) {
 	var path string
 	angled := false
 	start := 1
-	if t.Kind == TStr {
+	if t.Kind == frontend.TStr {
 		path = string(t.Str)
 	} else if t.Text == "<" {
 		var sb strings.Builder
@@ -731,15 +763,15 @@ func (p *Preprocessor) doEmbed(rest []Token, filename string) ([]Token, error) {
 
 	// Embed parameters: limit(N), prefix(...), suffix(...), if_empty(...).
 	limit := -1
-	var prefixToks, suffixToks, ifEmptyToks []Token
+	var prefixToks, suffixToks, ifEmptyToks []frontend.Token
 	j := start
 	for j < len(rest) {
 		par := rest[j]
-		if par.Kind == TIdent {
+		if par.Kind == frontend.TIdent {
 			switch par.Text {
 			case "limit":
 				if j+3 < len(rest) && rest[j+1].Text == "(" &&
-					rest[j+3].Text == ")" && rest[j+2].Kind == TNum {
+					rest[j+3].Text == ")" && rest[j+2].Kind == frontend.TNum {
 					limit = int(rest[j+2].Num)
 					j += 4
 					continue
@@ -788,7 +820,7 @@ func (p *Preprocessor) doEmbed(rest []Token, filename string) ([]Token, error) {
 	prefixToks = stripEndCommas(prefixToks)
 	suffixToks = stripEndCommas(suffixToks)
 
-	var out []Token
+	var out []frontend.Token
 	sep := false
 	if len(prefixToks) > 0 {
 		out = append(out, prefixToks...)
@@ -796,15 +828,15 @@ func (p *Preprocessor) doEmbed(rest []Token, filename string) ([]Token, error) {
 	}
 	for _, b := range data {
 		if sep {
-			out = append(out, Token{Kind: TPunct, Text: ",", Line: t.Line})
+			out = append(out, frontend.Token{Kind: frontend.TPunct, Text: ",", Line: t.Line})
 		} else {
 			sep = true
 		}
-		out = append(out, Token{Kind: TNum, Num: int64(b), Text: strconv.Itoa(int(b)), Line: t.Line})
+		out = append(out, frontend.Token{Kind: frontend.TNum, Num: int64(b), Text: strconv.Itoa(int(b)), Line: t.Line})
 	}
 	if len(suffixToks) > 0 {
 		if sep {
-			out = append(out, Token{Kind: TPunct, Text: ",", Line: t.Line})
+			out = append(out, frontend.Token{Kind: frontend.TPunct, Text: ",", Line: t.Line})
 		}
 		out = append(out, suffixToks...)
 	}
@@ -813,11 +845,11 @@ func (p *Preprocessor) doEmbed(rest []Token, filename string) ([]Token, error) {
 
 // stripEndCommas removes any leading/trailing ',' tokens from a #embed prefix/
 // suffix list so the groups join with a single separator.
-func stripEndCommas(toks []Token) []Token {
-	for len(toks) > 0 && toks[0].Kind == TPunct && toks[0].Text == "," {
+func stripEndCommas(toks []frontend.Token) []frontend.Token {
+	for len(toks) > 0 && toks[0].Kind == frontend.TPunct && toks[0].Text == "," {
 		toks = toks[1:]
 	}
-	for len(toks) > 0 && toks[len(toks)-1].Kind == TPunct && toks[len(toks)-1].Text == "," {
+	for len(toks) > 0 && toks[len(toks)-1].Kind == frontend.TPunct && toks[len(toks)-1].Text == "," {
 		toks = toks[:len(toks)-1]
 	}
 	return toks
@@ -826,12 +858,12 @@ func stripEndCommas(toks []Token) []Token {
 // parseParenList parses a parameter of the form name(...) beginning at rest[j],
 // returning the inner tokens (excluding the parentheses) and the index just past
 // the closing ')'. Used by #embed's prefix/suffix/if_empty parameters.
-func parseParenList(rest []Token, j int) ([]Token, int, bool) {
+func parseParenList(rest []frontend.Token, j int) ([]frontend.Token, int, bool) {
 	if j+1 >= len(rest) || rest[j+1].Text != "(" {
 		return nil, j + 1, false
 	}
 	depth := 0
-	var inner []Token
+	var inner []frontend.Token
 	k := j + 1 // at '('
 	for k+1 < len(rest) {
 		k++
@@ -853,6 +885,11 @@ func parseParenList(rest []Token, j int) ([]Token, int, bool) {
 }
 
 func (p *Preprocessor) resolveInclude(path, fromFile string, angled bool) (string, error) {
+	if p.builtinOnly {
+		// The library's own headers live in the built-in library and nowhere
+		// else; there is nothing on disk to find.
+		return "", fmt.Errorf("include file not found: %s", path)
+	}
 	var candidates []string
 	if !angled {
 		candidates = append(candidates, filepath.Join(filepath.Dir(fromFile), path))
@@ -892,23 +929,23 @@ func (p *Preprocessor) headerExists(path string) bool {
 // is the source line of the token currently being processed (the invocation
 // site), so __LINE__ resolves to where the macro is used, not where it was
 // defined.
-func (p *Preprocessor) expandAt(raw []Token, i int, filename string, line int) ([]Token, int) {
+func (p *Preprocessor) expandAt(raw []frontend.Token, i int, filename string, line int) ([]frontend.Token, int) {
 	t := raw[i]
-	if t.Kind == TIdent {
+	if t.Kind == frontend.TIdent {
 		switch t.Text {
 		case "__FILE__":
-			return []Token{tokStr(p.logicalFileName(filename), t.Line)}, i + 1
+			return []frontend.Token{tokStr(p.logicalFileName(filename), t.Line)}, i + 1
 		case "__LINE__":
-			return []Token{tokNum(int64(p.logicalLine(line)), t.Line)}, i + 1
+			return []frontend.Token{tokNum(int64(p.logicalLine(line)), t.Line)}, i + 1
 		case "__goc__":
-			return []Token{tokNum(1, t.Line)}, i + 1
+			return []frontend.Token{tokNum(1, t.Line)}, i + 1
 		case "defined":
 			// Pass "defined NAME" / "defined(NAME)" through verbatim: the
 			// name operand must NOT be macro-expanded (C standard, #if
 			// rules). Without this guard "defined(FOO)" expands to
 			// "defined(1)" and cePrimary looks up the macro "1" -- always
 			// false -- so every defined() test on a real macro broke.
-			out := []Token{t}
+			out := []frontend.Token{t}
 			i++
 			if i < len(raw) && raw[i].Text == "(" {
 				out = append(out, raw[i])
@@ -921,7 +958,7 @@ func (p *Preprocessor) expandAt(raw []Token, i int, filename string, line int) (
 					out = append(out, raw[i])
 					i++
 				}
-			} else if i < len(raw) && raw[i].Kind == TIdent {
+			} else if i < len(raw) && raw[i].Kind == frontend.TIdent {
 				out = append(out, raw[i])
 				i++
 			}
@@ -946,12 +983,12 @@ func (p *Preprocessor) expandAt(raw []Token, i int, filename string, line int) (
 			}
 		}
 	}
-	return []Token{t}, i + 1
+	return []frontend.Token{t}, i + 1
 }
 
 // expandTokens fully expands a token slice.
-func (p *Preprocessor) expandTokens(toks []Token, filename string, line int) []Token {
-	var out []Token
+func (p *Preprocessor) expandTokens(toks []frontend.Token, filename string, line int) []frontend.Token {
+	var out []frontend.Token
 	j := 0
 	for j < len(toks) {
 		e, nj := p.expandAt(toks, j, filename, line)
@@ -964,15 +1001,15 @@ func (p *Preprocessor) expandTokens(toks []Token, filename string, line int) []T
 // readArgs collects the comma-separated arguments of a function-like macro
 // invocation starting at the '(' at openIdx. Nested parentheses are tracked;
 // the top-level comma separates arguments.
-func (p *Preprocessor) readArgs(raw []Token, openIdx int) ([][]Token, int, error) {
+func (p *Preprocessor) readArgs(raw []frontend.Token, openIdx int) ([][]frontend.Token, int, error) {
 	if openIdx >= len(raw) || raw[openIdx].Text != "(" {
 		return nil, openIdx, fmt.Errorf("expected '('")
 	}
-	args := [][]Token{}
+	args := [][]frontend.Token{}
 	depth := 0
 	i := openIdx + 1
 	n := len(raw)
-	cur := []Token{}
+	cur := []frontend.Token{}
 	for i < n {
 		t := raw[i]
 		switch t.Text {
@@ -991,7 +1028,7 @@ func (p *Preprocessor) readArgs(raw []Token, openIdx int) ([][]Token, int, error
 		case ",":
 			if depth == 0 {
 				args = append(args, cur)
-				cur = []Token{}
+				cur = []frontend.Token{}
 				i++
 			} else {
 				cur = append(cur, t)
@@ -1007,20 +1044,20 @@ func (p *Preprocessor) readArgs(raw []Token, openIdx int) ([][]Token, int, error
 
 // expandFunc performs parameter substitution, '#' stringisation and '##'
 // pasting for a function-like macro, then re-expands the result.
-func (p *Preprocessor) expandFunc(m *Macro, args [][]Token, filename string, line int) []Token {
+func (p *Preprocessor) expandFunc(m *Macro, args [][]frontend.Token, filename string, line int) []frontend.Token {
 	if m.IsVariadic {
 		np := len(m.Params) // includes "__VA_ARGS__"
 		vaIdx := np - 1
 		// Pad up to np so __VA_ARGS__ is always addressable, even when the
 		// macro is invoked with no variadic arguments (it then becomes empty).
 		for len(args) < np {
-			args = append(args, []Token{})
+			args = append(args, []frontend.Token{})
 		}
 		if len(args) > np {
-			merged := []Token{}
+			merged := []frontend.Token{}
 			for k := vaIdx; k < len(args); k++ {
 				if k > vaIdx {
-					merged = append(merged, Token{Kind: TPunct, Text: ","})
+					merged = append(merged, frontend.Token{Kind: frontend.TPunct, Text: ","})
 				}
 				merged = append(merged, args[k]...)
 			}
@@ -1042,21 +1079,21 @@ func (p *Preprocessor) expandFunc(m *Macro, args [][]Token, filename string, lin
 // for a slice of body tokens, returning the substituted tokens WITHOUT the final
 // re-expansion (the caller does that). It is used both for the whole macro body
 // and for the contents of a __VA_OPT__(...) construct.
-func (p *Preprocessor) substTokens(body []Token, m *Macro, args [][]Token, filename string, line int, vaNonEmpty bool) []Token {
-	var out []Token
+func (p *Preprocessor) substTokens(body []frontend.Token, m *Macro, args [][]frontend.Token, filename string, line int, vaNonEmpty bool) []frontend.Token {
+	var out []frontend.Token
 	i := 0
 	n := len(body)
 	for i < n {
 		bt := body[i]
 		// Stringisation: # param
-		if bt.Kind == TPunct && bt.Text == "#" && i+1 < n && isParam(body[i+1], m) {
+		if bt.Kind == frontend.TPunct && bt.Text == "#" && i+1 < n && isParam(body[i+1], m) {
 			idx := paramIndex(body[i+1].Text, m)
 			out = append(out, stringize(args[idx], bt.Line)...)
 			i += 2
 			continue
 		}
 		// Pasting: a ## b  (b may be a __VA_OPT__ operand)
-		if bt.Kind == TPunct && bt.Text == "##" {
+		if bt.Kind == frontend.TPunct && bt.Text == "##" {
 			if len(out) == 0 {
 				i++
 				continue
@@ -1083,11 +1120,11 @@ func (p *Preprocessor) substTokens(body []Token, m *Macro, args [][]Token, filen
 					continue
 				}
 			}
-			var nxtToks []Token
+			var nxtToks []frontend.Token
 			if isParam(nxt, m) {
 				nxtToks = args[paramIndex(nxt.Text, m)]
 			} else {
-				nxtToks = []Token{nxt}
+				nxtToks = []frontend.Token{nxt}
 			}
 			if len(nxtToks) > 0 {
 				merged := lexOne(out[len(out)-1].Text + tokenSpelling(nxtToks[0]))
@@ -1115,7 +1152,7 @@ func (p *Preprocessor) substTokens(body []Token, m *Macro, args [][]Token, filen
 		if isParam(bt, m) {
 			idx := paramIndex(bt.Text, m)
 			// An argument used as a '##' operand is not pre-expanded.
-			if i+1 < n && body[i+1].Kind == TPunct && body[i+1].Text == "##" {
+			if i+1 < n && body[i+1].Kind == frontend.TPunct && body[i+1].Text == "##" {
 				out = append(out, args[idx]...)
 			} else {
 				out = append(out, p.expandTokens(args[idx], filename, line)...)
@@ -1130,15 +1167,15 @@ func (p *Preprocessor) substTokens(body []Token, m *Macro, args [][]Token, filen
 }
 
 // isVAOpt reports whether a token is the __VA_OPT__ preprocessing operator.
-func isVAOpt(t Token) bool {
-	return (t.Kind == TIdent || t.Kind == TKeyword) && t.Text == "__VA_OPT__"
+func isVAOpt(t frontend.Token) bool {
+	return (t.Kind == frontend.TIdent || t.Kind == frontend.TKeyword) && t.Text == "__VA_OPT__"
 }
 
 // parseVAOpt parses a __VA_OPT__(...) construct beginning at body[i]
 // (body[i].Text == "__VA_OPT__"). It returns the inner tokens (excluding the
 // parentheses), the index just past the closing ')', and whether parsing
 // succeeded.
-func parseVAOpt(body []Token, i int) (content []Token, nextIdx int, ok bool) {
+func parseVAOpt(body []frontend.Token, i int) (content []frontend.Token, nextIdx int, ok bool) {
 	if i+1 >= len(body) || body[i+1].Text != "(" {
 		return nil, i + 1, false
 	}
@@ -1164,8 +1201,8 @@ func parseVAOpt(body []Token, i int) (content []Token, nextIdx int, ok bool) {
 	return nil, k, false
 }
 
-func isParam(t Token, m *Macro) bool {
-	return t.Kind == TIdent && paramIndex(t.Text, m) >= 0
+func isParam(t frontend.Token, m *Macro) bool {
+	return t.Kind == frontend.TIdent && paramIndex(t.Text, m) >= 0
 }
 
 func paramIndex(name string, m *Macro) int {
@@ -1178,7 +1215,7 @@ func paramIndex(name string, m *Macro) int {
 }
 
 // stringize turns a token list into a string-literal token (the C '#' operator).
-func stringize(toks []Token, line int) []Token {
+func stringize(toks []frontend.Token, line int) []frontend.Token {
 	var sb strings.Builder
 	for idx, t := range toks {
 		if idx > 0 {
@@ -1186,44 +1223,44 @@ func stringize(toks []Token, line int) []Token {
 		}
 		sb.WriteString(tokenSpelling(t))
 	}
-	return []Token{{Kind: TStr, Str: []byte(sb.String()), Line: line}}
+	return []frontend.Token{{Kind: frontend.TStr, Str: []byte(sb.String()), Line: line}}
 }
 
 // tokenSpelling returns the textual form of a token, used for pasting and
 // stringisation.
-func tokenSpelling(t Token) string {
+func tokenSpelling(t frontend.Token) string {
 	switch t.Kind {
-	case TStr:
+	case frontend.TStr:
 		return "\"" + string(t.Str) + "\""
-	case TNum, TIdent, TKeyword:
+	case frontend.TNum, frontend.TIdent, frontend.TKeyword:
 		return t.Text
-	case TPunct:
+	case frontend.TPunct:
 		return t.Text
 	}
 	return t.Text
 }
 
 // lexOne re-lexes a piece of text into a single token (used by '##' pasting).
-func lexOne(s string) Token {
-	toks, err := Lex(s)
-	if err == nil && len(toks) > 0 && toks[0].Kind != TEOF {
+func lexOne(s string) frontend.Token {
+	toks, err := frontend.Lex(s)
+	if err == nil && len(toks) > 0 && toks[0].Kind != frontend.TEOF {
 		return toks[0]
 	}
-	return Token{Kind: TPunct, Text: s}
+	return frontend.Token{Kind: frontend.TPunct, Text: s}
 }
 
-func tokStr(s string, line int) Token {
-	return Token{Kind: TStr, Str: []byte(s), Line: line}
+func tokStr(s string, line int) frontend.Token {
+	return frontend.Token{Kind: frontend.TStr, Str: []byte(s), Line: line}
 }
 
-func tokNum(v int64, line int) Token {
-	return Token{Kind: TNum, Num: v, Text: strconv.FormatInt(v, 10), Line: line}
+func tokNum(v int64, line int) frontend.Token {
+	return frontend.Token{Kind: frontend.TNum, Num: v, Text: strconv.FormatInt(v, 10), Line: line}
 }
 
 // constExpr evaluates a (pre-expanded) integer constant expression used by
 // #if / #elif. Undefined identifiers and string constants are 0; character
-// literals carry their byte value (the lexer emits them as TNum).
-func (p *Preprocessor) constExpr(toks []Token) int64 {
+// literals carry their byte value (the lexer emits them as frontend.TNum).
+func (p *Preprocessor) constExpr(toks []frontend.Token) int64 {
 	if len(toks) == 0 {
 		return 0
 	}
@@ -1232,7 +1269,7 @@ func (p *Preprocessor) constExpr(toks []Token) int64 {
 	return v
 }
 
-func (p *Preprocessor) ceOr(toks []Token, i int) (int64, int) {
+func (p *Preprocessor) ceOr(toks []frontend.Token, i int) (int64, int) {
 	left, i := p.ceAnd(toks, i)
 	for i < len(toks) && toks[i].Text == "||" {
 		i++
@@ -1247,7 +1284,7 @@ func (p *Preprocessor) ceOr(toks []Token, i int) (int64, int) {
 	return left, i
 }
 
-func (p *Preprocessor) ceAnd(toks []Token, i int) (int64, int) {
+func (p *Preprocessor) ceAnd(toks []frontend.Token, i int) (int64, int) {
 	left, i := p.ceEq(toks, i)
 	for i < len(toks) && toks[i].Text == "&&" {
 		i++
@@ -1262,7 +1299,7 @@ func (p *Preprocessor) ceAnd(toks []Token, i int) (int64, int) {
 	return left, i
 }
 
-func (p *Preprocessor) ceEq(toks []Token, i int) (int64, int) {
+func (p *Preprocessor) ceEq(toks []frontend.Token, i int) (int64, int) {
 	left, i := p.ceRel(toks, i)
 	for i < len(toks) && (toks[i].Text == "==" || toks[i].Text == "!=") {
 		op := toks[i].Text
@@ -1288,7 +1325,7 @@ func (p *Preprocessor) ceEq(toks []Token, i int) (int64, int) {
 	return left, i
 }
 
-func (p *Preprocessor) ceRel(toks []Token, i int) (int64, int) {
+func (p *Preprocessor) ceRel(toks []frontend.Token, i int) (int64, int) {
 	left, i := p.ceAdd(toks, i)
 	for i < len(toks) && (toks[i].Text == "<" || toks[i].Text == ">" ||
 		toks[i].Text == "<=" || toks[i].Text == ">=") {
@@ -1320,7 +1357,7 @@ func (p *Preprocessor) ceRel(toks []Token, i int) (int64, int) {
 	return left, i
 }
 
-func (p *Preprocessor) ceAdd(toks []Token, i int) (int64, int) {
+func (p *Preprocessor) ceAdd(toks []frontend.Token, i int) (int64, int) {
 	left, i := p.ceMul(toks, i)
 	for i < len(toks) && (toks[i].Text == "+" || toks[i].Text == "-") {
 		op := toks[i].Text
@@ -1336,7 +1373,7 @@ func (p *Preprocessor) ceAdd(toks []Token, i int) (int64, int) {
 	return left, i
 }
 
-func (p *Preprocessor) ceMul(toks []Token, i int) (int64, int) {
+func (p *Preprocessor) ceMul(toks []frontend.Token, i int) (int64, int) {
 	left, i := p.ceUnary(toks, i)
 	for i < len(toks) && (toks[i].Text == "*" || toks[i].Text == "/" || toks[i].Text == "%") {
 		op := toks[i].Text
@@ -1366,7 +1403,7 @@ func (p *Preprocessor) ceMul(toks []Token, i int) (int64, int) {
 	return left, i
 }
 
-func (p *Preprocessor) ceUnary(toks []Token, i int) (int64, int) {
+func (p *Preprocessor) ceUnary(toks []frontend.Token, i int) (int64, int) {
 	if i >= len(toks) {
 		return 0, i
 	}
@@ -1387,15 +1424,15 @@ func (p *Preprocessor) ceUnary(toks []Token, i int) (int64, int) {
 	return p.cePrimary(toks, i)
 }
 
-func (p *Preprocessor) cePrimary(toks []Token, i int) (int64, int) {
+func (p *Preprocessor) cePrimary(toks []frontend.Token, i int) (int64, int) {
 	if i >= len(toks) {
 		return 0, i
 	}
 	t := toks[i]
 	switch {
-	case t.Kind == TNum:
+	case t.Kind == frontend.TNum:
 		return t.Num, i + 1
-	case t.Kind == TIdent && t.Text == "defined":
+	case t.Kind == frontend.TIdent && t.Text == "defined":
 		i++
 		name := ""
 		if i < len(toks) && toks[i].Text == "(" {
@@ -1430,7 +1467,7 @@ func (p *Preprocessor) cePrimary(toks []Token, i int) (int64, int) {
 		var path string
 		if i < len(toks) && toks[i].Text == "(" {
 			i++
-			if i < len(toks) && toks[i].Kind == TStr {
+			if i < len(toks) && toks[i].Kind == frontend.TStr {
 				path = string(toks[i].Str)
 				i++
 			} else if i < len(toks) && toks[i].Text == "<" {
@@ -1480,7 +1517,7 @@ func (p *Preprocessor) cePrimary(toks []Token, i int) (int64, int) {
 		default:
 			return 0, i
 		}
-	case t.Kind == TIdent:
+	case t.Kind == frontend.TIdent:
 		return 0, i + 1
 	case t.Text == "(":
 		v, ni := p.ceOr(toks, i+1)

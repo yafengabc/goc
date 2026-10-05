@@ -26,13 +26,16 @@ jobs:
           if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
       - name: go vet
         run: |
+          (cd src/frontend && go vet ./...)
           (cd src/goc && go vet ./...)
+          (cd src && go vet ./...)
           (cd src/goa && go vet ./...)
           (cd tools && go vet ./...)
       - name: go build
         run: |
           mkdir -p bin
-          (cd src/goc && go build -o ../../bin/goc .)
+          (cd src/goc && go build -o ../../bin/goc ./cmd/goc)
+          (cd src && go build -o ../bin/goc-standalone .)
           (cd src/goa && go build -o ../../bin/goa ./cmd/goa)
           (cd tools && go build -o ../bin/elfcheck ./elfcheck)
           # msgboxcheck drives a real Windows dialog box, so it only exists as

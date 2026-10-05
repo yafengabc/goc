@@ -1,4 +1,4 @@
-package main
+package frontend
 
 import "fmt"
 
@@ -1448,3 +1448,55 @@ func typesEqual(a, b *Type) bool {
 		return true
 	}
 }
+
+// ---------------------------------------------------------------------------
+//
+// Exported views of internal helpers.
+//
+// The code generator uses these, and it lives in another package now that the
+// front end is a library. Rather than rename the internals -- which would touch
+// hundreds of call sites inside this package for no benefit -- each one gets an
+// exported alias. A wrapper is preferable to a rename here because these names
+// are used heavily in the type rules below, where "Sizeof" reading better than
+// "sizeOf" is not worth the churn.
+
+// Sizeof is the size in bytes of a type, or -1 when it is incomplete.
+func Sizeof(t *Type) int { return sizeOf(t) }
+
+// BigArithResult is the result type of a _BitInt arithmetic operation.
+func BigArithResult(op string, lt0, rt0 *Type) *Type { return bigArithResult(op, lt0, rt0) }
+
+// PosMembers is a struct's members that participate in layout.
+func PosMembers(t *Type) []*Member { return posMembers(t) }
+
+// IsBig reports whether t is a _BitInt type, the only kind that needs
+// multi-word codegen.
+func IsBig(t *Type) bool { return isBig(t) }
+
+// FuncTypeOf extracts the function type from a function type or a pointer to
+// one, or nil when t is neither.
+func FuncTypeOf(t *Type) *Type { return funcTypeOf(t) }
+
+// MemberIndex is the offset of the named member within its struct, or -1.
+func MemberIndex(t *Type, name string) int { return memberIndex(t, name) }
+
+// WalkStmts visits every statement in a body, including nested blocks.
+func WalkStmts(s Stmt, visit func(Stmt)) { walkStmts(s, visit) }
+
+// Structs is the file-scope struct and union table, keyed by tag. The code
+// generator needs it to resolve a forward reference it sees after the front end
+// has already recorded the layout.
+func Structs() map[string]*Type { return structs }
+
+// Typedefs is the file-scope typedef table.
+func Typedefs() map[string]*Type { return typedefs }
+
+// EnumConsts is the enumeration-constant table produced by the checker, keyed
+// by name. The LLVM backend folds these into its IR, and it indexes and ranges
+// over it directly, so this is the map itself rather than an accessor.
+var EnumConsts = enumConsts
+
+// Keywords is the C keyword set. The generator consults it when it parses a
+// gcc-style command line and has to decide whether an identifier is a type name
+// it may redeclare.
+func Keywords() map[string]bool { return keywords }
