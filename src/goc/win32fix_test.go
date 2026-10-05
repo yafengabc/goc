@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"goc/common"
 	"os"
 	"regexp"
 	"strings"
@@ -17,9 +18,9 @@ import (
 // stopped being found fails here rather than silently skipping the assertions.
 func readGoclib(t *testing.T, name string) string {
 	t.Helper()
-	b, err := goclibHeaders.ReadFile("goclib/" + name)
+	b, err := common.Disk().ReadFile("goclib/" + name)
 	if err != nil {
-		t.Fatalf("read %s: %v (GOCLIB_PATH=%q)", name, err, os.Getenv(goclibRootEnv))
+		t.Fatalf("read %s: %v (GOCLIB_PATH=%q)", name, err, os.Getenv(common.RootEnv))
 	}
 	return string(b)
 }

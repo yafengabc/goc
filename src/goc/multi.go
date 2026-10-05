@@ -25,9 +25,9 @@ package compiler
 
 import (
 	"fmt"
+	"goc/common"
 	"goc/frontend"
 	"os"
-	"reflect"
 	"strings"
 )
 
@@ -54,7 +54,7 @@ func buildMulti(cfg buildCfg, isCC bool) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			b.WriteString(SerializeTokens(toks))
+			b.WriteString(common.SerializeTokens(toks))
 			b.WriteString("\n")
 		}
 		out := b.String()
@@ -116,7 +116,7 @@ func preprocessFile(cfg buildCfg, path string) ([]frontend.Token, error) {
 		return nil, err
 	}
 	src = []byte(injectDefines(string(src), cfg.defines))
-	toks, err := PreprocessTarget(string(src), path, cfg.linux, cfg.incDirs...)
+	toks, err := common.PreprocessTarget(string(src), path, cfg.linux, cfg.incDirs...)
 	if err != nil {
 		return nil, fmt.Errorf("%s: preprocess error: %w", path, err)
 	}
@@ -206,7 +206,7 @@ func mergeUnits(units []*parsedUnit) (*frontend.Program, error) {
 	protos := map[string]*frontend.FuncDecl{}
 	for i, u := range units {
 		if len(renames[i]) > 0 {
-			renameInProgram(u.prog, renames[i])
+			common.RenameInProgram(u.prog, renames[i])
 		}
 		merged.Funcs = append(merged.Funcs, u.prog.Funcs...)
 		for _, p := range u.prog.Prototypes {
@@ -260,90 +260,6 @@ func uniqueRename(name string, unit int, defs map[string][]unitSym) string {
 		}
 		if _, taken := defs[cand]; !taken {
 			return cand
-		}
-	}
-}
-
-// renameInProgram renames file-scope symbols throughout one unit's AST: the
-// declarations themselves and every frontend.Ident that refers to them. The walk is
-// reflection-based so it cannot silently miss a node type (an unhandled node
-// shape would be a missed rename, which is a wrong-reference bug).
-func renameInProgram(prog *frontend.Program, renames map[string]string) {
-	if len(renames) == 0 {
-		return
-	}
-	for _, f := range prog.Funcs {
-		if nn, ok := renames[f.Name]; ok {
-			f.Name = nn
-		}
-		renameInValue(f.Body, renames)
-	}
-	for _, f := range prog.Prototypes {
-		if nn, ok := renames[f.Name]; ok {
-			f.Name = nn
-		}
-	}
-	for _, g := range prog.Globals {
-		if nn, ok := renames[g.Name]; ok {
-			g.Name = nn
-		}
-		renameInValue(g.Init, renames)
-	}
-}
-
-func renameInValue(v any, renames map[string]string) {
-	if v == nil {
-		return
-	}
-	renameReflect(reflect.ValueOf(v), renames)
-}
-
-func renameReflect(v reflect.Value, renames map[string]string) {
-	switch v.Kind() {
-	case reflect.Invalid:
-		return
-	case reflect.Ptr, reflect.Interface:
-		if v.IsNil() {
-			return
-		}
-		if v.CanInterface() {
-			switch x := v.Interface().(type) {
-			case *frontend.Ident:
-				if nn, ok := renames[x.Name]; ok {
-					x.Name = nn
-				}
-				return
-			case *frontend.Call:
-				// A direct call names its callee as a string, not an *frontend.Ident.
-				// (An indirect call goes through frontend.IndirectCall.Fn/UFCS and is
-				// reached by the ordinary walk.)
-				if nn, ok := renames[x.Name]; ok {
-					x.Name = nn
-				}
-			case *frontend.Type:
-				return // types carry tags and member names, never symbols
-			case frontend.Type:
-				return
-			}
-		}
-		renameReflect(v.Elem(), renames)
-	case reflect.Struct:
-		if v.CanInterface() {
-			if _, ok := v.Interface().(frontend.Type); ok {
-				return
-			}
-		}
-		for i := 0; i < v.NumField(); i++ {
-			renameReflect(v.Field(i), renames)
-		}
-	case reflect.Slice, reflect.Array:
-		for i := 0; i < v.Len(); i++ {
-			renameReflect(v.Index(i), renames)
-		}
-	case reflect.Map:
-		it := v.MapRange()
-		for it.Next() {
-			renameReflect(it.Value(), renames)
 		}
 	}
 }

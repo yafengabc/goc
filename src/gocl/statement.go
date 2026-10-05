@@ -1,4 +1,4 @@
-package compiler
+package gocl
 
 // Statements and expressions, in LLVM IR.
 //
@@ -78,7 +78,7 @@ func (e *irEmitter) localDecl(d *frontend.DeclStmt) {
 		return
 	}
 	lty := e.ty(ty)
-	uid := e.tr.declareVar(d.Name, varInfo{typ: ty})
+	uid := e.tr.declareVar(d.Name, varInfo{ty: ty})
 	slot := e.slotFor(uid, lty)
 	e.tr.declUID[d] = uid
 	if d.Init != nil {

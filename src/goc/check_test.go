@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"testing"
 )
@@ -9,7 +10,7 @@ import (
 // check) and returns the diagnostics, for use by the tests below.
 func checkSrc(t *testing.T, src string) []error {
 	t.Helper()
-	toks, err := Preprocess(src, "test.c")
+	toks, err := common.Preprocess(src, "test.c")
 	if err != nil {
 		t.Fatalf("preprocess failed: %v", err)
 	}

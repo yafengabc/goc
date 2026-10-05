@@ -1,4 +1,4 @@
-package compiler
+package gocl
 
 // Building the IR for a whole program.
 //
@@ -7,6 +7,7 @@ package compiler
 
 import (
 	"fmt"
+	"goc/common"
 	"goc/frontend"
 	"strconv"
 	"strings"
@@ -34,7 +35,7 @@ import (
 // tests, which exercise fragments without the runtime present). Its function table
 // is consulted for prototypes and for the reachability walk that decides which
 // runtime code has to be emitted.
-func translateProgram(prog *frontend.Program, lib *clibCProgram, linux bool) (string, map[string]bool, error) {
+func translateProgram(prog *frontend.Program, lib *common.Program, linux bool) (string, map[string]bool, error) {
 	m := newIRMod()
 	defined := map[string]bool{}
 	tr := &typeResolver{
@@ -54,7 +55,7 @@ func translateProgram(prog *frontend.Program, lib *clibCProgram, linux bool) (st
 	// the same static, so each side keeps its own storage.
 	if lib != nil {
 		renames := map[string]string{}
-		for _, lg := range lib.globals {
+		for _, lg := range lib.Globals {
 			for _, gl := range prog.Globals {
 				if gl.Name != lg.Name {
 					continue
@@ -67,7 +68,7 @@ func translateProgram(prog *frontend.Program, lib *clibCProgram, linux bool) (st
 				break
 			}
 		}
-		renameInProgram(prog, renames)
+		common.RenameInProgram(prog, renames)
 	}
 
 	// The function table has to hold both halves before anything is generated, so
@@ -93,7 +94,7 @@ func translateProgram(prog *frontend.Program, lib *clibCProgram, linux bool) (st
 	// `print("hello world")` larger under -fllvm than under the native
 	// generator, which prunes by useLibGlobal. See emitLibGlobals.
 	if lib != nil {
-		for _, lg := range lib.globals {
+		for _, lg := range lib.Globals {
 			if _, dup := tr.globalTyp[lg.Name]; dup {
 				continue
 			}
@@ -174,7 +175,7 @@ func translateProgram(prog *frontend.Program, lib *clibCProgram, linux bool) (st
 	if lib != nil {
 		need, needGlobals := llvmRoots(prog, lib, linux, tr)
 		m.emitLibGlobals(lib, needGlobals)
-		// lib.order can name a function more than once -- the runtime's
+		// lib.Order can name a function more than once -- the runtime's
 		// sources are concatenated, so a name that two of them define reaches
 		// the order list twice. Emitting it twice gave LLVM "invalid
 		// redefinition of function"; one definition per name is all a module
@@ -184,12 +185,12 @@ func translateProgram(prog *frontend.Program, lib *clibCProgram, linux bool) (st
 		for _, f := range prog.Funcs {
 			emitted[f.Name] = true
 		}
-		for _, name := range lib.order {
+		for _, name := range lib.Order {
 			if !need[name] || emitted[name] {
 				continue
 			}
 			emitted[name] = true
-			f := lib.funcs[name]
+			f := lib.Funcs[name]
 			if f.Body == nil {
 				continue // a prototype, not a definition
 			}
@@ -229,14 +230,14 @@ func translateProgram(prog *frontend.Program, lib *clibCProgram, linux bool) (st
 
 // irNameTaken reports whether a global spelling is already in use by the
 // program or by the C runtime, so a rename cannot land on a second collision.
-func irNameTaken(prog *frontend.Program, lib *clibCProgram, name string) bool {
+func irNameTaken(prog *frontend.Program, lib *common.Program, name string) bool {
 	for _, g := range prog.Globals {
 		if g.Name == name {
 			return true
 		}
 	}
 	if lib != nil {
-		for _, g := range lib.globals {
+		for _, g := range lib.Globals {
 			if g.Name == name {
 				return true
 			}
@@ -255,10 +256,10 @@ func irNameTaken(prog *frontend.Program, lib *clibCProgram, name string) bool {
 // Emitting the whole runtime (every one of its ~380 functions) is what made
 // the -fllvm binary 100k+ next to the native build's ~13; pruning to what the
 // program reaches brings it back in line.
-func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeResolver) (map[string]bool, map[string]bool) {
+func llvmRoots(prog *frontend.Program, lib *common.Program, linux bool, tr *typeResolver) (map[string]bool, map[string]bool) {
 	need := map[string]bool{}
 	isLib := func(name string) bool {
-		f, ok := lib.funcs[name]
+		f, ok := lib.Funcs[name]
 		return ok && f.Body != nil
 	}
 	// The runtime's file-scope variables are pruned on the same evidence as its
@@ -267,7 +268,7 @@ func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeRe
 	// and identifiers alike and most identifiers it reports are functions.
 	needGlobals := map[string]bool{}
 	isLibGlobal := map[string]bool{}
-	for _, lg := range lib.globals {
+	for _, lg := range lib.Globals {
 		isLibGlobal[lg.Name] = true
 	}
 	markGlobal := func(name string) {
@@ -278,11 +279,11 @@ func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeRe
 	// The questions specializePrintfCall needs. A nil tr means there was no
 	// emitter context; the specialisation is skipped then, which costs size but
 	// never correctness.
-	var q printfQueries
+	var q common.PrintfQueries
 	if tr != nil {
-		q = printfQueries{
-			userDefines:   func(name string) bool { return tr.userDefs[name] },
-			shadowedByVar: func(name string) bool { _, _, ok := tr.fnPtrVar(name); return ok },
+		q = common.PrintfQueries{
+			UserDefines:   func(name string) bool { return tr.userDefs[name] },
+			ShadowedByVar: func(name string) bool { _, _, ok := tr.fnPtrVar(name); return ok },
 		}
 	}
 	markReachable := func(name string) {
@@ -307,7 +308,7 @@ func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeRe
 				walkExpr(e, func(n frontend.Expr) {
 					switch x := n.(type) {
 					case *frontend.Call:
-						if repl := specializePrintfCall(x, q); repl != nil {
+						if repl := common.SpecializePrintfCall(x, q); repl != nil {
 							markReachable(repl.Name)
 							// The rewrite introduces references of its own.
 							// fwrite is a library function, and the stdout
@@ -362,7 +363,7 @@ func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeRe
 	for {
 		changed := false
 		for name := range need {
-			f, ok := lib.funcs[name]
+			f, ok := lib.Funcs[name]
 			if !ok || f.Body == nil {
 				continue
 			}
@@ -385,7 +386,7 @@ func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeRe
 	//     "every reachable body was scanned" property explicit rather than an
 	//     accident of the iteration order.
 	for name := range need {
-		if f, ok := lib.funcs[name]; ok && f.Body != nil {
+		if f, ok := lib.Funcs[name]; ok && f.Body != nil {
 			collectLibRefs(f.Body, markGlobal)
 		}
 	}
@@ -401,7 +402,7 @@ func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeRe
 				for {
 					changed := false
 					for en := range need {
-						ef, ok := lib.funcs[en]
+						ef, ok := lib.Funcs[en]
 						if !ok || ef.Body == nil {
 							continue
 						}
@@ -424,7 +425,7 @@ func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeRe
 	// The exit upgrade above widened `need` again, so the globals of everything
 	// it pulled in have to be swept as well.
 	for name := range need {
-		if f, ok := lib.funcs[name]; ok && f.Body != nil {
+		if f, ok := lib.Funcs[name]; ok && f.Body != nil {
 			collectLibRefs(f.Body, markGlobal)
 		}
 	}
@@ -452,8 +453,8 @@ func llvmRoots(prog *frontend.Program, lib *clibCProgram, linux bool, tr *typeRe
 // pruned: a name's type is what makes a subscript decay and a scalar load, and
 // getting that wrong produces malformed IR rather than a missing symbol. Only
 // the storage is pruned.
-func (m *irMod) emitLibGlobals(lib *clibCProgram, need map[string]bool) {
-	for _, lg := range lib.globals {
+func (m *irMod) emitLibGlobals(lib *common.Program, need map[string]bool) {
+	for _, lg := range lib.Globals {
 		if !need[lg.Name] {
 			continue
 		}

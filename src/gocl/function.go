@@ -1,4 +1,4 @@
-package compiler
+package gocl
 
 // The LLVM IR back end: a pure AST -> IR translator with no code-generator
 // coupling.
@@ -201,7 +201,7 @@ func (e *irEmitter) bindParams(f *frontend.FuncDecl) []string {
 		name := "%p" + itoa(i)
 		out = append(out, ty+" "+name)
 		if i < len(f.Params) {
-			uid := e.tr.declareVar(f.Params[i], varInfo{typ: pt})
+			uid := e.tr.declareVar(f.Params[i], varInfo{ty: pt})
 			slot := e.newTmp()
 			e.entry.WriteString("  " + slot + " = alloca " + ty + ", align " +
 				itoa(alignOfIr(ty)) + "\n")

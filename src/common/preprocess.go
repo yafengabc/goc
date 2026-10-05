@@ -1,4 +1,4 @@
-package compiler
+package common
 
 // cpp.go — the C preprocessor for goc.
 //
@@ -112,12 +112,8 @@ func PreprocessTarget(src, filename string, linux bool, incDirs ...string) ([]fr
 // PreprocessLibrary preprocesses one of the C library's own sources. It differs
 // from PreprocessTarget in exactly one way: no header outside the built-in
 // library can be reached. See Preprocessor.builtinOnly.
-//
-// It resolves the library first, so calling it before the first compile is
-// safe -- a caller that reaches it directly, rather than through buildClibC,
-// would otherwise dereference a nil source.
 func PreprocessLibrary(src, filename string, linux bool) ([]frontend.Token, error) {
-	defaultLib()
+	ensureDisk()
 	return preprocess(src, filename, linux, true)
 }
 
@@ -683,7 +679,7 @@ func (p *Preprocessor) doInclude(rest []frontend.Token, filename string) ([]fron
 		// goclib ships one flat header directory, so a path with a POSIX
 		// prefix such as <sys/stat.h> matches on its basename (goclib/stat.h).
 		// That keeps the standard spelling working without a goclib/sys tree.
-		if src, rerr := goclibHeaders.ReadFile("goclib/" + path); rerr == nil {
+		if src, rerr := libHeaders.ReadFile("goclib/" + path); rerr == nil {
 			inc, perr := p.process(string(src), "<builtin:"+path+">")
 			if perr != nil {
 				return nil, perr
@@ -694,7 +690,7 @@ func (p *Preprocessor) doInclude(rest []frontend.Token, filename string) ([]fron
 			return inc, nil
 		}
 		if base := filepath.Base(path); base != path {
-			if src, rerr := goclibHeaders.ReadFile("goclib/" + base); rerr == nil {
+			if src, rerr := libHeaders.ReadFile("goclib/" + base); rerr == nil {
 				inc, perr := p.process(string(src), "<builtin:"+path+">")
 				if perr != nil {
 					return nil, perr
@@ -913,11 +909,11 @@ func (p *Preprocessor) headerExists(path string) bool {
 	if _, err := p.resolveInclude(path, filepath.Join(p.baseDir, "_"), false); err == nil {
 		return true
 	}
-	if _, err := goclibHeaders.ReadFile("goclib/" + path); err == nil {
+	if _, err := libHeaders.ReadFile("goclib/" + path); err == nil {
 		return true
 	}
 	if base := filepath.Base(path); base != path {
-		if _, err := goclibHeaders.ReadFile("goclib/" + base); err == nil {
+		if _, err := libHeaders.ReadFile("goclib/" + base); err == nil {
 			return true
 		}
 	}

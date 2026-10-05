@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"strings"
 	"testing"
@@ -91,7 +92,7 @@ func TestMFValueNotTreatedAsInput(t *testing.T) {
 // "unexpected character 'ï'".
 func TestBOMPrefixedSource(t *testing.T) {
 	src := string([]byte{0xEF, 0xBB, 0xBF}) + "int main(){ return 0; }"
-	if _, err := Preprocess(src, "bom.c"); err != nil {
+	if _, err := common.Preprocess(src, "bom.c"); err != nil {
 		t.Errorf("BOM-prefixed source must preprocess cleanly, got: %v", err)
 	}
 }
@@ -99,11 +100,11 @@ func TestBOMPrefixedSource(t *testing.T) {
 // TestIfDivideByZeroErrors pins the const-eval fix: a division (or remainder)
 // by zero inside #if/#elif was silently yielding 0; it must now be reported.
 func TestIfDivideByZeroErrors(t *testing.T) {
-	if _, err := Preprocess("#if 1/0\nint x;\n#endif\nint main(){ return 0; }", "d.c"); err == nil ||
+	if _, err := common.Preprocess("#if 1/0\nint x;\n#endif\nint main(){ return 0; }", "d.c"); err == nil ||
 		!strings.Contains(err.Error(), "division by zero") {
 		t.Errorf("#if 1/0 must report division by zero, got: %v", err)
 	}
-	if _, err := Preprocess("#if 0\n#elif 2/0\n#endif\nint main(){ return 0; }", "d.c"); err == nil ||
+	if _, err := common.Preprocess("#if 0\n#elif 2/0\n#endif\nint main(){ return 0; }", "d.c"); err == nil ||
 		!strings.Contains(err.Error(), "division by zero") {
 		t.Errorf("#elif 2/0 must report division by zero, got: %v", err)
 	}
@@ -115,14 +116,14 @@ func TestIfDivideByZeroErrors(t *testing.T) {
 // resolvable in the next: the built-in library TUs run before the user's, and
 // a name collision made _Alignof/typeof silently pick up a stale type.
 func TestVarTypesResetAcrossTUs(t *testing.T) {
-	toks1, err := Preprocess("int v;", "a.c")
+	toks1, err := common.Preprocess("int v;", "a.c")
 	if err != nil {
 		t.Fatalf("TU1 preprocess: %v", err)
 	}
 	if _, err := frontend.Parse(toks1); err != nil {
 		t.Fatalf("TU1 parse: %v", err)
 	}
-	toks2, err := Preprocess("int main(){ return _Alignof(v); }", "b.c")
+	toks2, err := common.Preprocess("int main(){ return _Alignof(v); }", "b.c")
 	if err != nil {
 		t.Fatalf("TU2 preprocess: %v", err)
 	}

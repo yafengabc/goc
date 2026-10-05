@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"strings"
 	"testing"
@@ -10,7 +11,7 @@ import (
 // what a wWinMain program is built with (-mwindows).
 func genAsmGUI(t *testing.T, src string) string {
 	t.Helper()
-	toks, err := Preprocess(src, "test.c")
+	toks, err := common.Preprocess(src, "test.c")
 	if err != nil {
 		t.Fatalf("preprocess: %v", err)
 	}

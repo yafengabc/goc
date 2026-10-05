@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"testing"
 )
@@ -9,7 +10,7 @@ import (
 // the program is well formed. Used by the negative cases.
 func genAsmErr(t *testing.T, src string) string {
 	t.Helper()
-	toks, err := Preprocess(src, "test.c")
+	toks, err := common.Preprocess(src, "test.c")
 	if err != nil {
 		return "preprocess: " + err.Error()
 	}
@@ -65,7 +66,7 @@ int main(void) { S s = { "hi", sizeof(s) }; return s.n - 16; }`,
 // separate regression, so assert on the count too.
 func TestSelfRefStillCatchesRedefinition(t *testing.T) {
 	src := `int main(void) { int x = 1; int x = 2; return x; }`
-	toks, err := Preprocess(src, "test.c")
+	toks, err := common.Preprocess(src, "test.c")
 	if err != nil {
 		t.Fatalf("preprocess: %v", err)
 	}

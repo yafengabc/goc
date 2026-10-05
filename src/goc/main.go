@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"goa"
+	"goc/common"
 	"goc/frontend"
 	"os"
 	"os/exec"
@@ -144,7 +145,7 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 	}
 	src = []byte(injectDefines(string(src), cfg.defines))
 
-	toks, err := PreprocessTarget(string(src), srcPath, cfg.linux, cfg.incDirs...)
+	toks, err := common.PreprocessTarget(string(src), srcPath, cfg.linux, cfg.incDirs...)
 	if err != nil {
 		return "", fmt.Errorf("preprocess error: %w", err)
 	}
@@ -152,7 +153,7 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 	// -E: preprocess only, emit the (directives-stripped, macro-expanded)
 	// translation unit and stop.
 	if cfg.mode == "preprocess" {
-		out := SerializeTokens(toks)
+		out := common.SerializeTokens(toks)
 		if cfg.outFile != "" && !isDir(cfg.outFile) {
 			if err := os.WriteFile(cfg.outFile, []byte(out), 0644); err != nil {
 				return "", err
@@ -186,26 +187,7 @@ func emitProgram(prog *frontend.Program, cfg buildCfg, isCC bool) (string, error
 		}
 		return "", errors.New(b.String())
 	}
-	// The LLVM back end hands the whole program to one owner: every user
-	// function and every C runtime function becomes LLVM IR, compiled by
-	// libLLVM into a COFF object. goa's own assembler then contributes only the
-	// entry stub -- which is not C -- and links that object into the image.
-	// The names LLVM defined are reported as `claimed` so genWith leaves them
-	// alone and emits nothing but the stub.
-	var irText string
-	var claimed map[string]bool
-	if cfg.llvm {
-		var err error
-		if irText, claimed, err = genLLVMProgram(prog, cfg.linux, cfg.opt); err != nil {
-			return "", err
-		}
-		if len(claimed) == 0 {
-			return "", fmt.Errorf("-fllvm: no function in this program can be compiled " +
-				"by the LLVM front end; every one of them uses a construct it does " +
-				"not model yet (variadic functions, bit-fields, _BitInt or inline asm)")
-		}
-	}
-	asm, err := genWith(prog, cfg.linux, cfg.opt, cfg.winGUI, claimed)
+	asm, err := genWith(prog, cfg.linux, cfg.opt, cfg.winGUI, nil)
 	if err != nil {
 		return "", fmt.Errorf("codegen error: %w", err)
 	}
@@ -214,23 +196,6 @@ func emitProgram(prog *frontend.Program, cfg buildCfg, isCC bool) (string, error
 	asmPath, outPath := outputPaths(cfg.inputs[0], cfg.outFile, cfg.linux, cfg.mode == "asm")
 	if err := os.MkdirAll(filepath.Dir(asmPath), 0755); err != nil {
 		return "", err
-	}
-
-	// -S with the LLVM back end: the readable artifact is the native assembly
-	// the AsmPrinter emits (a .s file), not the entry stub that genWith writes
-	// once `claimed` covers every function -- that stub has no user code, so the
-	// native .asm path would produce a useless file. This is the LLVM analogue
-	// of gcc's "cc -S" .s output (the AsmPrinter is already initialised for the
-	// object path, so emitting assembly costs nothing extra).
-	if cfg.mode == "asm" && cfg.llvm {
-		asmOut := strings.TrimSuffix(asmPath, filepath.Ext(asmPath)) + ".s"
-		if err := emitIRAssembly(irText, asmOut, cfg.opt, cfg.linux); err != nil {
-			return "", err
-		}
-		if !isCC {
-			fmt.Printf("assembly written to %s\n", asmOut)
-		}
-		return "", nil
 	}
 
 	if err := os.WriteFile(asmPath, []byte(asm), 0644); err != nil {
@@ -247,45 +212,9 @@ func emitProgram(prog *frontend.Program, cfg buildCfg, isCC bool) (string, error
 	// Hand the assembly to goa, our own assembler -- linked into this binary,
 	// so there is no external goa process and nothing to find on disk. With
 	// -fllvm the object's code goes into the same image.
+	// The LLVM back end is a separate compiler now (src/gocl), so there is no
+	// object to link here: the assembly below is the whole program.
 	var obj []byte
-	if irText != "" {
-		if cfg.dumpIR {
-			// Name the dump after the executable, which is what the user asked
-			// for: "goc -fllvm -dump-ir foo.c" leaves foo.ll (and foo.obj) beside
-			// foo.exe. The IR is the artifact worth reading -- it is what LLVM
-			// rejected, and what its optimiser would have to say about it -- but
-			// the object is kept too, since its relocations and undefined symbols
-			// are what a link error is really about.
-			llPath := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".ll"
-			if err := os.WriteFile(llPath, []byte(irText), 0644); err != nil {
-				return "", err
-			}
-			if !isCC {
-				fmt.Printf("IR written to %s\n", llPath)
-			}
-		}
-		if obj, err = compileIR(irText, cfg.opt, cfg.linux); err != nil {
-			// The IR is what LLVM rejected, so when it is being dumped, leave it
-			// on disk before failing: without it the error names a line in a file
-			// that no longer exists anywhere.
-			if cfg.dumpIR {
-				llPath := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".ll"
-				if werr := os.WriteFile(llPath, []byte(irText), 0644); werr == nil {
-					fmt.Fprintf(os.Stderr, "IR written to %s\n", llPath)
-				}
-			}
-			return "", err
-		}
-		if cfg.dumpIR {
-			objPath := strings.TrimSuffix(outPath, filepath.Ext(outPath)) + ".obj"
-			if err := os.WriteFile(objPath, obj, 0644); err != nil {
-				return "", err
-			}
-			if !isCC {
-				fmt.Printf("object written to %s\n", objPath)
-			}
-		}
-	}
 	if err := assemble(asm, outPath, cfg.linux, cfg.inputs[0], isCC, obj); err != nil {
 		return "", err
 	}

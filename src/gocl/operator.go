@@ -1,4 +1,4 @@
-package compiler
+package gocl
 
 // Operators, calls and aggregates, in LLVM IR.
 

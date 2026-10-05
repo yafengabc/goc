@@ -1,4 +1,4 @@
-package compiler
+package gocl
 
 // Driving the LLVM back end from a build.
 //
@@ -14,6 +14,7 @@ package compiler
 import (
 	"fmt"
 	"goa"
+	"goc/common"
 	"goc/frontend"
 	"os"
 	"path/filepath"
@@ -33,7 +34,7 @@ import (
 // What goa's own assembler still contributes is the entry stub, which is not C:
 // it sets up the process stack per the platform ABI before main runs.
 func genLLVMProgram(prog *frontend.Program, linux bool, opt int) (string, map[string]bool, error) {
-	lib := clibCStore(linux)
+	lib := common.Store(linux)
 	if lib == nil {
 		return "", nil, fmt.Errorf("-fllvm: the built-in C library for this target " +
 			"is unavailable; run without -fllvm to see why")

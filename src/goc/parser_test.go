@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"testing"
 )
@@ -9,7 +10,7 @@ import (
 // inspect the types the parser built rather than just whether it failed.
 func parseSrc(t *testing.T, src string) *frontend.Program {
 	t.Helper()
-	toks, err := Preprocess(src, "test.c")
+	toks, err := common.Preprocess(src, "test.c")
 	if err != nil {
 		t.Fatalf("preprocess failed: %v", err)
 	}

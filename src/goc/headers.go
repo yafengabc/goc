@@ -8,9 +8,9 @@ package compiler
 // The declarations use the full subset goc's front end parses today:
 // const/volatile qualifiers are accepted and ignored, typedefs (size_t,
 // ptrdiff_t) are real, and variadic prototypes (printf, sprintf) validate any
-// number of trailing arguments. goclib/goclib.h is also embedded here; it is
+// number of trailing arguments. goclib/gocommon.h is also embedded here; it is
 // the internal umbrella header that includes the standard headers and the
-// __goclib_* platform primitives for goclib/goclib.c.
+// __goclib_* platform primitives for goclib/gocommon.c.
 //
 // Read from disk by default, or from whatever SetLibrary installed; see
 // libfs.go for the search order.

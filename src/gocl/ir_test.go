@@ -1,4 +1,4 @@
-package compiler
+package gocl
 
 // Test-side driver for the IR back end.
 //
@@ -9,6 +9,7 @@ package compiler
 // the ones that need LLVM skip themselves when it is absent.
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"os"
 	"strings"
@@ -24,7 +25,7 @@ import (
 // program path is covered by the e2e -fllvm leg.
 func irFromSource(t *testing.T, src string) (string, map[string]bool) {
 	t.Helper()
-	toks, err := PreprocessTarget(src, "test.c", false)
+	toks, err := common.PreprocessTarget(src, "test.c", false)
 	if err != nil {
 		t.Fatalf("preprocess: %v", err)
 	}
@@ -307,7 +308,7 @@ func TestIREligibilityIsConservative(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			toks, err := PreprocessTarget(tc.src, "t.c", false)
+			toks, err := common.PreprocessTarget(tc.src, "t.c", false)
 			if err != nil {
 				t.Skipf("preprocess: %v", err)
 			}

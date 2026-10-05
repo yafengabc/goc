@@ -1,4 +1,4 @@
-package compiler
+package gocl
 
 import (
 	"goc/frontend"

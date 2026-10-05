@@ -1,4 +1,4 @@
-package compiler
+package common
 
 import (
 	"fmt"
@@ -36,14 +36,14 @@ import (
 // Each origin is searched by probe, which alternates descending and climbing.
 // See probe for why one direction alone is not enough.
 //
-// Everything below the found root is read as a plain directory: the calls are
-// on the same "goclib/<name>" spelling the embed version used, so the call
-// sites did not change.
+// Everything below the found root is read as a plain directory, and the calls
+// keep the "goclib/<name>" spelling an embed.FS would use, so a caller can swap
+// this for an embedded library without changing a single call site.
 
-// goclibRootEnv names the environment variable that overrides the search.
-const goclibRootEnv = "GOCLIB_PATH"
+// RootEnv names the environment variable that overrides the search.
+const RootEnv = "GOCLIB_PATH"
 
-// libSource is where the C library comes from. Two implementations satisfy it:
+// Source is where the C library comes from. Two implementations satisfy it:
 // sourceFS below, which reads a goclib/ directory from disk, and the embed.FS
 // an entry point injects so its binary needs nothing beside it.
 //
@@ -57,8 +57,8 @@ const goclibRootEnv = "GOCLIB_PATH"
 // unavailable header rather than failing, and it does that by testing
 // err == nil. A missing file on disk and a missing file in an embed are
 // indistinguishable there, which is the behaviour we want.
-// sourceFS reads the library from a directory on disk.
-type sourceFS struct {
+// diskSource reads the library from a directory on disk.
+type diskSource struct {
 	// root is the directory that holds goclib/. A path handed to ReadFile is
 	// joined onto it, so callers keep passing "goclib/<name>".
 	root string
@@ -70,7 +70,7 @@ type sourceFS struct {
 
 // ReadFile reads one library file. The name is a slash-separated path
 // relative to root, matching embed.FS conventions.
-func (f sourceFS) ReadFile(name string) ([]byte, error) {
+func (f diskSource) ReadFile(name string) ([]byte, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -81,7 +81,7 @@ func (f sourceFS) ReadFile(name string) ([]byte, error) {
 // is not cosmetic: it fixes the order the library's sources are compiled in,
 // and therefore the order their definitions reach the symbol table, so the
 // output does not depend on how the file system happens to enumerate.
-func (f sourceFS) ReadDir(name string) ([]string, error) {
+func (f diskSource) ReadDir(name string) ([]string, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -163,7 +163,7 @@ func descend(dir string, consider func(string) (string, bool)) (string, bool) {
 // The candidates are tried in order and the first one containing goclib/goclib.h
 // wins; a directory that exists but has no library in it is skipped rather than
 // accepted, so a stray GOCLIB_PATH does not silently produce an empty runtime.
-func findGoclibRoot() (string, error) {
+func FindRoot() (string, error) {
 	var tried []string
 	consider := func(dir string) (string, bool) {
 		if dir == "" {
@@ -184,7 +184,7 @@ func findGoclibRoot() (string, error) {
 		return "", false
 	}
 
-	if env := os.Getenv(goclibRootEnv); env != "" {
+	if env := os.Getenv(RootEnv); env != "" {
 		if root, ok := consider(env); ok {
 			return root, nil
 		}
@@ -220,7 +220,7 @@ func findGoclibRoot() (string, error) {
 	}
 	return "", fmt.Errorf("cannot find the goclib C library (looked in: %s); "+
 		"set %s to the directory that contains goclib/", strings.Join(tried, ", "),
-		goclibRootEnv)
+		RootEnv)
 }
 
 // The library's two sources, declared together because they are two
@@ -228,12 +228,12 @@ func findGoclibRoot() (string, error) {
 // value; they are two names so the call sites read as "the .c files" and "the
 // headers", the way the code generator and the preprocessor think about them.
 //
-// libSource is an interface rather than embed.FS so the on-disk implementation
+// Source is an interface rather than embed.FS so the on-disk implementation
 // satisfies it too. embed.FS could not be used directly: its ReadDir returns
 // []fs.DirEntry, so a wrapper would need the same adaptation anyway.
 // Normalising to a sorted list of names is where the two become
 // interchangeable.
-type libSource interface {
+type Source interface {
 	// ReadFile reads one library file, named as in embed.FS: a slash-separated
 	// path relative to the library root, so "goclib/stdio.h".
 	ReadFile(name string) ([]byte, error)
@@ -242,18 +242,18 @@ type libSource interface {
 }
 
 var (
-	goclibCFS     libSource
-	goclibHeaders libSource
+	goclibCFS     Source
+	goclibHeaders Source
 )
 
-// diskLib opens the on-disk library, or returns a source whose every call fails
+// Disk opens the on-disk library, or returns a source whose every call fails
 // with the reason. The loader checks the error once, so a missing library is
 // reported once with an actionable message instead of as a read error on an
 // unrelated header deep inside the front end.
-func diskLib() libSource {
-	root, err := findGoclibRoot()
+func Disk() Source {
+	root, err := FindRoot()
 	if err != nil {
-		return sourceFS{err: err}
+		return diskSource{err: err}
 	}
-	return sourceFS{root: root}
+	return diskSource{root: root}
 }

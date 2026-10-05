@@ -1,4 +1,4 @@
-package compiler
+package gocl
 
 // Helpers shared by the IR expression and statement generators: literal
 // classification, numeric conversions, string constants and the small type

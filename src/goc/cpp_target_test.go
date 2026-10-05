@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"strings"
 	"testing"
@@ -19,7 +20,7 @@ func TestPlatformBranchSelection(t *testing.T) {
 		{true, "int linv ;"},
 	}
 	for _, tc := range cases {
-		toks, err := PreprocessTarget(src, "probe.c", tc.linux)
+		toks, err := common.PreprocessTarget(src, "probe.c", tc.linux)
 		if err != nil {
 			t.Fatalf("linux=%v: %v", tc.linux, err)
 		}

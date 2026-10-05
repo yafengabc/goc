@@ -1,6 +1,7 @@
-package compiler
+package gocl
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"os"
 	"os/exec"
@@ -19,9 +20,9 @@ import (
 // property the sharing exists to protect.
 
 func TestSpecializePrintfCall(t *testing.T) {
-	noShadow := printfQueries{
-		userDefines:   func(string) bool { return false },
-		shadowedByVar: func(string) bool { return false },
+	noShadow := common.PrintfQueries{
+		UserDefines:   func(string) bool { return false },
+		ShadowedByVar: func(string) bool { return false },
 	}
 	cases := []struct {
 		name string
@@ -79,7 +80,7 @@ func TestSpecializePrintfCall(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := specializePrintfCall(c.call, noShadow)
+			got := common.SpecializePrintfCall(c.call, noShadow)
 			if c.want == "" {
 				if got != nil {
 					t.Fatalf("rewritten to %s, want no rewrite", got.Name)
@@ -101,38 +102,38 @@ func TestSpecializePrintfCall(t *testing.T) {
 func TestSpecializePrintfCallRespectsShadowing(t *testing.T) {
 	call := &frontend.Call{Name: "printf", Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("hi\n")}}}
 	t.Run("a program-defined fwrite blocks it", func(t *testing.T) {
-		q := printfQueries{
-			userDefines:   func(n string) bool { return n == "fwrite" },
-			shadowedByVar: func(string) bool { return false },
+		q := common.PrintfQueries{
+			UserDefines:   func(n string) bool { return n == "fwrite" },
+			ShadowedByVar: func(string) bool { return false },
 		}
-		if got := specializePrintfCall(call, q); got != nil {
+		if got := common.SpecializePrintfCall(call, q); got != nil {
 			t.Fatalf("rewrote to %s despite the program's own fwrite", got.Name)
 		}
 	})
 	t.Run("a function-pointer variable blocks it", func(t *testing.T) {
-		q := printfQueries{
-			userDefines:   func(string) bool { return false },
-			shadowedByVar: func(n string) bool { return n == "fwrite" },
+		q := common.PrintfQueries{
+			UserDefines:   func(string) bool { return false },
+			ShadowedByVar: func(n string) bool { return n == "fwrite" },
 		}
-		if got := specializePrintfCall(call, q); got != nil {
+		if got := common.SpecializePrintfCall(call, q); got != nil {
 			t.Fatalf("rewrote to %s despite a shadowing variable", got.Name)
 		}
 	})
 	t.Run("a program-defined lite entry blocks it", func(t *testing.T) {
 		lite := &frontend.Call{Name: "printf", Args: []frontend.Expr{&frontend.StrLit{Bytes: []byte("%d")},
 			&frontend.NumLit{Val: 1, Kind: frontend.TInt}}}
-		q := printfQueries{
-			userDefines:   func(n string) bool { return n == "__goclib_printf_lite" },
-			shadowedByVar: func(string) bool { return false },
+		q := common.PrintfQueries{
+			UserDefines:   func(n string) bool { return n == "__goclib_printf_lite" },
+			ShadowedByVar: func(string) bool { return false },
 		}
-		if got := specializePrintfCall(lite, q); got != nil {
+		if got := common.SpecializePrintfCall(lite, q); got != nil {
 			t.Fatalf("rewrote to %s despite the program's own lite entry", got.Name)
 		}
 	})
 	// A nil query set means the caller could not answer; rewriting on a guess
 	// would be worse than not rewriting at all.
 	t.Run("no queries means no rewrite", func(t *testing.T) {
-		if got := specializePrintfCall(call, printfQueries{}); got != nil {
+		if got := common.SpecializePrintfCall(call, common.PrintfQueries{}); got != nil {
 			t.Fatalf("rewrote to %s with no shadow information", got.Name)
 		}
 	})
@@ -144,9 +145,9 @@ func TestSpecializePrintfCallRespectsShadowing(t *testing.T) {
 // must come with both names.
 func TestPrintfSpecAddsItsOwnReferences(t *testing.T) {
 	lit := &frontend.StrLit{Bytes: []byte("hi\n")}
-	got := specializePrintfCall(&frontend.Call{Name: "printf", Args: []frontend.Expr{lit}}, printfQueries{
-		userDefines:   func(string) bool { return false },
-		shadowedByVar: func(string) bool { return false },
+	got := common.SpecializePrintfCall(&frontend.Call{Name: "printf", Args: []frontend.Expr{lit}}, common.PrintfQueries{
+		UserDefines:   func(string) bool { return false },
+		ShadowedByVar: func(string) bool { return false },
 	})
 	if got == nil {
 		t.Fatal("expected a rewrite")
@@ -201,9 +202,9 @@ func TestScanLiteFormat(t *testing.T) {
 		{"plain text", false, false, "no conversion at all -- the fwrite case"},
 	}
 	for _, c := range cases {
-		has, hasFloat := scanLiteFormat(c.fmt)
+		has, hasFloat := common.ScanLiteFormat(c.fmt)
 		if has != c.has || hasFloat != c.hasFloat {
-			t.Errorf("scanLiteFormat(%q) = (%v, %v), want (%v, %v) -- %s",
+			t.Errorf("common.ScanLiteFormat(%q) = (%v, %v), want (%v, %v) -- %s",
 				c.fmt, has, hasFloat, c.has, c.hasFloat, c.reasoning)
 		}
 	}

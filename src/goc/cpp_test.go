@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"os"
 	"path/filepath"
@@ -23,7 +24,7 @@ func spell(tok frontend.Token) string {
 // from the rest of the compiler, so it can be tested without assembling.
 func pptext(t *testing.T, src string) string {
 	t.Helper()
-	toks, err := Preprocess(src, "test.c")
+	toks, err := common.Preprocess(src, "test.c")
 	if err != nil {
 		t.Fatalf("Preprocess failed: %v", err)
 	}
@@ -143,7 +144,7 @@ func TestIncludeLocal(t *testing.T) {
 	}
 	mainFile := filepath.Join(dir, "main.c")
 	src := "#include \"h.h\"\nint x = HVAL;\n"
-	toks, err := Preprocess(src, mainFile)
+	toks, err := common.Preprocess(src, mainFile)
 	if err != nil {
 		t.Fatalf("include failed: %v", err)
 	}
@@ -206,7 +207,7 @@ func TestLineDirectiveDoesNotLeakIntoIncludes(t *testing.T) {
 		t.Fatal(err)
 	}
 	src := "#include \"h.h\"\n__LINE__\n"
-	toks, err := Preprocess(src, filepath.Join(dir, "m.c"))
+	toks, err := common.Preprocess(src, filepath.Join(dir, "m.c"))
 	if err != nil {
 		t.Fatalf("preprocess: %v", err)
 	}
@@ -351,7 +352,7 @@ func TestLibraryIgnoresDiskHeaders(t *testing.T) {
 	defer os.Chdir(wd)
 
 	// The library's view: no disk header may be visible.
-	if _, err := PreprocessLibrary("#include <stdio.h>\nint x;\n", "goclib/probe.c", false); err != nil {
+	if _, err := common.PreprocessLibrary("#include <stdio.h>\nint x;\n", "goclib/probe.c", false); err != nil {
 		t.Errorf("PreprocessLibrary must fall back to the built-in stdio.h, got: %v", err)
 	}
 
@@ -359,7 +360,7 @@ func TestLibraryIgnoresDiskHeaders(t *testing.T) {
 	// own translation unit sees it. This is the half that must NOT change --
 	// "external headers first" is the documented order, and this test failing
 	// on this line would mean the isolation leaked into user code.
-	toks, err := Preprocess("#include <stdio.h>\nint x;\n", filepath.Join(dir, "user.c"))
+	toks, err := common.Preprocess("#include <stdio.h>\nint x;\n", filepath.Join(dir, "user.c"))
 	if err != nil {
 		t.Fatalf("Preprocess failed: %v", err)
 	}

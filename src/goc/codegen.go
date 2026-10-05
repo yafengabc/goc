@@ -2,13 +2,13 @@ package compiler
 
 import (
 	"fmt"
+	"goc/common"
 	"goc/frontend"
 	"math"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 // CG emits x86-64 assembly in the Intel syntax that goa (our own assembler)
@@ -301,7 +301,7 @@ var dllOf = map[string]string{}
 // one, the symbol is not a known Windows import and Gen reports a hard error
 // rather than a silent guess.
 func dllFor(name string) (string, bool) {
-	d, ok := dllOf[name]
+	d, ok := common.DLLNames[name]
 	return d, ok
 }
 
@@ -325,7 +325,7 @@ var externLinux = map[string]bool{
 // goclib: the C library
 // ---------------------------------------------------------------------------
 //
-// The library is plain C (goclib/goclib.c plus the headers it includes) that
+// The library is plain C (goclib/gocommon.c plus the headers it includes) that
 // goc compiles at start-up exactly like a user program, once per target.
 // Functions land in the output only when a program actually calls them (plus
 // their transitive callees), so a hello-world does not pay for malloc.
@@ -333,83 +333,60 @@ var externLinux = map[string]bool{
 // It is read from disk rather than embedded, so goc and the library can be
 // separate projects; see libfs.go for the search order and for what that costs
 // (goc.exe is no longer self-contained).
-// SetLibrary redirects the C library. It has to be called before the first
-// compile, which is why the load below is lazy rather than done in init().
-//
-// The ordering is not incidental. A package's init() runs before its
-// importer's, so a library injected from an entry point's init() would arrive
-// after this package's init() had already read the library from disk -- and the
-// injection would silently do nothing. Deferring the load to first use is what
-// makes the call order independent of package initialisation.
-func SetLibrary(src libSource) {
-	goclibCFS, goclibHeaders = src, src
-}
-
-// defaultLib is the on-disk library, resolved once so that a compiler which
-// never calls SetLibrary still finds it. It is assigned at first use rather
-// than in a var initialiser because the search looks at the working directory
-// and the executable's location, and those are not meaningful during package
-// initialisation on every platform.
-func defaultLib() libSource {
-	if goclibCFS == nil {
-		goclibCFS, goclibHeaders = diskLib(), diskLib()
-	}
-	return goclibCFS
-}
-
+// The C library lives in package clib, shared with the LLVM back end (gocl).
+// What is left here is the vocabulary this package uses: the compiled program
+// per target, the function names a program may call, and the two entry points
+// that forward to common.
 var (
-	libOnce sync.Once
-	// libLoad is the deferred body of the once. SetLibrary replaces it with a
-	// no-op so a caller that has already supplied the library pays nothing.
-	libLoad = func() {
-		// Compile the C library for both targets. A failure surfaces through
-		// goclibErr when a compile runs. defaultLib only fills in the on-disk
-		// source when SetLibrary did not install one, so the compile below
-		// reads whichever source is in effect.
-		defaultLib()
-		clibCWin, clibCErr = buildClibC(false, "")
-		if clibCErr == nil {
-			clibCLinux, clibCErr = buildClibC(true, "")
-		}
-		goclibErr = clibCErr
-	}
+	// clibCWin and clibCLinux are the compiled library per target. They are
+	// read through storeFor rather than aliased at init time, because the
+	// library is compiled lazily: an alias captured before the first compile
+	// would be nil forever.
+	clibCErr  error
+	goclibErr error
 )
 
-// ensureLib compiles the C library on first use.
+// storeFor returns the compiled library for a target, or nil when that target
+// did not build.
+func storeFor(linux bool) *common.Program {
+	if linux {
+		return common.Linux
+	}
+	return common.Win
+}
+
+// SetLibrary redirects the C library. It must be called before the first
+// compile, and the load is deferred rather than performed here because of Go's
+// initialisation order -- a package's init() runs before its importer's, so an
+// entry point injecting a library from its own init() would otherwise arrive
+// too late and silently do nothing. See common.SetLibrary.
+func SetLibrary(src common.Source) { common.SetLibrary(src) }
+
+// ensureLib compiles the C library on first use. Every entry point calls it
+// before anything else: the preprocessor resolves `#include <stdio.h>` out of
+// the library, so reaching that with no library is a nil dereference inside a
+// header lookup rather than a diagnostic.
 func ensureLib() {
-	libOnce.Do(libLoad)
+	common.Ensure()
+	goclibErr = common.Err
+	clibCErr = common.Err
 }
 
 // ---------------------------------------------------------------------------
 // goclib in C: the library is compiled by goc itself
 // ---------------------------------------------------------------------------
 //
-// goclib.c (plus the headers it includes) is a plain C translation unit that
+// gocommon.c (plus the headers it includes) is a plain C translation unit that
 // goc compiles at start-up exactly like a user program. Every function the
 // library defines is emitted through the regular code generator (genFunc) when
 // a program needs it, so the C source is the single implementation of the
 // built-in library.
 //
 // Function implementations may live either in a declaration header or in a .c
-// file: the umbrella goclib.h is processed as its own translation unit first
+// file: the umbrella gocommon.h is processed as its own translation unit first
 // (collecting any definitions placed in the headers it includes), then every
 // goclib/*.c. A later definition of the same name wins, so a .c definition
 // overrides a header one and duplicates never reach the linker.
-
-// clibCProgram is the compiled built-in library for one target.
-type clibCProgram struct {
-	funcs   map[string]*frontend.FuncDecl // defined functions, by name
-	order   []string                      // definition order, for stable output
-	protos  []*frontend.FuncDecl          // prototypes declared by the library headers
-	globals []*frontend.DeclStmt          // file-scope variables (e.g. rand_state)
-}
-
-var (
-	clibCWin   *clibCProgram
-	clibCLinux *clibCProgram
-	clibCErr   error
-	goclibErr  error
-)
 
 // Diagnostic runtime (compile-time optional via `goc -rtdiag`). When enabled,
 // a second copy of the C library is compiled with GOC_RTDIAG defined,
@@ -419,8 +396,8 @@ var (
 var (
 	rtdiagMode     bool
 	rtdiagErr      error
-	clibCWinDiag   *clibCProgram
-	clibCLinuxDiag *clibCProgram
+	clibCWinDiag   *common.Program
+	clibCLinuxDiag *common.Program
 )
 
 // SetRtdiag turns the compile-time diagnostic runtime on. It eagerly compiles
@@ -433,11 +410,11 @@ func SetRtdiag(on bool) {
 	}
 	rtdiagMode = true
 	var e error
-	if clibCWinDiag, e = buildClibC(false, "#define GOC_RTDIAG 1\n"); e != nil {
+	if clibCWinDiag, e = common.Build(false, "#define GOC_RTDIAG 1\n"); e != nil {
 		rtdiagErr = e
 		return
 	}
-	if clibCLinuxDiag, e = buildClibC(true, "#define GOC_RTDIAG 1\n"); e != nil {
+	if clibCLinuxDiag, e = common.Build(true, "#define GOC_RTDIAG 1\n"); e != nil {
 		rtdiagErr = e
 	}
 }
@@ -504,101 +481,22 @@ func (c *CG) alignFrame(n int) int {
 
 // clibCStore picks the compiled C library for a target. With the diagnostic
 // runtime enabled it returns the GOC_RTDIAG-instrumented copy instead.
-func clibCStore(linux bool) *clibCProgram {
+func clibCStore(linux bool) *common.Program {
 	if rtdiagMode {
 		if linux {
 			return clibCLinuxDiag
 		}
 		return clibCWinDiag
 	}
-	if linux {
-		return clibCLinux
-	}
-	return clibCWin
-}
-
-// buildClibC compiles the on-disk goclib sources into a frontend.Program for one
-// target. The umbrella header goes first (its includes pull in the standard
-// headers, so definitions placed there are collected too), then the .c files
-// in name order. The library has no main(), so that one checker diagnostic is
-// expected and filtered; anything else is a hard error -- the library must
-// compile for every program. `defines` (may be empty) is prepended to every
-// source so a single macro (e.g. "#define GOC_RTDIAG 1\n") reaches each
-// translation unit -- the library files are compiled independently.
-func buildClibC(linux bool, defines string) (*clibCProgram, error) {
-	lib := &clibCProgram{funcs: map[string]*frontend.FuncDecl{}}
-	compile := func(name, src string) error {
-		if defines != "" {
-			src = defines + src
-		}
-		toks, err := PreprocessLibrary(src, "goclib/"+name, linux)
-		if err != nil {
-			return fmt.Errorf("goclib/%s: %v", name, err)
-		}
-		prog, err := frontend.Parse(toks)
-		if err != nil {
-			return fmt.Errorf("goclib/%s: %v", name, err)
-		}
-		for _, e := range frontend.Check(prog) {
-			if strings.Contains(e.Error(), "program has no main()") {
-				continue // the library is not a program
-			}
-			return fmt.Errorf("goclib/%s: %v", name, e)
-		}
-		lib.protos = append(lib.protos, prog.Prototypes...)
-		// A prototype may name its import library ("..., user32"); record it
-		// here too, because the library itself is parsed at start-up and only
-		// reaches Gen later, when the user program is generated.
-		for _, pr := range prog.Prototypes {
-			if pr.DLL != "" {
-				dllOf[pr.Name] = pr.DLL
-			}
-		}
-		for _, g := range prog.Globals {
-			lib.globals = append(lib.globals, g)
-		}
-		// Definitions: later files win over earlier ones (a .c definition
-		// overrides a header definition of the same name).
-		for _, f := range prog.Funcs {
-			if _, dup := lib.funcs[f.Name]; !dup {
-				lib.order = append(lib.order, f.Name)
-			}
-			lib.funcs[f.Name] = f
-		}
-		return nil
-	}
-	if b, err := goclibHeaders.ReadFile("goclib/goclib.h"); err != nil {
-		return nil, err
-	} else if err := compile("goclib.h", string(b)); err != nil {
-		return nil, err
-	}
-	// ReadDir already returns only the .c/.h files, sorted; the .h ones are
-	// skipped here because each .c includes what it needs.
-	entries, err := goclibCFS.ReadDir("goclib")
-	if err != nil {
-		return nil, err
-	}
-	for _, f := range entries {
-		if !strings.HasSuffix(f, ".c") {
-			continue
-		}
-		b, err := goclibCFS.ReadFile("goclib/" + f)
-		if err != nil {
-			return nil, err
-		}
-		if err := compile(f, string(b)); err != nil {
-			return nil, err
-		}
-	}
-	return lib, nil
+	return storeFor(linux)
 }
 
 // goclibNames lists the public (non-internal) built-in library functions, for
 // error messages.
 func goclibNames(linux bool) []string {
 	var out []string
-	if lib := clibCStore(linux); lib != nil {
-		for _, n := range lib.order {
+	if lib := common.Store(linux); lib != nil {
+		for _, n := range lib.Order {
 			if strings.HasPrefix(n, "__") {
 				continue
 			}
@@ -2784,8 +2682,8 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 	// double promotion for every caller, user or library-internal. Registering
 	// happens BEFORE the user's own functions so a user definition always
 	// overwrites the library entry in funcDefs.
-	if lib := clibCStore(linux); lib != nil {
-		for _, g := range lib.globals {
+	if lib := common.Store(linux); lib != nil {
+		for _, g := range lib.Globals {
 			if c.globals[g.Name] {
 				continue // user global of the same name wins
 			}
@@ -2799,17 +2697,17 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 			c.libGlobNames[g.Name] = true
 			c.libGlobals = append(c.libGlobals, g)
 		}
-		for _, pr := range lib.protos {
+		for _, pr := range lib.Protos {
 			if _, dup := c.funcDefs[pr.Name]; !dup {
 				c.funcDefs[pr.Name] = pr
 			}
 			if pr.DLL != "" {
-				dllOf[pr.Name] = pr.DLL
+				common.DLLNames[pr.Name] = pr.DLL
 			}
 		}
-		for _, name := range lib.order {
+		for _, name := range lib.Order {
 			if _, dup := c.funcDefs[name]; !dup {
-				c.funcDefs[name] = lib.funcs[name]
+				c.funcDefs[name] = lib.Funcs[name]
 			}
 		}
 	}
@@ -2845,7 +2743,7 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 	}
 	for _, f := range prog.Prototypes {
 		if f.DLL != "" {
-			dllOf[f.Name] = f.DLL
+			common.DLLNames[f.Name] = f.DLL
 		}
 	}
 
@@ -2907,8 +2805,8 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 	// direct OS write -- then carries no flush machinery at all. Without a
 	// C library the stub keeps calling extern exit (legacy behaviour).
 	c.exitSym = "exit"
-	if lib := clibCStore(c.linux); lib != nil {
-		if _, ok := lib.funcs["__goclib_exit"]; ok {
+	if lib := common.Store(c.linux); lib != nil {
+		if _, ok := lib.Funcs["__goclib_exit"]; ok {
 			c.need["__goclib_exit"] = true
 			c.exitSym = "__goclib_exit"
 		}
@@ -2988,8 +2886,8 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 	if c.linux {
 		// The C library's exit (if compiled in) replaced the extern stub --
 		// see the need["exit"] pull-in above.
-		if lib := clibCStore(c.linux); lib != nil {
-			if _, isC := lib.funcs["exit"]; !isC {
+		if lib := common.Store(c.linux); lib != nil {
+			if _, isC := lib.Funcs["exit"]; !isC {
 				importSet["exit"] = true
 			}
 		} else {
@@ -3000,12 +2898,12 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 		// via need["exit"] above); the ExitProcess import is then only needed
 		// by __goclib_exit, which the need closure tracks. Keep the import for
 		// the no-library fallback path.
-		if lib := clibCStore(c.linux); lib == nil {
+		if lib := common.Store(c.linux); lib == nil {
 			importSet["ExitProcess"] = true
 		}
 	}
 	// A WinMain entry needs the module handle and the raw command line; the
-	// stub calls them directly rather than through goclib. The W variant of
+	// stub calls them directly rather than through gocommon. The W variant of
 	// GetCommandLine matches wWinMain's LPWSTR parameter.
 	if c.entryIsGUI {
 		// hInstance comes straight from GetModuleHandleA; the command line is
@@ -4885,7 +4783,7 @@ func gpReg32(reg string) string {
 // function's own calls: library-internal helpers and the assembly platform
 // primitives), so the pass repeats until a round adds nothing.
 func (c *CG) genClibFuncs() error {
-	lib := clibCStore(c.linux)
+	lib := common.Store(c.linux)
 	if lib == nil {
 		return nil
 	}
@@ -4895,7 +4793,7 @@ func (c *CG) genClibFuncs() error {
 			if c.libEmitted[name] || c.skipFuncs[name] {
 				continue
 			}
-			if _, ok := lib.funcs[name]; ok {
+			if _, ok := lib.Funcs[name]; ok {
 				batch = append(batch, name)
 			}
 		}
@@ -4905,7 +4803,7 @@ func (c *CG) genClibFuncs() error {
 		sort.Strings(batch) // stable emission order
 		for _, name := range batch {
 			c.libEmitted[name] = true
-			if err := c.genFunc(lib.funcs[name]); err != nil {
+			if err := c.genFunc(lib.Funcs[name]); err != nil {
 				return err
 			}
 		}
@@ -10219,8 +10117,8 @@ func (c *CG) funcAddrSym(name string) (string, bool) {
 	if c.funcs[name] {
 		return name, true
 	}
-	if lib := clibCStore(c.linux); lib != nil {
-		if _, ok := lib.funcs[name]; ok {
+	if lib := common.Store(c.linux); lib != nil {
+		if _, ok := lib.Funcs[name]; ok {
 			c.need[name] = true
 			return name, true
 		}
@@ -10278,7 +10176,7 @@ func (c *CG) genCallExpr(n *frontend.Call) (frontend.CType, error) {
 	// richer (width, precision, %e/%g/%a, %p) keeps the real printf; the
 	// decision is compile-time, so a run-time probe is never needed. See
 	// constantFormatLite and the vfmt_lite comment in stdio.c.
-	if repl := specializePrintfCall(n, c.printfQueries()); repl != nil {
+	if repl := common.SpecializePrintfCall(n, c.printfQueries()); repl != nil {
 		return c.genCallExpr(repl)
 	}
 	// A call whose name designates a VARIABLE holding a function pointer is an
@@ -10292,88 +10190,15 @@ func (c *CG) genCallExpr(n *frontend.Call) (frontend.CType, error) {
 	return c.genCall(n.Name, nil, nil, n.Args)
 }
 
-// printfQueries adapts the assembly generator's symbol tables to the questions
+// common.PrintfQueries adapts the assembly generator's symbol tables to the questions
 // specializePrintfCall asks. Only the program's own declarations count: the C
 // runtime shares these tables but must not make every library function look
 // user-shadowed.
-func (c *CG) printfQueries() printfQueries {
-	return printfQueries{
-		userDefines:   func(name string) bool { return c.funcs[name] },
-		shadowedByVar: func(name string) bool { _, _, ok := c.fnPtrVar(name); return ok },
+func (c *CG) printfQueries() common.PrintfQueries {
+	return common.PrintfQueries{
+		UserDefines:   func(name string) bool { return c.funcs[name] },
+		ShadowedByVar: func(name string) bool { _, _, ok := c.fnPtrVar(name); return ok },
 	}
-}
-
-// liteTargetFor picks the cheapest lite formatter that covers a format
-// literal: the integer-only entry when there is no %f, the float one when
-// there is. Splitting them is what keeps double_to_buf/floor/fmod/signbit and
-// friends out of a program that never prints a double -- a single vfmt_lite
-// with an unconditional %f branch referenced them even for printf("%d").
-// Returns ok = false when the format is not lite at all.
-func liteTargetFor(f string) (string, bool) {
-	has, hasFloat := scanLiteFormat(f)
-	if !has {
-		return "", false
-	}
-	if hasFloat {
-		return "__goclib_printf_lite_f", true
-	}
-	return "__goclib_printf_lite", true
-}
-
-// scanLiteFormat reports whether every conversion in a printf format literal is
-// one the lite formatters reproduce exactly, whether there is at least one
-// conversion (a format with none is constantFormatFwrite's echo case, and a
-// separate function keeps each rewrite to one job), and whether any of them is
-// %f/%F -- which decides the integer-only or the float entry point.
-//
-// The walk follows the printf grammar vfmt parses, so it rejects exactly what
-// lite cannot do. Any of these after a '%' disqualify the format:
-//
-//   - a flag character  -  0  +  space  #
-//   - a width: '*' or any digit
-//   - a precision: '.', optionally followed by '*' or digits
-//   - a length modifier: h l L q j z t
-//   - a specifier outside s c d i u o x X f F
-//
-// '%%' is a literal percent, not a conversion; a 'f' or '%' anywhere outside a
-// conversion is plain text. A trailing lone '%' is malformed but harmless, so
-// it is treated as text rather than a reason to reject.
-func scanLiteFormat(f string) (has, hasFloat bool) {
-	has = false
-	for i := 0; i < len(f); i++ {
-		if f[i] != '%' {
-			continue
-		}
-		i++
-		if i >= len(f) {
-			break // trailing '%': not a conversion
-		}
-		if f[i] == '%' {
-			continue // "%%" is a literal percent
-		}
-		// From here on the conversion must be bare: no flags, width,
-		// precision or length modifier may precede the specifier.
-		if strings.IndexByte("-+0 #.", f[i]) >= 0 {
-			return false, false
-		}
-		if f[i] == '*' || (f[i] >= '0' && f[i] <= '9') {
-			return false, false // field width
-		}
-		if strings.IndexByte("hlLqjzt", f[i]) >= 0 {
-			return false, false // length modifier
-		}
-		switch f[i] {
-		case 'f', 'F':
-			has = true
-			hasFloat = true
-		case 's', 'c', 'd', 'i', 'u', 'o', 'x', 'X':
-			has = true
-		default:
-			// %p, %e, %g, %a and anything unknown stay on the full vfmt.
-			return false, false
-		}
-	}
-	return has, hasFloat
 }
 
 // needsFullExit reports whether the entry stub must terminate through the
@@ -10508,8 +10333,8 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 	target := name
 	if !indirect {
 		if !c.funcs[name] && name != "main" {
-			if lib := clibCStore(c.linux); lib != nil {
-				if _, ok := lib.funcs[name]; ok {
+			if lib := common.Store(c.linux); lib != nil {
+				if _, ok := lib.Funcs[name]; ok {
 					c.need[name] = true // built-in C library function
 				} else {
 					c.calls[name] = true
@@ -10799,7 +10624,7 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 	// for unsigned (DWORD/UINT). 8-byte returns (HANDLE, LONG, pointers) are
 	// left untouched.
 	if !c.linux && !indirect {
-		if f, ok := c.funcDefs[name]; ok && dllOf[name] != "" &&
+		if f, ok := c.funcDefs[name]; ok && common.DLLNames[name] != "" &&
 			f.Ret != nil && f.Ret.Kind == frontend.KInt && f.Ret.Width < 8 {
 			sh := 64 - 8*f.Ret.Width
 			c.emit("shl rax, %d", sh)

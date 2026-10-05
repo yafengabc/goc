@@ -1,8 +1,9 @@
-package compiler
+package gocl
 
 // Calls, subscripting, member access and address-of.
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"strings"
 )
@@ -99,7 +100,7 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 	// libc symbols*, and this module has none: goclib's printf is emitted here
 	// as a plain `define i32 @printf(ptr, ...)`, so from LLVM's point of view
 	// it is a local function that happens to have a standard prototype.
-	if repl := specializePrintfCall(n, e.printfQueries()); repl != nil {
+	if repl := common.SpecializePrintfCall(n, e.printfQueries()); repl != nil {
 		return e.callExpr(repl)
 	}
 	// va_start and va_end are compiler built-ins in goc, recognised by name.
@@ -174,16 +175,16 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 	return val{op: call, ty: rty}
 }
 
-// printfQueries adapts the IR path's resolver to the questions
+// common.PrintfQueries adapts the IR path's resolver to the questions
 // specializePrintfCall asks.
 //
 // userDefs, not funcDefs: the latter also holds the C runtime's own fwrite and
 // printf_lite, so testing against it would report every library function as
 // shadowed and the rewrite would never fire.
-func (e *irEmitter) printfQueries() printfQueries {
-	return printfQueries{
-		userDefines: func(name string) bool { return e.tr.userDefs[name] },
-		shadowedByVar: func(name string) bool {
+func (e *irEmitter) printfQueries() common.PrintfQueries {
+	return common.PrintfQueries{
+		UserDefines: func(name string) bool { return e.tr.userDefs[name] },
+		ShadowedByVar: func(name string) bool {
 			_, _, ok := e.tr.fnPtrVar(name)
 			return ok
 		},

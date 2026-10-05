@@ -1,6 +1,9 @@
-package compiler
+package gocl
 
-import "goc/frontend"
+import (
+	"goc/common"
+	"goc/frontend"
+)
 
 // typeResolver answers "what type is this expression" and "where does this
 // name live", and it belongs to neither back end.
@@ -8,19 +11,28 @@ import "goc/frontend"
 // The assembly generator and the LLVM IR translator both drive it, so the two
 // never disagree about a program's meaning -- and, crucially, the IR translator
 // needs no other handle on CG. When the resolver is serving the assembly path
-// it holds a *CG and reads that generator's live tables (funcDefs, globalTyp,
-// scopes, ...); when it is serving the IR path that back-pointer is nil and it
-// uses tables built from the typed AST and the C runtime instead. One set of
-// rules, no second opinion about the same program.
-type typeResolver struct {
-	cg *CG // nil for the IR path; for the assembly path, the owning generator
+// it reads tables built from the typed AST and the C runtime. One set of rules,
+// no second opinion about the same program.
+// varInfo is what the IR path needs to know about a local variable: which
+// storage slot it lives in and what type it has.
+//
+// The native generator carries more in the same struct -- whether the address
+// was taken, whether ptrCapable proved it holds a pointer, which register it
+// prefers -- because it has to encode a load for each of those situations. The
+// IR has no such distinction: LLVM decides register allocation, and an escaping
+// address is a fact about the IR (an alloca that is loaded from), not
+// something the front end has to track. Carrying the native fields here would
+// mean maintaining answers to questions this back end never asks.
+type varInfo struct {
+	op int // the uid of the alloca holding the value
+	ty *frontend.Type
+}
 
-	// Tables used only when cg == nil (the IR path). When cg != nil the
-	// resolver reads the equivalent maps off cg instead.
+type typeResolver struct {
 	funcDefs   map[string]*frontend.FuncDecl
 	globalTyp  map[string]*frontend.Type
 	staticVars map[string]string
-	lib        *clibCProgram
+	lib        *common.Program
 
 	// userDefs holds only the functions the *program* defines, keeping them
 	// apart from funcDefs, which also holds the C runtime's. The two have to be
@@ -38,23 +50,13 @@ type typeResolver struct {
 }
 
 // --- dispatch helpers -------------------------------------------------------
-// When cg is present the resolver reads the assembly generator's live tables;
-// otherwise it reads the ones built for the IR path.
-
 func (tr *typeResolver) funcDef(name string) (*frontend.FuncDecl, bool) {
-	if tr.cg != nil {
-		f, ok := tr.cg.funcDefs[name]
-		return f, ok
-	}
 	f, ok := tr.funcDefs[name]
 	return f, ok
 }
 
 func (tr *typeResolver) globalType(name string) (*frontend.Type, bool) {
-	if tr.cg != nil {
-		t, ok := tr.cg.globalTyp[name]
-		return t, ok
-	}
+
 	t, ok := tr.globalTyp[name]
 	return t, ok
 }
@@ -84,33 +86,14 @@ func (e *irEmitter) fnPtrTy(name string) *frontend.Type {
 }
 
 func (tr *typeResolver) staticLabel(name string) (string, bool) {
-	if tr.cg != nil {
-		l, ok := tr.cg.staticVars[name]
-		return l, ok
-	}
+
 	l, ok := tr.staticVars[name]
 	return l, ok
 }
 
 func (tr *typeResolver) libFunc(name string) (*frontend.FuncDecl, bool) {
-	if tr.cg != nil {
-		if lib := clibCStore(tr.cg.linux); lib != nil {
-			if f, ok := lib.funcs[name]; ok {
-				return f, true
-			}
-			// The header prototypes count too: a Win32 entry point is declared
-			// by a header and defined by the DLL, so it is never among the
-			// library's own function definitions.
-			for _, p := range lib.protos {
-				if p.Name == name {
-					return p, true
-				}
-			}
-		}
-		return nil, false
-	}
 	if tr.lib != nil {
-		if f, ok := tr.lib.funcs[name]; ok {
+		if f, ok := tr.lib.Funcs[name]; ok {
 			return f, true
 		}
 		// A Win32 entry point is declared by a header and defined by the DLL, so
@@ -120,7 +103,7 @@ func (tr *typeResolver) libFunc(name string) (*frontend.FuncDecl, bool) {
 		// the HANDLE GetStdHandle returns to 32 bits and left WriteFile holding
 		// a handle with no high half, so any program that printed anything died
 		// on a write it should never have attempted.
-		for _, p := range tr.lib.protos {
+		for _, p := range tr.lib.Protos {
 			if p.Name == name {
 				return p, true
 			}
@@ -132,27 +115,16 @@ func (tr *typeResolver) libFunc(name string) (*frontend.FuncDecl, bool) {
 // --- scope state ------------------------------------------------------------
 
 func (tr *typeResolver) pushScope() {
-	if tr.cg != nil {
-		tr.cg.pushScope()
-		return
-	}
 	tr.scopes = append(tr.scopes, map[string]int{})
 }
 
 func (tr *typeResolver) popScope() {
-	if tr.cg != nil {
-		tr.cg.popScope()
-		return
-	}
 	if len(tr.scopes) > 0 {
 		tr.scopes = tr.scopes[:len(tr.scopes)-1]
 	}
 }
 
 func (tr *typeResolver) declareVar(name string, info varInfo) int {
-	if tr.cg != nil {
-		return tr.cg.declareVar(name, info)
-	}
 	uid := tr.varUID
 	tr.varUID++
 	tr.varEnts[uid] = info
@@ -161,9 +133,6 @@ func (tr *typeResolver) declareVar(name string, info varInfo) int {
 }
 
 func (tr *typeResolver) lookupVar(name string) (varInfo, bool) {
-	if tr.cg != nil {
-		return tr.cg.lookupVar(name)
-	}
 	for i := len(tr.scopes) - 1; i >= 0; i-- {
 		if uid, ok := tr.scopes[i][name]; ok {
 			return tr.varEnts[uid], true
@@ -173,16 +142,6 @@ func (tr *typeResolver) lookupVar(name string) (varInfo, bool) {
 }
 
 func (tr *typeResolver) lookupUID(name string) (int, bool) {
-	if tr.cg != nil {
-		// Mirror CG.lookupVar's scope walk, but return the uid rather than the
-		// binding -- the assembly path keeps the uid table on the generator.
-		for i := len(tr.cg.scopes) - 1; i >= 0; i-- {
-			if uid, ok := tr.cg.scopes[i][name]; ok {
-				return uid, true
-			}
-		}
-		return 0, false
-	}
 	for i := len(tr.scopes) - 1; i >= 0; i-- {
 		if uid, ok := tr.scopes[i][name]; ok {
 			return uid, true
@@ -192,12 +151,9 @@ func (tr *typeResolver) lookupUID(name string) (int, bool) {
 }
 
 // resetScope clears the per-function emission scope state. The assembly path
-// resets its own scope in genFunc, so this is only ever called on the IR path
-// (cg == nil); the guard keeps it a no-op if somehow reached otherwise.
+// resets its own scope when a function body starts, so each function gets a
+// fresh variable numbering.
 func (tr *typeResolver) resetScope() {
-	if tr.cg != nil {
-		return
-	}
 	tr.varEnts = map[int]varInfo{}
 	tr.scopes = nil
 	tr.varUID = 0
@@ -244,7 +200,7 @@ func (tr *typeResolver) exprType(e frontend.Expr) *frontend.Type {
 		return nil
 	case *frontend.Ident:
 		if vi, ok := tr.lookupVar(n.Name); ok {
-			return vi.typ
+			return vi.ty
 		}
 		// A static local's type is registered under its .data label, not its
 		// source name (which may even collide with a file-scope global).
@@ -503,7 +459,7 @@ func (tr *typeResolver) constValue(name string) (int64, bool) {
 // global), returning its function type.
 func (tr *typeResolver) fnPtrVar(name string) (frontend.Expr, *frontend.Type, bool) {
 	if vi, ok := tr.lookupVar(name); ok {
-		if ft := frontend.FuncTypeOf(vi.typ); ft != nil {
+		if ft := frontend.FuncTypeOf(vi.ty); ft != nil {
 			return &frontend.Ident{Name: name}, ft, true
 		}
 	}

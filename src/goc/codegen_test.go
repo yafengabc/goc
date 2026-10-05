@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"goc/common"
 	"goc/frontend"
 	"strings"
 	"testing"
@@ -44,7 +45,7 @@ func fnAsm(asm, name string) string {
 // genAsmOpt is genAsm at an explicit optimisation level.
 func genAsmOpt(t *testing.T, src string, opt int) string {
 	t.Helper()
-	toks, err := Preprocess(src, "test.c")
+	toks, err := common.Preprocess(src, "test.c")
 	if err != nil {
 		t.Fatalf("preprocess: %v", err)
 	}
