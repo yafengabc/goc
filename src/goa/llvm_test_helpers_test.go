@@ -1,3 +1,5 @@
+//go:build windows
+
 package goa
 
 // Test-side glue for the LLVM pipeline tests: locating the library, turning IR

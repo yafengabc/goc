@@ -1,3 +1,5 @@
+//go:build windows
+
 package goa
 
 // LLVM binding: IR text -> COFF object, through a libLLVM shared library loaded
@@ -8,12 +10,18 @@ package goa
 // ErrNoLLVM rather than a link error, so a goc build without it behaves exactly
 // as before.
 //
-// Windows only. The library is found through, in order: the GOC_LLVM_DLL
-// environment variable, an explicit path, then the directory holding the running
-// executable (so a libLLVM.dll dropped next to goc.exe is picked up).
+// Windows only, because the library is opened through syscall.LazyDLL, which
+// exists on no other platform. The whole implementation is in this one
+// constrained file rather than shared with a portable half, so a cross-compile
+// that reached it would fail to compile -- which is the outcome that tells the
+// truth. llvm_stub.go declares the same exported names for the other platforms
+// and reports the back end unavailable there.
+//
+// The library is found through, in order: the GOC_LLVM_DLL environment
+// variable, an explicit path, then the directory holding the running executable
+// (so a libLLVM.dll dropped next to goc.exe is picked up).
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,21 +30,6 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
-)
-
-// ErrNoLLVM reports that no usable libLLVM shared library could be loaded. It is
-// an ordinary error, not a crash: the caller can fall back or explain.
-var ErrNoLLVM = errors.New("goa: libLLVM shared library not available")
-
-// LLVMCodeGenOptLevel selects how hard the backend works. The values match
-// llvm::CodeGenOptLevel.
-type LLVMCodeGenOptLevel int32
-
-const (
-	LLVMOptNone       LLVMCodeGenOptLevel = 0
-	LLVMOptLess       LLVMCodeGenOptLevel = 1
-	LLVMOptDefault    LLVMCodeGenOptLevel = 2
-	LLVMOptAggressive LLVMCodeGenOptLevel = 3
 )
 
 // llvmAPI holds the resolved entry points. Only the subset the compiler needs is

@@ -1,3 +1,5 @@
+//go:build windows
+
 package goa
 
 // Whole-pipeline check for the LLVM backend's link path: IR text -> COFF object
