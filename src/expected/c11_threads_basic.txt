@@ -1,0 +1,7 @@
+thread 0: rc=100 val=1
+thread 1: rc=101 val=11
+thread 2: rc=102 val=21
+thread 3: rc=103 val=31
+once_runs=1
+tss=12345
+self=1

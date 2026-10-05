@@ -335,6 +335,16 @@ var linuxSyscalls = map[string]int64{
 	// syscall. The wrapper cannot `extern rename` itself -- the name resolves
 	// to its own definition, an infinite recursion (see goclib/file.c).
 	"__goclib_rename": 82,
+	// Threads (goclib/threads.c). __goclib_exit_thread is 60 rather than the
+	// plain name `exit` because the C library defines a function called exit;
+	// one output cannot carry both symbols. 60 terminates only the calling
+	// thread, 231 (exit_group) the whole process -- which is why the library's
+	// exit() uses the other one.
+	"__goclib_clone":        56,
+	"__goclib_futex":        202,
+	"__goclib_gettid":       186,
+	"__goclib_sched_yield":  24,
+	"__goclib_exit_thread":  60,
 }
 
 func NewAssembler() *Assembler {
