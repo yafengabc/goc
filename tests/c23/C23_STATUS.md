@@ -33,7 +33,7 @@
 | 值错误 | **enum E:T 布局** | 语法与枚举值对，但 sizeof(enum) 恒为 4（`enum:uchar`/`enum:llong` 都 4，gcc 为 1/8） |
 | 值错误 | **空 {} 初始化首标量** | 已有局部后第一个 `{}` 标量不真正归零（读到稳定垃圾 71302960）；`static int s={}` 被拒 |
 | 值错误 | **ckd_* 64 位目标** | 溢出标志恒报 0（goclib 头自证：无 128 位数学，W≥8 直接判无溢出） |
-| 值错误 | **_Generic 区分 long/unsigned** | LLP64 上 `1L`/`1U` 误配 int 分支（宽度相同即折叠）；typedef 名关联与 `const int*` vs `int*` 也不可靠 |
+| 值错误 | ~~**_Generic 区分 long/unsigned**~~ **已修（2026-10-05）** | 字面量 `1L`/`1U` 此前一律按 int 定型（NumLit 丢了后缀），整型运算结果此前一律为 int；现已实现字面量后缀定型 + 整型提升 + 一般算术转换 + 移位取提升后左操作数，`_Generic(1L, long: …)`/`_Generic(0u, unsigned int: …)`/`_Generic(1u<<15, …)` 全部命中。**仍不可靠**：typedef 名关联、`const int*` vs `int*`（报 `type int* appears twice`） |
 | 值错误 | **u8 字面量类型** | u8 字符串按 `char*` 衰减、`sizeof(u8'A')=8`（应 1）；char8_t 类型名 goc 内建可用但语义仍 C11 模型 |
 | 值错误 | **`[[gnu::aligned(N)]]`** | 解析但不生效（_Alignof 仍自然对齐 4）；未知/vendor 属性静默忽略 |
 | 语义偏差 | **`[[fallthrough]]` switch 外** | goc 静默接受（gcc 硬错误） |
@@ -131,7 +131,7 @@
 | 字符串字面量直接下标 | **PASS** | 4 | "hello"[0]='h'(104)、[1]='e'(101)、与 const char* 控制组一致、0xE4 字节按有符号 char 得 -28（SUMMARY 4/4） | 一致（104/101/104/-28） | 放心用；字符串字面量可直接下标（P0.8 修复 2026-10-02，原垃圾值） |
 | 空 {} 初始化 | **PASS（附两坑）** | 9 | int/指针/double/数组/struct/union/嵌套/块内 `{}` 归零一致；**坑1**：已有局部后第一个 `{}` 标量不归零（稳定垃圾 71302960）；**坑2**：`static int s={}` → `codegen error: invalid braced initialiser for scalar type int` | 9/9 全归零 | 自动存储期基本可用；**关键位置用 `{0}`**；static 用 `= {0}` |
 | 复合字面量（块作用域） | **PASS** | 10 | 取地址/数组退化/循环内每轮重初始化/struct/union/指示符/按值传参全一致。**两个缺口移除**：文件作用域 → `type error: compound literal requires block scope`；`(const int){}` → `type error: compound literal is const-qualified` | 一致 | 块作用域放心用；勿写文件作用域 `&(T){...}`、勿用 const 限定字面量 |
-| _Generic | **PARTIAL** | 10 | goc 5/10：int 匹配/不求值（x++ 不生效）/char 与 short 不提升/default/宏全对；**`1L` 与 `1U` 误配 int 分支**（LLP64 宽度相同即折叠）、typedef 名关联不命中、`const int*` vs `int*` 报 `type int* appears twice`（gcc 可区分） | 10/10 | int/char/short 分支与"不求值"可靠；**别用 _Generic 区分 long/unsigned 与 int** |
+| _Generic | **PARTIAL（2026-10-05 部分转 PASS）** | 10 | goc 8/10：int 匹配/不求值（x++ 不生效）/char 与 short 不提升/default/宏全对；**`1L`/`1U`/`1u<<15`/`~0u` 已修**（NumLit 后缀定型 + 整型提升/一般算术转换/移位规则落地，见 `src/frontend/check_test.go`）；typedef 名关联仍不命中、`const int*` vs `int*` 仍报 `type int* appears twice`（gcc 可区分） | 10/10 | int/char/short 分支与"不求值"可靠；long/unsigned 与整型表达式现在也能区分；**别用 typedef 名或 const 限定做关联** |
 | constexpr 编译期使用（数组尺寸/case/_Static_assert/位域宽） | **FAIL** | 7 | 整文件拒：`parse error: line 20: expected integer constant, got "N"`；case 标签/局部与全局数组尺寸/位域宽度全部 `expected integer constant` 类拒绝；**只能当运行时值** | 7/7 全折叠 | **用 enum 或字面量宏代替 constexpr 编译期常量** |
 | constexpr 指针/数组 | **PASS（附备注）** | 5 | constexpr 数组 + 空指针与 gcc 一致；`constexpr int *p=&obj` 语法过但 `*p` 运行时崩溃 0xC0000005（gcc 侧也拒非空指针：`'constexpr' pointer initializer is not null`）；地址比较 _Static_assert 被拒 | 一致 | constexpr 数组/空指针放心用；勿用 constexpr 指真实对象地址 |
 | VLA 与变修改类型 | **FAIL** | 5 | 整文件拒：`parse error: line 21: expected integer constant, got n`（VLA 形参即拒）；**不定义 `__STDC_NO_VLA__`**（未声明取舍即 conformance 缺口） | 5/5（运行时尺寸/sizeof 运行时求值/多维/VLA 形参/static 数组参数） | **完全不可用**；可变长用定长上界或 malloc |
@@ -152,7 +152,7 @@
 | 特性 | 状态 | 子用例 | goc 证据（含 goclib 头摘录） | gcc 对拍结论 | 写标准库建议 |
 |---|---|---|---|---|---|
 | <stdckdint.h> ckd_add/sub/mul | **PARTIAL** | 12 | goc 9/12：int/uint/混合 32 位目标溢出检测全对；**64 位目标（long long/unsigned long long）溢出标志恒报 0**（goclib 头自证：`__ckd_oflow((long long)(a)+(long long)(b), sizeof(*(r)), r)` 且 `(W)>=8 ? 0 : ...`——"64-bit overflow cannot be detected without 128-bit math"）；回绕结果值两侧一致 | 12/12 | **32 位放心用**；**64 位溢出检查避开**（自实现 128 位或区间判断） |
-| <stdbit.h> | **UNSUPPORTED** | 3 | 双侧均无此头，守卫探针输出一致 `unavailable`；本地 shim（stdc_bit_width/count_ones）两侧 3/3 一致 | gcc 也无此头 | 避开；位运算手写（shim 已验证语义可行） |
+| <stdbit.h> | **PASS** | 10 | 2026-10-05 落地：src\goclib\stdbit.h/stdbit.c（14 个 stdc_* 宏 × 5 个宽度族 = 70 个函数，_Generic 分派）；goc 侧 10/10（含 0/全 1 边界、uint64/ulong、以及 "最高位下标+1" 规则：`stdc_first_leading_one(0x00FF00FFu)=9` 而非 24）；`stdc_bit_ceil(0)==1`；mingw gcc 无此头，用例走等值 shim 分支 4/4 | gcc 无此头（mingw-w64），守卫分支 `unavailable` | 放心用（含类型泛型宏）；**表达式实参保持无符号**（`1u<<15`/`~0u` 的整型提升/一般算术转换已修） |
 | <uchar.h> char16/char32/mbrtoc16 系 | **PASS** | 4 | 批次H：src\goclib\uchar.h/uchar.c（go:embed 内嵌）实现 C11 7.28 四函数（含 mbstate_t 代理半字状态机，非 BMP 走 -3/-1 协议），4/4 与 gcc 逐字节一致；char8_t/mbrtoc8 双方均缺（mingw 无） | gcc 4/4：sizeof=2/4，mbrtoc16/c16rtomb/mbrtoc32/c32rtomb ASCII 往返全对 | char16_t/char32_t 与 UTF-16/32 往返放心用；u""/U"" 字面量仍避开 |
 | <stddef.h> nullptr_t/unreachable/NULL/offsetof | **PASS（附 2 信息分叉）** | 7 | 功能核心 7/7；批次H 提供 offsetof（=4 与 gcc 一致）与 max_align_t（goc 8/8 vs gcc 16/32，long double 模型差异）；剩余分叉：`typeof(nullptr)`=4 字节 int（gcc 8 字节独立类型）、`_Generic(nullptr)` 命中 int | gcc：mingw 无 unreachable() 宏（用 __builtin_unreachable），有 offsetof=4、max_align_t=32 | NULL/size_t/unreachable(死分支)/offsetof/max_align_t 放心用；勿依赖 nullptr 的指针类型语义 |
 | <string.h> strdup/strndup | **PASS** | 5 | 正常/空串/strndup n<len/n>len/n=0/free 全对；goclib 声明在 string.h（stdlib.h 未重复，符合 C23） | 5/5 一致（一条无害 -Wstringop-overread） | 放心用（从 <string.h> 取） |

@@ -712,7 +712,17 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		if n.Wide {
 			return WCharType() // L'x' is a wchar_t constant
 		}
-		return IntType()
+		// Integer literals carry their real type from the suffix: a u/U suffix
+		// makes the constant unsigned, an l/L suffix makes it at least 64 bits
+		// wide. Without this, `0u` would be typed as a signed int and a
+		// _Generic(0u, unsigned: ...) selection (which <stdbit.h> relies on)
+		// would silently match the int branch instead. The width/signedness
+		// derivation mirrors typeof(0U) in parseTypeof.
+		w := 4
+		if n.Long {
+			w = 8
+		}
+		return &Type{Kind: KInt, Width: w, Signed: !n.Unsig}
 	case *StrLit:
 		if n.Wide {
 			return PtrType(WCharType()) // L"..." decays to wchar_t*
@@ -750,6 +760,15 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			if !t.IsArith() && t.Kind != KBitInt {
 				c.errf(0, "operand of '-' must be arithmetic, got %s", t)
 			}
+			if t.Kind == KBitInt {
+				return t
+			}
+			// Unary minus does not narrow its operand either: "-1u" is an
+			// unsigned int, not a signed one. Floating types keep theirs
+			// (the promotion only applies to the integer types).
+			if t.Kind == KInt {
+				return promotedInt(t)
+			}
 			return t
 		case "!":
 			t := c.checkExpr(n.E, fn)
@@ -768,7 +787,9 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			if t.Kind == KBitInt {
 				return t
 			}
-			return IntType()
+			// The usual integer promotions, but *after* them: "~0u" is an
+			// unsigned int, and _Generic sees that difference.
+			return promotedInt(t)
 		case "&":
 			// Taking the address of a function designator is how a function
 			// pointer is initialised ("fp = &add"). The designator is not an
@@ -995,7 +1016,7 @@ func (c *checker) binaryResultType(op string, lt, rt *Type) *Type {
 			}
 			return bigArithResult(op, lt, rt)
 		}
-		return IntType()
+		return usualArithInt(lt, rt)
 	case "<", ">", "<=", ">=", "==", "!=":
 		if !(lt.IsScalar() && rt.IsScalar()) && !isBig(lt) && !isBig(rt) {
 			c.errf(0, "relational operator requires scalar operands, got %s and %s", lt, rt)
@@ -1006,7 +1027,7 @@ func (c *checker) binaryResultType(op string, lt, rt *Type) *Type {
 			c.errf(0, "logical operator requires scalar operands, got %s and %s", lt, rt)
 		}
 		return IntType()
-	case "<<", ">>", "&", "|", "^":
+	case "<<", ">>":
 		if !(lt.IsIntClass() && rt.IsIntClass()) && !isBig(lt) && !isBig(rt) {
 			c.errf(0, "operator %q requires integer operands, got %s and %s", op, lt, rt)
 		}
@@ -1017,9 +1038,65 @@ func (c *checker) binaryResultType(op string, lt, rt *Type) *Type {
 			}
 			return bigArithResult(op, lt, rt)
 		}
-		return IntType()
+		// A shift does not convert its operands: the result is the promoted
+		// left operand (C11 6.5.7p3), so "1u << 15" stays unsigned int. That
+		// is observable through _Generic, which is exactly how <stdbit.h>'s
+		// type-generic macros dispatch.
+		return promotedInt(lt)
+	case "&", "|", "^":
+		if !(lt.IsIntClass() && rt.IsIntClass()) && !isBig(lt) && !isBig(rt) {
+			c.errf(0, "operator %q requires integer operands, got %s and %s", op, lt, rt)
+		}
+		if isBig(lt) || isBig(rt) {
+			if !(lt.IsIntClass() || isBig(lt)) || !(rt.IsIntClass() || isBig(rt)) {
+				c.errf(0, "invalid operands with _BitInt: %s and %s", lt, rt)
+				return IntType()
+			}
+			return bigArithResult(op, lt, rt)
+		}
+		return usualArithInt(lt, rt)
 	}
 	return IntType()
+}
+
+// promotedInt applies the integer promotions (C11 6.3.1.1): a type narrower
+// than int becomes int, everything else keeps its width and signedness.
+func promotedInt(t *Type) *Type {
+	if t == nil || t.Kind != KInt {
+		return IntType()
+	}
+	if t.Width < 4 {
+		return IntType()
+	}
+	return &Type{Kind: KInt, Width: t.Width, Signed: t.Signed}
+}
+
+// usualArithInt applies the usual arithmetic conversions (C11 6.3.1.8) to two
+// integer types and returns their common type: both operands are promoted, the
+// wider one wins, and the result is unsigned when the unsigned operand's width
+// is at least the signed one's (a strictly wider signed type can represent
+// every value of the narrower unsigned one, so it wins in that case).
+func usualArithInt(lt, rt *Type) *Type {
+	if lt == nil || rt == nil || lt.Kind != KInt || rt.Kind != KInt {
+		return IntType()
+	}
+	lp, rp := promotedInt(lt), promotedInt(rt)
+	w := lp.Width
+	if rp.Width > w {
+		w = rp.Width
+	}
+	signed := lp.Signed && rp.Signed
+	if lp.Signed != rp.Signed {
+		// Rank is the promoted width here: an unsigned operand of equal or
+		// greater width forces an unsigned result, otherwise the (strictly
+		// wider) signed type absorbs it.
+		uw := rp.Width
+		if !lp.Signed {
+			uw = lp.Width
+		}
+		signed = uw < w
+	}
+	return &Type{Kind: KInt, Width: w, Signed: signed}
 }
 
 func (c *checker) checkCall(n *Call, fn *FuncDecl) *Type {

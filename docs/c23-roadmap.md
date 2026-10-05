@@ -50,7 +50,8 @@
 | `<threads.h>` + 线程创建        | #130     | C11     | L     | ❌ 后置（依赖线程基础设施）                                                                                                                             |
 | `long double`（→ double 降级）  | —        | C99     | M（可选） | ❌ 标 `__goc_long_double_is_double`                                                                                                          |
 | `_BitInt(N)`                | **#131** | C23     | XL    | ✅ `bitint`：goclib 大整数运行时（schoolbook+Karatsuba 乘、Knuth D 除、十进制 str），按需分配 scratch；**10 万位 π（Chudnovsky 二分）100,011 位逐位对拍 Python 大整数通过，15.5s** |
-| `<uchar.h>` / `<stdbit.h>`  | —        | C11/C23 | M（可选） | ❌                                                                                                                                          |
+| `<uchar.h>`                 | —        | C11     | M        | ✅ 已落地（批次H）                                                                                                                              |
+| `<stdbit.h>`                | —        | C23     | M        | ✅ `c23_stdbit`：14 个 `stdc_*` 泛型宏 × 5 宽度族共 70 函数，含 0/全 1 边界与「最高位下标+1」规则；mingw gcc 无此头，用例走等值 shim 分支 |
 | TLS 测试钩子补全（#123）            | #123     | 工具链     | S     | ❌ tls_basic 尚无 golden，regress 中 SKIP                                                                                                       |
 
 ---
@@ -89,7 +90,8 @@
 
 - `long double`：软降级为 double，标 `__goc_long_double_is_double` 宏。
 - `_BitInt(N)`：已落地（#131），值模型 = ceil(N/64) 个 64 位小端字，按地址传值；回绕负数跨宽度必须经同宽 signed 类型符号扩展（`typedef signed _BitInt(N)`），否则模 2^N 同余破坏。
-- `<uchar.h>` / `<stdbit.h>`：纯库工作，收益看需求。
+- `<uchar.h>`：已落地（批次H）。
+- `<stdbit.h>`：已落地（2026-10-05），纯库工作，附带修了整型提升/一般算术转换/字面量后缀定型三个前端类型缺陷。
 
 ---
 
