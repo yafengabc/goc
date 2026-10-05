@@ -6,6 +6,7 @@
 - 验证日期：2026-10-02；重跑：`powershell -ExecutionPolicy Bypass -File tests\cstd\run_cstd_tests.ps1`（当前结果 0 MISMATCH，退出码 0）
 - 判定四类：**PASS** = goc 与 gcc 输出+退出码一致；**FAIL** = gcc 过而 goc 编译/运行错误（真实缺口，报错原文照录）；**UNSUPPORTED** = goc 明确设计取舍/后置；**PARTIAL** = 部分子用例通过
 - 汇总：**PASS=67 PARTIAL=2 FAIL=0 UNSUPPORTED=7 MISMATCH=0**（2026-10-06：原 60 PASS（c89/c99/c11/c17 共 69 用例）不变；新增 `cstd_lib_*` 详尽用例 7 个全部 PASS 并接入独立 `cstd` 组——此前这些文件因不匹配版本前缀被 harness 漏跑，现已注册 per-file std 覆盖）
+- 覆盖缺口跟踪：已实现但未写详尽测试的导出函数（34 个）及已知实现缺陷，详见 **`docs/goclib-coverage-gaps.md`**
 
 ---
 
