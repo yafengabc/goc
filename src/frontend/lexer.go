@@ -43,6 +43,7 @@ var keywords = map[string]bool{
 	"thread_local": true, "_Thread_local": true,
 	"__has_include": true, "__has_c_attribute": true,
 	"__VA_OPT__": true,
+	"_Atomic":    true,
 }
 
 type Token struct {

@@ -12,6 +12,7 @@ var typeKeywords = map[string]bool{
 	"unsigned": true, "signed": true, "double": true, "float": true,
 	"struct": true, "union": true, "enum": true, "_Bool": true, "bool": true, "char8_t": true,
 	"_BitInt": true,
+	"_Atomic": true,
 }
 
 // qualifierKeywords are type qualifiers that decorate a specifier list but
@@ -414,7 +415,18 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	align := 0           // a requested alignment from _Alignas(N) / _Alignas(type)
 	isConstExpr := false // a "constexpr" specifier appeared
 	isTLS := false       // a _Thread_local / thread_local specifier appeared
+	isAtomic := false    // a C11 _Atomic specifier appeared
 	var tdType *Type     // a typedef alias, if this specifier list names one
+	// markAtomic stamps the atomic flag onto a copy, so a shared type (a
+	// typedef alias or a tagged struct) is never polluted by one declaration.
+	markAtomic := func(t *Type) *Type {
+		if !isAtomic || t == nil {
+			return t
+		}
+		t2 := *t
+		t2.Atomic = true
+		return &t2
+	}
 	for {
 		if isQualifier(p.cur()) {
 			if p.cur().Text == "const" {
@@ -532,6 +544,31 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 			for isStorageClass(p.cur()) {
 				p.next()
 			}
+			continue
+		case "_Atomic":
+			// C11 _Atomic comes in two shapes: a qualifier on the type that
+			// follows ("_Atomic int x;") and a parenthesised type name
+			// ("_Atomic(int) x;"). Both only mark the resulting type atomic;
+			// the code generator turns a read-modify-write on such an object
+			// into a LOCK-prefixed instruction.
+			p.next()
+			if p.atPunct("(") {
+				p.next()
+				spec, err := p.parseDeclarationSpecifiers()
+				if err != nil {
+					return nil, err
+				}
+				dt, err := p.parseDeclarator(spec, false, true)
+				if err != nil {
+					return nil, err
+				}
+				if err := p.expect(")"); err != nil {
+					return nil, err
+				}
+				isAtomic = true
+				return markAtomic(dt.typ), nil
+			}
+			isAtomic = true
 			continue
 		case "char8_t":
 			// C23 char8_t is an unsigned char (1 byte) with a distinct type.
@@ -656,11 +693,16 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		return nil, fmt.Errorf("line %d: expected type specifier, got %q", p.cur().Line, p.cur().Text)
 	}
 	if fp != nil {
-		if isConst {
+		t := fp
+		if isConst || isAtomic {
 			t2 := *fp
 			t2.Const = true
 			t2.IsTLS = isTLS
-			return &t2, nil
+			t = markAtomic(&t2)
+			if !isConst {
+				t2.Const = false
+			}
+			return t, nil
 		}
 		fp.IsTLS = isTLS
 		return fp, nil
@@ -669,10 +711,8 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		return VoidType(), nil
 	}
 	if isBool {
-		if isConst {
-			return &Type{Kind: KBool, Width: 1, Signed: true, Const: true, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}, nil
-		}
-		return &Type{Kind: KBool, Width: 1, Signed: true, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}, nil
+		return &Type{Kind: KBool, Width: 1, Signed: true, Const: isConst, Align: align,
+			ConstExpr: isConstExpr, IsTLS: isTLS, Atomic: isAtomic}, nil
 	}
 	if tdType != nil {
 		// The specifier list was a typedef alias (e.g. va_list, size_t). The
@@ -681,11 +721,15 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		// is stamped onto a copy so the alias itself is never polluted. TLS of a
 		// typedef'd type is rare; stamp a copy when const so the shared alias is
 		// left untouched (non-const typedef TLS is not flagged).
-		if isConst {
+		if isConst || isAtomic {
 			t2 := *tdType
 			t2.Const = true
 			t2.IsTLS = isTLS
-			return &t2, nil
+			t := markAtomic(&t2)
+			if !isConst {
+				t.Const = false
+			}
+			return t, nil
 		}
 		return tdType, nil
 	}
@@ -696,6 +740,7 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	if isConst {
 		t.Const = true
 	}
+	t.Atomic = isAtomic
 	return t, nil
 }
 

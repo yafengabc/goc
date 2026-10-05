@@ -63,6 +63,7 @@ type Type struct {
 	ConstExpr  bool      // declared with the C23 "constexpr" specifier
 	AutoDeduce bool      // C23 "auto" placeholder: type to be inferred from the initialiser
 	IsTLS      bool      // declared with _Thread_local / thread_local (C11 TLS)
+	Atomic     bool      // C11 _Atomic: read-modify-writes on it carry a LOCK prefix
 }
 
 // --- constructors -----------------------------------------------------------

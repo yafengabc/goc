@@ -1,12 +1,12 @@
-/* C23 feature: _Atomic / <stdatomic.h> (C11; goc roadmap #129, deferred)
+/* C23 feature: _Atomic / <stdatomic.h> (C11; goc roadmap #129)
  * Clause:     C23 6.7.2.4 _Atomic; <stdatomic.h>
- * Strategy:   probe whether goc (a) accepts the raw _Atomic keyword and (b) provides
- *             <stdatomic.h>. Roadmap says syntax accepted + lock prefix (unverified) and
- *             the header is unimplemented. gcc compiles the whole thing; goc is expected
- *             to fail with the documented design-gap diagnostics.
- * Status:     UNSUPPORTED
- * EXPECT: UNSUPPORTED
- */
+ * Strategy:   minimal probe: does goc accept the raw _Atomic keyword, and does
+ *             it provide <stdatomic.h> (atomic_int, atomic_store, atomic_load)?
+ *             Written when goc rejected the keyword outright and had no header;
+ *             both are supported now (c23_atomic.c is the full suite), so the
+ *             probe compiles and runs on both toolchains.
+ * Status:     PASS (was UNSUPPORTED; #129 landed 2026-10-05)
+ * EXPECT: PASS */
 #include <stdio.h>
 #include <stdatomic.h>
 

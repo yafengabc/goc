@@ -46,7 +46,7 @@
 | --------------------------- | -------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | **十六进制浮点 `0x1.8p3`**        | **#126** | C99/C23 | M     | ✅ `c99_hexfloat`：p 指数可选（C23）、`0x.8p1`、f/l 后缀                                                                                               |
 | **匿名 struct/union 成员**      | **#128** | C11     | M     | ✅ `c23_anon`：扁平访问、初始化透明穿透、union 重叠，gcc 对拍一致                                                                                                |
-| `_Atomic` / `<stdatomic.h>` | #129     | C11     | XL    | ❌ 可选后置（语法接受 + lock 前缀标量原子即可）                                                                                                               |
+| `_Atomic` / `<stdatomic.h>` | **#129** | C11     | XL→M  | ✅ `c23_atomic`：两种写法解析 + 定宽；`++`/`--`/复合赋值发 `lock xadd`（+/-）或 `lock cmpxchg` 重试循环（其余）；`<stdatomic.h>` 给 typedef / `memory_order` / load-store 宏；**fetch_* 族仍缺** |
 | `<threads.h>` + 线程创建        | #130     | C11     | L     | ❌ 后置（依赖线程基础设施）                                                                                                                             |
 | `long double`（→ double 降级）  | —        | C99     | M（可选） | ❌ 标 `__goc_long_double_is_double`                                                                                                          |
 | `_BitInt(N)`                | **#131** | C23     | XL    | ✅ `bitint`：goclib 大整数运行时（schoolbook+Karatsuba 乘、Knuth D 除、十进制 str），按需分配 scratch；**10 万位 π（Chudnovsky 二分）100,011 位逐位对拍 Python 大整数通过，15.5s** |
@@ -117,7 +117,7 @@
 
 ## 4. 风险与牵连（更新）
 
-- **goa 牵连已基本清零**：TLS 目录、`.bss`、`#embed` 数据、属性/typeof 不触 goa——剩余特性中仅 `_Atomic`（lock 前缀，需确认）可能触及 goa；`_BitInt` 已落地（不触 goa）。
+- **goa 牵连已发生**：`_Atomic` 需要 `lock` 前缀与 `xadd`/`cmpxchg` 两条指令（goa 原都没有），已随 #129 一并加入（`src/goa/asm.go`，`atomic_test.go` 逐字节钉住编码）。
 - **回归护栏**：每特性必须配 gocregress 用例（cstd example + golden）；`-O0` 字节不变性底座不受影响（新特性都是语法/类型层，不改优化管线）。auto/\_Generic/复合字面量的实现均在 check 期完成消解，对 codegen 透明或以新 AST 节点发射，已验证零回归。
 - **_Generic 精确匹配教训**：类型匹配绝不能复用 `typesEqual`（它把所有整数当相等——`int*` 曾误配 `char *`），必须走 `genericTypeMatch` 的宽+符号+元素递归比较。
 - **变参检查教训**：修复 `_Generic` 时顺带修掉「printf 变参尾部实参完全跳过 checkExpr」的存量缺陷——今后新增表达式节点须确认变参位置也能被 check。

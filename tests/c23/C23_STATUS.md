@@ -26,7 +26,7 @@
 | 编译器直接报错 | **VLA** | `int a[n]`/VLA 形参全部解析拒绝，且不定义 `__STDC_NO_VLA__`（conformance 缺口） |
 | 编译器直接报错 | **constexpr 当编译期常量** | 不能作数组尺寸/case 标签/_Static_assert 条件/位域宽度（只能当运行时值）；且不强制初始化器为常量（`constexpr int bad = glob;` 被接受） |
 | 编译器直接报错 | **属性在类型位置** | `struct [[nodiscard]] T`、参数上属性、typedef 尾属性全部 parse error |
-| 编译器直接报错 | **_Atomic / <stdatomic.h>** | `_Atomic int` 连语法都不解析（roadmap #129 "语法接受"不成立）；头缺失 |
+| 编译器直接报错 | ~~**_Atomic / <stdatomic.h>**~~ **已修（2026-10-05）** | roadmap #129 落地：`_Atomic T` 与 `_Atomic(T)` 均可解析并定宽，`++`/`--`/复合赋值发 `lock xadd` 或 `lock cmpxchg` 重试循环（对齐标量 load/store 本身即原子）；`<stdatomic.h>` 提供 typedef、`memory_order` 与 atomic_load/store 宏。**仍缺**：`atomic_fetch_add` 等 fetch_* 族（需编译器内建或内联汇编，goclib 保持纯 C） |
 | 编译器直接报错 | **块作用域 constexpr**、`static T = {}`、无消息 `static_assert(e)`、结构体内 static_assert、`__typeof__`/嵌套 typeof、`typeof(&x)` | 均解析拒绝 |
 | 值错误 | **双层嵌套匿名成员** | 夹具名字段的两级匿名字段错位（`a=11` vs gcc `a=10`）；位域成员不可花括号初始化 |
 | 值错误 | **alignas 对齐成员/数组** | 标量变量真对齐，但结构体成员/字符数组/alignas(64) 局部数组实际未对齐（偏移 8/8/48） |
@@ -40,7 +40,7 @@
 | 语义偏差 | **非法数字分隔符** | goc 静默删 `'` 照常解析（`1''000`/`0x'FFFF'` 等 6 种全不报错）；十六进制浮点指数内分隔符报 "unterminated character literal"（`0x1p10'0`，归 P2.13）；前导小数点 `.12`/`.1'2` 已支持（2026-10-02 lexer 前导点修复） |
 | 语义偏差（已修） | **`__has_c_attribute` guard** | **已修复（P2.15，2026-10-02）**：`defined(__has_c_attribute)`/`defined(__has_include)` 现返回 1，标准 portable guard 正常激活（与 gcc 一致） |
 | 语义偏差 | **nullptr_t 类型模型** | goc `typedef void* nullptr_t`、`typeof(nullptr)` 为 4 字节 int（gcc 为独立 8 字节类型）；gcc 侧 mingw 的 <stddef.h> 也不暴露 nullptr_t 类型名 |
-| 缺失头/宏 | **<stdbit.h>**、**<stdatomic.h>** | goc 无此二头（"note: skipping unavailable system header"），mingw 侧 <stdbit.h> 也无；<uchar.h>/<threads.h>/<stdnoreturn.h>/<stdbool.h> 已于批次H提供 |
+| 缺失头/宏 | ~~**<stdbit.h>**~~ / ~~**<stdatomic.h>**~~ | 二者均已于 2026-10-05 落地（<stdbit.h> 全套 14 个 stdc_* 泛型宏；<stdatomic.h> 类型与 load/store，fetch_* 族仍缺）；mingw 侧仍无 <stdbit.h> |
 | 缺失宏 | （批次H 已提供） | limits.h/float.h C23 宽度/归一化宏全套已落地（CHAR_WIDTH…ULLONG_WIDTH/BOOL_WIDTH/BITINT_MAXWIDTH/FLT_NORM_MAX/*_IS_IEC_60559/EXP 系）；LONG_WIDTH=64 为 goc LP64 语义（gcc LLP64 报 32），LDBL_* 按 long double=double 降级值 |
 | 缺失设施 | （批次H 已提供） | stddef.h 现提供标准 offsetof 宏与 max_align_t（goc 8 字节对齐 vs gcc 16——long double 模型差异） |
 | 平台细节 | **printf %a / %wN** | goc 无 %a（打印字面 'a'）、无 %wN；`"hello"[0]` 直接下标已修复（P0.8，2026-10-02，见 c23_str_subscript.c PASS 4/4） |
@@ -84,7 +84,8 @@
 | u8 字面量类型身份（char8_t） | **PARTIAL（DIFF）** | 5 | u8 字符串按 `char*` 衰减（C11 模型）；`sizeof(u8'A')=8`（异常，应 1）；goc 内建 char8_t 类型名（无需 uchar.h） | gcc：u8"abc"=unsigned char*、u8'A'=unsigned char、sizeof=1；不 include <uchar.h> 时不暴露 char8_t 名 | 别按 char8_t 类型身份判断；u8 字符串当普通 char* 用 |
 | 无参 f() == f(void) | **PASS** | 5 | 声明等价/重声明兼容/函数指针类型同一，全对 | 5/5 逐行一致 | 放心用 |
 | __STDC_VERSION__ 等预定义宏 | **PASS** | 5 | 2026-10-02 P1.7 修复：`__STDC_VERSION__`=202311、`__STDC__`=1、`__STDC_HOSTED__`=1，与 gcc -std=c23 逐行一致（SUMMARY 3/3）；`__DATE__`=`"Oct  2 2026"`、`__TIME__`=`"hh:mm:ss"` | 一致 | **条件编译恢复**：可 `#if __STDC_VERSION__ >= 202311L` 判断 C23；`__DATE__`/`__TIME__` 可用 |
-| _Atomic / <stdatomic.h>（探针） | **UNSUPPORTED** | 1 | `note: skipping unavailable system header <stdatomic.h>`；`parse error: line 15: expected ";", got "int"`（`_Atomic int` 连语法都不解析——roadmap #129 "语法接受"**不成立**） | gcc 干净编译运行 | 原子类型/操作完全不可用，需绕开 |
+| _Atomic / <stdatomic.h>（探针） | **PASS** | 1 | 2026-10-05 修复：`_Atomic int` 解析通过并与 gcc 输出一致（`ax=1 a=6`） | gcc 干净编译运行 | 见下行全量用例 |
+| _Atomic 全量（++/--/复合赋值/成员/全局/指针/窄宽/fetch 外全套） | **PASS** | 7 | `c23_atomic.c` 7/7 与 gcc 逐字节一致；RMW 发 `lock xadd dword/byte/qword` 或 `lock cmpxchg` 重试循环；`sizeof(atomic_long)` 8 vs gcc 4（goc LP64 ABI 差异，非缺陷） | 7/7 一致 | 放心用 `_Atomic` 与 `atomic_int`；**`atomic_fetch_add` 等 fetch_* 族暂缺** |
 
 ## B. 预处理
 

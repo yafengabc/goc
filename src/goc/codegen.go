@@ -2321,11 +2321,136 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 // effects -- and the result is stored back to the same address. The parser
 // used to desugar "E1 op= E2" into "E1 = E1 op E2", which duplicated the
 // lvalue: "a[i++] += 10" incremented i twice.
+//
+// genAtomicCompound emits an atomic read-modify-write for "lhs op= rhs" where
+// lhs is an _Atomic integer of width aw (1, 2, 4 or 8) and addrSlot holds its
+// address. The result -- the NEW value, as C defines it -- is left in rax.
+//
+// The caller parked the address and owns tmpDepth; the CAS loop below takes
+// three slots of its own and gives them back.
+func (c *CG) genAtomicCompound(n *frontend.AssignExpr, lt *frontend.Type, aw int, signed bool, addrSlot int) (frontend.CType, error) {
+	wn := map[int]string{1: "byte", 2: "word", 4: "dword", 8: "qword"}[aw]
+	acc := map[int]string{1: "al", 2: "ax", 4: "eax", 8: "rax"}[aw]
+	// Evaluate the right operand once: it is the delta for += / -= and the
+	// operand for every other operator.
+	if _, err := c.genExprT(n.Rhs); err != nil {
+		return frontend.TInt, err
+	}
+	if err := c.ensureType(frontend.TInt); err != nil {
+		return frontend.TInt, err
+	}
+	c.tmpDepth++
+	valSlot := c.tmpSlot(c.tmpDepth)
+	c.emit("mov [rbp%+d], rax", valSlot)
+
+	// AssignExpr.Op holds the bare binary operator (the parser's assignOp
+	// maps "x += y" onto Op "+"), so these two are the add/sub forms.
+	if n.Op == "+" || n.Op == "-" {
+		// LOCK XADD is a fetch-and-add: memory becomes old+delta and the
+		// register comes away with old, so the new value is old+delta.
+		if n.Op == "-" {
+			c.emit("neg %s", acc)
+		}
+		c.emit("mov [rbp%+d], rax", valSlot)
+		c.emit("mov r10, [rbp%+d]", addrSlot)
+		c.emit("lock xadd %s [r10], %s", wn, acc)
+		c.widenFrom(aw, signed)
+		if aw == 8 {
+			c.emit("add rax, [rbp%+d]", valSlot)
+		} else {
+			c.emit("add eax, [rbp%+d]", valSlot)
+		}
+		c.truncTo(aw, signed)
+		c.tmpDepth--
+		c.resTyp = frontend.TInt
+		c.resSigned = signed
+		c.resW = c.semWOf(lt)
+		if c.resW == 4 {
+			c.canonInt(signed)
+		}
+		return frontend.TInt, nil
+	}
+
+	// Every other operator needs a compare-and-swap retry loop: CMPXCHG
+	// stores the desired value only while memory still holds the value it was
+	// computed from, so a racing update is detected (ZF cleared) and retried
+	// instead of being silently lost.
+	c.tmpDepth++
+	oldSlot := c.tmpSlot(c.tmpDepth)
+	newSlot := c.tmpSlot(c.tmpDepth + 1)
+	top := c.newLabel("atomic_cas")
+	c.line(top + ":\n")
+	c.emit("mov r10, [rbp%+d]", addrSlot)
+	c.emit("mov %s, %s [r10]", acc, wn)
+	c.widenFrom(aw, signed)
+	c.emit("mov [rbp%+d], rax", oldSlot)
+	bin := &frontend.Binary{Op: n.Op,
+		L: &frontend.TmpLoad{Slot: oldSlot, Typ: lt},
+		R: &frontend.TmpLoad{Slot: valSlot, Typ: lt}}
+	if _, err := c.genBinary(bin); err != nil {
+		c.tmpDepth -= 2
+		return frontend.TInt, err
+	}
+	if err := c.ensureType(frontend.TInt); err != nil {
+		c.tmpDepth -= 2
+		return frontend.TInt, err
+	}
+	c.truncTo(aw, signed)
+	c.emit("mov [rbp%+d], rax", newSlot)
+	des := map[int]string{1: "r11b", 2: "r11w", 4: "r11d", 8: "r11"}[aw]
+	c.emit("mov r10, [rbp%+d]", addrSlot)
+	c.emit("mov %s, [rbp%+d]", acc, oldSlot)
+	c.emit("mov %s, [rbp%+d]", des, newSlot)
+	c.emit("lock cmpxchg %s [r10], %s", wn, des)
+	c.emit("jne %s", top)
+	c.emit("mov rax, [rbp%+d]", newSlot)
+	c.tmpDepth -= 2
+	c.resTyp = frontend.TInt
+	c.resSigned = signed
+	c.resW = c.semWOf(lt)
+	if c.resW == 4 {
+		c.canonInt(signed)
+	}
+	return frontend.TInt, nil
+}
+
+// widenFrom extends the value an aw-byte XADD left in its narrow accumulator
+// back out to a full rax, the way genLoadElem would have loaded it.
+func (c *CG) widenFrom(aw int, signed bool) {
+	switch aw {
+	case 1:
+		c.emit("mov%sx rax, al", map[bool]string{true: "s", false: "z"}[signed])
+	case 2:
+		c.emit("mov%sx rax, ax", map[bool]string{true: "s", false: "z"}[signed])
+	}
+}
+
+// truncTo narrows rax to the low aw bytes, so a value computed in 64 bits
+// matches what an object of that width actually holds.
+func (c *CG) truncTo(aw int, signed bool) {
+	switch aw {
+	case 1:
+		c.emit("mov%sx rax, al", map[bool]string{true: "s", false: "z"}[signed])
+	case 2:
+		c.emit("mov%sx rax, ax", map[bool]string{true: "s", false: "z"}[signed])
+	case 4:
+		if signed {
+			c.emit("movsxd rax, eax")
+		} else {
+			// A 32-bit operation already zeroes the upper half of rax.
+			c.emit("mov eax, eax")
+		}
+	}
+}
+
+// An _Atomic lvalue is the exception: see genAtomicCompound.
 func (c *CG) genCompoundAssign(n *frontend.AssignExpr) (frontend.CType, error) {
+	// An _Atomic operand takes the general path even when it is a plain
+	// Ident: the fast path below is a load / operate / store sequence, which
+	// is exactly the non-atomic shape an atomic update must not take.
 	lt := c.exprType(n.Lhs)
-	// Fast path: a simple scalar local/param has no address computation and
-	// no side effects, so loadVar + storeVar suffice.
-	if id, ok := n.Lhs.(*frontend.Ident); ok {
+	atomic := lt != nil && lt.Atomic
+	if id, ok := n.Lhs.(*frontend.Ident); ok && !atomic {
 		if vi, ok2 := c.lookupVar(id.Name); ok2 {
 			entry := c.tmpDepth
 			c.loadVar(vi) // old value in rax (int) / xmm0 (double)
@@ -2365,6 +2490,21 @@ func (c *CG) genCompoundAssign(n *frontend.AssignExpr) (frontend.CType, error) {
 	c.emit("mov [rbp%+d], r11", addrSlot)
 	width := c.lvalueWidth(n.Lhs)
 	class := c.lvalueClass(n.Lhs)
+	// C11 _Atomic compound assignment. The generic shape below (load,
+	// operate, store) loses any update another thread performs in between, so
+	// an atomic lvalue gets one of two locked sequences instead:
+	//   - "+=" / "-=" are a single LOCK XADD (fetch-and-add), which also hands
+	//     back the previous value -- the result is that plus the delta;
+	//   - every other operator has no single atomic instruction, so it runs a
+	//     LOCK CMPXCHG retry loop.
+	if atomic && c.lvBitWidth == 0 && class == frontend.TInt {
+		if aw := c.typeWidth(lt); aw == 1 || aw == 2 || aw == 4 || aw == 8 {
+			signed := lt != nil && lt.Kind == frontend.KInt && lt.Signed
+			res, err := c.genAtomicCompound(n, lt, aw, signed, addrSlot)
+			c.tmpDepth = entry
+			return res, err
+		}
+	}
 	if c.lvBitWidth > 0 {
 		c.genLoadBitfield(c.lvBitUnit, c.lvBitOff, c.lvBitWidth, c.lvBitSigned)
 	} else {
@@ -7656,7 +7796,11 @@ func isAgg(t *frontend.Type) bool {
 // _BitInt travels by address. This is the single rule shared by the local and
 // the parameter register allocators (T2.1 R2/R3) so the two can never drift.
 func regCapable(t *frontend.Type) bool {
-	return t != nil && !t.IsArray() && !t.IsFloating() &&
+	// An _Atomic object must live in memory: its read-modify-writes are
+	// LOCK-prefixed instructions on its address, and a register copy would
+	// make them invisible to any other thread (or to a signal handler) that
+	// observes the object.
+	return t != nil && !t.IsArray() && !t.IsFloating() && !t.Atomic &&
 		t.Kind != frontend.KStruct && t.Kind != frontend.KUnion && t.Kind != frontend.KBitInt
 }
 
@@ -8420,6 +8564,47 @@ func (c *CG) genIncDec(n *frontend.IncDecExpr) (frontend.CType, error) {
 			c.canonInt(c.lvBitSigned)
 		}
 		return frontend.TInt, nil
+	}
+	// C11 _Atomic: an increment of an atomic object has to be ONE locked
+	// instruction -- the load/modify/store sequence below leaves a window in
+	// which another thread's update is lost. LOCK XADD is a fetch-and-add:
+	// the register comes away with the previous value and memory with the new
+	// one, so a prefix result just adds the step back on.
+	// ...but on the object's own width, not the 8-byte slot's: a qword
+	// fetch-and-add on an _Atomic int member would clobber whatever follows
+	// it in the struct.
+	if et != nil && et.Atomic && !double && c.lvBitWidth == 0 {
+		if aw := c.typeWidth(et); aw == 1 || aw == 2 || aw == 4 || aw == 8 {
+			wn := [...]string{"", "byte", "word", "", "dword", "", "", "", "qword"}[aw]
+			areg := [...]string{"", "al", "ax", "", "eax", "", "", "", "rax"}[aw]
+			delta := step
+			if n.Op == "--" {
+				delta = -step
+			}
+			c.emit("mov %s, %d", areg, delta)
+			c.emit("lock xadd %s [r10], %s", wn, areg)
+			// XADD writes only the narrow register (AL / AX), so the rest of
+			// rax is stale; widen the old value as genLoadElem would have.
+			if aw == 1 {
+				c.emit("mov%sx rax, al", map[bool]string{true: "s", false: "z"}[signed])
+			} else if aw == 2 {
+				c.emit("mov%sx rax, ax", map[bool]string{true: "s", false: "z"}[signed])
+			}
+			if n.Prefix {
+				if aw == 8 {
+					c.emit("add rax, %d", delta)
+				} else {
+					c.emit("add eax, %d", delta)
+				}
+			}
+			c.resTyp = frontend.TInt
+			c.resSigned = signed
+			c.resW = resW
+			if resW == 4 {
+				c.canonInt(signed)
+			}
+			return frontend.TInt, nil
+		}
 	}
 	c.genLoadElem("r10", width, frontend.TInt, signed)
 	os := 0
