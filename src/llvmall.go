@@ -84,28 +84,25 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 	// genWith skips these names because `claimed` says LLVM owns them, so neither
 	// half defined them and the program died on the first access. stdout is the
 	// one every program touches, which is why writing anything at all crashed.
+	//
+	// Only the *types* are registered here. The definitions come later, once
+	// reachability is known: the runtime declares about 25 file-scope
+	// variables and a program that only calls write() needs none of them, yet
+	// emitting all of them cost a whole extra 1 KB of .data -- enough to make
+	// `print("hello world")` larger under -fllvm than under the native
+	// generator, which prunes by useLibGlobal. See emitLibGlobals.
 	if lib != nil {
 		for _, lg := range lib.globals {
 			if _, dup := tr.globalTyp[lg.Name]; dup {
 				continue
 			}
 			tr.globalTyp[lg.Name] = lg.Typ
+			// Claimed whatever happens below, including the case where nothing
+			// is emitted. genWith skips these names on the strength of this
+			// same map, so the symbol keeps exactly one owner: if the reachability
+			// walk were to miss a reference, the symptom is a link error naming
+			// a global, not two definitions of one.
 			defined["G_"+lg.Name] = true
-			if lg.Typ == nil || typUnsupported(lg.Typ) {
-				continue
-			}
-			if lg.IsTLS {
-				m.noteExternGlobal("G_"+lg.Name, m.llirType(lg.Typ))
-				continue
-			}
-			init, ok := m.constInit(lg.Init, lg.Typ)
-			if !ok {
-				m.noteExternGlobal("G_"+lg.Name, m.llirType(lg.Typ))
-				continue
-			}
-			m.globals = append(m.globals, irGlobal{
-				name: "G_" + lg.Name, ty: m.llirType(lg.Typ), init: init,
-			})
 		}
 	}
 
@@ -174,7 +171,8 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 	// llvmRoots returns that reachable set, seeded from the program's own calls
 	// and the few helpers the entry stub names directly.
 	if lib != nil {
-		need := llvmRoots(prog, lib, linux, tr)
+		need, needGlobals := llvmRoots(prog, lib, linux, tr)
+		m.emitLibGlobals(lib, needGlobals)
 		// lib.order can name a function more than once -- the runtime's
 		// sources are concatenated, so a name that two of them define reaches
 		// the order list twice. Emitting it twice gave LLVM "invalid
@@ -256,11 +254,25 @@ func irNameTaken(prog *Program, lib *clibCProgram, name string) bool {
 // Emitting the whole runtime (every one of its ~380 functions) is what made
 // the -fllvm binary 100k+ next to the native build's ~13; pruning to what the
 // program reaches brings it back in line.
-func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) map[string]bool {
+func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) (map[string]bool, map[string]bool) {
 	need := map[string]bool{}
 	isLib := func(name string) bool {
 		f, ok := lib.funcs[name]
 		return ok && f.Body != nil
+	}
+	// The runtime's file-scope variables are pruned on the same evidence as its
+	// functions: a name goes in needGlobals when a reachable body mentions it.
+	// isLibGlobal has to exclude function names, because the walk reports calls
+	// and identifiers alike and most identifiers it reports are functions.
+	needGlobals := map[string]bool{}
+	isLibGlobal := map[string]bool{}
+	for _, lg := range lib.globals {
+		isLibGlobal[lg.Name] = true
+	}
+	markGlobal := func(name string) {
+		if isLibGlobal[name] {
+			needGlobals[name] = true
+		}
 	}
 	// The questions specializePrintfCall needs. A nil tr means there was no
 	// emitter context; the specialisation is skipped then, which costs size but
@@ -309,6 +321,7 @@ func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) m
 						markReachable(x.Name)
 					case *Ident:
 						markReachable(x.Name)
+						markGlobal(x.Name)
 					}
 				})
 			}
@@ -353,6 +366,7 @@ func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) m
 				continue
 			}
 			collectLibRefs(f.Body, func(callee string) {
+				markGlobal(callee)
 				if isLib(callee) && !need[callee] {
 					need[callee] = true
 					changed = true
@@ -361,6 +375,17 @@ func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) m
 		}
 		if !changed {
 			break
+		}
+	}
+	// 3b. One more sweep for globals, now that `need` has stopped growing. The
+	//     loop above only marks a global while it is visiting the body that
+	//     mentioned it, and it visits each body once per round -- so a global
+	//     first reached in the last round is marked, but this pass makes the
+	//     "every reachable body was scanned" property explicit rather than an
+	//     accident of the iteration order.
+	for name := range need {
+		if f, ok := lib.funcs[name]; ok && f.Body != nil {
+			collectLibRefs(f.Body, markGlobal)
 		}
 	}
 	// 4. Full-exit upgrade, mirroring the native generator's needsFullExit:
@@ -380,6 +405,7 @@ func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) m
 							continue
 						}
 						collectLibRefs(ef.Body, func(callee string) {
+							markGlobal(callee)
 							if isLib(callee) && !need[callee] {
 								need[callee] = true
 								changed = true
@@ -394,7 +420,58 @@ func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) m
 			break
 		}
 	}
-	return need
+	// The exit upgrade above widened `need` again, so the globals of everything
+	// it pulled in have to be swept as well.
+	for name := range need {
+		if f, ok := lib.funcs[name]; ok && f.Body != nil {
+			collectLibRefs(f.Body, markGlobal)
+		}
+	}
+	// A global the program itself declares is emitted by the loop over
+	// prog.Globals, not here, but a *reference* to one from runtime code still
+	// has to resolve. Runtime bodies only ever mention the runtime's own
+	// globals, so nothing extra is needed for that; the sweep is here to make
+	// the invariant checkable rather than assumed.
+	return need, needGlobals
+}
+
+// emitLibGlobals defines the C runtime's file-scope variables that the
+// reachability walk actually found a use for. The others are left out of the
+// module entirely.
+//
+// The alternative -- defining all ~25 of them -- is not a rounding error. The
+// runtime's variables are the big ones in the library (a 1 KB stdio buffer
+// among them), and they land in .data whether or not the program touches them,
+// so every image carried them. `print("hello world")` came out 1024 bytes
+// larger under -fllvm than under the native generator for exactly this reason:
+// the native generator's useLibGlobal marks a library global when an expression
+// names it, and the IR front end had no equivalent.
+//
+// Types were registered earlier, for every global, and are deliberately not
+// pruned: a name's type is what makes a subscript decay and a scalar load, and
+// getting that wrong produces malformed IR rather than a missing symbol. Only
+// the storage is pruned.
+func (m *irMod) emitLibGlobals(lib *clibCProgram, need map[string]bool) {
+	for _, lg := range lib.globals {
+		if !need[lg.Name] {
+			continue
+		}
+		if lg.Typ == nil || typUnsupported(lg.Typ) {
+			continue
+		}
+		if lg.IsTLS {
+			m.noteExternGlobal("G_"+lg.Name, m.llirType(lg.Typ))
+			continue
+		}
+		init, ok := m.constInit(lg.Init, lg.Typ)
+		if !ok {
+			m.noteExternGlobal("G_"+lg.Name, m.llirType(lg.Typ))
+			continue
+		}
+		m.globals = append(m.globals, irGlobal{
+			name: "G_" + lg.Name, ty: m.llirType(lg.Typ), init: init,
+		})
+	}
 }
 
 // collectLibRefs visits every expression in a function body and reports the

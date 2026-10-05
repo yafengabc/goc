@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -247,5 +248,149 @@ func TestPrintfSpecShrinksBinary(t *testing.T) {
 	}
 	if !containsBytes(string(o), "plain text, no conversion") {
 		t.Errorf("stdout %q does not contain the printed line", o)
+	}
+}
+
+// TestUnwindSectionsStayOutOfImage guards a size regression that is invisible
+// from the section contents: LLVM always emits .pdata/.xdata, and a PE section
+// occupies a whole multiple of FileAlignment -- 512, the smallest Windows
+// accepts -- no matter how few bytes it holds. Keeping the unwind tables
+// therefore cost every -fllvm image at least 1024 bytes, which was enough to
+// make `print("hello world")` come out larger than the same program built by
+// the native generator, which emits no unwind info at all.
+//
+// The test reads the section table rather than the total size, so a future
+// change that makes the tables grow cannot quietly make this pass while
+// reintroducing the waste.
+func TestUnwindSectionsStayOutOfImage(t *testing.T) {
+	if !llvmAvailable(t) {
+		t.Skip("skipping: no libLLVM configured (set GOC_LLVM_DLL)")
+	}
+	dir := t.TempDir()
+	cPath := filepath.Join(dir, "uw.c")
+	const src = "int main(void) { return 0; }\n"
+	if err := os.WriteFile(cPath, []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(dir, "uw.exe")
+	cmd := exec.Command(exePath(t), "-fllvm", cPath, "-o", exe)
+	cmd.Env = append(os.Environ(), "TMP="+dir, "TEMP="+dir, "TMPDIR="+dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("goc -fllvm failed: %v\n%s", err, out)
+	}
+	img, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The exception directory is a direct proxy: pe.go only fills it when a
+	// .pdata section was given an address, so a zero here means the tables were
+	// left out on purpose rather than by accident.
+	if got := peDataDirectory(img, 3); got != 0 {
+		t.Errorf("exception directory is %#x, want 0: the Win64 unwind table "+
+			"reached the image and cost at least 1024 bytes of file alignment", got)
+	}
+	for _, name := range []string{".pdata", ".xdata"} {
+		if _, _, ok := peFindSection(img, name); ok {
+			t.Errorf("image has a %s section; it should be merged but not mapped", name)
+		}
+	}
+}
+
+// peDataDirectory returns the (rva, size) pair of the PE optional header's
+// data directory entry i, or 0 for the RVA when the entry is absent.
+func peDataDirectory(img []byte, i int) uint32 {
+	off := int(le32(img, 0x3c))
+	if off+4+20+128 > len(img) {
+		return 0
+	}
+	opt := off + 4 + 20 // PE sig + COFF header
+	magic := le16(img, opt)
+	var dd int
+	switch magic {
+	case 0x20b: // PE32+
+		dd = opt + 112
+	case 0x10b: // PE32
+		dd = opt + 96
+	default:
+		return 0
+	}
+	at := dd + i*8
+	if at+8 > len(img) {
+		return 0
+	}
+	return le32(img, at)
+}
+
+// peFindSection reports whether the image carries a section with the given name.
+func peFindSection(img []byte, name string) (rva, size uint32, ok bool) {
+	off := int(le32(img, 0x3c))
+	if off+4+20 > len(img) {
+		return 0, 0, false
+	}
+	nsec := int(le16(img, off+6))
+	optSize := int(le16(img, off+20))
+	st := off + 4 + 20 + optSize
+	for i := 0; i < nsec; i++ {
+		e := st + 40*i
+		if e+40 > len(img) {
+			return 0, 0, false
+		}
+		if string(img[e:e+8]) == name {
+			return le32(img, e+12), le32(img, e+8), true
+		}
+	}
+	return 0, 0, false
+}
+
+func le16(b []byte, off int) uint16 { return uint16(b[off]) | uint16(b[off+1])<<8 }
+
+func le32(b []byte, off int) uint32 {
+	return uint32(b[off]) | uint32(b[off+1])<<8 | uint32(b[off+2])<<16 | uint32(b[off+3])<<24
+}
+
+// TestPrimitivesShrinkUnderLLVM pins the case that started this: the built-in
+// print lowers to a raw write of a string literal, the smallest thing goc can
+// emit, and the image should reflect that. Before the runtime's file-scope
+// variables were pruned and the unwind tables dropped, the same program was 50%
+// *larger* under -fllvm than under the native generator.
+func TestPrimitivesShrinkUnderLLVM(t *testing.T) {
+	if !llvmAvailable(t) {
+		t.Skip("skipping: no libLLVM configured (set GOC_LLVM_DLL)")
+	}
+	dir := t.TempDir()
+	cPath := filepath.Join(dir, "tiny.c")
+	const src = "int main(void) { print(\"hello world\"); return 0; }\n"
+	if err := os.WriteFile(cPath, []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+	sizeOf := func(extra ...string) int64 {
+		exe := filepath.Join(dir, "tiny"+strings.Join(extra, "")+".exe")
+		args := append([]string{"-o", exe}, extra...)
+		args = append(args, cPath)
+		cmd := exec.Command(exePath(t), args...)
+		cmd.Env = append(os.Environ(), "TMP="+dir, "TEMP="+dir, "TMPDIR="+dir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("goc %v failed: %v\n%s", extra, err, out)
+		}
+		fi, err := os.Stat(exe)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Size()
+	}
+	native := sizeOf()
+	llvm := sizeOf("-fllvm")
+	if llvm >= native {
+		t.Errorf("-fllvm image is %d bytes, native is %d; the LLVM backend "+
+			"should not be the larger of the two for a program this small", llvm, native)
+	}
+	exe := filepath.Join(dir, "tiny-fllvm.exe")
+	run := exec.Command(exe)
+	o, _ := run.CombinedOutput()
+	if got := run.ProcessState.ExitCode(); got != 0 {
+		t.Errorf("exit code %d, want 0 (stdout %q)", got, o)
+	}
+	if !containsBytes(string(o), "hello world") {
+		t.Errorf("stdout %q does not contain the printed text", o)
 	}
 }

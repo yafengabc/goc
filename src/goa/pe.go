@@ -69,6 +69,15 @@ func (a *Assembler) planUnwindSections(base int) map[string]int {
 	a.pdataRVA, a.pdataSize = 0, 0
 	xdata := a.sectionByName(".xdata")
 	pdata := a.sectionByName(".pdata")
+	// An Unmapped section still has its bytes and symbols; it just gets no
+	// address in the image, so it contributes neither a section record nor a
+	// slot in the exception directory.
+	if xdata != nil && xdata.Unmapped {
+		xdata = nil
+	}
+	if pdata != nil && pdata.Unmapped {
+		pdata = nil
+	}
 	// .pdata first when both exist: the exception directory is exactly that
 	// array, and putting it at the lowest address keeps the table compact.
 	if pdata != nil && pdata.cur > 0 {

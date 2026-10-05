@@ -172,6 +172,13 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 		if mapped.bss {
 			gs.Bss = true
 		}
+		// The unwind sections are merged all the same -- their symbols resolve
+		// and their relocations are applied, so nothing is left dangling -- but
+		// the bytes do not go into the image. See Section.Unmapped for why that
+		// is a size decision rather than a correctness one.
+		if name == ".xdata" || name == ".pdata" {
+			gs.Unmapped = true
+		}
 		want := coffAlign[cs.name]
 		if want == 0 {
 			want = 8

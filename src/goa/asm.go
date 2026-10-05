@@ -68,6 +68,21 @@ type Section struct {
 	// loader, never written to the file, and its virtual size is cur (not
 	// len(Data), which stays 0).
 	Bss bool
+	// Unmapped marks a section whose bytes are merged and whose symbols and
+	// relocations resolve normally, but which is left out of the finished image.
+	//
+	// The Win64 unwind sections are the only user. Their contents are small --
+	// 12 bytes of .pdata and about 11 of .xdata per function -- but a PE section
+	// occupies a whole multiple of FileAlignment (512, the smallest value Windows
+	// accepts) in the file, so a program with three functions paid 1024 bytes to
+	// store 72 bytes of table, and every image carried at least that. Dropping
+	// the sections is what goa's own generator does: it registers no unwind info
+	// at all, and the loader copes. goc compiles C, with no C++ exceptions to
+	// propagate and no unwinder of its own, so what is lost is the ability to
+	// walk the stack during a post-mortem crash dump -- the same loss the native
+	// path already accepted, which is why this is a size decision and not a
+	// correctness one.
+	Unmapped bool
 }
 
 type symLoc struct {

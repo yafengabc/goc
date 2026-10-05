@@ -23,10 +23,15 @@ package goa
 //   - one COMDAT selection group per unwind-info contribution
 //   - the absolute symbol @feat.00 (the /GS security cookie table)
 //
-// .pdata/.xdata carry the Win64 SEH unwind tables. goa's native path emits no
-// unwind info (the loader registers a synthetic table instead), so these are
-// preserved as opaque sections: dropping them would only cost the unwinder on
-// an actual crash, and keeping them costs nothing.
+// .pdata/.xdata carry the Win64 SEH unwind tables. They are merged -- symbols
+// resolved, relocations applied -- and then left out of the image (see
+// Section.Unmapped). The reasoning that used to keep them here was that they
+// were nearly free, and that was wrong in a way worth recording: the tables are
+// small (12 bytes of .pdata and about 11 of .xdata per function) but a PE
+// section takes a whole multiple of FileAlignment in the file, and 512 is the
+// smallest value Windows accepts. Three functions cost 1024 bytes to store 72
+// bytes of table, so every -fllvm image was at least a kilobyte larger than the
+// same program built by the native path, which emits no unwind info either.
 
 import (
 	"encoding/binary"
