@@ -1328,6 +1328,17 @@ func (a *Assembler) emitInstr(ln string) error {
 	} else {
 		mnem = ln
 	}
+	// `lock` is the legacy LOCK# prefix (F0). It makes the read-modify-write
+	// instruction that follows atomic -- which is how C11 _Atomic operations
+	// are built. It must precede REX and the opcode, so it is emitted here and
+	// the rest of the line is assembled as an ordinary instruction.
+	if strings.EqualFold(mnem, "lock") {
+		if rest == "" {
+			return fmt.Errorf("line %q: 'lock' must be followed by an instruction", ln)
+		}
+		a.emitByte(0xF0)
+		return a.emitInstr(rest)
+	}
 	// Data directives are not instructions: route them straight to the
 	// byte/quad emitter without operand parsing (operands may be
 	// "32 dup(0)", strings, char literals, etc.).
@@ -1740,6 +1751,10 @@ func (a *Assembler) encode(mnem string, ops []Operand, ln string) error {
 		return a.encodeMovExtend(mnem, ops, ln)
 	case "xchg":
 		return a.encodeXchg(ops, ln)
+	case "xadd":
+		return a.encodeXadd(ops, ln)
+	case "cmpxchg":
+		return a.encodeCmpxchg(ops, ln)
 	case "bt", "bts", "btr", "btc":
 		return a.encodeBit(mnem, ops, ln)
 	case "bswap":
@@ -3633,6 +3648,55 @@ func (a *Assembler) encodeXchg(ops []Operand, ln string) error {
 		op = 0x86
 	}
 	return a.emitOpRM(width, nil, false, op, dst.reg, src, nil)
+}
+
+// ---- xadd / cmpxchg ------------------------------------------------------
+
+// encodeXadd emits `xadd dst, src` (0F C0 /r for 8-bit, 0F C1 /r otherwise):
+// it swaps dst and src and writes their sum to dst. With a LOCK prefix it is
+// the canonical "fetch and add", which is how atomic_fetch_add is lowered:
+// the register comes away with the old value and memory with the new one.
+func (a *Assembler) encodeXadd(ops []Operand, ln string) error {
+	if len(ops) != 2 {
+		return fmt.Errorf("xadd needs 2 operands: %q", ln)
+	}
+	dst, src := ops[0], ops[1]
+	if src.kind != K_REG {
+		return fmt.Errorf("xadd src must be a register: %q", ln)
+	}
+	if dst.kind != K_REG && dst.kind != K_MEM {
+		return fmt.Errorf("xadd dst must be a register or memory: %q", ln)
+	}
+	width := regWidth(src)
+	op := byte(0xC1)
+	if width == 1 {
+		op = 0xC0
+	}
+	return a.emitOpRM(width, nil, true, op, src.reg, dst, nil)
+}
+
+// encodeCmpxchg emits `cmpxchg dst, src` (0F B0 /r for 8-bit, 0F B1 /r
+// otherwise): it compares AL/AX/EAX/RAX with dst and, when they are equal,
+// stores src into dst and sets ZF; otherwise it loads dst into the accumulator
+// and clears ZF. Under LOCK this is the compare-and-swap every atomic
+// exchange and CAS loop is built from.
+func (a *Assembler) encodeCmpxchg(ops []Operand, ln string) error {
+	if len(ops) != 2 {
+		return fmt.Errorf("cmpxchg needs 2 operands: %q", ln)
+	}
+	dst, src := ops[0], ops[1]
+	if src.kind != K_REG {
+		return fmt.Errorf("cmpxchg src must be a register: %q", ln)
+	}
+	if dst.kind != K_REG && dst.kind != K_MEM {
+		return fmt.Errorf("cmpxchg dst must be a register or memory: %q", ln)
+	}
+	width := regWidth(src)
+	op := byte(0xB1)
+	if width == 1 {
+		op = 0xB0
+	}
+	return a.emitOpRM(width, nil, true, op, src.reg, dst, nil)
 }
 
 // ---- bit test family -------------------------------------------------------
