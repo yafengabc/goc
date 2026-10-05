@@ -62,6 +62,7 @@ long strtol(const char *s, char **endp, int base) {
     /* skip leading whitespace */
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r' || *s == '\f' || *s == '\v')
         s++;
+    const char *start = s;
     int sign = 0;
     if (*s == '-') { sign = 1; s++; }
     else if (*s == '+') { s++; }
@@ -76,7 +77,17 @@ long strtol(const char *s, char **endp, int base) {
     } else if (base == 16) {
         if (*s == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
     }
-    long value = 0;
+    /* Accumulate in unsigned so the overflow test is defined behaviour: signed
+     * overflow in `value * base + digit` is UB and would let the optimiser
+     * discard the very comparison that is supposed to catch it. C99
+     * 7.20.1.4 requires the result to saturate at LONG_MAX/LONG_MIN and to set
+     * ERANGE; accumulating unsigned and shifting back reproduces both without
+     * ever overflowing. */
+    unsigned long acc = 0;
+    const unsigned long limit = (~0UL) >> 1;          /* LONG_MAX */
+    unsigned long prev = 0;
+    int conv = 0;
+    int over = 0;
     while (*s) {
         int digit;
         if (*s >= '0' && *s <= '9') digit = *s - '0';
@@ -84,10 +95,43 @@ long strtol(const char *s, char **endp, int base) {
         else if (*s >= 'A' && *s <= 'Z') digit = *s - 'A' + 10;
         else break;
         if (digit >= base) break;
-        value = value * base + digit;
+        /* would acc*base+digit exceed LONG_MAX? do it in the wider type and
+           compare, so nothing wraps silently */
+        unsigned long next;
+        if (acc > ((~0UL) - (unsigned long)digit) / (unsigned long)base) over = 1;
+        next = acc * (unsigned long)base + (unsigned long)digit;
+        if (over) {
+            /* keep consuming digits -- strtol must consume the whole valid
+               prefix even when the value no longer fits */
+            acc = next & ((~0UL) >> 1);
+        } else {
+            prev = acc;
+            acc = next;
+        }
         s++;
+        conv = 1;
     }
-    if (sign) value = -value;
+    if (!conv) {
+        /* C99: no conversion performed. endp points at the original string,
+           not past the sign -- "  -x" yields 0 with endp == s. */
+        if (endp) *endp = (char *)start;
+        return 0;
+    }
+    unsigned long mag = over ? limit : acc;
+    long value;
+    if (sign) {
+        /* magnitude limit for LONG_MIN is limit+1; only that one extra value
+           is representable, so allow it before negating */
+        if (over && mag == limit) {
+            if (endp) *endp = (char *)s;
+            errno = ERANGE;
+            return (-limit - 1L);
+        }
+        value = -(long)mag;
+    } else {
+        value = (long)mag;
+    }
+    if (over) errno = ERANGE;
     if (endp) *endp = (char *)s;
     return value;
 }
@@ -102,6 +146,7 @@ long strtol(const char *s, char **endp, int base) {
 unsigned long strtoul(const char *s, char **endp, int base) {
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r' || *s == '\f' || *s == '\v')
         s++;
+    const char *start = s;
     int sign = 0;
     if (*s == '-') { sign = 1; s++; }
     else if (*s == '+') { s++; }
@@ -115,7 +160,12 @@ unsigned long strtoul(const char *s, char **endp, int base) {
     } else if (base == 16) {
         if (*s == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
     }
+    /* Same overflow discipline as strtol, but the type is unsigned so the
+     * limit is ULONG_MAX (C99 7.20.1.4). A leading '-' negates the result
+     * afterwards, so "-1" is ULONG_MAX rather than an error. */
     unsigned long value = 0;
+    int conv = 0;
+    int over = 0;
     while (*s) {
         int digit;
         if (*s >= '0' && *s <= '9') digit = *s - '0';
@@ -123,8 +173,18 @@ unsigned long strtoul(const char *s, char **endp, int base) {
         else if (*s >= 'A' && *s <= 'Z') digit = *s - 'A' + 10;
         else break;
         if (digit >= base) break;
+        if (value > ((~0UL) - (unsigned long)digit) / (unsigned long)base) over = 1;
         value = value * (unsigned long)base + (unsigned long)digit;
         s++;
+        conv = 1;
+    }
+    if (!conv) {
+        if (endp) *endp = (char *)start;
+        return 0;
+    }
+    if (over) {
+        errno = ERANGE;
+        value = ~0UL;
     }
     if (sign) value = (unsigned long)0 - value;
     if (endp) *endp = (char *)s;
@@ -147,6 +207,34 @@ long long llabs(long long x) {
  * themselves rounded (1e32 is not exact), so a huge exponent can land a
  * ULP or two off the correctly rounded answer.
  */
+/* ---- helpers for strtod's hexadecimal-floating path (C99 6.4.4.2) ------- */
+
+static int is_hexdig(int c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return c - 'A' + 10;
+}
+
+/* 2^n by squaring, exact for the whole range a double can hold (n = -1074 is
+   the smallest normal/denormal scaling factor). */
+static double pow2i(int n) {
+    double r = 1.0;
+    double b = 2.0;
+    int e = n;
+    int neg = 0;
+    if (e < 0) { neg = 1; e = -e; }
+    while (e > 0) {
+        if (e & 1) r = r * b;
+        b = b * b;
+        e >>= 1;
+    }
+    return neg ? (1.0 / r) : r;
+}
+
 static double pow10i(int n) {
     double r = 1.0;
     double p = 10.0;
@@ -227,6 +315,57 @@ double strtod(const char *s, char **endp) {
         return mk_nan();
     }
 
+    /* C99 7.20.1.4 / strtod: a hexadecimal floating constant is
+     * "0x" hex-digits [. hex-digits] [pP exponent]. The mantissa is scaled by
+     * 2^exp, not 10^exp, so it needs its own path -- the decimal path below
+     * would stop at the 'x'. Both forms are accepted; only the value matters. */
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
+        (is_hexdig(p[2]) || (p[2] == '.' && is_hexdig(p[3])))) {
+        const char *q = p + 2;
+        double mant = 0.0;
+        int hdigits = 0;
+        int fexp = 0;
+        int pexp = 0;
+        int fdig = 0;
+        int negf = 0;
+        while (is_hexdig(*q)) {
+            mant = mant * 16.0 + (double)hexval(*q);
+            q++;
+            hdigits++;
+        }
+        if (*q == '.') {
+            q++;
+            /* Each fraction digit is worth 1/16, i.e. four binary places, so
+               they accumulate into fexp. The p-exponent read later must ADD to
+               that, not overwrite it: "0x1.8p1" is 1.5 * 2^0 * 2^1 = 3. */
+            while (is_hexdig(*q)) {
+                mant = mant * 16.0 + (double)hexval(*q);
+                fexp -= 4;
+                q++;
+                hdigits++;
+            }
+        }
+        if (hdigits == 0) {
+            if (endp) *endp = (char *)s;
+            return 0.0;
+        }
+        if (*q == 'p' || *q == 'P') {
+            const char *save = q;
+            q++;
+            if (*q == '+') q++;
+            else if (*q == '-') { negf = 1; q++; }
+            while (*q >= '0' && *q <= '9') {
+                pexp = pexp * 10 + (*q - '0');
+                q++;
+                fdig++;
+            }
+            if (fdig == 0) q = save;   /* "0x1p" with no digits: p is not part of it */
+            else fexp = negf ? fexp - pexp : fexp + pexp;
+        }
+        if (endp) *endp = (char *)q;
+        return sign * mant * pow2i(fexp);
+    }
+
     while (*p >= '0' && *p <= '9') {
         val = val * 10.0 + (double)(*p - '0');
         p++;
@@ -263,12 +402,36 @@ double strtod(const char *s, char **endp) {
     }
     val = val + frac / fscale;
     if (exp != 0) {
+        /* C99 7.20.1.4: set ERANGE when the result overflows to infinity or
+         * underflows to (sub)zero, and return HUGE_VAL resp. 0. A double only
+         * reaches infinity past about 1e309, so comparing the exponent against
+         * the decimal range catches it before the multiply -- comparing the
+         * product instead would already have lost the information. */
+        double dbl_max = 1.7976931348623157e308;
         if (eneg) exp = -exp;
+        if (exp > 400) {
+            errno = ERANGE;
+            if (endp) *endp = (char *)p;
+            return sign * mk_inf();
+        }
+        if (exp < -400) {
+            errno = ERANGE;
+            if (endp) *endp = (char *)p;
+            return sign * 0.0;
+        }
+        double before = val;
         if (exp > 0) {
             val = val * pow10i(exp);
         } else {
             val = val / pow10i(-exp);
         }
+        if (val > dbl_max) {
+            errno = ERANGE;
+            if (endp) *endp = (char *)p;
+            return sign * mk_inf();
+        }
+        /* underflow: nonzero input that became zero */
+        if (val == 0.0 && before != 0.0) errno = ERANGE;
     }
     if (endp) *endp = (char *)p;
     return sign * val;

@@ -29,6 +29,33 @@ typedef void* nullptr_t;
 
 #define NULL ((void *)0)
 
+/* Language-level feature macros. <stddef.h> is included by every other goc
+ * header and is always present, so this is the one place that can define them
+ * without a header-ordering dependency.
+ *
+ * __STDC_VERSION__ is the integer the standard prescribes: 199901L for C99,
+ * 201112L for C11, 201710L for C17 and 202311L for C23. Real code gates on it
+ * ("#if __STDC_VERSION__ >= 201112L") to pick between C99 and C11 interfaces, so
+ * leaving it undefined silently takes the oldest branch on goc while the same
+ * source takes the newest on gcc -- the classic "works on my compiler" split.
+ * goc implements the C23 feature set, so it reports C23.
+ *
+ * The other four are required to be defined by every conforming implementation
+ * (C23 5.1.1.2); they are macros rather than built-ins because that is what the
+ * standard specifies. */
+#define __STDC__ 1
+#define __STDC_VERSION__ 202311L
+#define __STDC_HOSTED__ 1
+/* goc is freestanding-plus: hosted for hosted-headers purposes (it ships
+   <stdio.h> and friends), but there is no OS FILE* concept beyond its own. */
+#define __STDC_UTF_16__ 1
+#define __STDC_UTF_32__ 1
+#define __STDC_NO_ATOMICS__ 1
+#define __STDC_NO_COMPLEX__ 1
+#define __STDC_NO_VLA__ 1
+/* __STDC_NO_THREADS__ is deliberately NOT defined: goclib ships <threads.h>
+   with real thrd_/mtx_/cnd_/tss_ entry points. */
+
 /* C23 unreachable(): marks an execution path as unreachable. goc has no
  * optimiser that consumes it, so it is a harmless no-op. */
 #define unreachable() ((void)0)

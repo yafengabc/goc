@@ -31,6 +31,9 @@ typedef struct __goclib_FILE {
                          -1 = sequential stream (std*): never seek, OS-positioned */
     int   _unget;     /* one pushed-back char, or -1 */
     int   _own;       /* 1 if _base and the FILE itself were heap-allocated */
+    char *_tmpname;   /* set only by tmpfile(); fclose() unlinks it, as
+                       * C99 7.19.5.4 requires ("automatically deleted when the
+                       * file is closed"). 0 for every other stream. */
 } __goclib_FILE;
 
 #if defined(_WIN32)
@@ -238,6 +241,8 @@ static FILE *finish_open(long fd, int readable, int writable, int append) {
     f->_readable = readable; f->_writable = writable; f->_append = append;
     f->_eof = 0; f->_err = 0; f->_unget = -1;
     f->_pos = 0; f->_len = 0; f->_off = 0;
+    /* heap_alloc does not zero, and fclose() reads _tmpname on every stream */
+    f->_tmpname = 0;
     f->_base = (char *)__goclib_heap_alloc(4096);
     f->_own = 1;
     if (f->_base == 0) { f->_size = 0; f->_own = 0; }  /* fall back to unbuffered */
@@ -383,6 +388,15 @@ int fclose(FILE *stream) {
     __goclib_FILE *f = (__goclib_FILE *)stream;
     if (f == 0) return -1;
     __goclib_file_flush(f);
+    /* C99 7.19.5.4: a tmpfile() stream deletes its file on close. The name is
+     * kept in the FILE precisely so this can happen here; unlink after the
+     * handle is closed, so the removal works on Windows too (DeleteFile
+     * refuses an open handle). */
+    if (f->_tmpname) {
+        remove(f->_tmpname);
+        __goclib_heap_free(f->_tmpname);
+        f->_tmpname = 0;
+    }
     if (f->_own) {                 /* heap-allocated stream (not a std stream) */
         __goclib_os_close(f->_fd);
         if (f->_base) __goclib_heap_free(f->_base);
@@ -421,6 +435,8 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
     f->_len = 0;
     f->_off = nf->_off;
     f->_unget = -1;
+    /* a freopen()ed stream is no longer a tmpfile() one */
+    f->_tmpname = 0;
     /* nf's buffer now belongs to f; only the FILE shell itself is dropped */
     __goclib_heap_free(nf);
     return (FILE *)f;
@@ -608,13 +624,17 @@ int rename(const char *oldp, const char *newp) {
 }
 
 FILE *tmpfile(void) {
-    /* Minimal: a uniquely-named temp file in the current directory. Unlike
-     * the C standard it is not auto-deleted on close, but it is valid for
-     * read+write scratch use. */
+    /* A uniquely-named temp file in the current directory. C99 7.19.5.4
+     * requires it to be deleted automatically when the stream is closed, so
+     * the name is copied into the FILE and fclose() unlinks it -- otherwise a
+     * program that calls tmpfile() in a loop litters the working directory.
+     * tmpnam() (the named variant) does NOT get this treatment, matching the
+     * standard: only tmpfile() promises deletion. */
     static long seq = 0;
     char name[40];
     long i = 0, v;
     const char *pre = "goc_tmp_";
+    FILE *f;
     while (pre[i]) { name[i] = pre[i]; i++; }
     v = ++seq;
     if (v == 0) { name[i++] = '0'; }
@@ -624,7 +644,21 @@ FILE *tmpfile(void) {
         while (k > 0) { name[i++] = t[--k]; }
     }
     name[i++] = '.'; name[i++] = 't'; name[i++] = 'm'; name[i++] = 'p'; name[i] = 0;
-    return fopen(name, "wb+");
+    f = fopen(name, "wb+");
+    if (f == 0) return 0;
+    {
+        /* strdup equivalent: goclib compiles one TU per file, so <string.h>
+           is available, but strdup is not declared there on every target --
+           the copy is written out to keep this file's dependencies as they
+           were. */
+        char *copy = __goclib_heap_alloc((long)strlen(name) + 1);
+        char *d = copy;
+        const char *s = name;
+        while (*s) { *d++ = *s++; }
+        *d = 0;
+        ((__goclib_FILE *)f)->_tmpname = copy;
+    }
+    return f;
 }
 
 int setvbuf(FILE *stream, char *buf, int mode, long size) {

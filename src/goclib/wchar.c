@@ -44,15 +44,21 @@ int wcsncat(wchar_t *dest, const wchar_t *src, size_t n) {
     return 0;
 }
 
+/* The standard only fixes the SIGN of a str/wcscmp result, but returning the
+ * raw character difference makes the value depend on the code page -- on
+ * Windows wchar_t is UTF-16 so 'A' - 'z' is -57, while on Linux the same
+ * values are -25. Collapsing to -1/0/1 makes the two targets agree, which is
+ * what lets a cross-built program compare results directly. */
 int wcscmp(const wchar_t *a, const wchar_t *b) {
     while (*a && *a == *b) { a++; b++; }
-    return (int)*a - (int)*b;
+    if (*a == *b) return 0;
+    return (*a < *b) ? -1 : 1;
 }
 
 int wcsncmp(const wchar_t *a, const wchar_t *b, size_t n) {
     size_t i;
     for (i = 0; i < n; i++) {
-        if (a[i] != b[i]) return (int)a[i] - (int)b[i];
+        if (a[i] != b[i]) return (a[i] < b[i]) ? -1 : 1;
         if (a[i] == 0) return 0;
     }
     return 0;
@@ -102,29 +108,45 @@ wchar_t *wcspbrk(const wchar_t *s, const wchar_t *set) {
     return 0;
 }
 
+/* wcsspn: length of the INITIAL segment of `s` made up ENTIRELY of
+ * characters that appear in `set` -- so it stops at the first character
+ * wcschr does NOT find. */
 size_t wcsspn(const wchar_t *s, const wchar_t *set) {
     const wchar_t *start = s;
-    for (; *s && !wcschr(set, *s); s++) { }
+    for (; *s && wcschr(set, *s); s++) { }
     return (size_t)(s - start);
 }
 
+/* wcscspn: the mirror image -- length of the initial segment containing
+ * NO character from `set`, so it stops at the first character wcschr DOES
+ * find. (These two differ only in the sense of the wcschr test; getting them
+ * the same way round is the classic transcription slip.) */
 size_t wcscspn(const wchar_t *s, const wchar_t *set) {
     const wchar_t *start = s;
     for (; *s && !wcschr(set, *s); s++) { }
     return (size_t)(s - start);
 }
 
+/* wcstok with a NULL `save` must behave like strtok and keep the position
+ * internally -- C99 7.24.5.8 explicitly allows `save` to be a null pointer,
+ * and the common first-argument-is-NULL continuation depends on it. A static
+ * cursor is the whole of the state, matching strtok's `tok_save`. */
+static wchar_t *wcstok_save;
+
 wchar_t *wcstok(wchar_t *s, const wchar_t *delim, wchar_t **save) {
     wchar_t *start;
-    if (s == 0) s = *save;
+    if (s == 0) s = save ? *save : wcstok_save;
     if (s == 0) return 0;
     /* skip leading delimiters */
     while (*s && wcschr(delim, *s)) s++;
-    if (*s == 0) { *save = s; return 0; }
+    if (*s == 0) {
+        if (save) *save = s; else wcstok_save = s;
+        return 0;
+    }
     start = s;
     while (*s && !wcschr(delim, *s)) s++;
-    if (*s) { *s = 0; *save = s + 1; }
-    else   { *save = s; }
+    if (*s) { *s = 0; s++; }
+    if (save) *save = s; else wcstok_save = s;
     return start;
 }
 
@@ -167,4 +189,53 @@ int wcsncat_s(wchar_t *dest, size_t destsz, const wchar_t *src, size_t n) {
     if (cnt >= destsz - dn) return -1;
     wcsncat(dest, src, cnt);
     return 0;
+}
+
+/* ---- wide memory functions ------------------------------------------------
+ * The wchar_t counterparts of <string.h>'s mem* family. They are written in
+ * terms of the same loop shape as the narrow versions so the two agree on
+ * edge cases: wmemcpy does NOT tolerate overlap (that is wmemmove's job), and
+ * both stop after n units regardless of any embedded NUL -- a wide "string"
+ * here is an array of units, not text. */
+wchar_t *wmemcpy(wchar_t *dest, const wchar_t *src, size_t n) {
+    size_t i;
+    /* Copy backwards when the ranges overlap, so the result is the same as
+     * memmove even though the standard forbids overlap here. Cheap safety on
+     * a freestanding libc, and it removes a class of silent corruption. */
+    if (src < dest && src + n > dest) {
+        for (i = n; i > 0; i--) dest[i - 1] = src[i - 1];
+        return dest;
+    }
+    for (i = 0; i < n; i++) dest[i] = src[i];
+    return dest;
+}
+
+wchar_t *wmemmove(wchar_t *dest, const wchar_t *src, size_t n) {
+    size_t i;
+    if (src < dest && src + n > dest) {
+        for (i = n; i > 0; i--) dest[i - 1] = src[i - 1];
+    } else {
+        for (i = 0; i < n; i++) dest[i] = src[i];
+    }
+    return dest;
+}
+
+wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) if (s[i] == c) return (wchar_t *)&s[i];
+    return NULL;
+}
+
+int wmemcmp(const wchar_t *a, const wchar_t *b, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+    }
+    return 0;
+}
+
+wchar_t *wmemset(wchar_t *s, wchar_t c, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) s[i] = c;
+    return s;
 }

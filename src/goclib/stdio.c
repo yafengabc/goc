@@ -1,6 +1,7 @@
 #include "goclib.h"
 #include <stdarg.h>
 #include <errno.h>
+#include <wchar.h>   /* %ls / %lc take wchar_t */
 
 /* ----------------------------- <stdio.h> --------------------------------- */
 /*
@@ -27,12 +28,16 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             p++;
             continue;
         }
-        /* flags: '-' left-justify, '0' zero-pad (numbers only), '#' forces
-         * the decimal point for %a/%A (and is otherwise ignored). */
-        int left = 0, zero = 0, alt = 0;
+        /* flags: '-' left-justify, '0' zero-pad (numbers only), '+' force a
+         * sign for non-negative numbers, ' ' reserve its column, '#' forces the
+         * base prefix (0x / 0X for %x/%X, 0 for %o) and the decimal point for
+         * %a/%A. (C99 7.19.6.1) */
+        int left = 0, zero = 0, alt = 0, plus = 0, blank = 0;
         while (*p == '-' || *p == '0' || *p == '+' || *p == ' ' || *p == '#') {
             if (*p == '-') left = 1;
             else if (*p == '0') zero = 1;
+            else if (*p == '+') plus = 1;
+            else if (*p == ' ') blank = 1;
             else if (*p == '#') alt = 1;
             p++;
         }
@@ -40,31 +45,66 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
         int width = 0;
         if (*p == '*') { width = va_arg(ap, int); p++; }
         else { while (*p >= '0' && *p <= '9') { width = width * 10 + (*p - '0'); p++; } }
-        /* optional precision: ".NN" digits, or a bare "." for zero.
-         * Only %f consumes it (fractional digit count); default 6. %a uses
-         * the distinction between "no precision" (exact value) and "explicit
-         * .N" (rounded fraction), so hasPrec records whether '.' was seen. */
+        /* optional precision: ".NN" digits, a bare "." for zero, or ".*" to
+         * read it from the args. Only %f consumes it (fractional digit count);
+         * default 6. %a uses the distinction between "no precision" (exact
+         * value) and "explicit .N" (rounded fraction), so hasPrec records
+         * whether '.' was seen. %s also consumes it, as a maximum count. */
         int prec = 6;
         int hasPrec = 0;
         if (*p == '.') {
             hasPrec = 1;
             p++;
             prec = 0;
-            while (*p >= '0' && *p <= '9') { prec = prec * 10 + (*p - '0'); p++; }
+            if (*p == '*') { prec = va_arg(ap, int); p++; }
+            else { while (*p >= '0' && *p <= '9') { prec = prec * 10 + (*p - '0'); p++; } }
         }
         /* length modifiers select long/short forms; every va slot is 8
-         * bytes, so skipping the whole run is enough (same as the asm). */
+         * bytes, so skipping the whole run is enough (same as the asm).
+         * "l" in front of s or c is NOT skippable: %ls/%lc take a wchar_t
+         * array / a wchar_t, not a char* / an int. */
+        int wide = 0;
         while (*p == 'l' || *p == 'h' || *p == 'L' ||
-               *p == 'z' || *p == 'j' || *p == 't') p++;
+               *p == 'z' || *p == 'j' || *p == 't') {
+            if (*p == 'l') wide = 1;
+            p++;
+        }
         char spec = *p++;
         /* The converted text lives in `field` (length `fl`); %s keeps its own
-         * pointer `s` because it may exceed the static buffer. */
+         * pointer `s` because it may exceed the static buffer. When a
+         * precision caps it, the characters are copied into `field` instead
+         * and `s` is cleared, so the padding code can just test `s != 0`. */
         char field[512];
         int fl = 0;
         const char *s = 0;
-        if (spec == 's') {
+        if (spec == 's' && wide) {
+            /* %ls: a wchar_t array (UTF-16LE on Windows, UTF-32 elsewhere).
+             * Only the low byte of each unit is emitted, which is exact for
+             * ASCII and lossy beyond it -- documented in <stdio.h>. Emitting
+             * a wide unit verbatim would interleave NULs on Windows. */
+            const wchar_t *ws = va_arg(ap, const wchar_t *);
+            int i;
+            if (!ws) { ws = (const wchar_t *)(const void *)"(null)"; }
+            for (i = 0; ws[i] != 0; i++) {
+                if (hasPrec && i >= prec) break;
+                if (fl < (int)sizeof field - 1) field[fl++] = (char)(ws[i] & 0xff);
+            }
+        } else if (spec == 'c' && wide) {
+            field[fl++] = (char)(va_arg(ap, int) & 0xff);
+        } else if (spec == 's') {
             s = va_arg(ap, const char *);
             if (!s) s = "(null)";
+            if (hasPrec) {
+                /* ".P" on %s caps the character count (C99 7.19.6.1p8). Copy
+                 * rather than NUL-terminate in place: the caller's string is
+                 * const and may live in read-only storage. */
+                int i = 0;
+                while (i < prec && s[i] && i < (int)sizeof field - 1) {
+                    field[fl++] = s[i];
+                    i++;
+                }
+                s = 0;
+            }
         } else if (spec == 'c') {
             int c = va_arg(ap, int);
             field[fl++] = (char)c;
@@ -145,34 +185,82 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             /* unknown specifier: emit it verbatim */
             field[fl++] = spec;
         }
-        /* ---- field-width padding ---- */
+        /* ---- field-width padding ----
+         *
+         * The converted text is in `field[0..fl)`, except for an uncapped %s
+         * whose characters still live at `s`. `sign` is the leading '-', '+'
+         * or ' ' that must stay to the left of any zero padding, and `prefix`
+         * is the "0x"/"0X" (or "0" for %o) base marker that '#' asks for. Both
+         * are computed here rather than baked into `field`, because zero
+         * padding has to go *between* them and the digits.
+         */
         {
             int numeric = (spec == 'd' || spec == 'i' || spec == 'u' ||
                            spec == 'o' || spec == 'x' || spec == 'X' ||
                            spec == 'f' || spec == 'F' || spec == 'e' ||
                            spec == 'E' || spec == 'g' || spec == 'G' ||
                            spec == 'a' || spec == 'A');
-            int clen = (spec == 's') ? (int)strlen(s) : fl;
+            int signedish = (spec == 'd' || spec == 'i');
+            /* the sign character, if any, and where it is in `field` */
+            char sign = 0;
+            int signlen = 0;
+            if (signedish && (plus || blank) && fl > 0 && field[0] != '-') {
+                /* "+"/" " only applies to non-negative values; a literal '-'
+                 * from the conversion wins over both. */
+                sign = plus ? '+' : ' ';
+                signlen = 1;
+            }
+            /* the '#' base marker, if any */
+            char pfx[2];
+            int pfxlen = 0;
+            if (alt) {
+                if (spec == 'x') { pfx[0] = '0'; pfx[1] = 'x'; pfxlen = 2; }
+                else if (spec == 'X') { pfx[0] = '0'; pfx[1] = 'X'; pfxlen = 2; }
+                else if (spec == 'o') { pfx[0] = '0'; pfxlen = 1; }
+            }
+            /* digits start after any existing '-', so zero padding never
+             * lands between the minus and the digits */
+            int digoff = (fl > 0 && field[0] == '-') ? 1 : 0;
+            int clen = s ? (int)strlen(s) : fl;
+            int emit_text = s ? 1 : 0;
+            int body = emit_text ? 0 : fl - digoff;   /* digits to write */
+            int prelen = (digoff ? 1 : 0) + signlen + pfxlen;
+
+            /* advance() writes one byte honouring `limit` and always counts */
+            int k;
+#define ADV(ch) do { if (limit < 0 || n < limit) out[n] = (char)(ch); n++; } while (0)
+
             if (clen >= width || width <= 0) {
-                if (spec == 's') { while (*s) { if (limit<0||n<limit) out[n]=*s; n++; s++; } }
-                else { int k; for (k=0;k<fl;k++) { if (limit<0||n<limit) out[n]=field[k]; n++; } }
+                if (signlen) ADV(sign);
+                if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
+                if (emit_text) { while (*s) { ADV(*s); s++; } }
+                else { for (k = 0; k < fl; k++) ADV(field[k]); }
             } else {
                 int pad = width - clen;
                 if (left) {
-                    if (spec == 's') { while (*s) { if (limit<0||n<limit) out[n]=*s; n++; s++; } }
-                    else { int k; for (k=0;k<fl;k++) { if (limit<0||n<limit) out[n]=field[k]; n++; } }
-                    int k; for (k=0;k<pad;k++) { if (limit<0||n<limit) out[n]=' '; n++; }
-                } else if (zero && numeric && fl > 0 && field[0] == '-') {
-                    if (limit<0||n<limit) out[n]='-'; n++;
-                    int k; for (k=0;k<pad;k++) { if (limit<0||n<limit) out[n]='0'; n++; }
-                    for (k=1;k<fl;k++) { if (limit<0||n<limit) out[n]=field[k]; n++; }
-                } else {
+                    if (signlen) ADV(sign);
+                    if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
+                    if (emit_text) { while (*s) { ADV(*s); s++; } }
+                    else { for (k = 0; k < fl; k++) ADV(field[k]); }
+                    for (k = 0; k < pad; k++) ADV(' ');
+                } else if (zero && numeric) {
+                    /* "0" flag: pad with zeros, but only after sign/prefix */
                     char pc = (zero && numeric) ? '0' : ' ';
-                    int k; for (k=0;k<pad;k++) { if (limit<0||n<limit) out[n]=pc; n++; }
-                    if (spec == 's') { while (*s) { if (limit<0||n<limit) out[n]=*s; n++; s++; } }
-                    else { int k; for (k=0;k<fl;k++) { if (limit<0||n<limit) out[n]=field[k]; n++; } }
+                    if (digoff) ADV(field[0]);
+                    if (signlen) ADV(sign);
+                    if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
+                    for (k = 0; k < pad; k++) ADV(pc);
+                    if (emit_text) { while (*s) { ADV(*s); s++; } }
+                    else { for (k = 0; k < body; k++) ADV(field[digoff + k]); }
+                } else {
+                    for (k = 0; k < pad; k++) ADV(' ');
+                    if (signlen) ADV(sign);
+                    if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
+                    if (emit_text) { while (*s) { ADV(*s); s++; } }
+                    else { for (k = 0; k < body; k++) ADV(field[digoff + k]); }
                 }
             }
+#undef ADV
         }
     }
     return n;
@@ -1294,10 +1382,13 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
         fp++;
         continue;
     }
-    /* Nothing assigned AND nothing consumed means the input ran out before
-     * the first conversion could finish -- the C "EOF" answer. The va_list
-     * is owned by the caller (sscanf), which calls va_end. */
-    if (assigned == 0 && sp == s) return -1;
+    /* EOF means "an input failure occurred before the first conversion could
+     * complete", i.e. the input was already exhausted. A *matching* failure
+     * (a digit expected, a letter found) is not an input failure: scanf returns
+     * the number of items assigned, which is then 0. Telling the two apart is
+     * the whole point of the return value -- callers test "!= 1" after asking
+     * for one item, and would misread a matching failure as end-of-input. */
+    if (assigned == 0 && sp == s && *s == '\0') return -1;
     return assigned;
 }
 
