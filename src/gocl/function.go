@@ -182,6 +182,13 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 	b.WriteString(e.entry.String())
 	b.WriteString(e.body.String())
 	b.WriteString("}\n")
+	// The attribute goes on the definition, after the body -- which is where
+	// LLVM reads it from. Marking every function is not a compromise: the
+	// attribute is what tells the size pipeline it may trade speed for bytes in
+	// this function, and a program is one unit for that decision.
+	if e.c.optSize {
+		b.WriteString("\nattributes #0 = { optsize }\n")
+	}
 	return b.String(), nil
 }
 

@@ -42,7 +42,7 @@ func TranslateProgram(prog *frontend.Program, linux bool, opt int) (string, map[
 		return "", nil, nil, fmt.Errorf("the built-in C library for this target "+
 			"is unavailable: %w", libErr)
 	}
-	ir, claimed, externals, err := translateProgram(prog, lib, linux)
+	ir, claimed, externals, err := translateProgram(prog, lib, linux, opt)
 	if err != nil {
 		return "", nil, nil, fmt.Errorf("generating IR: %w", err)
 	}
@@ -149,11 +149,16 @@ func irPasses(opt int) string {
 		return "default<O3>"
 	case opt == 3:
 		return "default<O2>"
-	// -Os/-Oz ask for size, and LLVM has a pipeline for that. Sending them to
-	// default<O1> instead was not just wrong in spirit: O1 is a speed pipeline,
-	// so a size-optimised build came out no smaller than an ordinary one.
+	// -Os/-Oz ask for size. LLVM 21 removed the `Os` pipeline and replaced it
+	// with the optsize attribute under an O2 pipeline, so asking for `Os` here
+	// is not merely outdated -- libLLVM rejects the pipeline string outright:
+	//
+	//	The optimization level "Os" is no longer supported. Use O2 in
+	//	conjunction with the optsize attribute instead.
+	//
+	// The attribute itself is emitted per function, from irMod.optSize.
 	case opt == 2:
-		return "default<Os>"
+		return "default<O2>"
 	}
 	return "default<O1>"
 }

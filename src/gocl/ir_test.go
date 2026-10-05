@@ -50,7 +50,7 @@ func irFromSource(t *testing.T, src string) (string, map[string]bool) {
 	}
 	// No runtime is linked here: the fragments guard only the user-code surface
 	// this compiler lowers. translateProgram(nil lib) emits exactly that.
-	ir, claimed, _, err := translateProgram(prog, nil, false)
+	ir, claimed, _, err := translateProgram(prog, nil, false, 1)
 	if err != nil {
 		t.Fatalf("generate IR: %v", err)
 	}
@@ -339,4 +339,58 @@ func TestIRRoundTripsThroughFile(t *testing.T) {
 	if err := os.WriteFile(out, []byte(ir), 0644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestIRSizePipeline pins the -Os shape, and it exists because LLVM broke it
+// without warning at the source level.
+//
+// LLVM 21 removed the `Os` pipeline: asking for it is not a pipeline that runs
+// badly, it is a pipeline string the library rejects, so a build that had been
+// working stopped with
+//
+//	The optimization level "Os" is no longer supported. Use O2 in
+//	conjunction with the optsize attribute instead.
+//
+// The replacement is not just the pipeline name -- it is an attribute on each
+// function, which is the half that is easy to leave out and produces a build
+// that succeeds and is not size-optimised. So both are asserted: the pipeline
+// the library is given, and the attribute the IR carries.
+func TestIRSizePipeline(t *testing.T) {
+	if !llvmAvailable(t) {
+		t.Skip("skipping: no libLLVM configured")
+	}
+	if got := irPasses(2); got != "default<O2>" {
+		t.Errorf("-Os pipeline = %q, want default<O2> (LLVM 21 removed the Os pipeline)", got)
+	}
+
+	// The attribute is only present for -Os.
+	plain := irFrom(t, 1)
+	if strings.Contains(plain, "optsize") {
+		t.Error("an ordinary build carries the optsize attribute; it would trade speed for bytes nobody asked to save")
+	}
+
+	for _, sizeOpt := range []int{2} {
+		ir := irFrom(t, sizeOpt)
+		if !strings.Contains(ir, "attributes #0 = { optsize }") {
+			t.Errorf("-Os IR has no optsize attribute:\n%s", ir)
+		}
+	}
+}
+
+// irFrom lowers a one-function program at the given optimisation level.
+func irFrom(t *testing.T, opt int) string {
+	t.Helper()
+	toks, err := common.PreprocessTarget("int f(int n){return n*2;}\nint main(void){return f(21);}", "test.c", false)
+	if err != nil {
+		t.Fatalf("preprocess: %v", err)
+	}
+	prog, err := frontend.Parse(toks)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	ir, _, _, err := translateProgram(prog, nil, false, opt)
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	return ir
 }

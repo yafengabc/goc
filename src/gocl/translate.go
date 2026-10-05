@@ -35,8 +35,11 @@ import (
 // tests, which exercise fragments without the runtime present). Its function table
 // is consulted for prototypes and for the reachability walk that decides which
 // runtime code has to be emitted.
-func translateProgram(prog *frontend.Program, lib *common.Program, linux bool) (string, map[string]bool, []string, error) {
+func translateProgram(prog *frontend.Program, lib *common.Program, linux bool, opt int) (string, map[string]bool, []string, error) {
 	m := newIRMod()
+	// -Os is a property of the module rather than of one function: it decides
+	// which pipeline runs, and the optsize attribute is what that pipeline reads.
+	m.optSize = opt == 2
 	defined := map[string]bool{}
 	tr := &typeResolver{
 		funcDefs:   map[string]*frontend.FuncDecl{},

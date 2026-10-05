@@ -50,6 +50,11 @@ type irMod struct {
 	// because another generator does. They still get declared, so calls to
 	// them type-check and link.
 	defined map[string]bool
+	// optSize asks the optimiser for a size-oriented result. LLVM 21 removed
+	// the `Os` pipeline and replaced it with the optsize attribute on the
+	// functions to shrink, run under O2 -- so this is what -Os now means, and
+	// the pipeline string alone can no longer ask for it.
+	optSize bool
 }
 
 type irGlobal struct {
