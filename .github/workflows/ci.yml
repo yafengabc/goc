@@ -26,14 +26,14 @@ jobs:
           if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
       - name: go vet
         run: |
-          (cd src && go vet ./...)
-          (cd cmd/goa && go vet ./...)
+          (cd src/goc && go vet ./...)
+          (cd src/goa && go vet ./...)
           (cd tools && go vet ./...)
       - name: go build
         run: |
           mkdir -p bin
-          (cd src && go build -o ../bin/goc .)
-          (cd cmd/goa && go build -o ../../bin/goa .)
+          (cd src/goc && go build -o ../../bin/goc .)
+          (cd src/goa && go build -o ../../bin/goa ./cmd/goa)
           (cd tools && go build -o ../bin/elfcheck ./elfcheck)
           # msgboxcheck drives a real Windows dialog box, so it only exists as
           # a Windows program: building it here without GOOS fails with "build
@@ -61,7 +61,7 @@ jobs:
       #
       # Every example, both goals above plus unit tests for all three modules
       # and the assembler's own suite (run_tests.sh delegates to
-      # cmd/goa/run_tests.sh, so there is one definition of that suite).
+      # goa/run_tests.sh, so there is one definition of that suite).
       #
       # GOC_SKIP_MSGBOX: the GUI example is driven by msgboxcheck, which needs
       # an interactive desktop; runners do not have one.

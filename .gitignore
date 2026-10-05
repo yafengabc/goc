@@ -36,8 +36,8 @@ src/examples/*
 # Same rule for goa's own examples. goa/run_tests.sh assembles each example
 # where it lives: Windows .exe output is already caught by the *.exe rule above,
 # but the Linux ELF output has no suffix, so name it explicitly.
-cmd/goa/examples/linux/*
-!cmd/goa/examples/linux/*.asm
+goa/examples/linux/*
+!goa/examples/linux/*.asm
 
 # ...and the AT&T front end's test samples. These are LLVM AsmPrinter output
 # checked in as test *inputs*, not build products -- without them the breadth
@@ -45,15 +45,15 @@ cmd/goa/examples/linux/*
 # valuable coverage. Only a handful are committed; tools/gen-att-samples.sh
 # regenerates the full corpus on demand, and the gitignore rule is what keeps
 # that regeneration from showing up as 70 untracked files.
-cmd/goa/testdata/att/*
-!cmd/goa/testdata/att/longmin.s
-!cmd/goa/testdata/att/intprint.s
-!cmd/goa/testdata/att/print_thin.s
-!cmd/goa/testdata/att/variadic.s
+goa/testdata/att/*
+!goa/testdata/att/longmin.s
+!goa/testdata/att/intprint.s
+!goa/testdata/att/print_thin.s
+!goa/testdata/att/variadic.s
 
-# goclib/*.c and goclib/*.def are embedded into goc with go:embed (via the
-# patterns in src/codegen.go), so they are source, not build products -- and
-# the *.exe rule above does not reach them anyway.
+# src/goclib/ is source, not build products. src/goc reads it from disk at run
+# time and src/main.go embeds it, so in both cases the .c/.h files belong in
+# the repository -- and the *.exe rule above does not reach them anyway.
 
 # Local agent workspace, not part of the project.
 .workbuddy/
@@ -81,5 +81,5 @@ tests/*/_build/
 # Perf-benchmark dir: keep only the .c sources, ignore built artifacts.
 bench/*
 !bench/*.c
-cmd/goa/zz_*.tmpl
+goa/zz_*.tmpl
 src/**/zz_*_test.go.tmpl

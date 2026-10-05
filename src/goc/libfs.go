@@ -28,10 +28,13 @@ import (
 //
 // The lookup order is deliberate. GOCLIB_PATH wins so a distribution can point
 // at a shared library copy, and so the test suite can build a second compiler
-// against a different tree; then the directory holding the running executable,
-// which covers both the repo layout and an installed layout with goclib/ beside
-// the exe. Only then the source tree, which is what a developer running
-// `go run ./cmd/goc` gets.
+// against a different tree. After that the search runs from the directory
+// holding the running executable, and then from the working directory -- a
+// developer running `go run ./goc` or `go test` gets a different origin than
+// one running the installed binary, and both have to work.
+//
+// Each origin is searched by probe, which alternates descending and climbing.
+// See probe for why one direction alone is not enough.
 //
 // Everything below the found root is read as a plain directory: the calls are
 // on the same "goclib/<name>" spelling the embed version used, so the call
@@ -96,6 +99,61 @@ func (f sourceFS) ReadDir(name string) ([]dirEntry, error) {
 	return out, nil
 }
 
+// probe searches outward from one origin, alternating between descending and
+// climbing so the two directions interleave.
+//
+// The alternation is not decoration. goclib/ is at src/goclib while the
+// binary is at bin/goc.exe: the library is neither an ancestor of the binary
+// (climb from bin/ goes to the repo root, the parent, the volume, and never
+// through src) nor a child of it (descend from bin/ reaches the goc-out*
+// build directories). Only going up one level and then back down finds it, and
+// a search that tries all of one direction before starting the other cannot
+// express that.
+//
+// Each level is tried as descend-then-climb, so a nearer hit always wins over
+// a farther one regardless of direction.
+func probe(dir string, consider func(string) (string, bool)) (string, bool) {
+	for depth := 0; depth < 4; depth++ {
+		if root, ok := descend(dir, consider); ok {
+			return root, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false // reached the volume root
+		}
+		dir = parent
+	}
+	return "", false
+}
+
+// descend tries dir, then its children. One level is enough here because
+// probe alternates: a deeper library is found by climbing to its parent first
+// and descending from there.
+func descend(dir string, consider func(string) (string, bool)) (string, bool) {
+	if root, ok := consider(dir); ok {
+		return root, true
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	// Sorted so the choice is deterministic when two subdirectories both
+	// carry a library, e.g. a stale copy beside a current one.
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if root, ok := consider(filepath.Join(dir, n)); ok {
+			return root, true
+		}
+	}
+	return "", false
+}
+
 // findGoclibRoot locates the directory that holds goclib/.
 //
 // The candidates are tried in order and the first one containing goclib/goclib.h
@@ -127,42 +185,33 @@ func findGoclibRoot() (string, error) {
 			return root, nil
 		}
 	}
-	// The running executable's directory: covers the repo layout (goc and
-	// goclib are siblings under bin/ and the source tree) and an installed
-	// layout with goclib/ shipped next to the exe.
+	// Walk up from the executable, then from the working directory.
+	//
+	// Both are loops over filepath.Dir rather than a fixed number of ".."
+	// hops, because the library has moved more than once (src/goclib, then the
+	// repository root, now src/ again) and each move broke a hardcoded depth.
+	// Two details make this more than a loop:
+	//
+	//   - filepath.Join(dir, "..") is NOT the way up. Join cleans the ".." away
+	//     and returns the parent, so a loop written with it never climbs at all.
+	//     An earlier version asked for the parent of the parent and silently
+	//     got the parent, which is why the library went missing from src/goc.
+	//   - an installed layout has goclib/ beside the exe, while the repository
+	//     has it under src/. Climbing covers both without a special case.
+	//
+	// The executable is tried before the working directory so a copy of the
+	// toolchain run from an unrelated project still finds its own library.
 	if exe, err := os.Executable(); err == nil {
 		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 			exe = resolved
 		}
-		dir := filepath.Dir(exe)
-		if root, ok := consider(dir); ok {
-			return root, nil
-		}
-		if root, ok := consider(filepath.Join(dir, "..")); ok {
+		if root, ok := probe(filepath.Dir(exe), consider); ok {
 			return root, nil
 		}
 	}
-	// The source tree. goclib/ sits at the repository root, but the compiler
-	// runs from all over it -- the root, cmd/goc, goa/, and (under `go test`)
-	// a temporary directory whose path leads nowhere near the checkout. So walk
-	// up from the working directory instead of testing a fixed number of
-	// parent hops: two levels is enough for cmd/goc but not for cmd/goc/a/b.
-	//
-	// filepath.Join is not usable for this. Join(wd, "..") *cleans* the ".."
-	// away, so it yields the parent -- correct for one hop, and the reason an
-	// earlier version of this function missed the repository root from
-	// cmd/goc: it asked for the parent of the parent and got the parent. Hence
-	// Dir() in the loop rather than a Join per level.
 	if wd, err := os.Getwd(); err == nil {
-		for dir, i := wd, 0; i < 6; i++ {
-			if root, ok := consider(dir); ok {
-				return root, nil
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break // reached the volume root
-			}
-			dir = parent
+		if root, ok := probe(wd, consider); ok {
+			return root, nil
 		}
 	}
 	return "", fmt.Errorf("cannot find the goclib C library (looked in: %s); "+

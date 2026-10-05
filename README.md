@@ -40,7 +40,7 @@ zip 里是**开箱即用**的工具链目录，但**必须整目录一起解压*
 goc 自带汇编器（goa 已编译进二进制），所以 zip 里那份独立 `goa` 只是给手写
 汇编用的，goc 编译 C 不再需要它。
 
-查找顺序见 `cmd/goc/libfs.go`：`GOCLIB_PATH` 环境变量 → exe 旁边的目录 →
+查找顺序见 `goc/libfs.go`：`GOCLIB_PATH` 环境变量 → exe 旁边的目录 →
 exe 的上级目录 → 当前工作目录及其各级上级。所以 zip 里的目录结构是固定的，
 不要只取单个文件；想让多个编译器共用一份库，设 `GOCLIB_PATH` 指向它即可。
 
@@ -52,7 +52,7 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 
 ```
 .
-├── cmd/goc/                                            # 编译器源码（go 模块 goc）
+├── src/goc/                                        # 编译器源码（go 模块 goc）
 │   ├── lexer.go  parser.go  ast.go  types.go  headers.go
 │   ├── check.go  codegen.go  cpp.go  main.go
 │   ├── libfs.go                                        #   在磁盘上定位 goclib/（见下）
@@ -65,12 +65,11 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 │   │   string.h  ctype.h
 │   ├── windows.h  windef.h  winbase.h  wingdi.h  winuser.h
 │   └── README.md                                       #   库的实现机制
-├── goa/                                                # goa：汇编器（独立 go 模块）
+├── src/goa/                                            # goa：汇编器（独立 go 模块）
 │   ├── asm.go  pe.go  elf.go  main.go                  #   Intel 语法子集 -> PE32+ / ELF64
 │   ├── examples/  expected/  run_tests.sh              #   用例与 golden
 │   └── README.md                                       #   汇编器自己的文档
-├── src/                                                # 回归套件的数据（gocregress 的输入）
-│   ├── examples/*.c  expected/*.txt                    #   goc 的用例与 golden
+├── src/examples/  src/expected/                      # goc 回归套件的数据（gocregress 的输入）
 │   └── examples/multi/                                 #   多文件链接用例
 ├── tools/                                              # 验证工具（独立 go 模块）
 │   ├── elfcheck                                        #   ELF 结构校验（不再解释执行）
@@ -81,9 +80,9 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 └── .github/workflows/ci.yml                            # CI：Linux 原生端到端 + Windows 端到端
 ```
 
-`goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
-直接出 exe，不需要 goc。同理 `cmd/goc/`、`goa/`、`tools/` 是**三个** Go 模块，
-在 `src/` 里跑 `go test ./...` 是看不到 goa 的单测的。
+`src/goa/` 是独立的 go 模块（自己的 `go.mod`），可以单独拿出来用：给一份 `.asm`，
+直接出 exe，不需要 goc。同理 `src/goc/`、`src/goa/`、`tools/` 是**三个** Go 模块，
+在 `src/goc/` 里跑 `go test ./...` 是看不到 goa 的单测的。
 
 ## Linux 目标
 
@@ -321,7 +320,7 @@ cd goa && bash run_tests.sh           # 只跑汇编器自己的用例
    时这一对腿整段跳过（见下）
 5. **委托 `goa/run_tests.sh`**：11 个 Windows 例子 + 3 个 Linux 例子 + 1 个 GUI
    （`msgboxcheck` 真的去点对话框的「是」）
-6. **三个 Go module 各自跑单测**：cmd/goc、goa、tools 各跑 `go test ./...`
+6. **三个 Go module 各自跑单测**：goc、goa、tools 各跑 `go test ./...`
 
 本机（Windows 11 + MSYS2 的 Python 带 unicorn 2.1.4）现状 **`pass=253 fail=0`**。
 

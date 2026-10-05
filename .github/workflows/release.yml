@@ -31,8 +31,8 @@ jobs:
       - name: cross-compile Linux toolchain
         run: |
           V="$(git describe --tags --always)"
-          (cd src && GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=$V" -o ../bin/goc-linux .)
-          (cd cmd/goa && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../../bin/goa-linux .)
+          (cd src/goc && GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=$V" -o ../../bin/goc-linux .)
+          (cd src/goa && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../../bin/goa-linux ./cmd/goa)
           ls -l bin/
 
       - name: package + checksums
@@ -55,6 +55,13 @@ jobs:
           cp README.md build/linux/README.md
           cp LICENSE build/win/LICENSE
           cp LICENSE build/linux/LICENSE
+          # goclib/ travels with the compiler. It is read from disk at run
+          # time (src/goc/libfs.go), so a zip without it yields a goc that
+          # fails on the first program with "cannot find the goclib C library".
+          # Copy the tree, not a wildcard: os.listdir below only writes files.
+          rm -rf build/win/goclib build/linux/goclib
+          cp -r src/goclib build/win/goclib
+          cp -r src/goclib build/linux/goclib
           python - "$V" <<'PY'
           import os, sys, zipfile
           V = sys.argv[1]
@@ -64,7 +71,19 @@ jobs:
                       p = os.path.join(d, f)
                       if os.path.isfile(p):
                           zf.write(p, arcname=f)
-              print('->', out, zipfile.ZipFile(out).namelist())
+                      elif os.path.isdir(p):
+                          # goclib/ -- the C library, which the compiler reads
+                          # from disk. Recurse; a flat copy would leave the
+                          # headers behind and every #include <stdio.h> would
+                          # fall through to "skipping unavailable system
+                          # header", producing a compiler that builds but
+                          # cannot printf.
+                          for root, _, files in os.walk(p):
+                              rel = os.path.relpath(root, d)
+                              for n in sorted(files):
+                                  zf.write(os.path.join(root, n),
+                                           arcname=os.path.join(rel, n).replace(os.sep, '/'))
+              print('->', out, len(zipfile.ZipFile(out).namelist()), 'entries')
           z('build/win',   'release/goc-%s-windows-x86_64.zip' % V)
           z('build/linux', 'release/goc-%s-linux-x86_64.zip' % V)
           PY
