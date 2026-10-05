@@ -1,6 +1,6 @@
 //go:build !windows
 
-package goa
+package gocl
 
 import "fmt"
 

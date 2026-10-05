@@ -1,4 +1,4 @@
-package goa
+package gocl
 
 import "errors"
 

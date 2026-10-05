@@ -1,4 +1,4 @@
-package goa
+package gocld
 
 // IngestCOFF splices a COFF object -- the output of the LLVM backend's codegen
 // -- into this assembler, so BuildPE/BuildELF lay out the result exactly as they
@@ -15,10 +15,10 @@ package goa
 //     keeping them means the image stays well-formed for anything that walks the
 //     exception chain.
 //
-//  2. Symbols and relocations. Every defined symbol enters a.syms at its new
+//  2. Symbols and relocations. Every defined symbol enters img.Syms at its new
 //     offset. Every undefined external becomes an import through the same
 //     mechanism goa already uses for `extern Name, dll`: the name is registered
-//     in a.exts, and references to it are rewritten to the "IAT:name" form that
+//     in img.Exts, and references to it are rewritten to the "IAT:name" form that
 //     buildIData resolves into an address-table slot.
 //
 // Relocation arithmetic differs between the two models, and getting it wrong
@@ -63,22 +63,22 @@ var coffAlign = map[string]int{
 }
 
 // IngestCOFF merges the object at path into the assembler.
-func (a *Assembler) IngestCOFF(path string) error {
+func (img *Image) IngestCOFF(path string) error {
 	src, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	return a.IngestCOFFBytes(src)
+	return img.IngestCOFFBytes(src)
 }
 
 // IngestCOFFBytes merges an in-memory object. It is the form the compiler uses,
 // which already has the object in hand.
-func (a *Assembler) IngestCOFFBytes(src []byte) error {
+func (img *Image) IngestCOFFBytes(src []byte) error {
 	o, err := parseCOFF(src)
 	if err != nil {
 		return err
 	}
-	return a.ingestParsedCOFF(o, src)
+	return img.ingestParsedCOFF(o, src)
 }
 
 // refptrLoc is where an object's .refptr slot for an undefined data symbol
@@ -90,7 +90,7 @@ type refptrLoc struct {
 
 // ingestParsedCOFF does the merge for an already-parsed object; src is the raw
 // file, needed because relocations are read from it.
-func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
+func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 	// LLVM emits a call to the C runtime's __main module initialiser at the top
 	// of every function whose module has global constructors. goc does its own
 	// start-up and never calls it, but the reference still has to resolve -- and
@@ -100,17 +100,17 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 	// A real one is emitted here: a single `ret`. A `ret` reached through the
 	// call pops the caller's own return address, so the program continues
 	// exactly as if __main had done nothing -- which is precisely the intent.
-	text := a.sectionByName(".text")
+	text := sectionByName(img, ".text")
 	if text == nil {
-		text = a.newSection(".text", false, true)
+		text = newSection(img, ".text", false, true)
 	}
-	if _, ok := a.syms[coffNoOpAnchor]; !ok {
-		if pad := align(text.cur, 16) - text.cur; pad > 0 {
+	if _, ok := img.Syms[coffNoOpAnchor]; !ok {
+		if pad := align(text.VSize, 16) - text.VSize; pad > 0 {
 			padSection(text, pad)
 		}
 		text.Data = append(text.Data, 0xC3) // ret
-		text.cur++
-		a.syms[coffNoOpAnchor] = symLoc{sect: sectionIndexOf(a, text), off: text.cur - 1}
+		text.VSize++
+		img.Syms[coffNoOpAnchor] = SymLoc{Sect: sectionIndexOf(img, text), Off: text.VSize - 1}
 	}
 
 	// LLVM lowers a stack frame larger than a page into a call to the C
@@ -126,17 +126,17 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 	// walked the stack for a garbage size) or subtracted pages themselves
 	// (double allocation), both ending in STATUS_STACK_OVERFLOW (0xC00000FD).
 	// r10/r11 are volatile per the Windows ABI, so they are free scratch.
-	if _, ok := a.syms["___chkstk_ms"]; !ok {
-		if pad := align(text.cur, 16) - text.cur; pad > 0 {
+	if _, ok := img.Syms["___chkstk_ms"]; !ok {
+		if pad := align(text.VSize, 16) - text.VSize; pad > 0 {
 			padSection(text, pad)
 		}
-		start := text.cur
+		start := text.VSize
 		// mov r11, rax ; mov r10, rsp
 		// (4C 8B D4 = mov r10,rsp; the 89 variant would be mov rsp,r10 and
 		// clobber the stack pointer with garbage r10 on entry.)
 		text.Data = append(text.Data, 0x49, 0x89, 0xC3, 0x4C, 0x8B, 0xD4)
-		text.cur += 6
-		loop := text.cur
+		text.VSize += 6
+		loop := text.VSize
 		// loop: sub rsp,4096 ; mov [rsp],r11 ; sub r11,4096
 		// The probe block is 18 bytes (7 + 4 + 7); the cursor must advance by
 		// exactly the bytes appended or every symbol merged from the COFF
@@ -146,17 +146,17 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 			0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00, // sub rsp, 4096
 			0x4C, 0x89, 0x1C, 0x24, // mov [rsp], r11  (touch the page)
 			0x49, 0x81, 0xEB, 0x00, 0x10, 0x00, 0x00) // sub r11, 4096
-		text.cur += 18
+		text.VSize += 18
 		// jg loop: short jump back to the probe block. The offset is relative
 		// to the instruction's end; it must be computed, not hard-coded -- a
 		// literal offset would land the jump outside the probe block.
-		rel8 := int8(loop - (text.cur + 2))
+		rel8 := int8(loop - (text.VSize + 2))
 		text.Data = append(text.Data, 0x7F, byte(rel8))
-		text.cur += 2
+		text.VSize += 2
 		// mov rsp, r10 ; ret
 		text.Data = append(text.Data, 0x4C, 0x89, 0xD4, 0xC3)
-		text.cur += 4
-		a.syms["___chkstk_ms"] = symLoc{sect: sectionIndexOf(a, text), off: start}
+		text.VSize += 4
+		img.Syms["___chkstk_ms"] = SymLoc{Sect: sectionIndexOf(img, text), Off: start}
 	}
 
 	// --- sections ---
@@ -192,9 +192,9 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 			// home instead of dropping data; read-only is the safe assumption.
 			mapped.writable = false
 		}
-		gs := a.sectionByName(name)
+		gs := sectionByName(img, name)
 		if gs == nil {
-			gs = a.newSection(name, mapped.writable, mapped.code)
+			gs = newSection(img, name, mapped.writable, mapped.code)
 		}
 		if mapped.bss {
 			gs.Bss = true
@@ -210,7 +210,7 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 		if want == 0 {
 			want = 8
 		}
-		if pad := align(gs.cur, want) - gs.cur; pad > 0 {
+		if pad := align(gs.VSize, want) - gs.VSize; pad > 0 {
 			padSection(gs, pad)
 		}
 		// Win64 COFF has no data relocation: a reference to undefined data
@@ -222,24 +222,24 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 		// so a reference to the undefined symbol can be resolved to the slot.
 		if k := strings.LastIndex(cs.name, "$.refptr."); k >= 0 {
 			refptrFor[cs.name[k+len("$.refptr."):]] = refptrLoc{
-				sect: sectionIndexOf(a, gs), off: gs.cur,
+				sect: sectionIndexOf(img, gs), off: gs.VSize,
 			}
 		}
-		baseOf[i+1] = gs.cur
+		baseOf[i+1] = gs.VSize
 		if mapped.bss {
 			// An uninitialised section has no file bytes; its size is virtual.
 			// Advancing only by len(data) would leave the cursor at zero, the
 			// image builder would skip the section entirely, and the symbols in
 			// it would resolve to whatever address the NEXT section got -- which
 			// is how a .bss counter ends up aliasing the unwind table.
-			gs.cur += cs.vsize
+			gs.VSize += cs.vsize
 		} else {
 			if len(cs.data) > 0 {
 				gs.Data = append(gs.Data, cs.data...)
-				gs.cur += len(cs.data)
+				gs.VSize += len(cs.data)
 			}
 		}
-		sectOf[i+1] = sectionIndexOf(a, gs)
+		sectOf[i+1] = sectionIndexOf(img, gs)
 	}
 
 	// --- symbols ---
@@ -261,7 +261,7 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 			if s.class != scnClassExternal {
 				continue
 			}
-			if _, already := a.syms[s.name]; already {
+			if _, already := img.Syms[s.name]; already {
 				continue // provided by the assembly we are merging into
 			}
 			// A data symbol the object declared but did not define, and for
@@ -276,7 +276,7 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 			// bytes, which is why the failure is a crash rather than a link
 			// error.
 			if rp, ok := refptrFor[s.name]; ok {
-				a.syms[s.name] = symLoc{sect: rp.sect, off: rp.off}
+				img.Syms[s.name] = SymLoc{Sect: rp.sect, Off: rp.off}
 				continue
 			}
 			// __main is the module-initialiser stub a C runtime calls before
@@ -297,21 +297,21 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 				unresolved = append(unresolved, s.name)
 				continue
 			}
-			if a.exts == nil {
-				a.exts = map[string]string{}
+			if img.Exts == nil {
+				img.Exts = map[string]string{}
 			}
-			if _, dup := a.exts[s.name]; !dup {
+			if _, dup := img.Exts[s.name]; !dup {
 				// parseExtern normalises the name by appending ".dll", and the
 				// loader matches the string exactly -- an import written as
 				// "kernel32" instead of "kernel32.dll" names a library that does
 				// not exist, and the image fails to load. Two descriptors for
 				// what is really one DLL is the visible symptom.
-				a.exts[s.name] = dll + ".dll"
+				img.Exts[s.name] = dll + ".dll"
 			}
 			continue
 		}
 		si := int(s.secNum)
-		a.syms[s.name] = symLoc{sect: sectOf[si], off: baseOf[si] + int(s.value)}
+		img.Syms[s.name] = SymLoc{Sect: sectOf[si], Off: baseOf[si] + int(s.value)}
 	}
 
 	// --- import thunks ---
@@ -323,19 +323,19 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 	// Data references (lea/mov RIP-relative) keep naming the IAT slot, which
 	// is the correct address-of semantics. Generating a thunk for every
 	// import is a few bytes each and keeps the code simple.
-	if len(a.exts) > 0 {
-		for name := range a.exts {
-			if _, ok := a.syms["thunk:"+name]; ok {
+	if len(img.Exts) > 0 {
+		for name := range img.Exts {
+			if _, ok := img.Syms["thunk:"+name]; ok {
 				continue
 			}
-			off := text.cur
+			off := text.VSize
 			// FF 25 <rel32>: jmp qword ptr [rip+disp]
 			text.Data = append(text.Data, 0xFF, 0x25, 0, 0, 0, 0)
-			text.cur += 6
-			a.fixups = append(a.fixups, Fixup{
-				sect: sectionIndexOf(a, text), off: off + 2, sym: "IAT:" + name,
+			text.VSize += 6
+			img.Fixups = append(img.Fixups, Fixup{
+				Sect: sectionIndexOf(img, text), Off: off + 2, Sym: "IAT:" + name,
 			})
-			a.syms["thunk:"+name] = symLoc{sect: sectionIndexOf(a, text), off: off}
+			img.Syms["thunk:"+name] = SymLoc{Sect: sectionIndexOf(img, text), Off: off}
 		}
 	}
 
@@ -380,7 +380,7 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 				switch {
 				case sym.name == "__main":
 					key = coffNoOpAnchor
-				case a.definesSymbol(sym.name):
+				case img.definesSymbol(sym.name):
 					key = sym.name
 				default:
 					key = "IAT:" + sym.name
@@ -426,19 +426,19 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 				// Route those through the per-import jump thunk emitted above.
 				// Any other opcode is a data reference (lea/mov RIP-relative),
 				// which legitimately names the slot itself. The import check
-				// goes through a.exts rather than the key's prefix: an import
+				// goes through img.Exts rather than the key's prefix: an import
 				// that already satisfied a defining reference lands here under
 				// its bare name (definesSymbol), not as "IAT:...".
 				if off > 0 && off <= len(cs.data) {
 					if op := cs.data[off-1]; op == 0xE8 || op == 0xE9 {
-						if _, isImport := a.exts[sym.name]; isImport {
+						if _, isImport := img.Exts[sym.name]; isImport {
 							key = "thunk:" + sym.name
 						}
 					}
 				}
 				addend := rd32(cs.data, off)
-				a.fixups = append(a.fixups, Fixup{
-					sect: sectOf[si], off: at, sym: key, addend: addend,
+				img.Fixups = append(img.Fixups, Fixup{
+					Sect: sectOf[si], Off: at, Sym: key, Addend: addend,
 				})
 			case relAMD64Addr32NB:
 				// A relocation against a *section* symbol is how the Win64 unwind
@@ -470,18 +470,18 @@ func (a *Assembler) ingestParsedCOFF(o *coffObj, src []byte) error {
 				if off+4 <= len(cs.data) {
 					addend = rd32(cs.data, off)
 				}
-				a.fixups = append(a.fixups, Fixup{
-					sect: sectOf[si], off: at, sym: key,
-					absolute: true, addend: addend,
+				img.Fixups = append(img.Fixups, Fixup{
+					Sect: sectOf[si], Off: at, Sym: key,
+					Absolute: true, Addend: addend,
 				})
 			case relAMD64Addr64:
 				// A 64-bit absolute address: a pointer-sized slot holding the
 				// target's image address, which is how a 64-bit global is
 				// reached. It stores an address rather than a distance, so it
 				// goes through the same absolute path as ADDR32NB.
-				a.fixups = append(a.fixups, Fixup{
-					sect: sectOf[si], off: at, sym: key,
-					absolute: true, wide: true, virtual: true,
+				img.Fixups = append(img.Fixups, Fixup{
+					Sect: sectOf[si], Off: at, Sym: key,
+					Absolute: true, Wide: true, Virtual: true,
 				})
 			default:
 				return fmt.Errorf("coff: unknown relocation type %d for %s (%s)",
@@ -510,11 +510,11 @@ func (o *coffObj) symbolAt(i int) (coffSym, error) {
 // definesSymbol reports whether the assembler half already provides this name.
 // A symbol the object leaves undefined is satisfied by the assembly when one is
 // there, and becomes an import only when nothing else defines it.
-func (a *Assembler) definesSymbol(name string) bool {
-	if _, ok := a.syms[name]; ok {
+func (img *Image) definesSymbol(name string) bool {
+	if _, ok := img.Syms[name]; ok {
 		return true
 	}
-	_, imported := a.exts[name]
+	_, imported := img.Exts[name]
 	return imported
 }
 
@@ -525,16 +525,16 @@ func padSection(s *Section, n int) {
 		return
 	}
 	if s.Bss {
-		s.cur += n
+		s.VSize += n
 		return
 	}
 	s.Data = append(s.Data, make([]byte, n)...)
-	s.cur += n
+	s.VSize += n
 }
 
 // sectionIndexOf returns the assembler's index of s, or -1.
-func sectionIndexOf(a *Assembler, s *Section) int {
-	for i, x := range a.sections {
+func sectionIndexOf(img *Image, s *Section) int {
+	for i, x := range img.Sections {
 		if x == s {
 			return i
 		}
@@ -593,21 +593,21 @@ var coffWin32DLLs = map[string]string{
 // `call main` / `mov <reg>, rax` / `call <exit>` shape the stub always has, and
 // returns a negative value when the text does not look like that (an object
 // linked without a stub, say).
-func (a *Assembler) findStubReturn() symLoc {
-	text := a.sectionByName(".text")
+func (img *Image) findStubReturn() SymLoc {
+	text := sectionByName(img, ".text")
 	if text == nil {
-		return symLoc{sect: -1}
+		return SymLoc{Sect: -1}
 	}
-	callEntry, ok := a.syms[a.entry]
-	if a.entry == "" || !ok || a.sections[callEntry.sect] != text {
-		return symLoc{sect: -1}
+	callEntry, ok := img.Syms[img.Entry]
+	if img.Entry == "" || !ok || img.Sections[callEntry.Sect] != text {
+		return SymLoc{Sect: -1}
 	}
 	// The call is E8 rel32, so the instruction after it sits five bytes on.
-	ret := callEntry.off + 5
+	ret := callEntry.Off + 5
 	if ret >= len(text.Data) {
-		return symLoc{sect: -1}
+		return SymLoc{Sect: -1}
 	}
-	return symLoc{sect: sectionIndexOf(a, text), off: ret}
+	return SymLoc{Sect: sectionIndexOf(img, text), Off: ret}
 }
 
 // coffNoOpAnchor is the synthetic symbol undefined references that must resolve

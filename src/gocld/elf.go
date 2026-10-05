@@ -1,4 +1,4 @@
-package goa
+package gocld
 
 import (
 	"fmt"
@@ -58,7 +58,7 @@ const (
 )
 
 // BuildELF lays out every section and writes a runnable ELF64 executable.
-func (a *Assembler) BuildELF(outPath string) error {
+func (state *Image) BuildELF(outPath string) error {
 	// Lay the sections out back to back. Every section gets a file offset
 	// (== vaddr - elfBase, since there is a single PT_LOAD) even when empty,
 	// so symbols in a section with no bytes still resolve.
@@ -67,14 +67,14 @@ func (a *Assembler) BuildELF(outPath string) error {
 		s    *Section
 		off  int
 		flag uint64
-		sz   int // virtual size: len(s.Data) normally, s.cur for .bss
+		sz   int // virtual size: len(s.Data) normally, s.VSize for .bss
 	}
 	var placed2 []placed
 
 	cur := elfTextFileOff
 	var bssSecs []*Section
 	for _, name := range []string{".text", ".rdata", ".data", ".tls", ".bss"} {
-		s := a.sectionByName(name)
+		s := sectionByName(state, name)
 		if s == nil {
 			continue
 		}
@@ -106,46 +106,46 @@ func (a *Assembler) BuildELF(outPath string) error {
 	// loader zero-fills them. memEnd tracks the full virtual extent.
 	memEnd := loadEnd
 	for _, s := range bssSecs {
-		if s.cur == 0 {
+		if s.VSize == 0 {
 			continue
 		}
 		secOff[s] = loadEnd
-		placed2 = append(placed2, placed{s: s, off: loadEnd, flag: shfAlloc | shfWrite, sz: s.cur})
-		memEnd += align(s.cur, 16)
+		placed2 = append(placed2, placed{s: s, off: loadEnd, flag: shfAlloc | shfWrite, sz: s.VSize})
+		memEnd += align(s.VSize, 16)
 	}
 
 	// Resolve every symbol to a virtual address.
 	symVA := map[string]int{}
-	for name, loc := range a.syms {
-		s := a.sections[loc.sect]
+	for name, loc := range state.Syms {
+		s := state.Sections[loc.Sect]
 		if off, ok := secOff[s]; ok {
-			symVA[name] = elfBase + off + loc.off
+			symVA[name] = elfBase + off + loc.Off
 		}
 	}
 
 	// Apply fixups. The displacement is measured from the byte after the
 	// displacement field itself, plus any trailing bytes the instruction has
-	// (f.ripAdj). Short jumps carry a 1-byte rel8 instead of a disp32.
-	for _, f := range a.fixups {
-		t, ok := symVA[f.sym]
+	// (f.RipAdjust). Short jumps carry a 1-byte rel8 instead of a disp32.
+	for _, f := range state.Fixups {
+		t, ok := symVA[f.Sym]
 		if !ok {
-			return fmt.Errorf("undefined symbol referenced: %s", f.sym)
+			return fmt.Errorf("undefined symbol referenced: %s", f.Sym)
 		}
 		var t2 int
-		if f.sym2 != "" {
-			if t2, ok = symVA[f.sym2]; !ok {
-				return fmt.Errorf("undefined symbol referenced: %s", f.sym2)
+		if f.Sym2 != "" {
+			if t2, ok = symVA[f.Sym2]; !ok {
+				return fmt.Errorf("undefined symbol referenced: %s", f.Sym2)
 			}
 		}
-		s := a.sections[f.sect]
+		s := state.Sections[f.Sect]
 		if err := applyFixup(s, f, t, t2, elfBase+secOff[s]); err != nil {
 			return err
 		}
 	}
 
-	entryVA, ok := symVA[a.entry]
+	entryVA, ok := symVA[state.Entry]
 	if !ok {
-		return fmt.Errorf("entry symbol %q not defined", a.entry)
+		return fmt.Errorf("entry symbol %q not defined", state.Entry)
 	}
 
 	// ---- symbol table (.symtab + .strtab) ----
@@ -156,7 +156,7 @@ func (a *Assembler) BuildELF(outPath string) error {
 	for i, p := range placed2 {
 		secIdx[p.s] = i + 1
 	}
-	symtab, strtab := a.buildSymtab(symVA, secIdx)
+	symtab, strtab := state.buildSymtab(symVA, secIdx)
 
 	// ---- guest unwind metadata (.gocuw) ----
 	// One fixed-layout record per function (see gocrun's parser for the exact
@@ -168,19 +168,19 @@ func (a *Assembler) BuildELF(outPath string) error {
 	putU32 := func(v uint32) {
 		uwData = append(uwData, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
 	}
-	for _, fn := range a.uwRecs {
-		so, ok1 := secOff[a.sections[fn.sect]]
-		eo, ok2 := secOff[a.sections[fn.sect]]
+	for _, fn := range state.UWRecs {
+		so, ok1 := secOff[state.Sections[fn.Sect]]
+		eo, ok2 := secOff[state.Sections[fn.Sect]]
 		if !ok1 || !ok2 {
 			continue
 		}
-		putU32(uint32(so + fn.start)) // RVA of function start (vaddr - elfBase)
-		putU32(uint32(eo + fn.end))   // RVA of function end
-		uwData = append(uwData, byte(len(fn.pushes)))
-		for _, r := range fn.pushes {
+		putU32(uint32(so + fn.Start)) // RVA of function start (vaddr - elfBase)
+		putU32(uint32(eo + fn.End))   // RVA of function end
+		uwData = append(uwData, byte(len(fn.Pushes)))
+		for _, r := range fn.Pushes {
 			uwData = append(uwData, byte(r))
 		}
-		putU32(uint32(fn.alloc)) // sub rsp, N frame allocation
+		putU32(uint32(fn.Alloc)) // sub rsp, N frame allocation
 	}
 
 	// Section headers live after the loadable image and the symbol table;
@@ -228,42 +228,42 @@ func (a *Assembler) BuildELF(outPath string) error {
 	shstrOff := shOff + numSh*elfShEntSize
 	shStrIdx := numSh - 1
 
-	img := make([]byte, loadEnd)
+	buf := make([]byte, loadEnd)
 
 	// ELF header.
-	putU32at(img, 0, elfIdentMagic)
-	img[4] = elfClass64
-	img[5] = elfDataLSB
-	img[6] = elfVersion
-	img[7] = elfOSABISysV
-	img[8] = 0 // ABI version
-	putU16at(img, 16, etExec)
-	putU16at(img, 18, emX8664)
-	putU32at(img, 20, elfVersion)
-	putU64at(img, 24, uint64(entryVA))
-	putU64at(img, 32, elfEhSize)     // e_phoff
-	putU64at(img, 40, uint64(shOff)) // e_shoff
-	putU32at(img, 48, 0)             // e_flags
-	putU16at(img, 52, elfEhSize)
-	putU16at(img, 54, elfPhEntSize)
-	putU16at(img, 56, 1) // e_phnum
-	putU16at(img, 58, elfShEntSize)
-	putU16at(img, 60, uint16(numSh))
-	putU16at(img, 62, uint16(shStrIdx))
+	putU32at(buf, 0, elfIdentMagic)
+	buf[4] = elfClass64
+	buf[5] = elfDataLSB
+	buf[6] = elfVersion
+	buf[7] = elfOSABISysV
+	buf[8] = 0 // ABI version
+	putU16at(buf, 16, etExec)
+	putU16at(buf, 18, emX8664)
+	putU32at(buf, 20, elfVersion)
+	putU64at(buf, 24, uint64(entryVA))
+	putU64at(buf, 32, elfEhSize)     // e_phoff
+	putU64at(buf, 40, uint64(shOff)) // e_shoff
+	putU32at(buf, 48, 0)             // e_flags
+	putU16at(buf, 52, elfEhSize)
+	putU16at(buf, 54, elfPhEntSize)
+	putU16at(buf, 56, 1) // e_phnum
+	putU16at(buf, 58, elfShEntSize)
+	putU16at(buf, 60, uint16(numSh))
+	putU16at(buf, 62, uint16(shStrIdx))
 
 	// Program header: one PT_LOAD covering the whole image, RWX.
-	putU32at(img, 64, ptLoad)
-	putU32at(img, 68, pfR|pfW|pfX)
-	putU64at(img, 72, 0)               // p_offset
-	putU64at(img, 80, elfBase)         // p_vaddr
-	putU64at(img, 88, elfBase)         // p_paddr (unused on Linux)
-	putU64at(img, 96, uint64(loadEnd)) // p_filesz
-	putU64at(img, 104, uint64(memEnd)) // p_memsz (includes zero-filled .bss)
-	putU64at(img, 112, 0x1000)         // p_align
+	putU32at(buf, 64, ptLoad)
+	putU32at(buf, 68, pfR|pfW|pfX)
+	putU64at(buf, 72, 0)               // p_offset
+	putU64at(buf, 80, elfBase)         // p_vaddr
+	putU64at(buf, 88, elfBase)         // p_paddr (unused on Linux)
+	putU64at(buf, 96, uint64(loadEnd)) // p_filesz
+	putU64at(buf, 104, uint64(memEnd)) // p_memsz (includes zero-filled .bss)
+	putU64at(buf, 112, 0x1000)         // p_align
 
 	// Section contents.
 	for _, p := range placed2 {
-		copy(img[p.off:], p.s.Data)
+		copy(buf[p.off:], p.s.Data)
 	}
 
 	// Section header table.
@@ -318,7 +318,7 @@ func (a *Assembler) BuildELF(outPath string) error {
 	}
 
 	out := make([]byte, 0, shstrOff+len(shstr))
-	out = append(out, img...)
+	out = append(out, buf...)
 	for i := range posts {
 		for len(out) < postOff[i] {
 			out = append(out, 0)
@@ -338,7 +338,7 @@ func (a *Assembler) BuildELF(outPath string) error {
 // string table (.strtab). Every symbol goc defines (function/label) becomes a
 // global STT_FUNC entry so external tools -- and the Windows gocrun loader --
 // can resolve names such as __goc_syscall by address.
-func (a *Assembler) buildSymtab(symVA map[string]int, secIdx map[*Section]int) ([]byte, []byte) {
+func (state *Image) buildSymtab(symVA map[string]int, secIdx map[*Section]int) ([]byte, []byte) {
 	type ent struct {
 		name    string
 		nameOff int
@@ -347,14 +347,14 @@ func (a *Assembler) buildSymtab(symVA map[string]int, secIdx map[*Section]int) (
 		value   uint64
 	}
 	ents := []ent{{}} // leading null symbol (all-zero)
-	names := make([]string, 0, len(a.syms))
-	for n := range a.syms {
+	names := make([]string, 0, len(state.Syms))
+	for n := range state.Syms {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 	for _, n := range names {
-		loc := a.syms[n]
-		s := a.sections[loc.sect]
+		loc := state.Syms[n]
+		s := state.Sections[loc.Sect]
 		shndx := 0
 		if idx, ok := secIdx[s]; ok {
 			shndx = idx

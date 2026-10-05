@@ -1,6 +1,6 @@
 //go:build windows
 
-package goa
+package gocl
 
 // Whole-pipeline check for the LLVM backend's link path: IR text -> COFF object
 // (produced by libLLVM through the FFI layer) -> merged with the entry stub ->
@@ -23,6 +23,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+
+	"goa"
+	"gocld"
 	"testing"
 )
 
@@ -61,15 +64,12 @@ func TestLinkLLVMLifecycle(t *testing.T) {
 		t.Run(tc.file, func(t *testing.T) {
 			ll := loadLLVM(t)
 			obj := compileIRToObject(t, ll, filepath.Join("testdata", tc.file))
-			a := NewAssembler()
-			if err := a.Assemble(llvmE2EStub); err != nil {
-				t.Fatalf("assemble entry stub: %v", err)
-			}
-			if err := a.IngestCOFFBytes(obj); err != nil {
+			img := assembleStub(t)
+			if err := img.IngestCOFFBytes(obj); err != nil {
 				t.Fatalf("merge object: %v", err)
 			}
 			out := filepath.Join(t.TempDir(), "a.exe")
-			if err := a.BuildPE(out); err != nil {
+			if err := img.BuildPE(out); err != nil {
 				t.Fatalf("BuildPE: %v", err)
 			}
 			runAndCheckExit(t, out, tc.want, tc.why)
@@ -84,22 +84,23 @@ func TestLinkLLVMLifecycle(t *testing.T) {
 func TestLinkLLVMUnwindTablePresent(t *testing.T) {
 	ll := loadLLVM(t)
 	obj := compileIRToObject(t, ll, filepath.Join("testdata", "pure.ll"))
-	a := NewAssembler()
-	if err := a.Assemble(llvmE2EStub); err != nil {
+	img := assembleStub(t)
+	_ = img
+	if err := error(nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.IngestCOFFBytes(obj); err != nil {
+	if err := img.IngestCOFFBytes(obj); err != nil {
 		t.Fatal(err)
 	}
 	out := filepath.Join(t.TempDir(), "a.exe")
-	if err := a.BuildPE(out); err != nil {
+	if err := img.BuildPE(out); err != nil {
 		t.Fatal(err)
 	}
-	img, err := os.ReadFile(out)
+	data, err := os.ReadFile(out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rva, size := peDataDir(t, img, 3) // exception directory
+	rva, size := peDataDir(t, data, 3) // exception directory
 	if size == 0 {
 		t.Fatal("exception directory is empty: the loader cannot unwind frames")
 	}
@@ -107,16 +108,16 @@ func TestLinkLLVMUnwindTablePresent(t *testing.T) {
 	// Each RUNTIME_FUNCTION must name a range inside .text and an unwind record
 	// inside .xdata; a zero or out-of-range value here is what turns an
 	// exception into STATUS_PRIVILEGED_INSTRUCTION.
-	textBase, textEnd := sectionRange(t, img, ".text")
-	xdata, xdataEnd := sectionRange(t, img, ".xdata")
+	textBase, textEnd := sectionRange(t, data, ".text")
+	xdata, xdataEnd := sectionRange(t, data, ".xdata")
 	if xdata == 0 {
 		t.Fatal("image has an exception directory but no .xdata section")
 	}
 	for i := 0; i < entries; i++ {
-		off := fileOffsetOfRVA(t, img, rva+i*12)
-		begin := rd32(img, off)
-		end := rd32(img, off+4)
-		unwind := rd32(img, off+8)
+		off := fileOffsetOfRVA(t, data, rva+i*12)
+		begin := rd32(data, off)
+		end := rd32(data, off+4)
+		unwind := rd32(data, off+8)
 		if begin < textBase || end > textEnd || end <= begin {
 			t.Errorf("entry %d: code range 0x%x..0x%x is not inside .text (0x%x..0x%x)",
 				i, begin, end, textBase, textEnd)
@@ -148,11 +149,8 @@ entry:
 		t.Fatal(err)
 	}
 	obj := compileIRToObject(t, ll, path)
-	a := NewAssembler()
-	if err := a.Assemble(llvmE2EStub); err != nil {
-		t.Fatal(err)
-	}
-	err := a.IngestCOFFBytes(obj)
+	img := assembleStub(t)
+	err := img.IngestCOFFBytes(obj)
 	if err == nil {
 		t.Fatal("expected a link error for an undefined symbol")
 	}
@@ -162,6 +160,20 @@ entry:
 }
 
 // --- helpers ---------------------------------------------------------------
+
+// assembleStub encodes the entry stub into an Image the linker can consume.
+//
+// This is the two-module handshake the split is built around: goa turns
+// assembly text into sections and symbols, gocld turns those into an image.
+// Neither does the other's job, and this is where they meet.
+func assembleStub(t *testing.T) *gocld.Image {
+	t.Helper()
+	a := goa.NewAssembler()
+	if err := a.Assemble(llvmE2EStub); err != nil {
+		t.Fatalf("assemble entry stub: %v", err)
+	}
+	return a.LinkImage()
+}
 
 // runAndCheckExit runs a freshly linked image and compares its exit code. The
 // entry stub passes main's return value to ExitProcess, so the program's own

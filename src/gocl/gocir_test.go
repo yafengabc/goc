@@ -1,6 +1,6 @@
 //go:build windows
 
-package goa
+package gocl
 
 // LLVM's verdict on the IR goc's front end produces.
 //

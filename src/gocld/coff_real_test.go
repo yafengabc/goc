@@ -1,4 +1,4 @@
-package goa
+package gocld
 
 // Validation of the COFF parser against a real LLVM-produced object, rather
 // than only against the synthetic builder in coff_test.go. The fixture is

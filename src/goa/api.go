@@ -21,20 +21,7 @@ func AssembleSource(src, outPath string, elf bool) (int64, error) {
 	if err := a.Assemble(src); err != nil {
 		return 0, err
 	}
-	if elf {
-		if err := a.BuildELF(outPath); err != nil {
-			return 0, err
-		}
-	} else {
-		if err := a.BuildPE(outPath); err != nil {
-			return 0, err
-		}
-	}
-	fi, err := os.Stat(outPath)
-	if err != nil {
-		return 0, err
-	}
-	return fi.Size(), nil
+	return a.writeImage(outPath, elf)
 }
 
 // AssembleFile reads the assembly in srcPath, assembles it and writes outPath.
@@ -74,20 +61,7 @@ func AssembleATT(src, outPath string, elf bool) (int64, error) {
 	if err := attAssemble(a, src); err != nil {
 		return 0, err
 	}
-	if elf {
-		if err := a.BuildELF(outPath); err != nil {
-			return 0, err
-		}
-	} else {
-		if err := a.BuildPE(outPath); err != nil {
-			return 0, err
-		}
-	}
-	fi, err := os.Stat(outPath)
-	if err != nil {
-		return 0, err
-	}
-	return fi.Size(), nil
+	return a.writeImage(outPath, elf)
 }
 
 // AssembleWithObject assembles src and then merges a COFF object into the same
@@ -108,23 +82,16 @@ func AssembleWithObject(src string, obj []byte, outPath string, elf bool) (int64
 	if err := a.Assemble(src); err != nil {
 		return 0, err
 	}
+	// One image for the whole program. Building it once matters: the object
+	// merges into this Image, so a second LinkImage() would hand the linker a
+	// program whose functions live in the object and whose entry stub lives in
+	// a different copy of the sections -- and the stub's `call main` would
+	// resolve against an image that has no main at all.
+	img := a.LinkImage()
 	if len(obj) > 0 {
-		if err := a.IngestCOFFBytes(obj); err != nil {
+		if err := img.IngestCOFFBytes(obj); err != nil {
 			return 0, fmt.Errorf("linking the LLVM object: %w", err)
 		}
 	}
-	if elf {
-		if err := a.BuildELF(outPath); err != nil {
-			return 0, err
-		}
-	} else {
-		if err := a.BuildPE(outPath); err != nil {
-			return 0, err
-		}
-	}
-	fi, err := os.Stat(outPath)
-	if err != nil {
-		return 0, err
-	}
-	return fi.Size(), nil
+	return a.writeImageTo(img, outPath, elf)
 }

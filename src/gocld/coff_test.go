@@ -1,4 +1,4 @@
-package goa
+package gocld
 
 // COFF parser tests. The fixtures are real LLVM 23.1.2 output for
 // x86_64-w64-windows-gnu, captured as byte arrays so the tests need no external

@@ -30,3 +30,9 @@ replace goc/common => ../common
 replace goc/frontend => ../frontend
 
 replace goa => ../goa
+
+require (
+	gocld v0.0.0 // indirect: goa reaches the linker, and this is goa's dependency
+)
+
+replace gocld => ../gocld

@@ -1,12 +1,13 @@
 //go:build windows
 
-package goa
+package gocl
 
 // Test-side glue for the LLVM pipeline tests: locating the library, turning IR
 // into an object, and reading a few fields back out of a built image so the
 // tests can assert on them.
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -133,4 +134,23 @@ func fileOffsetOfRVA(t *testing.T, img []byte, rva int) int {
 	}
 	t.Fatalf("RVA 0x%x is not inside any section with file contents", rva)
 	return 0
+}
+
+// The two little-endian readers the PE inspection above needs. They were
+// goa's own unexported helpers, and a test file in one module cannot reach
+// another module's internals -- so they are repeated rather than exported.
+// Two functions of three lines each is a smaller cost than widening goa's
+// public surface to serve a test in a different package.
+func rd16(b []byte, off int) int {
+	if off < 0 || off+2 > len(b) {
+		return 0
+	}
+	return int(binary.LittleEndian.Uint16(b[off:]))
+}
+
+func rd32(b []byte, off int) int {
+	if off < 0 || off+4 > len(b) {
+		return 0
+	}
+	return int(int32(binary.LittleEndian.Uint32(b[off:])))
 }

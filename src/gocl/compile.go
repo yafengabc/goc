@@ -13,7 +13,6 @@ package gocl
 
 import (
 	"fmt"
-	"goa"
 	"goc/common"
 	"goc/frontend"
 	"os"
@@ -57,7 +56,7 @@ func TranslateProgram(prog *frontend.Program, linux bool, opt int) (string, map[
 // a missing library is reported as such rather than being allowed to look like
 // a successful build.
 func CompileIR(ir string, opt int, linux bool) ([]byte, error) {
-	api, err := goa.OpenLLVM()
+	api, err := OpenLLVM()
 	if err != nil {
 		return nil, fmt.Errorf("gocl needs the LLVM shared library: %w", err)
 	}
@@ -74,9 +73,9 @@ func CompileIR(ir string, opt int, linux bool) ([]byte, error) {
 	}
 	defer os.RemoveAll(dir)
 	obj := filepath.Join(dir, "llvm.obj")
-	level := goa.LLVMOptDefault
+	level := LLVMOptDefault
 	if opt >= 3 {
-		level = goa.LLVMOptAggressive
+		level = LLVMOptAggressive
 	}
 	if err := api.CompileToObject([]byte(ir), obj, level, irPasses(opt)); err != nil {
 		return nil, fmt.Errorf("libLLVM: %w", err)
@@ -93,7 +92,7 @@ func CompileIR(ir string, opt int, linux bool) ([]byte, error) {
 // AsmPrinter's output, not
 // the entry stub that genWith emits once `claimed` covers every function.
 func emitIRAssembly(ir string, outPath string, opt int, linux bool) error {
-	api, err := goa.OpenLLVM()
+	api, err := OpenLLVM()
 	if err != nil {
 		return fmt.Errorf("gocl needs the LLVM shared library: %w", err)
 	}
@@ -102,9 +101,9 @@ func emitIRAssembly(ir string, outPath string, opt int, linux bool) error {
 		// Linux image would need an ELF triple that this build does not set up.
 		return fmt.Errorf("the LLVM back end does not emit ELF objects yet, so -target linux is not available")
 	}
-	level := goa.LLVMOptDefault
+	level := LLVMOptDefault
 	if opt >= 3 {
-		level = goa.LLVMOptAggressive
+		level = LLVMOptAggressive
 	}
 	if err := api.CompileToAssembly([]byte(ir), outPath, level, irPasses(opt)); err != nil {
 		return fmt.Errorf("libLLVM: %w", err)

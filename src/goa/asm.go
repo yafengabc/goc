@@ -2,6 +2,7 @@ package goa
 
 import (
 	"fmt"
+	"gocld"
 	"math"
 	"sort"
 	"strconv"
@@ -509,7 +510,7 @@ func applyFixup(s *Section, f Fixup, target, sym2, base int) error {
 		if f.virtual {
 			// The preferred load address is above 4GB, so a 32-bit field
 			// would truncate it; only the 64-bit form can hold one.
-			addr += uint64(imageBase)
+			addr += uint64(gocld.ImageBase)
 		}
 		for i := 0; i < size; i++ {
 			s.Data[f.off+i] = byte(addr >> (8 * i))

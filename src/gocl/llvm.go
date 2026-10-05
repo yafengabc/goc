@@ -1,6 +1,6 @@
 //go:build windows
 
-package goa
+package gocl
 
 // LLVM binding: IR text -> COFF object, through a libLLVM shared library loaded
 // at run time.

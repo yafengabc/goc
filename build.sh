@@ -52,6 +52,12 @@ echo "== gocl (LLVM back end) =="
 # when a program is compiled, which is where the failure is actually meaningful.
 (cd src/gocl && go build -trimpath -ldflags="-s -w" -o "../../bin/gocl$EXE" ./cmd/gocl)
 
+echo "== gocld (linker) =="
+# A library, so building it is a compile check rather than a product. It is here
+# because goa depends on it, and a goa that fails to build is a goc that fails
+# to build -- the error surfaces one package earlier this way.
+(cd src/gocld && go build ./...)
+
 echo "== goc (self-contained) =="
 # The same compiler with the C library embedded: no goclib/ needed beside the
 # binary. goc itself reads the library from disk, which is what lets a

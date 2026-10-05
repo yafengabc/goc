@@ -1,4 +1,4 @@
-package goa
+package gocld
 
 // COFF object ingestion.
 //

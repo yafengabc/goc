@@ -1,4 +1,4 @@
-package goa
+package gocld
 
 import (
 	"fmt"
@@ -21,7 +21,7 @@ const (
 	// Default base address for a PE32+ executable. The TLS directory fields
 	// (StartAddressOfRawData / EndAddressOfRawData / AddressOfIndex) are
 	// absolute virtual addresses, so they must be emitted as ImageBase + RVA.
-	imageBase = 0x140000000
+	ImageBase = 0x140000000
 )
 
 func align(v, a int) int {
@@ -64,11 +64,11 @@ func imageEndOf(secs []outSec) int {
 // invalidate every entry. goa's own assembler emits neither (it registers a
 // synthetic table at load time), so this yields nothing on the native path and
 // only matters for objects merged in from the LLVM backend.
-func (a *Assembler) planUnwindSections(base int) map[string]int {
+func (img *Image) planUnwindSections(base int) map[string]int {
 	out := map[string]int{}
-	a.pdataRVA, a.pdataSize = 0, 0
-	xdata := a.sectionByName(".xdata")
-	pdata := a.sectionByName(".pdata")
+	img.PdataRVA, img.PdataSize = 0, 0
+	xdata := sectionByName(img, ".xdata")
+	pdata := sectionByName(img, ".pdata")
 	// An Unmapped section still has its bytes and symbols; it just gets no
 	// address in the image, so it contributes neither a section record nor a
 	// slot in the exception directory.
@@ -80,13 +80,13 @@ func (a *Assembler) planUnwindSections(base int) map[string]int {
 	}
 	// .pdata first when both exist: the exception directory is exactly that
 	// array, and putting it at the lowest address keeps the table compact.
-	if pdata != nil && pdata.cur > 0 {
+	if pdata != nil && pdata.VSize > 0 {
 		base = align(base, 4)
 		out[".pdata"] = base
-		a.pdataRVA, a.pdataSize = base, pdata.cur
-		base += align(pdata.cur, sectAlign)
+		img.PdataRVA, img.PdataSize = base, pdata.VSize
+		base += align(pdata.VSize, sectAlign)
 	}
-	if xdata != nil && xdata.cur > 0 {
+	if xdata != nil && xdata.VSize > 0 {
 		base = align(base, 4)
 		out[".xdata"] = base
 	}
@@ -95,16 +95,16 @@ func (a *Assembler) planUnwindSections(base int) map[string]int {
 
 // unwindSectionOut builds the image section records for the unwind sections,
 // using the addresses planUnwindSections assigned.
-func (a *Assembler) unwindSectionOut(layout map[string]int) []outSec {
+func (img *Image) unwindSectionOut(layout map[string]int) []outSec {
 	var out []outSec
 	for _, name := range []string{".pdata", ".xdata"} {
 		va, ok := layout[name]
 		if !ok {
 			continue
 		}
-		s := a.sectionByName(name)
+		s := sectionByName(img, name)
 		// 0x40000040 = IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA.
-		out = append(out, outSec{name, va, s.Data, s.cur, 0x40000040, false})
+		out = append(out, outSec{name, va, s.Data, s.VSize, 0x40000040, false})
 	}
 	return out
 }
@@ -138,10 +138,10 @@ func sortedKeys(m map[string][]string) []string {
 
 // buildIData constructs the .idata section content (import directory, ILT, IAT,
 // hint/name tables, DLL name strings). Returns the raw bytes plus RVA info.
-func (a *Assembler) buildIData(idataBase int) (data []byte, iatSymOff map[string]int, dirRVA, dirSize, iatRVA, iatSize int) {
+func (img *Image) buildIData(idataBase int) (data []byte, iatSymOff map[string]int, dirRVA, dirSize, iatRVA, iatSize int) {
 	iatSymOff = map[string]int{}
 	dlls := map[string][]string{}
-	for name, dll := range a.exts {
+	for name, dll := range img.Exts {
 		dlls[dll] = append(dlls[dll], name)
 	}
 	dllNames := sortedKeys(dlls)
@@ -236,8 +236,8 @@ func (a *Assembler) buildIData(idataBase int) (data []byte, iatSymOff map[string
 // sections is the minimum that keeps code non-writable, it lets the headers fit
 // in one 512-byte file block, and it avoids paying FileAlignment padding three
 // times over.
-func (a *Assembler) BuildPE(outPath string) error {
-	text := a.sectionByName(".text")
+func (img *Image) BuildPE(outPath string) error {
+	text := sectionByName(img, ".text")
 	if text == nil || len(text.Data) == 0 {
 		return fmt.Errorf("no code in .text section")
 	}
@@ -247,8 +247,8 @@ func (a *Assembler) BuildPE(outPath string) error {
 	// own generator inlines the probe per frame (see CG.emitFrameAlloc) and
 	// never emits a call, so an image built without a COFF object has nothing to
 	// probe for.
-	rdata := a.sectionByName(".rdata")
-	data := a.sectionByName(".data")
+	rdata := sectionByName(img, ".rdata")
+	data := sectionByName(img, ".data")
 
 	blob := func(s *Section) []byte {
 		if s == nil {
@@ -274,7 +274,7 @@ func (a *Assembler) BuildPE(outPath string) error {
 	idOff := align(dOff+dataLen, 8)
 	idataBase := dataBase + idOff
 
-	idata, iatSymOff, dirRVA, dirSize, iatRVA, iatSize := a.buildIData(idataBase)
+	idata, iatSymOff, dirRVA, dirSize, iatRVA, iatSize := img.buildIData(idataBase)
 
 	// Provisional virtual bases for the data-derived sections, computed before
 	// the merged .data blob is assembled so that symbol and fixup resolution
@@ -285,8 +285,8 @@ func (a *Assembler) BuildPE(outPath string) error {
 	var tls *Section
 	var bss *Section
 	tlsBase, tlsLen, bssBase := 0, 0, 0
-	tls = a.sectionByName(".tls")
-	bss = a.sectionByName(".bss")
+	tls = sectionByName(img, ".tls")
+	bss = sectionByName(img, ".bss")
 	if tls != nil && len(tls.Data) > 0 {
 		tlsLen = len(tls.Data)
 		tlsBase = dataBase + align(mergedLen, sectAlign)
@@ -302,10 +302,10 @@ func (a *Assembler) BuildPE(outPath string) error {
 	// section's base. The unwind sections go after everything else in the image,
 	// so their base is derived from the end of the data/tls/bss ranges.
 	unwindBase := align(bssBase, sectAlign)
-	if bss != nil && bss.cur > 0 {
-		unwindBase = bssBase + align(bss.cur, sectAlign)
+	if bss != nil && bss.VSize > 0 {
+		unwindBase = bssBase + align(bss.VSize, sectAlign)
 	}
-	uwLayout := a.planUnwindSections(unwindBase)
+	uwLayout := img.planUnwindSections(unwindBase)
 
 	// Base RVA per *source* section, used to resolve symbol references.
 	symBase := map[string]int{
@@ -321,9 +321,9 @@ func (a *Assembler) BuildPE(outPath string) error {
 
 	// Resolve symbol RVAs.
 	symRVA := map[string]int{}
-	for name, loc := range a.syms {
-		s := a.sections[loc.sect]
-		symRVA[name] = symBase[s.Name] + loc.off
+	for name, loc := range img.Syms {
+		s := img.Sections[loc.Sect]
+		symRVA[name] = symBase[s.Name] + loc.Off
 	}
 	for k, v := range iatSymOff {
 		symRVA[k] = idataBase + v
@@ -342,26 +342,26 @@ func (a *Assembler) BuildPE(outPath string) error {
 
 	// Apply fixups: patch each recorded displacement (rel32 normally, rel8 for
 	// short jumps) at the site the instruction left for it.
-	for _, f := range a.fixups {
-		t, ok := symRVA[f.sym]
+	for _, f := range img.Fixups {
+		t, ok := symRVA[f.Sym]
 		if !ok {
-			return fmt.Errorf("undefined symbol referenced: %s", f.sym)
+			return fmt.Errorf("undefined symbol referenced: %s", f.Sym)
 		}
 		var t2 int
-		if f.sym2 != "" {
-			if t2, ok = symRVA[f.sym2]; !ok {
-				return fmt.Errorf("undefined symbol referenced: %s", f.sym2)
+		if f.Sym2 != "" {
+			if t2, ok = symRVA[f.Sym2]; !ok {
+				return fmt.Errorf("undefined symbol referenced: %s", f.Sym2)
 			}
 		}
-		s := a.sections[f.sect]
+		s := img.Sections[f.Sect]
 		if err := applyFixup(s, f, t, t2, symBase[s.Name]); err != nil {
 			return err
 		}
 	}
 
-	entryRVA, ok := symRVA[a.entry]
+	entryRVA, ok := symRVA[img.Entry]
 	if !ok {
-		return fmt.Errorf("entry symbol %q not defined", a.entry)
+		return fmt.Errorf("entry symbol %q not defined", img.Entry)
 	}
 
 	// Concatenate the data blobs into one section payload.
@@ -383,17 +383,17 @@ func (a *Assembler) BuildPE(outPath string) error {
 	// .data by the code generator) with the real module index.
 	var tlsDirRVA, tlsDirSize, tlsIdxRVA int
 	if tls != nil && len(tls.Data) > 0 {
-		if loc, ok := a.syms["G_goc_tls_index"]; ok {
-			tlsIdxRVA = dataBase + dOff + loc.off // filled by the OS loader
+		if loc, ok := img.Syms["G_goc_tls_index"]; ok {
+			tlsIdxRVA = dataBase + dOff + loc.Off // filled by the OS loader
 		}
 		dirOff := len(merged)
 		merged = append(merged, make([]byte, 40)...) // IMAGE_TLS_DIRECTORY64
 		// These fields are ABSOLUTE virtual addresses (ImageBase + RVA), not
 		// RVAs. The Windows loader uses them as-is, so omitting ImageBase makes
 		// it write the TLS index to a near-zero address and AV (fault == Idx).
-		putU64at(merged, dirOff+0, uint64(imageBase+tlsBase))        // StartAddressOfRawData
-		putU64at(merged, dirOff+8, uint64(imageBase+tlsBase+tlsLen)) // EndAddressOfRawData
-		putU64at(merged, dirOff+16, uint64(imageBase+tlsIdxRVA))     // AddressOfIndex
+		putU64at(merged, dirOff+0, uint64(ImageBase+tlsBase))        // StartAddressOfRawData
+		putU64at(merged, dirOff+8, uint64(ImageBase+tlsBase+tlsLen)) // EndAddressOfRawData
+		putU64at(merged, dirOff+16, uint64(ImageBase+tlsIdxRVA))     // AddressOfIndex
 		putU64at(merged, dirOff+24, 0)                               // AddressOfCallBacks (none)
 		putU32at(merged, dirOff+32, 0)                               // SizeOfZeroFill
 		putU32at(merged, dirOff+36, 0)                               // Characteristics
@@ -409,10 +409,10 @@ func (a *Assembler) BuildPE(outPath string) error {
 		// IMAGE_SCN_MEM_TLS_SET (0x04000000) marks the thread-local template.
 		sections = append(sections, outSec{".tls", tlsBase, tls.Data, len(tls.Data), 0xC4000040, false})
 	}
-	if bss != nil && bss.cur > 0 {
+	if bss != nil && bss.VSize > 0 {
 		// IMAGE_SCN_CNT_UNINITIALIZED_DATA (0x80) + read/write. No file bytes;
-		// the loader zero-fills the virtual range at bssBase..bssBase+bss.cur.
-		sections = append(sections, outSec{".bss", bssBase, nil, bss.cur, 0xC0000080, true})
+		// the loader zero-fills the virtual range at bssBase..bssBase+bss.VSize.
+		sections = append(sections, outSec{".bss", bssBase, nil, bss.VSize, 0xC0000080, true})
 	}
 	// Win64 unwind data, last so the addresses already computed above stay
 	// valid. goa's own assembler never emits any, but a COFF object from the
@@ -421,7 +421,7 @@ func (a *Assembler) BuildPE(outPath string) error {
 	// rather than part of the merged .data blob: every entry stores the RVA of
 	// its own section, so relocating the bytes into a shared blob would
 	// invalidate all of them.
-	sections = append(sections, a.unwindSectionOut(uwLayout)...)
+	sections = append(sections, img.unwindSectionOut(uwLayout)...)
 
 	// SizeOfImage must cover the end of the last section's virtual range
 	// (each section's virtual address plus its virtual size, rounded up to the
@@ -461,19 +461,19 @@ func (a *Assembler) BuildPE(outPath string) error {
 	putU32at(hdr, oh+8, uint32(len(merged)))
 	putU32at(hdr, oh+16, uint32(entryRVA))
 	putU32at(hdr, oh+20, uint32(textBase))
-	putU64at(hdr, oh+24, imageBase) // ImageBase
+	putU64at(hdr, oh+24, ImageBase) // ImageBase
 	putU32at(hdr, oh+32, sectAlign) // SectionAlignment
 	putU32at(hdr, oh+36, fileAlign) // FileAlignment
 	putU16at(hdr, oh+40, 6)         // OS major version
 	putU16at(hdr, oh+48, 6)         // Subsystem major version
 	putU32at(hdr, oh+56, uint32(imageSize))
 	putU32at(hdr, oh+60, uint32(headerSize))
-	putU16at(hdr, oh+68, a.subsystem) // Subsystem (2 = GUI, 3 = console)
-	putU64at(hdr, oh+72, 0x4000000)   // SizeOfStackReserve: 64 MiB (wide _BitInt values live on the stack)
-	putU64at(hdr, oh+80, 0x1000)      // SizeOfStackCommit
-	putU64at(hdr, oh+88, 0x100000)    // SizeOfHeapReserve
-	putU64at(hdr, oh+96, 0x1000)      // SizeOfHeapCommit
-	putU32at(hdr, oh+108, 16)         // NumberOfRvaAndSizes
+	putU16at(hdr, oh+68, img.Subsystem) // Subsystem (2 = GUI, 3 = console)
+	putU64at(hdr, oh+72, 0x4000000)     // SizeOfStackReserve: 64 MiB (wide _BitInt values live on the stack)
+	putU64at(hdr, oh+80, 0x1000)        // SizeOfStackCommit
+	putU64at(hdr, oh+88, 0x100000)      // SizeOfHeapReserve
+	putU64at(hdr, oh+96, 0x1000)        // SizeOfHeapCommit
+	putU32at(hdr, oh+108, 16)           // NumberOfRvaAndSizes
 	// Data directories at oh+112
 	dd := oh + 112
 	if dirSize > 0 {
@@ -488,12 +488,12 @@ func (a *Assembler) BuildPE(outPath string) error {
 		putU32at(hdr, dd+9*8, uint32(tlsDirRVA)) // TLS (index 9)
 		putU32at(hdr, dd+9*8+4, uint32(tlsDirSize))
 	}
-	if a.pdataSize > 0 {
+	if img.PdataSize > 0 {
 		// Exception (index 3): the RUNTIME_FUNCTION array. Without it the
 		// loader cannot walk frames, so an exception passing through code
 		// compiled by the LLVM backend would fail to unwind.
-		putU32at(hdr, dd+3*8, uint32(a.pdataRVA))
-		putU32at(hdr, dd+3*8+4, uint32(a.pdataSize))
+		putU32at(hdr, dd+3*8, uint32(img.PdataRVA))
+		putU32at(hdr, dd+3*8+4, uint32(img.PdataSize))
 	}
 	// Section table at oh+240; raw pointers advance by file-aligned sizes.
 	// BSS sections contribute no file bytes (rawSize 0, PointerToRawData 0).

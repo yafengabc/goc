@@ -16,6 +16,7 @@ require (
 	goa v0.0.0 // indirect
 	goc/common v0.0.0 // indirect
 	goc/frontend v0.0.0 // indirect
+	gocld v0.0.0 // indirect: goa reaches the linker
 )
 
 // The three replaces below all point inside the repository. Each name is
@@ -29,3 +30,5 @@ replace goc/common => ./common
 replace goc/frontend => ./frontend
 
 replace goa => ./goa
+
+replace gocld => ./gocld
