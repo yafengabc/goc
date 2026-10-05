@@ -86,6 +86,19 @@ func (e *irEmitter) indexValue(x Expr) string {
 // callExpr lowers a direct call. Arguments are converted to the parameter types
 // the front end resolved, because IR will not convert them.
 func (e *irEmitter) callExpr(n *Call) val {
+	// The same constant-format specialisation the native generator applies in
+	// genCallExpr, from the one shared decision (see printfspec.go). Without
+	// it a hello-world drags in the whole float exponent machine: printf
+	// resolves to vfmt, vfmt's switch mentions every conversion the C library
+	// defines, and the call-graph prune pulls vfmt's callees in with it.
+	//
+	// LLVM cannot do this for us. SimplifyLibCalls recognises calls to *known
+	// libc symbols*, and this module has none: goclib's printf is emitted here
+	// as a plain `define i32 @printf(ptr, ...)`, so from LLVM's point of view
+	// it is a local function that happens to have a standard prototype.
+	if repl := specializePrintfCall(n, e.printfQueries()); repl != nil {
+		return e.callExpr(repl)
+	}
 	// va_start and va_end are compiler built-ins in goc, recognised by name.
 	// Both take the cursor's address: the intrinsics write through it.
 	switch n.Name {
@@ -156,6 +169,22 @@ func (e *irEmitter) callExpr(n *Call) val {
 	}
 	e.line("%s = call %s @%s(%s)", call, rs, n.Name, argText)
 	return val{op: call, ty: rty}
+}
+
+// printfQueries adapts the IR path's resolver to the questions
+// specializePrintfCall asks.
+//
+// userDefs, not funcDefs: the latter also holds the C runtime's own fwrite and
+// printf_lite, so testing against it would report every library function as
+// shadowed and the rewrite would never fire.
+func (e *irEmitter) printfQueries() printfQueries {
+	return printfQueries{
+		userDefines: func(name string) bool { return e.tr.userDefs[name] },
+		shadowedByVar: func(name string) bool {
+			_, _, ok := e.tr.fnPtrVar(name)
+			return ok
+		},
+	}
 }
 
 // calleeSig finds a callee's declared signature.

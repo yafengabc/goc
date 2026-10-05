@@ -20,6 +20,14 @@ type typeResolver struct {
 	staticVars map[string]string
 	lib        *clibCProgram
 
+	// userDefs holds only the functions the *program* defines, keeping them
+	// apart from funcDefs, which also holds the C runtime's. The two have to be
+	// distinguishable: a rewrite that assumes the library symbol is there --
+	// "call fwrite directly, it is certainly ours" -- must first be sure the
+	// program has not defined its own fwrite, and funcDefs cannot answer that
+	// because it contains the runtime's copy too.
+	userDefs map[string]bool
+
 	// Per-function emission scope state, used only when cg == nil.
 	scopes  []map[string]int
 	varEnts map[int]varInfo
@@ -47,6 +55,30 @@ func (tr *typeResolver) globalType(name string) (*Type, bool) {
 	}
 	t, ok := tr.globalTyp[name]
 	return t, ok
+}
+
+// isFuncName reports whether name designates a function -- the user's own or the
+// C runtime's, which funcDef covers for both paths.
+//
+// It exists for the function-designator conversion: a bare function name in a
+// value context (assigned to a pointer, passed as an argument) *is* the
+// function's address. It cannot be inferred from exprType, which reports a
+// call's result type for a name that is also callable -- asking whether the name
+// has a type answers "int" for `twice` and misses the conversion entirely.
+func (tr *typeResolver) isFuncName(name string) bool {
+	f, ok := tr.funcDef(name)
+	return ok && f != nil && f.Body != nil
+}
+
+// fnPtrTy is the type a function designator decays to: a pointer to the
+// function's own type. The parameter list is carried over so the pointer type
+// matches the declaration, which is what lets the indirect call type-check.
+func (e *irEmitter) fnPtrTy(name string) *Type {
+	f, ok := e.tr.funcDef(name)
+	if !ok || f == nil {
+		return PtrType(IntType())
+	}
+	return PtrType(FuncType(f.Ret, f.ParamTypes))
 }
 
 func (tr *typeResolver) staticLabel(name string) (string, bool) {

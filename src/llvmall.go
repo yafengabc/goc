@@ -71,8 +71,10 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 
 	// The function table has to hold both halves before anything is generated, so
 	// a call can be resolved whether its target is the user's or the runtime's.
+	tr.userDefs = map[string]bool{}
 	for _, f := range prog.Funcs {
 		tr.funcDefs[f.Name] = f
+		tr.userDefs[f.Name] = true
 		defined[f.Name] = true
 	}
 	// The runtime's globals, when the program's own do not shadow them, are part
@@ -107,8 +109,8 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 		}
 	}
 
-// --- globals ---
-// A definition needs its initialiser lowered to an LLVM constant, which this
+	// --- globals ---
+	// A definition needs its initialiser lowered to an LLVM constant, which this
 	// front end does for the forms C programs actually use: a scalar constant, a
 	// string, and a brace-initialised array or struct of them. A global whose
 	// initialiser is not one of those keeps the native generator's definition
@@ -172,7 +174,7 @@ func translateProgram(prog *Program, lib *clibCProgram, linux bool) (string, map
 	// llvmRoots returns that reachable set, seeded from the program's own calls
 	// and the few helpers the entry stub names directly.
 	if lib != nil {
-		need := llvmRoots(prog, lib, linux)
+		need := llvmRoots(prog, lib, linux, tr)
 		// lib.order can name a function more than once -- the runtime's
 		// sources are concatenated, so a name that two of them define reaches
 		// the order list twice. Emitting it twice gave LLVM "invalid
@@ -254,19 +256,61 @@ func irNameTaken(prog *Program, lib *clibCProgram, name string) bool {
 // Emitting the whole runtime (every one of its ~380 functions) is what made
 // the -fllvm binary 100k+ next to the native build's ~13; pruning to what the
 // program reaches brings it back in line.
-func llvmRoots(prog *Program, lib *clibCProgram, linux bool) map[string]bool {
+func llvmRoots(prog *Program, lib *clibCProgram, linux bool, tr *typeResolver) map[string]bool {
 	need := map[string]bool{}
 	isLib := func(name string) bool {
 		f, ok := lib.funcs[name]
 		return ok && f.Body != nil
 	}
+	// The questions specializePrintfCall needs. A nil tr means there was no
+	// emitter context; the specialisation is skipped then, which costs size but
+	// never correctness.
+	var q printfQueries
+	if tr != nil {
+		q = printfQueries{
+			userDefines:   func(name string) bool { return tr.userDefs[name] },
+			shadowedByVar: func(name string) bool { _, _, ok := tr.fnPtrVar(name); return ok },
+		}
+	}
+	markReachable := func(name string) {
+		if isLib(name) {
+			need[name] = true
+		}
+	}
 	// 1. References in the user's own code: a direct call, or an identifier
 	//    used as a value (taking a runtime function's address, e.g.
 	//    "fp = memcpy;"). In both the definition has to be in this object.
+	//
+	// A printf call is counted as whatever it will *become*. The emitter
+	// rewrites printf("lit") to fwrite, so counting the name as written would
+	// keep printf -- and through it vfmt and the float exponent machine --
+	// reachable, and the prune would undo the rewrite, making the emitter's work
+	// invisible. Both kinds of reference therefore go through one walk: a
+	// second, plain walk over the same tree would reinstate the name the
+	// rewrite just removed.
 	for _, f := range prog.Funcs {
-		collectLibRefs(f.Body, func(name string) {
-			if isLib(name) {
-				need[name] = true
+		walkStmts(f.Body, func(s Stmt) {
+			for _, e := range stmtExprs(s) {
+				walkExpr(e, func(n Expr) {
+					switch x := n.(type) {
+					case *Call:
+						if repl := specializePrintfCall(x, q); repl != nil {
+							markReachable(repl.Name)
+							// The rewrite introduces references of its own.
+							// fwrite is a library function, and the stdout
+							// accessor it is handed is a *call* the original
+							// printf never contained -- nothing else pulls it
+							// in, so the specialisation has to add both or the
+							// link fails on a missing symbol.
+							markReachable("fwrite")
+							markReachable("__goclib_stdout")
+							return
+						}
+						markReachable(x.Name)
+					case *Ident:
+						markReachable(x.Name)
+					}
+				})
 			}
 		})
 	}

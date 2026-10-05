@@ -306,6 +306,19 @@ func (e *irEmitter) ident(n *Ident) val {
 	if v, ok := e.tr.constValue(n.Name); ok {
 		return val{op: itoa64(v), ty: ty}
 	}
+	// A function used as a value decays to its own address. C spells this
+	// "function designator conversion"; in LLVM a function *is* its address, so
+	// the symbol reference is already the pointer and no load is involved --
+	// loading would read the instruction bytes at the entry point instead.
+	//
+	// This is what makes `int (*fp)(int) = twice;` and `apply(twice, 21)` work.
+	// Without it they silently produced a null pointer, and the program crashed
+	// at the first indirect call -- which is how goclib's own
+	// `printf_lite_with(vfmt_i, ...)` took the program down: the formatter was
+	// handed a null function pointer and called through it.
+	if e.tr.isFuncName(n.Name) {
+		return val{op: "@" + n.Name, ty: PtrType(e.fnPtrTy(n.Name))}
+	}
 	// A name with no storage at all. The checker's own view is that this can
 	// only be reached when the operand is an integer (an enum member whose
 	// value the front end did not fold) or a pointer to nothing, so the zero

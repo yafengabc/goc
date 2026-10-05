@@ -232,12 +232,12 @@ func (a *Assembler) BuildPE(outPath string) error {
 	if text == nil || len(text.Data) == 0 {
 		return fmt.Errorf("no code in .text section")
 	}
-	// LLVM calls the CRT's stack probe for any frame over one page, so the
-	// image has to carry one. Emitted before the fixups run because its own
-	// backward jump is a fixup like any other.
-	if err := a.emitChkstk(); err != nil {
-		return err
-	}
+	// The stack probe LLVM calls for frames over one page is supplied by the
+	// COFF ingest path (coffmerge.go), which is where a translation unit that
+	// actually contains such a frame arrives from. Nothing to add here: goa's
+	// own generator inlines the probe per frame (see CG.emitFrameAlloc) and
+	// never emits a call, so an image built without a COFF object has nothing to
+	// probe for.
 	rdata := a.sectionByName(".rdata")
 	data := a.sectionByName(".data")
 

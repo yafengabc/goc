@@ -80,6 +80,28 @@ func TestIRGeneration(t *testing.T) {
 			not:  []string{"+ i32", "- i32", "* i32"},
 		},
 		{
+			// A bare function name in a value context *is* the function's
+			// address. LLVM agrees -- a function symbol is its own pointer --
+			// so the conversion is the bare symbol and no load. Rendering the
+			// zero value instead (the "a name with no storage" fallback) put a
+			// null where a function pointer belonged, and the program faulted
+			// at the first indirect call.
+			name: "function designator decays to its address",
+			src:  "static int f(int x) { return x; }\nint main(void) { int (*p)(int) = f; return p(1); }",
+			want: []string{"ptr @f", "store ptr @f"},
+			not:  []string{"store ptr null"},
+		},
+		{
+			// The same conversion on an argument, which is how goclib's
+			// printf_lite_with(vfmt_i, ...) passes its formatter.
+			name: "function designator as an argument",
+			src: "static int g(int (*q)(int), int v) { return q(v); }\n" +
+				"static int f(int x) { return x; }\n" +
+				"int main(void) { return g(f, 1); }",
+			want: []string{"call i32 @g(ptr @f, i32 1)"},
+			not:  []string{"call i32 @g(ptr null"},
+		},
+		{
 			name: "local variable gets a slot",
 			src:  "int f(void) { int x = 5; x = x + 1; return x; }",
 			want: []string{"alloca i32", "store i32 5", "load i32"},

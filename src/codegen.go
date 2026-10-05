@@ -10241,15 +10241,8 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	// richer (width, precision, %e/%g/%a, %p) keeps the real printf; the
 	// decision is compile-time, so a run-time probe is never needed. See
 	// constantFormatLite and the vfmt_lite comment in stdio.c.
-	if n.Name == "printf" || n.Name == "fprintf" {
-		if repl := c.constantFormatFwrite(n); repl != nil {
-			return c.genCallExpr(repl)
-		}
-	}
-	if n.Name == "printf" {
-		if repl := c.constantFormatLite(n); repl != nil {
-			return c.genCallExpr(repl)
-		}
+	if repl := specializePrintfCall(n, c.printfQueries()); repl != nil {
+		return c.genCallExpr(repl)
 	}
 	// A call whose name designates a VARIABLE holding a function pointer is an
 	// indirect call: C spells it exactly like a direct call ("fp(x)"), but the
@@ -10262,80 +10255,15 @@ func (c *CG) genCallExpr(n *Call) (CType, error) {
 	return c.genCall(n.Name, nil, nil, n.Args)
 }
 
-// constantFormatFwrite rewrites printf("lit") / fprintf(stream, "lit") with a
-// '%'-free literal format and no further arguments into an fwrite call.
-// It returns nil when the rewrite does not apply: extra arguments (whose
-// evaluation would be lost), a format that contains conversions, or a
-// user-defined fwrite / function-pointer variable of that name in the way.
-func (c *CG) constantFormatFwrite(n *Call) *Call {
-	fmtIdx := 1 // fprintf: the stream comes first, the format second
-	if n.Name == "printf" {
-		fmtIdx = 0
+// printfQueries adapts the assembly generator's symbol tables to the questions
+// specializePrintfCall asks. Only the program's own declarations count: the C
+// runtime shares these tables but must not make every library function look
+// user-shadowed.
+func (c *CG) printfQueries() printfQueries {
+	return printfQueries{
+		userDefines:   func(name string) bool { return c.funcs[name] },
+		shadowedByVar: func(name string) bool { _, _, ok := c.fnPtrVar(name); return ok },
 	}
-	if len(n.Args) != fmtIdx+1 {
-		return nil
-	}
-	lit, ok := n.Args[fmtIdx].(*StrLit)
-	if !ok || strings.Contains(string(lit.Bytes), "%") {
-		return nil
-	}
-	if c.funcs["fwrite"] {
-		return nil // the program defines its own fwrite
-	}
-	if _, _, shadowed := c.fnPtrVar("fwrite"); shadowed {
-		return nil
-	}
-	stream := Expr(&Call{Name: "__goclib_stdout"})
-	if fmtIdx == 1 {
-		stream = n.Args[0]
-	}
-	return &Call{Name: "fwrite", Args: []Expr{
-		lit,
-		&NumLit{Val: 1, Kind: TInt},
-		&NumLit{Val: int64(len(lit.Bytes)), Kind: TInt},
-		stream,
-	}}
-}
-
-// constantFormatLite rewrites printf(fmt, ...) into __goclib_printf_lite when
-// fmt is a literal that the lite formatter can handle exactly: %s, %c, %d %i
-// %u %o %x %X, %f, and %%. goc prunes the embedded C library by call graph at
-// function granularity, so the full vfmt would drag the float exponent
-// machine (log/log10/frexp/fmod) into any binary that prints one %f, and the
-// FILE layer into any binary that prints anything at all. vfmt_lite has
-// neither.
-//
-// The decision is made here, at compile time, from the literal. A run-time
-// "try lite, fall back to vfmt" probe would not help: the fallback keeps vfmt
-// reachable, so nothing would be pruned. Rejecting the call outright leaves
-// the program correct via the ordinary printf, just larger.
-//
-// Returns nil -- the real printf handles it -- when the format is not a
-// literal, carries a field width, precision or any flag character ('-', '0',
-// '+', ' ', '#'), uses a length modifier, or names a specifier outside the
-// lite set (notably %e/%g/%a, which need the exponent estimator, and %p, whose
-// printf lowering ufcs_print_test.go asserts on).
-func (c *CG) constantFormatLite(n *Call) *Call {
-	if len(n.Args) < 1 {
-		return nil
-	}
-	lit, ok := n.Args[0].(*StrLit)
-	if !ok {
-		return nil // run-time format string: nothing to prove
-	}
-	target, ok := liteTargetFor(string(lit.Bytes))
-	if !ok {
-		return nil
-	}
-	if c.funcs[target] {
-		return nil // the program defines its own lite entry
-	}
-	if _, _, shadowed := c.fnPtrVar(target); shadowed {
-		return nil
-	}
-	args := make([]Expr, 0, len(n.Args))
-	args = append(args, n.Args...)
-	return &Call{Name: target, Args: args}
 }
 
 // liteTargetFor picks the cheapest lite formatter that covers a format

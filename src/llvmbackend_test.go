@@ -131,6 +131,34 @@ func TestLLVMBackendEndToEnd(t *testing.T) {
 			wantCode: 21,
 		},
 		{
+			// A bare function name in a value context is the function's
+			// address. The IR front end has to recognise that rather than
+			// falling through to "a name with no storage", which renders a
+			// null -- and a null function pointer faults at the first
+			// indirect call. goclib's own printf_lite_with(vfmt_i, ...) is
+			// this same shape, which is how the gap reached a hello-world.
+			name: "function pointer assigned and called",
+			src: "static int twice(int x){return x*2;}\n" +
+				"int main(void){int (*fp)(int) = twice; return fp(21) == 42 ? 0 : 1;}",
+			wantCode: 0,
+		},
+		{
+			name: "function pointer passed as an argument",
+			src: "static int twice(int x){return x*2;}\n" +
+				"static int apply(int (*fn)(int), int v){return fn(v);}\n" +
+				"int main(void){return apply(twice, 21) == 42 ? 0 : 1;}",
+			wantCode: 0,
+		},
+		{
+			// The C library's own path: printf_lite_with takes the formatter
+			// as a function pointer, so a printf that specialises to the lite
+			// formatter goes through this too.
+			name:     "printf reaching a function-pointer parameter",
+			src:      "#include <stdio.h>\nint main(void){printf(\"n=%d\\n\", 42);return 0;}",
+			wantCode: 0,
+			wantOut:  "n=42",
+		},
+		{
 			name:     "struct by pointer",
 			src:      "struct P{int x;int y;};\nint sum(struct P *p){return p->x+p->y;}\nint main(void){struct P p; p.x=3; p.y=4; return sum(&p);}",
 			wantCode: 7,
