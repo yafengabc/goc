@@ -30,8 +30,18 @@ func (c *checker) pop()  { c.scopes = c.scopes[:len(c.scopes)-1] }
 
 func (c *checker) put(name string, t *Type, line int) {
 	top := c.scopes[len(c.scopes)-1]
-	if _, dup := top.vars[name]; dup {
-		c.errf(line, "redefinition of %q in the same scope", name)
+	prev, dup := top.vars[name]
+	if dup {
+		// At file (global) scope a declaration may legitimately be followed
+		// by a definition or another compatible declaration of the same
+		// object: C 6.9.2 tentative-definition rules allow an
+		//   extern T x;            // declaration in a header
+		//   T x = ...;             // definition in the .c file
+		// pairing, which refers to one object. Inside a function such a
+		// duplicate is always a genuine redefinition.
+		if len(c.scopes) > 1 || !typesEqual(prev, t) {
+			c.errf(line, "redefinition of %q in the same scope", name)
+		}
 		return
 	}
 	top.vars[name] = t

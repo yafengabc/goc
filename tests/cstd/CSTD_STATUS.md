@@ -5,7 +5,7 @@
 - 被测对象：`D:\projects\goc\bin\goc.exe`（单模式：接受但忽略 `-std`，所有用例同一语义）
 - 验证日期：2026-10-02；重跑：`powershell -ExecutionPolicy Bypass -File tests\cstd\run_cstd_tests.ps1`（当前结果 0 MISMATCH，退出码 0）
 - 判定四类：**PASS** = goc 与 gcc 输出+退出码一致；**FAIL** = gcc 过而 goc 编译/运行错误（真实缺口，报错原文照录）；**UNSUPPORTED** = goc 明确设计取舍/后置；**PARTIAL** = 部分子用例通过
-- 汇总：**PASS=60 PARTIAL=2 FAIL=0 UNSUPPORTED=7 MISMATCH=0**（2026-10-02：批次E c89_pp_elif/c89_pp_obj 转 PASS；批次D c99_compound 转 PASS；批次F c99_stdint/c99_funcname/c99_vacopy 转 PASS；批次H c89_lib_stdlib 转 PASS（RAND_MAX 落地），stdbool/threads/uchar 等头补全后维持 PASS）
+- 汇总：**PASS=67 PARTIAL=2 FAIL=0 UNSUPPORTED=7 MISMATCH=0**（2026-10-06：原 60 PASS（c89/c99/c11/c17 共 69 用例）不变；新增 `cstd_lib_*` 详尽用例 7 个全部 PASS 并接入独立 `cstd` 组——此前这些文件因不匹配版本前缀被 harness 漏跑，现已注册 per-file std 覆盖）
 
 ---
 
@@ -110,6 +110,23 @@
 |---|---|---|---|---|---|
 | c17_stdver.c | 版本宏记录 | PARTIAL（设计性 OUTPUT_DIFF） | 5 | goc：`STDC_VERSION=202311 / STDC=1 / HOSTED=1 / NO_ATOMICS=not-defined / NO_THREADS=not-defined`；gcc `-std=c17`：`201710 / 1 / 1 / not-defined / not-defined`（P1.7 后 STDC 宏已定义；版本值差异为设计性记录，goc 单模式报 C23） | 条件编译依赖 `__STDC_VERSION__` 的代码现可工作（goc 报 202311） |
 | c17_smoke.c | C17 冒烟回归（_Generic/_Static_assert/_Alignas/匿名成员/thread_local 抽查） | PASS | 5 | 与 gcc 一致（C11 特性集在 goc 行为稳定） | 放心用 |
+
+---
+
+## C-stdlib 详尽用例（cstd_lib_*，7 文件全 PASS）
+
+> 这些文件不走版本前缀，由 harness 的 `cstd` 组（默认 `-std=c2x`，per-file `std` 覆盖）单独跑。
+> 目的是对 goclib 的「高阶/跨版本」函数做逐字节对拍，覆盖标准版本用例未触及的导出面。
+
+| 文件 | 特性 | 状态 | 子用例 | gcc 对拍 / 备注 |
+|---|---|---|---|---|
+| cstd_lib_stdio2.c | printf 标志 `+/-/#/.*s/%ls`、sscanf 返回值语义、tmpfile 自删 | PASS | 多 | gcc `-std=c99` 逐字节一致 |
+| cstd_lib_wchar.c | wcsspn/wcstok/wcscmp/wmem*、<wchar.h> wint_t/WEOF | PASS | 多 | gcc `-std=c99` 一致 |
+| cstd_lib_stdlib2.c | strtod 十六进制浮点、strtol/strtoul ERANGE、qsort/bsearch | PASS | 多 | gcc `-std=c99` 一致 |
+| cstd_lib_string2.c | strnlen（C23 上限 n）、stpcpy（POSIX 返回 NUL 指针） | PASS | 3 | gcc `-std=c2x -DSTUB_STPCPY`：mingw 不导 stpcpy 符号，gcc 侧用测试内参考实现对拍 goc 真 stpcpy |
+| cstd_lib_math2.c | scalbn(x,int)/scalbln(x,long)（C99 7.12.6.13/14） | PASS | 3 | gcc `-std=c2x` 一致（避开大指数浮点打印精度差） |
+| cstd_lib_stdbit.c | stdc_bit_floor_*/stdc_has_single_bit_* 各 5 宽度（C23 <stdbit.h>） | PASS | 多 | gcc 无 <stdbit.h>，用测试内参考实现 cross-check；goclib 的 bit_floor 本就正确 |
+| cstd_lib_time2.c | timespec_get（返回 TIME_UTC）、tzset（不崩、tzname[] 非空） | PASS | 3 | gcc `-std=c2x` 一致；tzname[0] 拼写 OS 相关、timespec_get 返墙钟，仅断言确定性不变量 |
 
 ---
 

@@ -70,6 +70,16 @@ $expected = @{
     'c89_lib_ctype.c'   = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_lib_limits.c'  = @{ status = 'PARTIAL';     gocFails = $false; extra = '' }
     'c89_lib_varargs.c' = @{ status = 'PASS';        gocFails = $false; extra = '' }
+    # ---------- C-stdlib detailed coverage (not version-prefixed; cross-checked) ----------
+    # These go through a dedicated 'cstd' group below. std pins the gcc -std
+    # (goc ignores it); extra carries any gcc-only defines.
+    'cstd_lib_stdio2.c'  = @{ status = 'PASS'; gocFails = $false; extra = '';                std = 'c99' }
+    'cstd_lib_wchar.c'   = @{ status = 'PASS'; gocFails = $false; extra = '';                std = 'c99' }
+    'cstd_lib_stdlib2.c' = @{ status = 'PASS'; gocFails = $false; extra = '';                std = 'c99' }
+    'cstd_lib_string2.c' = @{ status = 'PASS'; gocFails = $false; extra = '-DSTUB_STPCPY';   std = 'c2x' }
+    'cstd_lib_math2.c'   = @{ status = 'PASS'; gocFails = $false; extra = '';                std = 'c2x' }
+    'cstd_lib_stdbit.c'  = @{ status = 'PASS'; gocFails = $false; extra = '';                std = 'c2x' }
+    'cstd_lib_time2.c'   = @{ status = 'PASS'; gocFails = $false; extra = '';                std = 'c2x' }
     'c89_trigraph.c'    = @{ status = 'UNSUPPORTED'; gocFails = $true;  extra = '-trigraphs' }
     'c89_lit_octal.c'   = @{ status = 'PASS';        gocFails = $false; extra = '' }
     'c89_pp_elif.c'     = @{ status = 'PASS';        gocFails = $false; extra = '' }
@@ -173,7 +183,8 @@ $groups = @(
     @{ prefix = 'c89'; std = 'c89'; label = 'C89' },
     @{ prefix = 'c99'; std = 'c99'; label = 'C99' },
     @{ prefix = 'c11'; std = 'c11'; label = 'C11' },
-    @{ prefix = 'c17'; std = 'c17'; label = 'C17' }
+    @{ prefix = 'c17'; std = 'c17'; label = 'C17' },
+    @{ prefix = 'cstd_lib'; std = 'c2x'; label = 'C-stdlib' }
 )
 
 $overallOk = $true
@@ -212,7 +223,8 @@ foreach ($g in $groups) {
             }
             continue
         }
-        $gr = Run-Gcc $gocSrc $g.std $exp.extra ("gcc_" + [IO.Path]::GetFileNameWithoutExtension($name) + '.exe') $gdir
+        $std = if ($exp.std) { $exp.std } else { $g.std }
+        $gr = Run-Gcc $gocSrc $std $exp.extra ("gcc_" + [IO.Path]::GetFileNameWithoutExtension($name) + '.exe') $gdir
         if (-not $gr.ok) {
             $cnt.MISMATCH++; $overallOk = $false
             Write-Output ("{0} : MISMATCH (gcc failed to compile, expected {1})" -f $name, $exp.status)

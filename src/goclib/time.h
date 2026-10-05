@@ -108,7 +108,12 @@ int timespec_get(struct timespec *ts, int base);
 int clock_gettime(long clk, struct timespec *ts);
 /* Populate tzname[] and timezone from the TZ environment variable (or UTC).
  * Called automatically before the first local-time lookup, so it is safe to
- * ignore; provided for source compatibility. */
+ * ignore; provided for source compatibility. The three globals below are
+ * part of <time.h> (C/POSIX) and must be declared here so callers can read
+ * them after tzset(). */
+extern char *tzname[2];
+extern long timezone;
+extern int daylight;
 void tzset(void);
 
 #endif /* GOC_TIME_H */
