@@ -32,7 +32,11 @@ export GOTMPDIR="$TMP"
 [ -n "${GOCACHE:-}" ] || export GOCACHE="$HOME/.cache/go-build"
 
 echo "== building goc =="
-(cd src/goc && go build -trimpath -ldflags="-s -w" -o ../../bin/goc.exe .) || { echo "BUILD FAILED"; exit 1; }
+# ./cmd/goc, not "." -- src/goc is a library package (package compiler) since the
+# split, and `go build -o bin/goc.exe .` would leave a Go archive there. The
+# failure looks nothing like the cause: every example then fails as if the
+# compiler itself were broken.
+(cd src/goc && go build -trimpath -ldflags="-s -w" -o ../../bin/goc.exe ./cmd/goc) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
 (cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa.exe ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }

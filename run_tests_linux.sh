@@ -24,7 +24,11 @@ export GOTMPDIR="$TMP"
 
 echo "== building goc =="
 mkdir -p bin
-(cd src/goc && go build -trimpath -ldflags="-s -w" -o ../../bin/goc .) || { echo "BUILD FAILED"; exit 1; }
+# ./cmd/goc, not "." -- src/goc is a library package (package compiler) since the
+# split, and `go build -o bin/goc .` would leave a Go archive there. The failure
+# looks nothing like the cause: every example then reports
+# "(compile): ./bin/goc: Permission denied", which reads as a broken compiler.
+(cd src/goc && go build -trimpath -ldflags="-s -w" -o ../../bin/goc ./cmd/goc) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
 (cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }
