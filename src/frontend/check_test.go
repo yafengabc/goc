@@ -88,6 +88,47 @@ func TestIntegerResultTypes(t *testing.T) {
 	}
 }
 
+// A C23 "enum Tag : T" fixes the enumeration's own width and signedness, and
+// the width has to survive to later references to the tag ("enum Tag x;"),
+// otherwise sizeof(enum E : unsigned char) is 4 and a struct member of that
+// type is laid out wrong.
+func TestEnumUnderlyingType(t *testing.T) {
+	src := ("enum Small : unsigned char { S0 = 200, S1 };\n" +
+		"enum Big : long long { B0 = 4000000000LL };\n" +
+		"enum Plain { P0, P1 };\n" +
+		"enum Small s;\n" +
+		"enum Big b;\n" +
+		"enum Plain p;\n" +
+		"int main(void){ return 0; }\n")
+	toks, err := Lex(src)
+	if err != nil {
+		t.Fatalf("lex: %v", err)
+	}
+	prog, err := Parse(toks)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if errs := Check(prog); len(errs) > 0 {
+		t.Fatalf("check: %v", errs)
+	}
+	want := map[string]int{"s": 1, "b": 8, "p": 4}
+	for _, g := range prog.Globals {
+		w, ok := want[g.Name]
+		if !ok {
+			continue
+		}
+		if got := Sizeof(g.Typ); got != w {
+			t.Errorf("sizeof(%s) = %d, want %d (type %s)", g.Name, got, w, g.Typ)
+		}
+	}
+	if enumConsts["S1"] != 201 {
+		t.Errorf("S1 = %d, want 201", enumConsts["S1"])
+	}
+	if enumConsts["B0"] != 4000000000 {
+		t.Errorf("B0 = %d, want 4000000000", enumConsts["B0"])
+	}
+}
+
 // Unary minus must not drag a floating operand down to int: "-1.5f" is still a
 // float and "-2.0" is still a double. Both are observable through _Generic,
 // and the double case used to break print()'s float formatting (it printed a

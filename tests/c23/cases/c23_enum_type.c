@@ -47,6 +47,27 @@ int main(void) {
     printf("case%d: enum->int converted=%d\n", total, converted);
     if (converted == 2) passed++;
 
+    /* the underlying type must also drive struct layout ... */
+    ++total;
+    struct H { enum EUChar a; enum EInt b; enum ELLong c; };
+    struct H h;
+    h.a = EC_A; h.b = EI_B; h.c = EL_A;
+    printf("case%d: member sizeof=%d %d %d struct=%d\n", total,
+           (int)sizeof(h.a), (int)sizeof(h.b), (int)sizeof(h.c),
+           (int)sizeof(struct H));
+    if ((int)sizeof(h.a) == 1 && (int)sizeof(h.b) == 4 &&
+        (int)sizeof(h.c) == 8 && (int)sizeof(struct H) == 16) passed++;
+
+    /* ... and objects of the enum type: arrays, and ++ on a narrow enum */
+    ++total;
+    enum EUChar arr[3];
+    arr[0] = EC_A; arr[1] = EC_B; arr[2] = EC_A;
+    enum EUChar narrow = EC_B;
+    narrow++;
+    printf("case%d: arr=%d %d %d narrow++=%d\n", total,
+           (int)arr[0], (int)arr[1], (int)arr[2], (int)narrow);
+    if (arr[0] == 250 && arr[1] == 251 && arr[2] == 250 && narrow == 252) passed++;
+
     printf("SUMMARY: %d/%d\n", passed, total);
     return passed == total ? 0 : 1;
 }

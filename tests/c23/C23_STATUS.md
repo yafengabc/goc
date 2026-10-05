@@ -30,7 +30,7 @@
 | 编译器直接报错 | **块作用域 constexpr**、`static T = {}`、无消息 `static_assert(e)`、结构体内 static_assert、`__typeof__`/嵌套 typeof、`typeof(&x)` | 均解析拒绝 |
 | 值错误 | **双层嵌套匿名成员** | 夹具名字段的两级匿名字段错位（`a=11` vs gcc `a=10`）；位域成员不可花括号初始化 |
 | 值错误 | **alignas 对齐成员/数组** | 标量变量真对齐，但结构体成员/字符数组/alignas(64) 局部数组实际未对齐（偏移 8/8/48） |
-| 值错误 | **enum E:T 布局** | 语法与枚举值对，但 sizeof(enum) 恒为 4（`enum:uchar`/`enum:llong` 都 4，gcc 为 1/8） |
+| 值错误 | ~~**enum E:T 布局**~~ **已修（2026-10-05）** | 此前 sizeof(enum) 恒为 4；现按底层类型定宽（`enum:uchar`=1、`enum:llong`=8），含结构体成员布局与窄枚举 `++` |
 | 值错误 | **空 {} 初始化首标量** | 已有局部后第一个 `{}` 标量不真正归零（读到稳定垃圾 71302960）；`static int s={}` 被拒 |
 | 值错误 | **ckd_* 64 位目标** | 溢出标志恒报 0（goclib 头自证：无 128 位数学，W≥8 直接判无溢出） |
 | 值错误 | ~~**_Generic 区分 long/unsigned**~~ **已修（2026-10-05）** | 字面量 `1L`/`1U` 此前一律按 int 定型（NumLit 丢了后缀），整型运算结果此前一律为 int；现已实现字面量后缀定型 + 整型提升 + 一般算术转换 + 移位取提升后左操作数，`_Generic(1L, long: …)`/`_Generic(0u, unsigned int: …)`/`_Generic(1u<<15, …)` 全部命中。**仍不可靠**：typedef 名关联、`const int*` vs `int*`（报 `type int* appears twice`） |
@@ -75,7 +75,7 @@
 | typeof / typeof_unqual | **PASS（附缺口）** | 7 | typeof(类型/标量变量/常量) 与 typeof_unqual(const/volatile) 可用；**拒** `__typeof__`（`parse error`）、`typeof(&x)`（`only typeof(type), typeof(var) and typeof(constant) are supported`）、嵌套 typeof；`typeof(2.0)` 得 0.0（bug） | 7/7 全支持 | 放心用，实参限类型名/标量变量；勿用旧拼写/嵌套/地址表达式 |
 | auto 类型推导 | **PASS** | 7 | int/指针/数组衰减/函数指针/const/static/for-init/文件作用域全过 | 7/7（gcc 对 `static auto` 仅警告声明序） | 放心用 |
 | auto 无初始化器（负向） | **PASS（双方拒）** | 1 | `type error(s): line 11: auto declaration of "x" requires an initialiser` | `error: 'auto' requires an initialized data declaration` | 一致拒绝 |
-| enum E:T 底层类型 | **PARTIAL** | 5 | 语法解析 + 枚举常量值正确（9000000000LL/4000000000U）；但 `sizeof(enum)` **恒为 4**（`enum:uchar`→4、`enum:llong`→4） | 5/5，sizeof 按底层类型（1/8） | 枚举值可用；**别用于紧凑存储/大范围枚举**（布局被忽略） |
+| enum E:T 底层类型 | **PASS** | 7 | 2026-10-05 修复：`enum Tag : T` 的 T 成为枚举自身类型（tag 级 `enumUnderlying` 表，`enum Tag x;` 也按 T 定宽）；7/7 与 gcc 逐字节一致（sizeof 4/1/8/4、结构体成员布局 16、窄枚举数组与 `++`） | 7/7 一致 | 放心用（含紧凑存储/`long long` 大范围枚举） |
 | static_assert 两形式 | **PASS（附缺口）** | 4 | `static_assert(e,"msg")`/`_Static_assert(e,"msg")` 文件与块作用域可用；**拒**无消息形式 `static_assert(e)`（`expected "," after static_assert condition`）与结构体内形式 | 4/4 全支持 | 放心用但**必须带消息**；勿写无消息形式、勿放 struct 体内 |
 | static_assert(0) 假条件（负向） | **PASS（双方拒）** | 1 | `parse error: static_assert failed: this condition is always false` | `error: static assertion failed` | 一致拒绝 |
 | 匿名 struct/union 成员 | **PARTIAL** | 7 | 单层（扁平访问/union 重叠/指示符/箭头/sizeof）全对；**双层嵌套匿名错位**（`a=11` vs gcc `a=10`）；位域成员不可花括号初始化（`cannot brace-initialise bit-field member "lo"`） | 7/7 | 单层放心用；**双层嵌套避开**；位域用逐字段赋值 |

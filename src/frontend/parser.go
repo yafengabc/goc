@@ -60,6 +60,13 @@ var structs = map[string]*Type{}
 // name is not a variable.
 var enumConsts = map[string]int64{}
 
+// enumUnderlying maps an enum tag to the underlying type of a C23
+// "enum Tag : T { ... }" specifier. A later reference to the tag
+// ("enum Tag x;") resolves through it, so the width survives past the
+// definition -- before this, every enum was a plain int and
+// sizeof(enum E : unsigned char) was 4 instead of 1.
+var enumUnderlying = map[string]*Type{}
+
 // isAutoDeduction reports whether the current "auto" keyword opens a C23
 // type-inference declaration ("auto name = init;"): the follower is the
 // declarator name -- an identifier that is not a typedef alias. Any other
@@ -150,6 +157,9 @@ func Parse(toks []Token) (*Program, error) {
 	}
 	for k := range enumConsts {
 		delete(enumConsts, k)
+	}
+	for k := range enumUnderlying {
+		delete(enumUnderlying, k)
 	}
 	for k := range varTypes {
 		delete(varTypes, k)
@@ -894,24 +904,36 @@ func promoteAnonMembers(dst *[]*Member, t *Type, shell *Member) {
 // the previous value plus one.
 func (p *Parser) parseEnumSpecifier() (*Type, error) {
 	p.next() // consume "enum"
+	tag := ""
 	if p.cur().Kind == TIdent {
-		// A tag name ("enum Color { ... }" or "enum Color x;"). Consume it and
-		// fall through; every enum is modelled as int.
-		p.next()
+		tag = p.next().Text
 	}
 	// C23 underlying type: "enum Tag : int { ... }" (or even "enum : int { ... }").
-	// goc models every enum as a plain int regardless of the requested
-	// underlying type, so the specifier is parsed and dropped (it only refines
-	// the enumerators' storage width, which goc does not track separately).
+	// It fixes the enumeration's width and signedness, so it becomes the type
+	// of the enum itself -- sizeof(enum E : unsigned char) is 1, not 4. Only
+	// integer types are accepted (a bit-precise _BitInt is not allowed here).
+	var und *Type
 	if p.atPunct(":") {
 		p.next()
-		if _, err := p.parseDeclarationSpecifiers(); err != nil {
+		t, err := p.parseDeclarationSpecifiers()
+		if err != nil {
 			return nil, err
+		}
+		if t != nil && (t.Kind == KInt || t.Kind == KBool) {
+			und = t
 		}
 	}
 	if !p.atPunct("{") {
-		// Tag reference (or forward declaration "enum Tag;"). Every enum is
-		// modelled as int; the tag is not otherwise consulted.
+		// Tag reference (or forward declaration "enum Tag;"). An underlying
+		// type was either just spelled out or recorded at the definition.
+		if tag != "" {
+			if t, ok := enumUnderlying[tag]; ok {
+				return t, nil
+			}
+		}
+		if und != nil {
+			return und, nil
+		}
 		return IntType(), nil
 	}
 	p.next() // consume "{"
@@ -943,7 +965,14 @@ func (p *Parser) parseEnumSpecifier() (*Type, error) {
 	if err := p.expect("}"); err != nil {
 		return nil, err
 	}
-	return IntType(), nil
+	res := IntType()
+	if und != nil {
+		res = und
+	}
+	if tag != "" {
+		enumUnderlying[tag] = res
+	}
+	return res, nil
 }
 
 // parseDeclarator applies pointer prefixes, a direct declarator (name or
