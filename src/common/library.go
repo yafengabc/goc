@@ -58,9 +58,30 @@ var (
 // order: a package's init() runs before its importer's, so a library injected
 // from the entry point's init() would arrive after this package had already
 // committed to the on-disk one -- and the injection would silently do nothing.
+//
+// Installing a source does NOT mean the build can be skipped. Build reads
+// through libC/libHeaders, so an injected library still has to be compiled --
+// prepareLoad installs the source and leaves the build in place. Replacing
+// load with a no-op here left both targets nil, and the failure surfaced far
+// from its cause: every call in every program came out as
+// "unknown function X: not in goclib ()", with the empty list the only hint
+// that the library itself had never been built at all.
 func SetLibrary(src Source) {
 	libC, libHeaders = src, src
-	load = func() {}
+	load = prepareLoad
+}
+
+// prepareLoad is the body of loadOnce for an installed (non-disk) library.
+// It differs from the on-disk default only in that it skips ensureDisk: the
+// source is already set, and ensureDisk would be a no-op anyway.
+func prepareLoad() {
+	// Both targets are attempted even if the first fails, so a problem
+	// confined to one platform does not hide the other. The first error
+	// is the one reported.
+	Win, Err = Build(false, "")
+	if Err == nil {
+		Linux, Err = Build(true, "")
+	}
 }
 
 func ensureDisk() {
@@ -71,18 +92,12 @@ func ensureDisk() {
 
 var (
 	loadOnce sync.Once
-	// load is the deferred body of loadOnce. SetLibrary replaces it with a
-	// no-op so a caller that supplied its own library pays nothing for the
-	// on-disk search it will not use.
+	// load is the deferred body of loadOnce. SetLibrary swaps in prepareLoad,
+	// the same build without the on-disk search a caller-supplied library does
+	// not need.
 	load = func() {
 		ensureDisk()
-		// Both targets are attempted even if the first fails, so a problem
-		// confined to one platform does not hide the other. The first error
-		// is the one reported.
-		Win, Err = Build(false, "")
-		if Err == nil {
-			Linux, Err = Build(true, "")
-		}
+		prepareLoad()
 	}
 )
 

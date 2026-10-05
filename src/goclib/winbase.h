@@ -356,4 +356,76 @@ extern UINT    GetSystemDirectoryW(LPWSTR buf, UINT n), kernel32;
 #define FILE_ATTRIBUTE_NORMAL    0x00000080
 #endif
 
+/* ------------------------------------------------------------------ */
+/* Threads and synchronisation                                         */
+/* ------------------------------------------------------------------ */
+/* The surface <threads.h> is built on: CreateThread for starting one,
+ * CRITICAL_SECTION for mtx_t, CONDITION_VARIABLE for cnd_t, the Tls* family
+ * for tss_t and InitOnceExecuteOnce for call_once.
+ *
+ * CRITICAL_SECTION is laid out exactly as the SDK defines it on x86-64:
+ * a debug pointer, two 32-bit counters, two handles and a spin count, 40
+ * bytes in total. kernel32 only ever writes through the pointer we hand it,
+ * so the field names do not have to match -- the offsets do.
+ */
+typedef struct _GOC_CRITICAL_SECTION {
+    void         *DebugInfo;
+    int           LockCount;
+    int           RecursionCount;
+    void         *OwningThread;
+    void         *LockSemaphore;
+    unsigned long SpinCount;
+} CRITICAL_SECTION;
+
+typedef struct _GOC_CONDITION_VARIABLE {
+    void *Ptr;
+} CONDITION_VARIABLE;
+
+typedef struct _GOC_INIT_ONCE {
+    void *Ptr;
+} INIT_ONCE;
+
+/* CreateThread's start routine. The real type takes and returns DWORD, which
+ * is 32-bit here just as it is in the SDK. */
+typedef int (*LPTHREAD_START_ROUTINE)(void *lpParameter);
+
+extern HANDLE CreateThread(void *lpThreadAttributes, unsigned long dwStackSize,
+                           LPTHREAD_START_ROUTINE lpStartAddress, void *lpParameter,
+                           unsigned int dwCreationFlags, unsigned int *lpThreadId), kernel32;
+extern void   ExitThread(unsigned int dwExitCode), kernel32;
+extern unsigned int GetCurrentThreadId(void), kernel32;
+extern int    SwitchToThread(void), kernel32;
+extern int    GetExitCodeThread(HANDLE hThread, unsigned int *lpExitCode), kernel32;
+
+/* Thread-local storage. TlsAlloc returns TLS_OUT_OF_INDEXES ((DWORD)-1) when
+ * the process has used up all 1088 slots. */
+extern unsigned int TlsAlloc(void), kernel32;
+extern int    TlsSetValue(unsigned int dwTlsIndex, void *lpTlsValue), kernel32;
+extern void  *TlsGetValue(unsigned int dwTlsIndex), kernel32;
+extern int    TlsFree(unsigned int dwTlsIndex), kernel32;
+
+extern void   InitializeCriticalSection(CRITICAL_SECTION *cs), kernel32;
+extern void   EnterCriticalSection(CRITICAL_SECTION *cs), kernel32;
+extern int    TryEnterCriticalSection(CRITICAL_SECTION *cs), kernel32;
+extern void   LeaveCriticalSection(CRITICAL_SECTION *cs), kernel32;
+extern void   DeleteCriticalSection(CRITICAL_SECTION *cs), kernel32;
+
+extern void   InitializeConditionVariable(CONDITION_VARIABLE *cv), kernel32;
+extern int    SleepConditionVariableCS(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs,
+                                       unsigned int dwMilliseconds), kernel32;
+extern void   WakeConditionVariable(CONDITION_VARIABLE *cv), kernel32;
+extern void   WakeAllConditionVariable(CONDITION_VARIABLE *cv), kernel32;
+
+/* InitOnceExecuteOnce runs the callback exactly once per INIT_ONCE, even
+ * under a race, and blocks every other caller until it returns -- the same
+ * contract call_once() makes. A FALSE return means the callback failed. */
+extern int    InitOnceExecuteOnce(INIT_ONCE *once, void *fn, void *param, void **ctx), kernel32;
+
+/* WaitForSingleObject return codes. */
+#define WAIT_OBJECT_0    0x00000000L
+#define WAIT_TIMEOUT     0x00000102L
+#define WAIT_FAILED      0xFFFFFFFFL
+#define INFINITE         0xFFFFFFFFL
+#define TLS_OUT_OF_INDEXES ((unsigned int)-1)
+
 #endif /* GOC_WINBASE_H */

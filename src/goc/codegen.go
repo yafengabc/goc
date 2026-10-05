@@ -286,6 +286,8 @@ var externLinux = map[string]bool{
 	"__goclib_getcwd":     true, "__goclib_chmod": true, "__goclib_access": true,
 	"__goclib_fstat": true,
 	"__goclib_vfork": true, "__goclib_execve": true, "__goclib_wait4": true,
+	"__goclib_clone": true, "__goclib_futex": true, "__goclib_gettid": true,
+	"__goclib_sched_yield": true, "__goclib_exit_thread": true,
 }
 
 // ---------------------------------------------------------------------------

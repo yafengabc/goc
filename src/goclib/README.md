@@ -50,7 +50,7 @@ goclib/
 | `__goclib_heap_realloc(p,size)` | `HeapReAlloc` | 新分配 + 拷贝（bump 分配器不能原地长） |
 | `__goclib_heap_free(p)` | `HeapFree` | 空操作（进程退出一起还） |
 
-## 3. 函数清单（182 个，全部按需链接）
+## 3. 函数清单（200 个，全部按需链接）
 
 | 头文件 | 数量 | 内容 |
 |---|---|---|
@@ -61,6 +61,13 @@ goclib/
 | ctype.h | 13 | `isalnum` `isalpha` `iscntrl` `isdigit` `isgraph` `islower` `isprint` `ispunct` `isspace` `isupper` `isxdigit` `tolower` `toupper` |
 | time.h | 16 | `time` `clock` `difftime` `gmtime` `localtime` `mktime` `strftime` `asctime` `ctime` `gmtime_r` `localtime_r` `asctime_r` `ctime_r` `timespec_get` `clock_gettime` `tzset` |
 | errno.h | 1 | `strerror`（外加 `errno` 本身） |
+| threads.h | 18 | 线程 `thrd_create` `thrd_equal` `thrd_current` `thrd_detach` `thrd_join` `thrd_exit` `thrd_sleep` `thrd_yield`；条件变量 `cnd_init` `cnd_destroy` `cnd_signal` `cnd_broadcast` `cnd_wait`；线程本地存储 `tss_create` `tss_get` `tss_set` `tss_delete`；`call_once`。**`mtx_*`（6 个）尚未实现** —— `cnd_wait` 内部会调用 `mtx_unlock`/`mtx_lock`，所以用到 `cnd_wait` 的程序要等互斥锁落地才能链接 |
+
+`<threads.h>` 是双平台实现（见 `threads.c`）：Windows 走 CreateThread +
+CRITICAL_SECTION + CONDITION_VARIABLE + Tls*，Linux 走 `clone`(56) + mmap 栈 +
+`futex`(202) + `gettid`(186)。Linux 侧的三个已知限制都写在 `threads.c` 的头注释里：
+detached 线程的栈不回收、`_Thread_local` 在所有线程间共享（clone 没带 CLONE_SETTLS）、
+堆分配器不是线程安全的。
 
 `float` 不是独立精度：goc 把 float 当"有效 double"处理，所以没有 `fabsf`/`powf`
 那一族，也没有 `long double`。用到这些名字会在 codegen 报 unknown function，

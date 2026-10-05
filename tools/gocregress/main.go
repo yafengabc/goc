@@ -34,13 +34,19 @@ import (
 	"time"
 )
 
-// winOnly are the examples that import Windows-only DLLs (user32/gdi32/
-// kernel32) and therefore cannot be compiled for the Linux (ELF64) target.
-// They have no golden output -- they are compile-only smoke tests.
+// winOnly are the examples that cannot be exercised on the Linux (ELF64)
+// target and are therefore skipped there. Most import Windows-only DLLs
+// (user32/gdi32/kernel32); c11_threads_basic is here because the Linux leg
+// runs under ucrun, which implements neither clone nor futex.
+//
+// winOnly also relaxes the golden rule: an entry with no src/expected file is
+// a compile-only smoke test, while one that has a golden (c11_threads_basic)
+// is still run and compared -- but only on the Windows leg.
 var winOnly = map[string]bool{
-	"wintest": true,
-	"winbox":  true,
-	"winreg":  true,
+	"wintest":           true,
+	"winbox":            true,
+	"winreg":            true,
+	"c11_threads_basic": true,
 }
 
 // repoRoot is set in main() and read by childEnv()/buildArtifacts().
