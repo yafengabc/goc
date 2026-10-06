@@ -9,7 +9,18 @@
  * stopping after `limit` characters (limit < 0 means "no limit", used by
  * sprintf). Returns the number of characters written.
  */
+/* The float formatting machine, all defined well below vfmt but reached from
+ * it. They need declaring here, at the first use, because ISO C forbids
+ * calling an undeclared function (C99 6.5.2.2): goc tolerates the implicit
+ * declaration, gcc/clang reject it, and rejecting it is what keeps this file
+ * compilable outside goc. Same reason __goclib_double_to_hex above needs its
+ * forward declaration. */
 int __goclib_double_to_hex(char *buf, double x, int prec, int hasPrec, int upper, int alt);
+int __goclib_double_to_buf(char *buf, double x, int prec);
+int __goclib_double_strip_g(char *buf, int n);
+int __goclib_double_to_exp(char *buf, double x, int prec, int upper, int strip);
+static double fmt_split_dec(double x, int *e10);
+static int      fmt_g_exp(double x);
 
 static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
     long n = 0;
@@ -489,7 +500,7 @@ static int lite_write(const char *s, long n) {
     return WriteFile(h, s, n, &w, 0) ? (int)w : -1;
 }
 #else
-extern long write(long fd, const void *buf, long n);
+#include <syscall.h>   /* write(2), reached per host */
 #define GOC_LITE_STDOUT 1      /* stdout is file descriptor 1 */
 static int lite_write(const char *s, long n) {
     if (n <= 0) return -1;
@@ -497,15 +508,27 @@ static int lite_write(const char *s, long n) {
 }
 #endif
 
-/* Shared measure-then-write driver. goc's va_list is a pointer, so copying the
- * started list restarts it -- that is what makes the measuring pass possible.
+/* Shared measure-then-write driver.
+ *
+ * The format engine consumes its va_list, so the measuring pass cannot walk the
+ * caller's `ap` directly. va_copy is what makes the second pass possible: it
+ * duplicates the whole va_list, leaving the original untouched (C99 7.16.1.1).
+ * Note the explicit declaration -- `va_list m = ap;` is not portable C. On
+ * x86-64 SysV a va_list is an array type, so initialising one from another is
+ * rejected outright ("array initializer must be an initializer list") and even
+ * where it compiles the copy would share one cursor instead of duplicating it.
+ * va_copy is also a plain builtin in gcc/clang, which is what lets this file
+ * build as an ordinary C library outside goc.
+ *
  * Copy ap, never an unstarted local: va_start writes through ap, and a copy of
  * a never-started va_list is garbage (symptom: two printf_lite calls in a row
  * exit 127 and the second line is lost, while a single call happens to work). */
 static int printf_lite_with(int (*fmtfn)(char *, long, const char *, va_list),
                             const char *fmt, va_list ap) {
-    va_list measure = ap;
+    va_list measure;
+    va_copy(measure, ap);
     long n = fmtfn(0, 0, fmt, measure);      /* pass 1: length only */
+    va_end(measure);
     if (n <= 0) return (int)n;
     if (n <= 512) {
         char buf[512];
@@ -601,6 +624,15 @@ int __goclib_double_to_buf(char *buf, double x, int prec) {
      * less than zero, and it is reachable (copysign makes one). */
     if (signbit(x)) { neg = 1; x = -x; }
     if (prec > 17) prec = 17;          /* past double's precision */
+    /* A negative precision is reachable, not hypothetical: the %g path calls
+     * this with `sig - 1 - e10', which is negative for every value whose
+     * decimal exponent is at or past its significant count -- "%.3g" of 1e100
+     * arrives as -98. Without a floor the loop below never runs, so dig stays
+     * uninitialized, and the rounding step then both reads and increments
+     * dig[prec] and dig[prec-1] with a negative index. Clamping to 0 makes the
+     * whole tail well-defined: the value prints with no fractional digits,
+     * which is the only answer a negative digit count can have. */
+    if (prec < 0) prec = 0;
     whole = floor(x);
     frac = x - whole;
     for (k = 0; k <= prec; k++) {
@@ -892,8 +924,10 @@ int sprintf(char *buf, const char *fmt, ...) {
  * written: short text stays on the stack, anything larger gets an exactly
  * sized heap buffer. */
 int vfprintf(FILE *stream, const char *fmt, va_list ap) {
-    va_list measure = ap;              /* va_list is a pointer: copying restarts it */
-    long n = vfmt(0, 0, fmt, measure); /* pass 1: length only */
+    va_list measure;
+    va_copy(measure, ap);                /* the caller's list survives intact */
+    long n = vfmt(0, 0, fmt, measure);   /* pass 1: length only */
+    va_end(measure);
     if (n <= 0) return (int)n;
     if (n <= 512) {
         char buf[512];

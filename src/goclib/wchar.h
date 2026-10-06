@@ -25,8 +25,10 @@
 typedef unsigned short wint_t;
 
 #define WEOF ((wint_t)-1)
-#define WCHAR_MIN ((wint_t)0)
-#define WCHAR_MAX ((wint_t)0xffff)
+/* WCHAR_MIN / WCHAR_MAX belong to <stddef.h> (C11 7.19p3 lists them there),
+ * which this header includes above -- defining them again here is a redefinition
+ * even though the values agree. A host compiler warns about it, so they are not
+ * repeated. */
 
 /* ---- C95 wide string functions ---------------------------------------- */
 

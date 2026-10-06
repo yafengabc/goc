@@ -15,13 +15,23 @@ typedef long          ptrdiff_t;
 /* wchar_t (C11 7.19 / 7.29). It lives in <stddef.h> because it is an integer
  * type, not a string type -- <wchar.h> merely adds the functions.
  *
- * The width is an ABI decision: 2 bytes unsigned on Windows (one UTF-16 code
- * unit, matching WCHAR in <windef.h>) and 4 bytes signed on Linux. goc emits
- * Windows first -- that is where a real ABI sits behind it -- so wchar_t is
- * unsigned short, and the UTF-16 data behind an L"..." literal agrees with it. */
+ * The width is an ABI decision, and it follows the target rather than being
+ * fixed: Win64 wchar_t is 2 bytes unsigned, because that is exactly one UTF-16
+ * code unit and therefore exactly what WCHAR in <windef.h> holds, so a wide
+ * string from GetCommandLineW or GetOpenFileNameW reaches these functions with
+ * no conversion. The x86-64 SysV ABI (Linux) makes wchar_t 4 bytes *signed*,
+ * which is what every real Linux toolchain and glibc use. So the type is picked
+ * from the same macros that pick the platform everywhere else in goclib, and
+ * the two hosts agree with their own ABIs instead of with each other. */
+#if defined(_WIN32) || defined(_WIN64)
 typedef unsigned short wchar_t;
 #define WCHAR_MIN 0
 #define WCHAR_MAX 0xFFFF
+#else
+typedef int wchar_t;
+#define WCHAR_MIN (-2147483647 - 1)
+#define WCHAR_MAX 2147483647
+#endif
 
 /* C23 nullptr_t: the type of the nullptr keyword. goc models it as void*
  * (the keyword itself lowers to a null pointer constant, i.e. 0). */

@@ -160,10 +160,22 @@ double logb(double x);
 double nan(const char *tagp);
 
 /* ---- C99: neighbour, scaled exponent, quotient remainder ---------------- */
-/* The next double after x in the direction of y. The standard spells y as a
- * long double; goc has no long double, so nexttoward takes a plain double. */
+/* The next double after x in the direction of y, and its scaled-exponent and
+ * quotient-remainder siblings.
+ *
+ * nexttoward's second parameter is `long double' in the standard (C11 7.12.11.5)
+ * because the step has to be resolved in the wider type. goc has no long
+ * double -- long double folds to double in its type system -- so under goc it
+ * takes a plain double. A host compiler does have long double, and a host that
+ * already declares nexttoward as a library function would disagree with the
+ * narrower spelling, so the signature follows the host. Both spellings name the
+ * same symbol; only the width of the direction argument differs. */
 double nextafter(double x, double y);
+#ifdef __goc__
 double nexttoward(double x, double y);
+#else
+double nexttoward(double x, long double y);
+#endif
 /* x * 2^n exactly, with an int (scalbn) or long (scalbln) exponent. */
 double scalbn(double x, int n);
 double scalbln(double x, long n);

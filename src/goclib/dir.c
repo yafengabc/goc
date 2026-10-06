@@ -1,6 +1,7 @@
 #include "goclib.h"
 #include <dirent.h>
 #include <sys/stat.h>
+#include <syscall.h>   /* the raw system calls, reached per host (see the file) */
 #include <stdlib.h>
 #include <string.h>
 
@@ -159,17 +160,9 @@ int fstat(int fd, struct stat *buf) {
 
 #elif defined(__linux__)
 
-extern long __goclib_getcwd(char *buf, long size);
-extern long __goclib_chmod(const char *path, long mode);
-extern long __goclib_access(const char *path, long amode);
-extern long __goclib_fstat(long fd, void *buf);
-
-extern long open(const char *path, long flags, long mode);
-extern long close(long fd);
-extern long __goclib_getdents64(long fd, void *buf, long count);
-extern long __goclib_stat(const char *path, void *buf);
-extern long __goclib_mkdir(const char *path, long mode);
-extern long __goclib_rmdir(const char *path);
+/* The raw system calls. Each __goclib_ alias is the raw syscall under a name
+ * that cannot collide with the public wrapper this same file defines (stat,
+ * mkdir, rmdir); <syscall.h> says how each one is reached on each host. */
 
 DIR *opendir(const char *name) {
     DIR *d;

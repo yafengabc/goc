@@ -95,7 +95,9 @@ typedef struct {
     long nsec;
 } GTimeSpec;
 
-extern long __goc_clock_gettime(long clk, void *tp);
+/* clock_gettime: goa's syscall stub under goc, syscall(2) under a host compiler
+ * (the vDSO is not used, so both hosts take the same route to the kernel). */
+#include <syscall.h>
 
 #define CLOCK_REALTIME            0
 #define CLOCK_PROCESS_CPUTIME_ID  2
@@ -537,7 +539,7 @@ int timespec_get(struct timespec *ts, int base) {
  * timezone for source compatibility; they are populated lazily. */
 char *tzname[2] = { "UTC", "UTC" };
 long timezone = 0;
-long daylight = 0;
+int daylight = 0;
 
 void tzset(void) {
     char *tz = getenv("TZ");

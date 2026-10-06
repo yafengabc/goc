@@ -34,6 +34,12 @@
  * bytes, fixed at compile time by C23) and available memory limit it.
  * ========================================================================== */
 
+/* malloc / free, for the scratch pool below. ISO C forbids calling an
+ * undeclared function (C99 6.5.2.2), and this file is compiled by gcc/clang
+ * as well as by goc -- goc tolerates the implicit declaration, a real compiler
+ * rejects it. */
+#include <stdlib.h>
+
 /* No fixed word ceiling any more -- only the declared width of the values
  * involved. BI_WMAX is kept as a sanity bound for the front end's own
  * (separate) limit, which is 4,194,304 bits = 65536 words per value. */
@@ -492,6 +498,14 @@ static int bi_clz32(unsigned int x) {
  * The work happens in 32-bit limbs: bi_divmod_limbs picks Knuth's schoolbook
  * or Burnikel-Ziegler's recursion by width, so wide divisions run at
  * multiplication speed instead of quadratic speed. */
+
+/* Defined far below (next to the Knuth loop it drives), but called from here --
+ * and from the decimal conversion further up -- so it needs a declaration
+ * before its first use. Declaring it here rather than moving the definition
+ * keeps the limb code together with the rest of the division internals. */
+static void bi_divmod_limbs(unsigned int *q, unsigned int *r,
+                            const unsigned int *a, long an,
+                            const unsigned int *b, long bn);
 static void bi_udivmod(unsigned long long *q, unsigned long long *rem,
                        const unsigned long long *a, const unsigned long long *b,
                        long n) {

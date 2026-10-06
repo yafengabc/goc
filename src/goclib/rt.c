@@ -64,7 +64,7 @@ static void rt_emit(const char *s) {
     if (h) WriteFile(h, s, n, &w, 0);
 }
 #else
-extern long write(long fd, const void *buf, long n);
+#include <syscall.h>   /* write(2), reached per host */
 static void rt_emit(const char *s) {
     const char *p = s;
     long n = 0;

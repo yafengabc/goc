@@ -1,5 +1,14 @@
 #ifndef GOC_STDATOMIC_H
 #define GOC_STDATOMIC_H
+
+/* This header is goc-only and stays inside this guard. It defines the atomics
+ * as macros over goc's own builtins (__goc_atomic_compare_exchange,
+ * atomic_fetch_add, ...) which only goc's code generator recognises, and it
+ * defines them as plain macros rather than the functions C11 calls for. A
+ * host compiler has real C11 <stdatomic.h> with real functions, so it defers
+ * to that instead -- see the non-goc branch at the bottom of this file. */
+#ifdef __goc__
+
 /* goc stdatomic.h -- C11 7.17 atomics, goc subset.
  *
  * goc models an _Atomic scalar as its underlying integer type with the
@@ -105,5 +114,42 @@ typedef enum memory_order {
     __goc_atomic_compare_exchange(p, e, d)
 #define atomic_compare_exchange_weak_explicit(p, e, d, sm, fm) \
     __goc_atomic_compare_exchange(p, e, d)
+
+#else /* !__goc__ */
+
+/* goclib needs only a handful of the C11 atomic operations, and it needs them
+ * to work under two quite different host setups: gcc/clang normally, and any
+ * host compiler with -nostdinc (which drops the system include directories so
+ * that goclib's own headers are provably the only ones in play). So rather than
+ * deferring to a host <stdatomic.h> -- which the -nostdinc build cannot see --
+ * the operations goclib actually uses are defined here directly, over
+ * __atomic_*: compiler builtins that gcc and clang both provide and lower to
+ * LOCK XADD / LOCK CMPXCHG, the same instructions goc itself emits. The
+ * _Atomic qualifier on the objects (see threads.c's spin lock) is a C11 keyword
+ * both hosts accept, so the two hosts agree on object layout as well as on
+ * behaviour.
+ *
+ * The operations are spelled over __atomic_* builtins, whose pointer argument
+ * must point to a *non-atomic* type: the C11 generic functions are selected on
+ * such a pointer, so an `_Atomic long *' is rejected with "address argument to
+ * atomic operation must be a pointer to integer or pointer". That is not a
+ * restriction of this header but of the builtins, and it is why the fallback
+ * here is not a restatement of C11 <stdatomic.h> -- it is the small set goclib
+ * needs, for objects that need no _Atomic declaration of their own. */
+#define atomic_load(p)                     (*(p))
+#define atomic_store(p, v)                 (*(p) = (v))
+#define atomic_exchange(p, v)              __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+#define atomic_fetch_add(p, v)             __atomic_fetch_add((p), (v), __ATOMIC_SEQ_CST)
+#define atomic_fetch_sub(p, v)             __atomic_fetch_sub((p), (v), __ATOMIC_SEQ_CST)
+#define atomic_fetch_or(p, v)              __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
+#define atomic_fetch_xor(p, v)             __atomic_fetch_xor((p), (v), __ATOMIC_SEQ_CST)
+#define atomic_compare_exchange_strong(p, e, d) \
+    __atomic_compare_exchange_n((p), (e), (d), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define atomic_compare_exchange_weak(p, e, d) \
+    __atomic_compare_exchange_n((p), (e), (d), 1, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define atomic_thread_fence(mo)            __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define kill_dependency(y)                 (y)
+
+#endif /* __goc__ */
 
 #endif /* GOC_STDATOMIC_H */

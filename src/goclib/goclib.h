@@ -33,14 +33,28 @@
  * the windows.h family names its DLL inline (e.g. `extern void ExitProcess(DWORD),
  * kernel32;`). Pulling windows.h in here makes every binding visible to the
  * library translation units, which is what the old central win32.def provided
- * globally. User code that never touches the OS simply does not call them. */
+ * globally. User code that never touches the OS simply does not call them.
+ *
+ * That inline-DLL syntax ("extern BOOL f(HANDLE), kernel32;") is goc's own, and
+ * no other compiler can parse it -- clang reads the trailing ", kernel32" as a
+ * second declarator declaring a *function named kernel32*, so every prototype
+ * in the family collides with the first. The windows.h family is therefore goc-
+ * only, and under any other host compiler the Win32 calls are already dead code
+ * anyway: every one of them sits inside a `#if defined(_WIN32)` block, so on a
+ * POSIX host the preprocessor discards them and goclib needs no Win32 header at
+ * all. */
+#ifdef __goc__
 #include <windows.h>
+#endif
 
 /* ---- platform primitives (implemented in goclib.c, OS glue) ---------------- */
 /* Write `len` bytes from `buf` to standard output. Returns bytes written. */
 long __goclib_write(const char *buf, long len);
-/* Terminate the process with `code` (does not return). */
-void __goclib_exit(long code);
+/* Terminate the process with `code` (does not return). _Noreturn because the
+ * callers that end in this call -- exit, abort, quick_exit -- are themselves
+ * _Noreturn, and a compiler cannot see through a plain call to conclude their
+ * control flow stops here. */
+_Noreturn void __goclib_exit(long code);
 /* Allocate `size` bytes from the process heap; returns 0 on failure. */
 void *__goclib_heap_alloc(long size);
 /* Free a block previously returned by __goclib_heap_alloc. */

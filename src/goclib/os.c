@@ -45,7 +45,7 @@ long __goclib_read(char *buf, long len) {
     return got;
 }
 
-void __goclib_exit(long code) {
+_Noreturn void __goclib_exit(long code) {
 #ifdef GOC_RTDIAG
     __goc_rt_report();
 #endif
@@ -76,11 +76,14 @@ void *__goclib_heap_realloc(void *p, long size) {
  * exit_group (231) instead of exit (60): the library itself defines a
  * function named exit, and one output cannot carry both symbols. The entry
  * stub calls the C exit, which calls __goclib_exit, which lands here.
+ *
+ * Under a host compiler there is no such constraint, but the route is the same
+ * one for a different reason: _exit() is the closest libc equivalent to
+ * exit_group(), leaving the process immediately without running atexit handlers
+ * or flushing stdio -- which is what a program that has already torn down its
+ * own I/O wants. <syscall.h> maps the name per host.
  */
-extern long write(long fd, const void *buf, long n);
-extern long read(long fd, void *buf, long n);
-extern void *brk(void *addr);
-extern void exit_group(long code);
+#include <syscall.h>
 
 static char *heap_cur;                      /* brk bump-allocator cursor */
 
@@ -101,7 +104,7 @@ long __goclib_read(char *buf, long len) {
     return read(0, buf, len);
 }
 
-void __goclib_exit(long code) {
+_Noreturn void __goclib_exit(long code) {
 #ifdef GOC_RTDIAG
     __goc_rt_report();
 #endif
@@ -115,10 +118,10 @@ void *__goclib_heap_alloc(long size) {
     if (size <= 0) size = 1;
     need = ((size + HEAP_HDR) + 15) / 16 * 16;  /* header + 16-byte aligned */
     if (heap_cur == 0) {
-        heap_cur = (char *)brk((void *)0);  /* query the current break */
+        heap_cur = (char *)__goclib_brk((void *)0);  /* query the current break */
     }
     next = heap_cur + need;
-    if ((char *)brk((void *)next) != next) {
+    if ((char *)__goclib_brk((void *)next) != next) {
         return 0;                           /* failed: brk returns the old break */
     }
     raw = heap_cur;

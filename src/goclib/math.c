@@ -958,10 +958,20 @@ double nextafter(double x, double y) {
     return u.d;
 }
 
-/* goc has no long double, so nexttoward is identical to nextafter here. */
+/* nexttoward: the next double in the direction of y. Under goc there is no
+ * long double, so y is a plain double and this is nextafter (see the declaration
+ * in <math.h>, which picks the argument width from the host). A host compiler
+ * does have long double, so the body still narrows y to double to reach the same
+ * nextafter -- the wider type is part of the interface, not of the step. */
+#ifdef __goc__
 double nexttoward(double x, double y) {
     return nextafter(x, y);
 }
+#else
+double nexttoward(double x, long double y) {
+    return nextafter(x, (double)y);
+}
+#endif
 
 /* remquo: remainder() for the value, plus the low 7 bits (mod 128, with the
  * sign of x/y) of the integer quotient x/y stored through quo. */

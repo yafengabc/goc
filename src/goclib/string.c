@@ -108,8 +108,27 @@ char *strtok(char *s, const char *delim) {
     return start;
 }
 
+/* The byte loops below look like the textbook definitions of memset, memcpy and
+ * memmove, and that is the problem on a host compiler: at -O2, gcc recognises the
+ * pattern, decides the loop is a call to the library function of that name, and
+ * emits `call memset` inside memset. Measured on gcc 15.2 with musl, the result
+ * disassembles as
+ *
+ *     memset: test %rdx,%rdx / je .L0 / sub $8,%rsp / call memset / add $8,%rsp
+ *
+ * which is unbounded recursion, reached from musl's own calloc the first time
+ * anything calls it. It never showed under goc because goc's code generator
+ * emits the loop verbatim.
+ *
+ * The fix is `volatile` on the destination pointer: it keeps the stores in the
+ * order written, which is exactly what C23 asks of memset_explicit, and it denies
+ * the built-in matcher the pattern it looks for. Verified on gcc 15.2 -- the same
+ * source without volatile compiles to the self-call above, and with it the loop
+ * survives. memset_explicit below is unchanged in behaviour; it was already
+ * volatile for the dead-store reason, so it now reads the same way.
+ */
 void *memset(void *dst, int v, size_t n) {
-    unsigned char *p = (unsigned char *)dst;
+    volatile unsigned char *p = (volatile unsigned char *)dst;
     unsigned char b = (unsigned char)v;
     size_t i;
     for (i = 0; i < n; i++) p[i] = b;
@@ -118,7 +137,8 @@ void *memset(void *dst, int v, size_t n) {
 
 /* memset_explicit (C23): identical to memset, but the compiler must not optimize
  * the store away even if the buffer is never read again. goc has no DSE pass
- * that would elide a dead memset, so a direct byte loop is already compliant. */
+ * that would elide a dead memset, so the volatile loop above is already
+ * compliant -- same body, same reason for volatile. */
 void *memset_explicit(void *dst, int v, size_t n) {
     volatile unsigned char *p = (volatile unsigned char *)dst;
     unsigned char b = (unsigned char)v;
@@ -128,7 +148,7 @@ void *memset_explicit(void *dst, int v, size_t n) {
 }
 
 void *memcpy(void *dst, const void *src, size_t n) {
-    unsigned char *d = (unsigned char *)dst;
+    volatile unsigned char *d = (volatile unsigned char *)dst;
     const unsigned char *s = (const unsigned char *)src;
     size_t i;
     for (i = 0; i < n; i++) d[i] = s[i];
@@ -136,7 +156,7 @@ void *memcpy(void *dst, const void *src, size_t n) {
 }
 
 void *memmove(void *dst, const void *src, size_t n) {
-    unsigned char *d = (unsigned char *)dst;
+    volatile unsigned char *d = (volatile unsigned char *)dst;
     const unsigned char *s = (const unsigned char *)src;
     if (d < s) {
         size_t i;

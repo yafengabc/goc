@@ -54,12 +54,20 @@ char *getenv(const char *name);
 
 /* Register fn to run at exit() (LIFO, last registered runs first). Max 32. */
 int atexit(void (*fn)(void));
-/* Abnormal termination: exits with the conventional failure code. */
-void abort(void);
+/* Abnormal termination: exits with the conventional failure code.
+ *
+ * abort, exit and quick_exit are _Noreturn by C11 7.22.4.1/7.22.4.4/7.22.4.7, and
+ * the annotation is what lets a caller drop the unreachable code a compiler
+ * would otherwise keep -- and what lets goclib's own definitions pass the check:
+ * without it clang reports "function declared 'noreturn' should not return" for
+ * both exit() and abort(), because the __goclib_exit() call at the end of each
+ * body is not itself annotated and the compiler cannot see that it never
+ * returns. */
+_Noreturn void abort(void);
 
 int   rand(void);
 void  srand(unsigned int seed);
-void  exit(int code);
+_Noreturn void exit(int code);
 
 /* Largest value rand() can return (7.22.2.1). Matches the compared gcc. */
 #define RAND_MAX 32767
@@ -72,7 +80,7 @@ void *aligned_alloc(size_t alignment, size_t size);
 /* quick_exit runs only the handlers registered with at_quick_exit (LIFO) and
  * then terminates, skipping the atexit chain and stream flushing. */
 int  at_quick_exit(void (*fn)(void));
-void quick_exit(int code);
+_Noreturn void quick_exit(int code);
 
 /* system runs `command` through the host shell and returns the child's exit
  * status (or -1 if the shell could not be started); system(NULL) returns a

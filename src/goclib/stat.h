@@ -1,6 +1,8 @@
 #ifndef GOC_STAT_H
 #define GOC_STAT_H
 
+#include <stddef.h>   /* size_t, for getcwd() below */
+
 /* <sys/stat.h> -- file metadata.
  *
  * Only the three fields a portable program can rely on are named the same on

@@ -455,7 +455,7 @@ void srand(unsigned int seed) {
 void (*atexit_fns[ATEXIT_MAX])(void);
 int atexit_n = 0;
 
-void exit(int code) {
+_Noreturn void exit(int code) {
     /* atexit handlers run last-registered-first; a handler may itself
      * register more handlers, so re-check the counter after each call. */
     while (atexit_n > 0) {
@@ -524,7 +524,7 @@ int at_quick_exit_n = 0;
 
 /* C11 quick_exit: run only the at_quick_exit handlers (LIFO) and terminate.
  * Unlike exit(), the atexit chain and stream flushing are skipped. */
-void quick_exit(int code) {
+_Noreturn void quick_exit(int code) {
     while (at_quick_exit_n > 0) {
         void (*fn)(void) = at_quick_exit_fns[at_quick_exit_n - 1];
         at_quick_exit_n--;
@@ -539,7 +539,7 @@ int at_quick_exit(void (*fn)(void)) {
     return 0;
 }
 
-void abort(void) {
+_Noreturn void abort(void) {
 #if defined(_WIN32)
     __goclib_exit(3);
 #else
@@ -644,9 +644,7 @@ void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
 #if defined(_WIN32)
 extern long GetEnvironmentVariableA(const char *name, char *buf, long size);
 #else
-extern long open(const char *path, long flags, long mode);
-extern long read(long fd, void *buf, long n);
-extern long close(long fd);
+#include <syscall.h>   /* open/read/close, reached per host */
 #endif
 
 static char envbuf[1024];
@@ -714,11 +712,11 @@ char *getenv(const char *name) {
  * there.
  * ------------------------------------------------------------------------- */
 #if !defined(_WIN32)
-/* Raw Linux syscalls backing system() -- declared at file scope (goc parses
- * the ", linux" platform marker only on a top-level extern). */
-extern long __goclib_vfork(void), linux;
-extern long __goclib_execve(const char *path, char **argv, char **envp), linux;
-extern long __goclib_wait4(long pid, long *status, long options, void *rusage), linux;
+/* system()'s three raw calls (__goclib_vfork / __goclib_execve /
+ * __goclib_wait4). Under goc these are goa's syscall stubs, recognised by name;
+ * under a host compiler they are libc's vfork / execve / wait4. <syscall.h>
+ * carries both routes. */
+#include <syscall.h>
 #endif
 
 int system(const char *command) {

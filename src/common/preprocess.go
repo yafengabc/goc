@@ -134,6 +134,20 @@ func preprocess(src, filename string, linux, builtinOnly bool, incDirs ...string
 		p.macros["_WIN32"] = &Macro{Name: "_WIN32", Body: []frontend.Token{tokNum(1, 0)}}
 		p.macros["_WIN64"] = &Macro{Name: "_WIN64", Body: []frontend.Token{tokNum(1, 0)}}
 	}
+	// __goc__ marks "this source is being compiled by goc". It is the hook
+	// goclib's headers use to tell the two apart: under goc the variadic
+	// operations are code-generator builtins and the windows.h family is
+	// spelled with goc's own inline-DLL syntax; under gcc/clang the same sources
+	// must reach the host's __builtin_va_* builtins and libc instead. Real
+	// compilers define their own such macro (__GNUC__, _MSC_VER, __clang__),
+	// and none of them define this one, so the test is false there.
+	//
+	// It has to live in p.macros, not only in expandAt's switch: a header asks
+	// with `#ifdef __goc__', and that consults the macro table. Handling it
+	// solely as an expansion-time special case made every such test read false
+	// and silently compiled goclib down the host path -- defining va_list as
+	// __builtin_va_list, which goc does not have a type for.
+	p.macros["__goc__"] = &Macro{Name: "__goc__", Body: []frontend.Token{tokNum(1, 0)}}
 	// Standard predefined macros (C99 6.10.8 / C23 6.11). goc is a single-mode
 	// compiler that accepts C89 through C23 source; __STDC_VERSION__ reports the
 	// highest standard whose core features are implemented (C23) and also drives

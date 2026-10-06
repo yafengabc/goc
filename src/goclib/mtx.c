@@ -24,6 +24,9 @@
 #include "goclib.h"
 #include <threads.h>
 #include <time.h>
+#ifndef __goc__
+#include <stdatomic.h>   /* the atomic primitives below (see gthr_lock_xchg_i) */
+#endif
 
 #if defined(_WIN32)
 
@@ -78,11 +81,11 @@ int mtx_timedlock(mtx_t *mtx, const struct timespec *ts) {
 
 #else /* Linux */
 
-/* goclib runtime primitives threads.c also uses. Declared here because goclib
- * compiles each .c as its own translation unit. */
-extern long __goclib_futex(int *uaddr, long op, long val, void *timeout,
-                           int *uaddr2, long val3);
-extern long __goclib_gettid(void);
+/* goclib runtime primitives threads.c also uses: futex(2) and gettid(2).
+ * Declared here because goclib compiles each .c as its own translation unit,
+ * and resolved per host by <syscall.h> -- goa's syscall stub under goc, the
+ * libc function or syscall(2) under a host compiler. */
+#include <syscall.h>
 
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
@@ -90,7 +93,15 @@ extern long __goclib_gettid(void);
 /* 32-bit atomic primitives over the int futex word. The state word is an int,
  * and a futex is a 32-bit word, so these must stay 32-bit -- an 8-byte xchg
  * would clobber the neighbouring type/inited fields. xchg is implicitly locked
- * on x86-64; cmpxchg gets the lock prefix by hand. */
+ * on x86-64; cmpxchg gets the lock prefix by hand.
+ *
+ * Under a host compiler the same two operations are the __atomic_* builtins
+ * that goclib/stdatomic.h maps atomic_exchange / atomic_compare_exchange onto.
+ * They lower to the very same LOCK XCHG / LOCK CMPXCHG, and both take a plain
+ * `int *' here, so the futex word needs no _Atomic declaration and its layout is
+ * identical on the two hosts -- which matters, because the kernel writes this
+ * word through the futex syscall. */
+#ifdef __goc__
 static int gthr_lock_xchg_i(int *p, int v) {
     int r;
     __asm {
@@ -113,6 +124,19 @@ static int gthr_lock_cas_i(int *p, int old, int newv) {
     }
     return r;
 }
+#else /* !__goc__ */
+static int gthr_lock_xchg_i(int *p, int v) {
+    return atomic_exchange(p, v);
+}
+
+/* Returns what the word held before the attempt: `old` when the swap happened,
+ * the current value when it did not. That is exactly the cmpxchg operand the
+ * assembly returns in eax. */
+static int gthr_lock_cas_i(int *p, int old, int newv) {
+    return __atomic_compare_exchange_n(p, &old, newv, 0,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 0 : old;
+}
+#endif /* __goc__ */
 
 int mtx_init(mtx_t *mtx, int type) {
     if (mtx == 0) return thrd_error;

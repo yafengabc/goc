@@ -2,6 +2,7 @@
 #define GOC_STDIO_H
 
 #include <stddef.h>
+#include <stdarg.h>   /* va_list, for the v*printf / v*scanf family below */
 
 /* goc stdio.h -- the printf/scanf families and the file-I/O primitives goc
  * provides. printf / sprintf / fprintf / scanf are variadic; goc's checker
@@ -117,8 +118,12 @@ FILE *_wfopen(const wchar_t *path, const wchar_t *mode);
  * the FILE * itself stays valid (the freopen(stdout, ...) idiom). */
 FILE *freopen(const char *path, const char *mode, FILE *stream);
 int fclose(FILE *stream);
-long fread(void *ptr, long size, long nmemb, FILE *stream);
-long fwrite(const void *ptr, long size, long nmemb, FILE *stream);
+/* size_t, not long, on the count and the element size (C11 7.21.8.1/8.2): both
+ * are the returned count of items, so a host compiler that already knows these
+ * as library functions sees a matching declaration. The two spell the same
+ * 64-bit type on every target goc builds, so no call site changes. */
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
+size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
 int fgetc(FILE *stream);
 int fputc(int c, FILE *stream);
 char *fgets(char *s, long n, FILE *stream);

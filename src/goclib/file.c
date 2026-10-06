@@ -61,18 +61,15 @@ extern long  MoveFileA(const char *oldp, const char *newp);
 #define FILE_CURRENT 1
 #define FILE_END   2
 #else
-/* ---- Linux: syscall stubs (goa turns these into `mov rax,N; syscall`) ---- */
-extern long open(const char *path, long flags, long mode);
-extern long read(long fd, void *buf, long n);
-extern long write(long fd, const void *buf, long n);
-extern long close(long fd);
-extern long lseek(long fd, long offset, long whence);
-extern long unlink(const char *path);
-/* The rename syscall carries the __goclib_ prefix on purpose: this file also
- * defines the public rename() wrapper, and a plain `extern rename` would
- * resolve to it -- an infinite recursion (the wrapper calling itself) that
- * burns the whole stack. Same trick musl uses for its internal names. */
-extern long __goclib_rename(const char *oldp, const char *newp);
+/* ---- Linux: the raw system calls, reached per host ----------------------
+ * Under goc these are goa's syscall stubs (`mov rax,N; syscall; ret`), emitted
+ * from its syscall table; under a host compiler they are the libc functions of
+ * the same names. <syscall.h> carries both routes, including the __goclib_
+ * aliases -- rename among them, which cannot be spelled plainly here because
+ * this file defines the public rename() wrapper and an `extern rename` would
+ * resolve to it, an infinite recursion of the wrapper calling itself. */
+
+#include <syscall.h>
 
 #define LO_RDONLY 0
 #define LO_WRONLY 1
@@ -444,7 +441,7 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
 
 /* --------------------------- read / write --------------------------------- */
 
-long fread(void *ptr, long size, long nmemb, FILE *stream) {
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     __goclib_FILE *f = (__goclib_FILE *)stream;
     char *p = (char *)ptr;
     long want, done = 0;
@@ -471,7 +468,7 @@ long fread(void *ptr, long size, long nmemb, FILE *stream) {
     return (size > 0) ? (done / size) : 0;
 }
 
-long fwrite(const void *ptr, long size, long nmemb, FILE *stream) {
+size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
     __goclib_FILE *f = (__goclib_FILE *)stream;
     const char *p = (const char *)ptr;
     long want, done = 0;
@@ -541,6 +538,11 @@ char *fgets(char *s, long n, FILE *stream) {
     return s;
 }
 
+/* The null check is deliberate, and gcc's -Wnonnull-compare fires because it
+ * knows strdup/fputs from its own built-ins as nonnull. Passing a null buffer
+ * through as an error (-1) rather than dereferencing it is what a caller
+ * handing over an unchecked pointer gets; the alternative is the crash. Same
+ * reasoning as strdup's check in string.c, which returns null. */
 int fputs(const char *s, FILE *stream) {
     if (s == 0) return -1;
     fwrite(s, 1, (long)strlen(s), stream);

@@ -2,6 +2,9 @@
 #include <threads.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef __goc__
+#include <stdatomic.h>   /* the spin lock's fallback (see gthr_spin_lock) */
+#endif
 
 /* =============================================================================
  * threads.c -- the C11/C23 threads library.
@@ -70,11 +73,22 @@
  * lock that needed one would be a chicken-and-egg problem.
  * -------------------------------------------------------------------------- */
 
+/* The lock word itself. It is a plain long on both hosts: goc's xchg acts on
+ * one, and the host compiler's __atomic_* builtins (what atomic_exchange in
+ * goclib/stdatomic.h lowers to) take a plain pointer too. So the two hosts see
+ * the same object layout, and the spin lock means the same thing in both. */
 typedef struct { long v; } gthr_spin_t;
 
 /* Note on style: an inline __asm body is handed to goa almost verbatim, and
  * goa comments start with `;` -- a C comment inside the block would reach the
- * assembler as text. That is why the explanations stay out here. */
+ * assembler as text. That is why the explanations stay out here.
+ *
+ * The two spin primitives below are the one part of this file that is not plain
+ * C: an atomic test-and-set in hand-written assembly. Under a host compiler
+ * the same operation is expressed with C11 <stdatomic.h>, which the compiler
+ * lowers to the very same xchg -- so the spin lock keeps its meaning on both
+ * hosts instead of being dropped from the build. */
+#ifdef __goc__
 static void gthr_spin_lock(gthr_spin_t *l) {
     __asm {
         mov rax, l
@@ -96,6 +110,19 @@ static void gthr_spin_unlock(gthr_spin_t *l) {
         mov [rax], rdx
     }
 }
+#else /* !__goc__: same semantics, written with the __atomic_* builtins that
+       * goclib/stdatomic.h maps atomic_exchange onto -- one xchg, as before. */
+static void gthr_spin_lock(gthr_spin_t *l) {
+    while (atomic_exchange(&l->v, 1) != 0) {
+        /* the assembly path spins on `pause`; a plain load is the portable
+         * equivalent of that hint */
+    }
+}
+
+static void gthr_spin_unlock(gthr_spin_t *l) {
+    atomic_store(&l->v, 0);
+}
+#endif /* __goc__ */
 
 /* -----------------------------------------------------------------------------
  * Shared state
@@ -477,15 +504,9 @@ int tss_set(tss_t key, void *val) {
  * Linux
  * ========================================================================== */
 
-extern long  __goclib_clone(long flags, void *stack, void *ptid, void *ctid, long tls);
-extern long  __goclib_futex(int *uaddr, long op, long val, void *timeout,
-                            int *uaddr2, long val3);
-extern long  __goclib_gettid(void);
-extern long  __goclib_sched_yield(void);
-extern void  __goclib_exit_thread(long code);
-extern void *mmap(void *addr, long len, long prot, long flags, long fd, long off);
-extern long  munmap(void *addr, long len);
-extern long  nanosleep(const struct timespec *req, struct timespec *rem);
+/* The raw system calls: goa's stubs under goc, libc's functions (and, for
+ * clone/futex, syscall(2)) under a host compiler. <syscall.h> carries both. */
+#include <syscall.h>
 
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
@@ -536,6 +557,7 @@ static void __goc_thrd_body(struct __goc_thrd *t);
  * memory the parent might be writing: the child is on its own stack from the
  * moment clone returns.
  */
+#ifdef __goc__
 static long gthr_clone(void *stack, int *ctid) {
     long r;
     /* Held in a variable rather than written as GTHR_CLONE_FLAGS inside the
@@ -564,6 +586,25 @@ static long gthr_clone(void *stack, int *ctid) {
     }
     return r;
 }
+#else /* !__goc__ */
+/* The same clone(2), reached through the host's syscall() rather than goa's
+ * hand-written stub. The child half of the contract is identical: thrd_create
+ * plants the thread record at sp[0] and the thread body at sp[1], and the
+ * assembly path reads them in exactly that order (`mov rdi,[rsp]`,
+ * `mov rax,[rsp+8]`). Reaching clone() with the same argument order goa's stub
+ * uses keeps the thread model the rest of this file is written against --
+ * detached by flag, no TLS bookkeeping, tid == the kernel's own pid -- so
+ * nothing below has to know which of the two paths built the thread. */
+static long gthr_clone(void *stack, int *ctid) {
+    long r = __goclib_clone(GTHR_CLONE_FLAGS, stack, 0, ctid, 0);
+    if (r != 0) return r;              /* parent: the new tid, or -1   */
+    /* Child. The new stack is already live, and its bottom two words are the
+     * argument and the entry point, planted by thrd_create before the clone. */
+    __goc_thrd_body(((void **)stack)[0]);
+    _exit(0);
+    return 0;
+}
+#endif /* __goc__ */
 
 /* Register a thread so thrd_current() can find it by tid. Threads started by
  * thrd_create are registered up front; anything else gets an entry on first
