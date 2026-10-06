@@ -104,6 +104,18 @@ func rd32(b []byte, off int) int {
 	return int(int32(binary.LittleEndian.Uint32(b[off:])))
 }
 
+// rdU32 reads a dword as an unsigned value. rd32 sign-extends, which is right
+// for a field that holds a signed quantity and wrong for one whose top bit is a
+// flag: the resource tree uses bit 31 of both an entry's Name field and its
+// Data field as a discriminator, and sign extension turns 0x80000020 into a
+// negative number that every offset test then rejects.
+func rdU32(b []byte, off int) int {
+	if off < 0 || off+4 > len(b) {
+		return 0
+	}
+	return int(binary.LittleEndian.Uint32(b[off:]) & 0xFFFFFFFF)
+}
+
 func rdu32(b []byte, off int) uint32 {
 	if off < 0 || off+4 > len(b) {
 		return 0

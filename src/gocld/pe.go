@@ -43,7 +43,10 @@ type outSec struct {
 }
 
 // imageEndOf returns the first virtual address past every section listed, which
-// is where another section can be appended.
+// is where another section can be appended. A .rsrc is placed with it rather
+// than by arithmetic on the unwind layout, because the two must not disagree
+// about where .pdata ends -- a .rsrc that overlapped it would produce a file
+// that loads and then cannot walk an exception frame.
 func imageEndOf(secs []outSec) int {
 	end := 0
 	for _, s := range secs {
@@ -423,6 +426,24 @@ func (img *Image) BuildPE(outPath string) error {
 	// invalidate all of them.
 	sections = append(sections, img.unwindSectionOut(uwLayout)...)
 
+	// The resource section, sized but not yet filled. emit writes the tree once
+	// the loop below has decided where the section starts in the file, and the
+	// tree's leaf offsets are file offsets -- so the payload is deliberately
+	// empty here and replaced afterwards rather than computed now and shifted
+	// afterwards. Nothing between here and that point may read it.
+	rsrcIndex := -1
+	if img.Rsrc != nil {
+		// vsize is known now even though the bytes are not: the section's size
+		// depends on the tree alone, and only its file offset needs the layout
+		// below. VirtualSize is written from this, so leaving it 0 would
+		// declare an empty section.
+		// 0x40000040 = IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA.
+		sections = append(sections, outSec{
+			".rsrc", imageEndOf(sections), nil, img.Rsrc.size(), 0x40000040, false,
+		})
+		rsrcIndex = len(sections) - 1
+	}
+
 	// SizeOfImage must cover the end of the last section's virtual range
 	// (each section's virtual address plus its virtual size, rounded up to the
 	// section alignment). Hard-coding two pages worked only while the whole
@@ -495,35 +516,74 @@ func (img *Image) BuildPE(outPath string) error {
 		putU32at(hdr, dd+3*8, uint32(img.PdataRVA))
 		putU32at(hdr, dd+3*8+4, uint32(img.PdataSize))
 	}
-	// Section table at oh+240; raw pointers advance by file-aligned sizes.
+	// Section file offsets, assigned before anything is emitted.
+	//
 	// BSS sections contribute no file bytes (rawSize 0, PointerToRawData 0).
-	st := oh + 240
+	//
+	// The resource section is why this cannot be a single pass that writes each
+	// section as it goes: IMAGE_RESOURCE_DATA_ENTRY.OffsetToData is a file
+	// offset, so the tree cannot be emitted until the .rsrc section's own
+	// position is known -- and that position is only known once every earlier
+	// section's file-aligned size has been added up. Two passes break the
+	// cycle: sizes come from the tree alone, so they can be laid out first, and
+	// the bytes follow.
+	rawOf := make([]int, len(sections))
+	rawSz := make([]int, len(sections))
 	filePtr := headerSize
-	for _, s := range sections {
-		for i := 0; i < 8; i++ {
-			if i < len(s.name) {
-				hdr[st+i] = s.name[i]
+	if rsrcIndex >= 0 {
+		// Reserve the bytes so every later offset can be computed. The length
+		// comes from the tree alone, so it is known without knowing where the
+		// section lands -- which is exactly what breaks the circle: the leaf
+		// offsets need the file position, the file position needs the size, and
+		// neither depends on the other. Only the addresses change afterwards.
+		sections[rsrcIndex].data = make([]byte, img.Rsrc.size())
+	}
+	for i, s := range sections {
+		if s.bss {
+			continue // no file bytes: the loader zero-fills the range
+		}
+		rawOf[i] = filePtr
+		rawSz[i] = align(len(s.data), fileAlign)
+		filePtr += rawSz[i]
+	}
+	if rsrcIndex >= 0 {
+		// Now the section's position is known, the tree can be written with
+		// real file offsets in its leaves. The size does not change -- only
+		// where the leaves point -- so the offsets above stay valid, and
+		// .rsrc being last means nothing after it needs shifting.
+		sections[rsrcIndex].data = img.Rsrc.emit(rawOf[rsrcIndex])
+		// Resource (index 2): the root table, which is the first thing in the
+		// section, so the data directory is the section itself.
+		//
+		// This is written HERE rather than with the other directories because
+		// it needs len(data), and the data does not exist until the line
+		// above. Written earlier it gets a length of zero -- and a data
+		// directory with a correct RVA and no size is a section the loader
+		// walks past, so the resource is silently absent rather than broken.
+		putU32at(hdr, dd+2*8, uint32(sections[rsrcIndex].va))
+		putU32at(hdr, dd+2*8+4, uint32(len(sections[rsrcIndex].data)))
+	}
+
+	// Now the section table itself, at oh+240.
+	st := oh + 240
+	for i, s := range sections {
+		for j := 0; j < 8; j++ {
+			if j < len(s.name) {
+				hdr[st+j] = s.name[j]
 			} else {
-				hdr[st+i] = ' '
+				hdr[st+j] = ' '
 			}
 		}
-		rawSize := 0
-		if !s.bss {
-			rawSize = align(len(s.data), fileAlign)
-		}
-		putU32at(hdr, st+8, uint32(s.vsize))  // VirtualSize
-		putU32at(hdr, st+12, uint32(s.va))    // VirtualAddress
-		putU32at(hdr, st+16, uint32(rawSize)) // SizeOfRawData
-		ptr := uint32(0)
-		if !s.bss {
-			ptr = uint32(filePtr)
-		}
-		putU32at(hdr, st+20, ptr) // PointerToRawData
+		// VirtualSize is vsize, NOT len(data). They differ for exactly one
+		// section -- .bss has no file bytes at all and its size lives only in
+		// vsize -- and writing len(data) there declares a zero-length section
+		// whose space the loader will hand to something else.
+		putU32at(hdr, st+8, uint32(s.vsize))   // VirtualSize
+		putU32at(hdr, st+12, uint32(s.va))     // VirtualAddress
+		putU32at(hdr, st+16, uint32(rawSz[i])) // SizeOfRawData
+		putU32at(hdr, st+20, uint32(rawOf[i])) // PointerToRawData
 		putU32at(hdr, st+36, s.ch)
 		st += 40
-		if !s.bss {
-			filePtr += rawSize
-		}
 	}
 
 	// Assemble final file.

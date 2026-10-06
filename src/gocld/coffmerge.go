@@ -192,6 +192,21 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 	}
 
 	// --- sections ---
+	// The object's own name, from the .file pseudo symbol. It is read before
+	// the sections because a malformed .rsrc has to be reported against the
+	// file it came from: "rsrc: truncated section" on its own says nothing
+	// about which of a dozen objects is at fault.
+	objName := ""
+	for _, s := range o.syms {
+		if s.class == scnClassFile {
+			objName = s.name
+			break
+		}
+	}
+	if objName == "" {
+		objName = "<object>"
+	}
+
 	// refptrFor records, for each undefined data symbol, the eight-byte slot
 	// the object put in .rdata to hold its address. See the .refptr note below.
 	refptrFor := map[string]refptrLoc{}
@@ -201,6 +216,32 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 	sectOf := make([]int, len(o.secs)+1)
 	baseOf := make([]int, len(o.secs)+1)
 	for i, cs := range o.secs {
+		// .rsrc is handled apart from everything else, and before the section
+		// is created: its bytes are a resource tree, not data, and giving it a
+		// Section would merge it into an unknown read-only blob that the image
+		// builder then drops -- the resources would vanish from the executable
+		// with nothing said. It is also the one section whose contents must not
+		// be concatenated: two objects with an icon each have to become one
+		// RT_ICON node with two leaves, which is a tree merge, not a byte copy.
+		// A malformed tree is an error here rather than a section full of
+		// whatever followed it in the file.
+		if cs.name == ".rsrc" {
+			tree, err := parseRsrc(cs.data)
+			if err != nil {
+				return fmt.Errorf("coff: %s: %w", objName, err)
+			}
+			if img.Rsrc == nil {
+				img.Rsrc = tree
+			} else if err := img.Rsrc.merge(tree); err != nil {
+				return fmt.Errorf("coff: %s: %w", objName, err)
+			}
+			// The section keeps its place in the numbering so that a symbol
+			// filed in some later section still resolves, but nothing is left
+			// pointing into these bytes.
+			sectOf[i+1] = -1
+			baseOf[i+1] = 0
+			continue
+		}
 		mapped, known := coffSectionMap[cs.name]
 		name := cs.name
 		if !known {
@@ -280,16 +321,8 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 	// at the end, because an image built on a guessed import loads fine and then
 	// dies with STATUS_ENTRYPOINT_NOT_FOUND and no explanation.
 	var unresolved []string
-	// The object's own name, for a duplicate-definition diagnostic. COFF records
-	// it as the .file symbol (storage class 103); an object without one is
-	// identified by position instead, which is still enough to say which two.
-	objName := ""
-	for _, s := range o.syms {
-		if s.class == scnClassFile {
-			objName = s.name
-			break
-		}
-	}
+	// objName was read with the sections above, since a bad .rsrc has to be
+	// reported against the file it came from.
 	// The library-symbol table the writer rode along in (see WriteCOFFObject).
 	// It is what makes a second inlined copy of printf recognisable as the same
 	// library rather than as a duplicate definition -- and a link over
@@ -413,6 +446,17 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 			continue
 		}
 		si := int(s.secNum)
+		// A symbol filed in .rsrc has no address in the finished image: the
+		// resource tree is rebuilt from the parsed leaves, so the offsets the
+		// object recorded for its own internal labels are gone. windres does not
+		// emit any (a resource file has no code), and a relocation against one
+		// would have nothing to point at. Skipping it leaves the reference
+		// unresolved and the link reports it by name, which is the honest
+		// outcome -- versus indexing Sections[-1] and panicking, or recording
+		// Sect -1 and having BuildPE compute an address from a negative base.
+		if si > 0 && si < len(sectOf) && sectOf[si] < 0 {
+			continue
+		}
 		// A name two objects both define is an error, not a silent "last one
 		// wins": the program would run one of the two with nothing to say which.
 		//
@@ -488,6 +532,15 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 			continue
 		}
 		si := i + 1
+		// .rsrc received no Image section, so a relocation against it has
+		// nowhere to land. See the matching note in the symbol pass: the tree is
+		// rebuilt from parsed leaves and the object's own offsets into those
+		// bytes do not survive it. Skipping keeps sectOf from handing a negative
+		// section index to a Fixup, which BuildPE would resolve against
+		// Sections[-1].
+		if si < len(sectOf) && sectOf[si] < 0 {
+			continue
+		}
 		for r := 0; r < cs.relCount; r++ {
 			rec := cs.relOff + 10*r
 			if rec+10 > len(src) {

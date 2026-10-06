@@ -176,12 +176,12 @@ type Image struct {
 	deduped map[string]bool
 
 	// FileName is the object's own name, used for the COFF .file symbol so that a
-// duplicate-definition diagnostic can name the two files that collided. Empty
-// is fine -- the symbol then reads ".file" and the diagnostic falls back to
-// position.
-FileName string
+	// duplicate-definition diagnostic can name the two files that collided. Empty
+	// is fine -- the symbol then reads ".file" and the diagnostic falls back to
+	// position.
+	FileName string
 
-// LibSyms names the C library symbols an image defines. The library's
+	// LibSyms names the C library symbols an image defines. The library's
 	// function names are fixed by the C ABI and so carry no marker of their
 	// own; the set is what lets a link of several units see the same function
 	// inlined into two of them and treat the second as another copy rather than
@@ -189,6 +189,19 @@ FileName string
 	// file because a link over separately compiled units has no other way to
 	// learn it.
 	LibSyms map[string]bool
+
+	// Rsrc is the merged resource tree, or nil when no object carried one.
+	//
+	// It is deliberately not a Section. A .rsrc section's bytes are a tree
+	// whose leaves record file offsets, so merging two of them means merging
+	// the trees -- two objects with an icon each must become one RT_ICON node
+	// with two leaves, or the loader shows the first and ignores the second.
+	// Concatenating the bytes would give two roots and a resource directory
+	// the loader walks straight past.
+	//
+	// ELF has no resources at all, so this stays nil there and the ELF writer
+	// has nothing to do about it.
+	Rsrc *rsrc
 
 	// PdataRVA and PdataSize record where the .pdata section landed, which
 	// the PE header's exception directory points at. Zero when there is none.
