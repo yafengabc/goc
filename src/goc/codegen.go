@@ -218,6 +218,29 @@ func (c *CG) argRegs() []string {
 	return []string{"rcx", "rdx", "r8", "r9"} // Windows x64
 }
 
+// callArgRegs returns the integer argument registers to use at a *call site*
+// for the callee named `name`.
+//
+// A Linux ELF target has no libc: goa turns every extern in externLinux into a
+// `mov rax,N; call __goc_syscall; ret` stub, so the callee is the raw syscall
+// entry, not an ordinary function. Linux syscall argument 4 is r10, not rcx --
+// the `syscall` instruction destroys rcx and r11, so the kernel takes the
+// fourth argument from r10 instead. gocrun's Win32 translator reads exactly
+// the same set (a1..a6 = rdi, rsi, rdx, r10, r8, r9), so both the real kernel
+// and the Windows harness agree on r10.
+//
+// Anything else -- a call through a function pointer, or a call to a function
+// goc itself generated -- keeps the ordinary SysV register file, which is also
+// what the prologue at the receiving end unpacks (see the argRegs use in the
+// frame setup). Only the call site changes; the two must not be confused, or
+// every 4+-argument call in the program breaks in the other direction.
+func (c *CG) callArgRegs(name string, indirect bool) []string {
+	if c.linux && !indirect && externLinux[name] {
+		return []string{"rdi", "rsi", "rdx", "r10", "r8", "r9"} // Linux syscall
+	}
+	return c.argRegs()
+}
+
 // argXMM returns the XMM argument registers for the target ABI.
 func (c *CG) argXMM() []string {
 	if c.linux {
@@ -9712,7 +9735,8 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 	if indirect {
 		diag = "function pointer"
 	}
-	argRegs := c.argRegs()
+	// Syscall stubs want r10, not rcx, as argument 4 -- see callArgRegs.
+	argRegs := c.callArgRegs(name, indirect)
 	argXMM := c.argXMM()
 	nargs := len(args)
 	if nargs > maxArgs {

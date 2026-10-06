@@ -659,7 +659,13 @@ int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
     if (t == 0) return thrd_nomem;
     base = mmap((void *)0, GTHR_STACK, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-    if (base == (void *)0 || base == (void *)-1) {
+    /* A raw Linux syscall reports failure as a *negative errno* (-EBADF,
+     * -ENOMEM, ...), not as the -1 a libc wrapper would hand back, and there
+     * is no libc here to do that translation. Testing only 0 and -1 lets a
+     * real failure through as a plausible pointer, and the next thing this
+     * function does with it is a store near address -9. Every error value a
+     * Linux mmap can return is negative, so one signed test covers them. */
+    if ((long)base < 0) {
         free(t);
         return thrd_nomem;
     }
