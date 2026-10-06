@@ -195,6 +195,29 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 			// A variadic argument keeps its own promoted type; a small
 			// integer is widened to int, as C requires.
 			v = e.defaultPromote(v)
+			// ...and then widened again to fill its whole eight-byte slot.
+			// A vararg occupies one eight-byte slot per argument (C 7.16.1.1,
+			// and the SysV/Win64 register save areas are arrays of eight-byte
+			// slots), while the callee reads the slot as a full register. For a
+			// 32-bit int LLVM fills only the low half of the slot and leaves the
+			// high half undefined, so a callee that reads it as a pointer --
+			// which is exactly how goclib's own `printf_lite_with(int (*fmtfn)
+			// (char *, long, const char *, va_list), const char *, va_list)` sees
+			// its second and third parameters, the front end having typed
+			// va_list as `char *` -- read whatever the register happened to hold
+			// above the value.
+			//
+			// The symptom was every signed 32-bit variadic argument arriving as
+			// its unsigned counterpart: `printf("%d", -8)` printed 4294967288,
+			// because `sub i32 0, 8` only wrote edx and the stale upper half of
+			// rdx was read back as part of the value. Clang, compiling this same
+			// IR, widens with `xor %edx,%edx; sub $0x8,%edx` and is right.
+			// Extending here is what makes the two agree -- and extending
+			// rather than leaving it to the callee is the only place that can:
+			// the callee is reached through a pointer whose signature already
+			// says `ptr`, so the information about the argument's real width is
+			// gone by then.
+			v = e.widenVarargSlot(v)
 		}
 		args = append(args, e.ty(v.ty)+" "+v.op)
 	}
@@ -261,6 +284,45 @@ func (e *irEmitter) defaultPromote(v val) val {
 	return v
 }
 
+// widenVarargSlot extends a variadic argument to the full eight bytes of its
+// slot.
+//
+// Only a narrow integer needs it. A double is already 64 bits and a pointer is
+// already 64 bits, and an i64 integer occupies the whole slot on its own -- so
+// in every case but the 1/2/4-byte integers the value is already the width the
+// callee will read. Those are exactly the ones LLVM stores in the low half of
+// the register and leaves the high half undefined.
+//
+// The extension follows the type's own signedness, not its width: `sext` for a
+// signed int reproduces C's integer promotion, and `zext` for unsigned (and for
+// _Bool, whose values are 0 and 1 and must not become 0xFFFFFFFF and 0) keeps
+// the value non-negative. Getting this backwards is the bug being fixed, only
+// with the sign bit set in the other half.
+func (e *irEmitter) widenVarargSlot(v val) val {
+	if v.ty == nil || v.ty.Kind != frontend.KInt {
+		// A pointer, a double, or a type the emitter did not classify: already
+		// a full slot.
+		return v
+	}
+	lty := e.ty(v.ty)
+	switch lty {
+	case "i8", "i16", "i32":
+	default:
+		// i64 and anything wider already fills the slot.
+		return v
+	}
+	out := e.newTmp()
+	opc := "zext"
+	if v.ty.Signed {
+		opc = "sext"
+	}
+	e.line("%s = %s %s %s to i64", out, opc, lty, v.op)
+	// The widened value is a long as far as the IR is concerned: eight bytes
+	// carrying the argument, which is what the callee's eight-byte read wants.
+	// The original type stays for the caller's own arithmetic on the result.
+	return val{op: out, ty: &frontend.Type{Kind: frontend.KInt, Width: 8, Signed: true}}
+}
+
 // indirectCall lowers a call through a computed callee.
 func (e *irEmitter) indirectCall(n *frontend.IndirectCall) val {
 	if n.UFCS != nil {
@@ -283,6 +345,12 @@ func (e *irEmitter) indirectCall(n *frontend.IndirectCall) val {
 		}
 		v := e.eval(a)
 		v = e.defaultPromote(v)
+		// Same eight-byte slot rule as a direct variadic call (see callExpr):
+		// a narrow integer would otherwise leave the upper half of the slot
+		// undefined for the callee to read. Every argument of an indirect call
+		// is variadic in the sense that matters here -- the callee's signature
+		// is not known at this call site, so nothing else will widen them.
+		v = e.widenVarargSlot(v)
 		args = append(args, e.ty(v.ty)+" "+v.op)
 	}
 	argText := ""
