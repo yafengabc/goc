@@ -40,8 +40,14 @@ type Config struct {
 	// DumpAsm writes the entry stub and image layout instead of linking. The
 	// stub is goa's assembly for the whole program under this back end -- the
 	// bodies are in the object -- so it is small, and it is the level at which
-	// "where did this symbol come from" is answerable.
+	// "where did this symbol come from" is answerable. It is a debugging aid
+	// for the assembler path, distinct from EmitLLVMAsm (-S), which writes the
+	// AsmPrinter's .s for the C bodies themselves.
 	DumpAsm bool
+	// EmitLLVMAsm lowers the program to native assembly text via LLVM's
+	// AsmPrinter and stops -- the `-S` behaviour. The artifact is the .s a
+	// `gcc -S` would write: the C function bodies in AT&T syntax.
+	EmitLLVMAsm bool
 	// PreprocessOnly is -E: emit the preprocessed source and stop.
 	PreprocessOnly bool
 	OutFile        string
@@ -120,6 +126,21 @@ func Compile(cfg *Config) (string, error) {
 			return "", err
 		}
 	}
+	if cfg.EmitLLVMAsm {
+		// -S / -c: lower to native assembly text via the AsmPrinter and stop.
+		// The artifact is the .s a `gcc -S` would write (the C bodies in AT&T
+		// syntax); the entry stub is not part of it, just as CRT startup is
+		// absent from a gcc -S .s. -o names the file directly; without it the
+		// .s lands next to the source, like the .exe would.
+		asmPath := cfg.OutFile
+		if asmPath == "" {
+			asmPath = strings.TrimSuffix(outputPath(cfg), ".exe") + ".s"
+		}
+		if err := gocl.EmitIRAssembly(ir, asmPath, cfg.Opt, cfg.Linux); err != nil {
+			return "", err
+		}
+		return "", nil
+	}
 	obj, err := gocl.CompileIR(ir, cfg.Opt, cfg.Linux)
 	if cfg.DumpIR && os.Getenv("GOC_DUMP_OBJ") != "" {
 		os.WriteFile(os.Getenv("GOC_DUMP_OBJ"), obj, 0644)
@@ -138,7 +159,15 @@ func Compile(cfg *Config) (string, error) {
 	}
 	outPath := outputPath(cfg)
 	if cfg.DumpAsm {
-		if err := os.WriteFile(strings.TrimSuffix(outPath, ".exe")+".stub.asm", []byte(asm), 0644); err != nil {
+		// -S / -dump-asm: write the assembly gocl emits (the entry stub goa
+		// assembles) and stop before linking. A -o path is used verbatim, so
+		// `gocl -S f.c -o f.asm` lands there; without -o the file is named
+		// after the source as <source>.stub.asm, kept separate from any .exe.
+		asmPath := cfg.OutFile
+		if asmPath == "" {
+			asmPath = strings.TrimSuffix(outPath, ".exe") + ".stub.asm"
+		}
+		if err := os.WriteFile(asmPath, []byte(asm), 0644); err != nil {
 			return "", err
 		}
 		return "", nil
@@ -234,37 +263,28 @@ func linkData(prog *frontend.Program, cfg *Config, claimed map[string]bool, exte
 	return d, nil
 }
 
-// externalImports lists the extern declarations the entry stub needs: the ones
-// the program calls that the object itself does not define -- the platform's
-// process and file APIs, and the C library's own imports.
+// externalImports lists the extern declarations the entry stub needs: the OS
+// entry points the program actually reaches, and therefore the only symbols the
+// LLVM object leaves undefined. Declaring every prototype a header declares --
+// <windows.h> names hundreds of Win32 functions -- would import all of them and
+// inflate the import table by ~10 KB for a program that calls one (a MessageBoxA
+// "Hello World" is the classic case). The linker resolves each undefined object
+// symbol against this set, so anything the code or its C library reaches must be
+// here; everything else is dead weight.
 func externalImports(prog *frontend.Program, linux bool, obj []byte) []string {
 	seen := map[string]bool{}
 	// Each import is stored newline-terminated, matching the convention native
 	// goc uses (codegen.go emits "extern %s, %s\n"). emit.go writes the strings
 	// verbatim, one per line; without the trailing newline two externs would
-	// collapse onto one line and goa's `;` comment marker would swallow the
-	// second, leaving its stub undefined.
+	// collapse onto one line and goa's assembler -- which splits on '\n' and
+	// only reads an `extern` that starts a line -- would drop all but the
+	// first, leaving the rest undefined at link time.
 	add := func(s string) {
 		s = strings.TrimSpace(s)
 		if s == "" {
 			return
 		}
 		seen[s+"\n"] = true
-	}
-	for _, f := range prog.Prototypes {
-		if f.DLL == "" {
-			continue
-		}
-		name := f.Name
-		if linux {
-			// On Linux the C library is compiled into the same object, so a
-			// prototype naming a system function is still a function the object
-			// references -- and goa's ELF half declares it from the symbol
-			// table. Only the handful of things the stub itself calls are
-			// declared here.
-			continue
-		}
-		add("extern " + name + ", " + f.DLL + ";")
 	}
 	if linux && len(obj) > 0 {
 		// Declare a syscall stub for every undefined symbol the LLVM object
@@ -282,7 +302,39 @@ func externalImports(prog *frontend.Program, linux bool, obj []byte) []string {
 				}
 			}
 		}
+		return externalImportsOut(seen)
 	}
+	// Windows: build the name -> DLL map from the prototypes the program
+	// declared, then declare only the ones the object actually leaves
+	// undefined. name -> DLL is a lookup, not an iteration, so a program that
+	// never calls a function never imports it.
+	dllOf := map[string]string{}
+	for _, f := range prog.Prototypes {
+		if f.DLL != "" {
+			dllOf[f.Name] = f.DLL
+		}
+	}
+	undefs, err := gocld.UndefinedSymbols(obj)
+	if err != nil {
+		// A parser hiccup must never masquerade as a missing import: fall back
+		// to declaring every DLL prototype (the pre-fix behaviour) so the link
+		// still succeeds.
+		for _, f := range prog.Prototypes {
+			if f.DLL != "" {
+				add("extern " + f.Name + ", " + f.DLL)
+			}
+		}
+	} else {
+		for _, name := range undefs {
+			if dll, ok := dllOf[name]; ok {
+				add("extern " + name + ", " + dll)
+			}
+		}
+	}
+	return externalImportsOut(seen)
+}
+
+func externalImportsOut(seen map[string]bool) []string {
 	out := make([]string, 0, len(seen))
 	for s := range seen {
 		out = append(out, s)
@@ -430,10 +482,13 @@ func parseArgs(args []string) (*Config, error) {
 		case a == "-E":
 			cfg.PreprocessOnly = true
 		case a == "-S", a == "-c":
-			// Both mean "stop before the executable". Without a separate
-			// assembly-output mode they produce the executable anyway, which is
-			// what goc does; a caller wanting only the object is served by
-			// -dump-ir, which keeps the text LLVM actually consumed.
+			// "Stop before the executable" -- lower the program to native
+			// assembly text with LLVM's AsmPrinter and write it, the way
+			// `gcc -S` does. gocl's C code goes through LLVM into a COFF
+			// object, so the assembly worth showing is the AsmPrinter's .s of
+			// the C bodies, not the entry stub goa assembles (that one is the
+			// -dump-asm debugging aid).
+			cfg.EmitLLVMAsm = true
 		case strings.HasPrefix(a, "-"):
 			// An unrecognised flag is ignored rather than rejected. Build
 			// scripts pass gcc's whole vocabulary to the compiler driver, and
@@ -459,6 +514,9 @@ const usage = `usage: gocl [options] file.c [file2.c ...]
   -target linux    emit an ELF binary instead of a PE
   -mwindows        PE GUI subsystem (pairs with wWinMain or WinMain)
   -dump-ir         keep the LLVM IR beside the output
+  -S, -c           stop before linking: write the AsmPrinter's .s (the C
+                   bodies in AT&T syntax) to <file>.s or <source>.s
+  -dump-asm        debugging aid: write goa's entry stub instead of linking
   -E               preprocess only
   --help, --version
 `
