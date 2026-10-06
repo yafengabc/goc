@@ -711,14 +711,15 @@ char *getenv(const char *name) {
  * targets; the ucrun-based regression runner cannot fork, so it is not run
  * there.
  * ------------------------------------------------------------------------- */
-#if !defined(_WIN32)
 /* system()'s three raw calls (__goclib_vfork / __goclib_execve /
  * __goclib_wait4). Under goc these are goa's syscall stubs, recognised by name;
- * under a host compiler they are libc's vfork / execve / wait4. <syscall.h>
- * carries both routes. */
-#include <syscall.h>
-#endif
-
+ * under a host compiler they are libc's vfork / execve / wait4.
+ *
+ * Not included a second time: <syscall.h> is already above, at file scope, and
+ * it is the same translation unit. A second include is harmless under goc and
+ * an error under gcc, which sees the header's inline helper defined twice --
+ * which is why the header carries a guard now and why this is not relying on
+ * it. */
 int system(const char *command) {
     if (command == 0) return 1;   /* a command processor is available */
 #if defined(_WIN32)

@@ -1,3 +1,6 @@
+#ifndef GOC_SYSCALL_H
+#define GOC_SYSCALL_H
+
 /* =============================================================================
  * syscall.h -- the raw Linux system calls goclib makes, and how each one is
  * reached on whichever host is compiling.
@@ -68,6 +71,42 @@ extern long __goclib_vfork(void);
 extern long __goclib_execve(const char *path, char **argv, char **envp);
 extern long __goclib_wait4(long pid, long *status, long options, void *rusage);
 
+/* Sockets (goclib/socket.c). Aliased for the reason everything in this block
+ * is: goclib defines socket(), bind(), listen(), accept(), connect(), send(),
+ * recv(), shutdown(), select() and the option calls, so each of those names
+ * resolves to the wrapper and not to the stub.
+ *
+ * There is no __goclib_send or __goclib_recv: Linux has no send(2) or recv(2),
+ * only sendto(2) and recvfrom(2), and socket.c passes those a null address.
+ *
+ * select(2) is worth a note as the widest call here: five arguments, and the
+ * fifth (the timeout) travels in r8 -- the fourth went to r10, because the
+ * `syscall' instruction clobbers rcx. codegen.go's externLinux is what selects
+ * that register file. */
+extern long __goclib_socket(long domain, long type, long protocol);
+extern long __goclib_bind(long fd, const void *addr, long addrlen);
+extern long __goclib_listen(long fd, long backlog);
+extern long __goclib_accept(long fd, void *addr, long *addrlen);
+extern long __goclib_connect(long fd, const void *addr, long addrlen);
+extern long __goclib_sendto(long fd, const void *buf, long len, long flags,
+                            const void *to, long tolen);
+extern long __goclib_recvfrom(long fd, void *buf, long len, long flags,
+                              void *from, long *fromlen);
+extern long __goclib_shutdown(long fd, long how);
+extern long __goclib_setsockopt(long fd, long level, long optname,
+                                const void *val, long len);
+extern long __goclib_getsockopt(long fd, long level, long optname,
+                                void *val, long *len);
+extern long __goclib_getsockname(long fd, void *addr, long *addrlen);
+extern long __goclib_getpeername(long fd, void *addr, long *addrlen);
+extern long __goclib_select(long nfds, void *readfds, void *writefds,
+                            void *exceptfds, void *timeout);
+/* fcntl (72): the only way to reach F_SETFL/O_NONBLOCK, which the socket layer
+ * needs to make a descriptor non-blocking. Aliased, like the rest, so that one
+ * name works on both hosts -- under goc it is a stub, under libc it is the real
+ * function with its return value restored to the kernel's shape. */
+extern long __goclib_fcntl(long fd, long cmd, long arg);
+
 /* The ones whose plain names goclib does NOT define, so no alias was needed
  * and the stub table carries the plain spelling. */
 extern long read(long fd, void *buf, long n);
@@ -89,6 +128,9 @@ extern void exit_group(long code);
 /* ---- under a host compiler: libc, or syscall(2) ---------------------------- */
 
 #else /* !__goc__ */
+
+extern long  fcntl(long fd, long cmd, long arg);
+#define __goclib_fcntl(fd, cmd, arg) __goclib_raw(fcntl((fd), (cmd), (arg)))
 
 /* Only the names goclib does not already declare for itself. The public POSIX
  * surface -- stat, mkdir, rmdir, chmod, access, getcwd, rename -- is declared in
@@ -151,13 +193,37 @@ extern long  wait4(long pid, long *status, long options, void *rusage);
  * because <sys/syscall.h> is out of reach under -nostdinc. */
 extern long  syscall(long number, ...);
 
-#define __goclib_brk(addr)                   ((void *)syscall(12, (long)(addr)))
+/* Every macro below is wrapped in __goclib_raw, and the reason is a difference
+ * between the two routes that is invisible until a call fails.
+ *
+ * goa's stubs hand back the raw kernel value: a failed call is a small negative
+ * number, -111 for a refused connection. libc's syscall(2) does not -- musl and
+ * glibc both condense any error to -1 and record the number in their own errno.
+ * goclib's Linux arm is written against the raw value (it negates it and looks
+ * the number up in a table), so -1 arrives there as "negate 1, look up 1", which
+ * is not a code and falls through to the default. Measured: every socket error
+ * under gcc reported EIO, including one that was really ECONNREFUSED.
+ *
+ * Putting the number back needs the host's errno, which under -nostdinc means
+ * naming the accessor libc exports for it.
+ *
+ * inline rather than plain static: this header is included by a dozen
+ * translation units and only one of them makes socket calls, so a plain static
+ * would be an unused function in the other eleven. */
+extern int *__errno_location(void);
+
+static inline long __goclib_raw(long r) {
+    if (r < 0) return -(long)(*__errno_location());
+    return r;
+}
+
+#define __goclib_brk(addr)                   ((void *)__goclib_raw(syscall(12, (long)(addr))))
 #define __goclib_clone(flags, stack, ptid, ctid, tls) \
-    syscall(56, (flags), (stack), (ptid), (ctid), (tls))
+    __goclib_raw(syscall(56, (flags), (stack), (ptid), (ctid), (tls)))
 #define __goclib_futex(uaddr, op, val, timeout, uaddr2, val3) \
-    syscall(202, (uaddr), (op), (val), (timeout), (uaddr2), (val3))
+    __goclib_raw(syscall(202, (uaddr), (op), (val), (timeout), (uaddr2), (val3)))
 #define __goclib_exit_thread(code)           syscall(60, (code))
-#define __goc_clock_gettime(clk, ts)         syscall(228, (clk), (ts))
+#define __goc_clock_gettime(clk, ts)         __goclib_raw(syscall(228, (clk), (ts)))
 
 /* exit_group has no libc function of that name, and _exit is the closest
  * equivalent on the way out of a process -- it leaves immediately, without
@@ -173,21 +239,51 @@ extern _Noreturn void _exit(int code);
 /* The stat / directory family. None of these can use the libc name, for the two
  * reasons above: goclib defines stat/mkdir/rmdir/getcwd/chmod/access/fstat itself,
  * and getdents64 is not exported by libc at all. */
-#define __goclib_stat(path, buf)             syscall(4,  (path), (buf))
-#define __goclib_fstat(fd, buf)              syscall(5,  (long)(fd), (buf))
-#define __goclib_access(path, mode)          syscall(21, (path), (mode))
-#define __goclib_rename(oldp, newp)          syscall(82, (oldp), (newp))
-#define __goclib_mkdir(path, mode)           syscall(83, (path), (mode))
-#define __goclib_rmdir(path)                 syscall(84, (path))
-#define __goclib_getcwd(buf, size)           syscall(79, (buf), (size))
-#define __goclib_chmod(path, mode)           syscall(90, (path), (mode))
-#define __goclib_getdents64(fd, buf, n)      syscall(217, (long)(fd), (buf), (long)(n))
-#define __goclib_gettid()                    gettid()
-#define __goclib_sched_yield()               sched_yield()
-#define __goclib_vfork()                     vfork()
-#define __goclib_execve(p, a, e)             execve((p), (a), (e))
-#define __goclib_wait4(p, s, o, r)           wait4((p), (s), (o), (r))
+#define __goclib_stat(path, buf)             __goclib_raw(syscall(4,  (path), (buf)))
+#define __goclib_fstat(fd, buf)              __goclib_raw(syscall(5,  (long)(fd), (buf)))
+#define __goclib_access(path, mode)          __goclib_raw(syscall(21, (path), (mode)))
+#define __goclib_rename(oldp, newp)          __goclib_raw(syscall(82, (oldp), (newp)))
+#define __goclib_mkdir(path, mode)           __goclib_raw(syscall(83, (path), (mode)))
+#define __goclib_rmdir(path)                 __goclib_raw(syscall(84, (path)))
+#define __goclib_getcwd(buf, size)           __goclib_raw(syscall(79, (buf), (size)))
+#define __goclib_chmod(path, mode)           __goclib_raw(syscall(90, (path), (mode)))
+#define __goclib_getdents64(fd, buf, n)      __goclib_raw(syscall(217, (long)(fd), (buf), (long)(n)))
+#define __goclib_gettid()                    __goclib_raw(gettid())
+#define __goclib_sched_yield()               __goclib_raw(sched_yield())
+#define __goclib_vfork()                     __goclib_raw(vfork())
+#define __goclib_execve(p, a, e)             __goclib_raw(execve((p), (a), (e)))
+#define __goclib_wait4(p, s, o, r)           __goclib_raw(wait4((p), (s), (o), (r)))
+
+/* Sockets. Every one of these goes through syscall(2) and none of them can go
+ * through libc, for the reason that applies to the stat family above: goclib
+ * defines socket(), bind(), connect(), select() and the rest itself, so
+ * `#define __goclib_socket(...) socket(...)' would call goclib's own wrapper
+ * and recurse without end -- and gcc would be right to say so.
+ *
+ * The numbers are x86-64: 41 socket, 42 connect, 43 accept, 44 sendto,
+ * 45 recvfrom, 48 shutdown, 49 bind, 50 listen, 51 getsockname,
+ * 52 getpeername, 54 setsockopt, 55 getsockopt, 23 select. */
+#define __goclib_socket(d, t, p)             __goclib_raw(syscall(41, (long)(d), (long)(t), (long)(p)))
+#define __goclib_bind(fd, a, l)              __goclib_raw(syscall(49, (long)(fd), (a), (long)(l)))
+#define __goclib_listen(fd, n)               __goclib_raw(syscall(50, (long)(fd), (long)(n)))
+#define __goclib_accept(fd, a, l)            __goclib_raw(syscall(43, (long)(fd), (a), (l)))
+#define __goclib_connect(fd, a, l)           __goclib_raw(syscall(42, (long)(fd), (a), (long)(l)))
+#define __goclib_sendto(fd, b, n, f, to, tl) \
+    __goclib_raw(syscall(44, (long)(fd), (b), (long)(n), (long)(f), (to), (long)(tl)))
+#define __goclib_recvfrom(fd, b, n, f, fr, fl) \
+    __goclib_raw(syscall(45, (long)(fd), (b), (long)(n), (long)(f), (fr), (fl)))
+#define __goclib_shutdown(fd, how)           __goclib_raw(syscall(48, (long)(fd), (long)(how)))
+#define __goclib_setsockopt(fd, lv, op, v, l) \
+    __goclib_raw(syscall(54, (long)(fd), (long)(lv), (long)(op), (v), (long)(l)))
+#define __goclib_getsockopt(fd, lv, op, v, l) \
+    __goclib_raw(syscall(55, (long)(fd), (long)(lv), (long)(op), (v), (l)))
+#define __goclib_getsockname(fd, a, l)       __goclib_raw(syscall(51, (long)(fd), (a), (l)))
+#define __goclib_getpeername(fd, a, l)       __goclib_raw(syscall(52, (long)(fd), (a), (l)))
+#define __goclib_select(n, r, w, e, t) \
+    __goclib_raw(syscall(23, (long)(n), (r), (w), (e), (t)))
 
 #endif /* __goc__ */
 
 #endif /* __linux__ */
+
+#endif /* GOC_SYSCALL_H */
