@@ -81,9 +81,10 @@ func CompileIR(ir string, opt int, linux bool) ([]byte, error) {
 }
 
 // emitIRAssembly lowers IR to native assembly text and writes it to outPath.
-// Used by -dump-asm with the IR kept: the readable artifact is the
-// AsmPrinter's output, not
-// the entry stub that genWith emits once `claimed` covers every function.
+// Used by -S (EmitLLVMAsm): lowers IR to native assembly text via the
+// AsmPrinter, the way `gcc -S` does. The readable artifact is the C bodies'
+// assembly, not the entry stub that genWith emits once `claimed` covers every
+// function -- that stub is the -dump-asm debugging aid, handled separately.
 func emitIRAssembly(ir string, outPath string, opt int, linux bool) error {
 	api, err := OpenLLVM()
 	if err != nil {

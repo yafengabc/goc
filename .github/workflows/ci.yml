@@ -29,6 +29,8 @@ jobs:
           (cd src/frontend && go vet ./...)
           (cd src/goc && go vet ./...)
           (cd src && go vet ./...)
+          (cd src/common && go vet ./...)
+          (cd src/gocl && go vet ./...)
           (cd src/gocld && go vet ./...)
           (cd src/goa && go vet ./...)
           (cd tools && go vet ./...)

@@ -21,16 +21,24 @@ package gocld
 //     in img.Exts, and references to it are rewritten to the "IAT:name" form that
 //     buildIData resolves into an address-table slot.
 //
-// Relocation arithmetic differs between the two models, and getting it wrong
-// silently produces a program that jumps into the middle of nowhere:
+// Relocation arithmetic differs from a naive reading of the COFF spec, and
+// getting it wrong silently produces a program that jumps into the middle of
+// nowhere:
 //
-//   COFF IMAGE_REL_AMD64_REL32    S + A - P, P = address OF the field
+//   COFF IMAGE_REL_AMD64_REL32    S + A - P,  P = address OF the field
 //   goa fixup                       target - (base + off + size + ripAdj)
-//                                   (P = the address AFTER the field)
+//                                   (P = the address AFTER the field, per the
+//                                    CPU's RIP after the instruction)
 //
-// So ripAdj = -size makes the two identical. IMAGE_REL_AMD64_ADDR32NB -- the
-// form the unwind table uses -- is also S - P but with P at the START of the
-// containing section, so ripAdj = -(off+size) is what lines that one up.
+// The PE spec defines P as the field's address, but the CPU computes RIP at the
+// field's END, so a literal "S - P" lands four bytes past the target. For the
+// REL32 case (relAMD64Rel32 below) ripAdj = 0, so goa's
+// "target - (base + off + size)" already matches what the CPU computes.
+// IMAGE_REL_AMD64_ADDR32NB -- the form the unwind table uses -- is an absolute
+// fixup (relAMD64Addr32NB below): the value wanted is the target's RVA, so P
+// drops out and ripAdj = -(at+4) cancels the field's own address, leaving the
+// absolute image address. The per-case comments below are authoritative; this
+// header only sketches the two shapes.
 
 import (
 	"fmt"
