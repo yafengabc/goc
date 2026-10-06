@@ -507,6 +507,7 @@ func containsStr(hay, needle string) bool {
 	}
 	return false
 }
+
 // TestWriteELFObjectShndxFollowsLayout pins st_shndx to the index the section
 // has in the *file*, not the provisional index it had before the layout was
 // chosen.

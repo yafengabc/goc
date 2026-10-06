@@ -54,7 +54,7 @@ const (
 	elfEhSize      = 64
 	elfPhEntSize   = 56
 	elfShEntSize   = 64
-	elfSymEntSize  = 24 // sizeof(Elf64_Sym)
+	elfSymEntSize  = 24   // sizeof(Elf64_Sym)
 	elfTextFileOff = 0x80 // ELF header + one program header, 16-aligned
 )
 

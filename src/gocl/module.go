@@ -50,6 +50,13 @@ type irMod struct {
 	// because another generator does. They still get declared, so calls to
 	// them type-check and link.
 	defined map[string]bool
+	// symKind says what a C identifier written in a static initialiser names:
+	// "global" for a file-scope or runtime object (emitted as G_<name>),
+	// "func" for a function or a prototype. It is the only way "&g" in an
+	// initialiser can be rendered as the address of the right symbol -- the
+	// initialiser is lowered before the definitions exist, and a name that is
+	// not in here is not something whose address can be taken.
+	symKind map[string]string
 	// optSize asks the optimiser for a size-oriented result. LLVM 21 removed
 	// the `Os` pipeline and replaced it with the optsize attribute on the
 	// functions to shrink, run under O2 -- so this is what -Os now means, and
@@ -642,8 +649,16 @@ func (e *irEmitter) convertTo(op string, from *frontend.Type, toIR string) strin
 		return v
 	}
 	// Anything else moves through memory: the two types have different shapes,
-	// so a store and a load of the right width is the general answer.
-	slot := e.scratchSlot(8)
+	// so a store and a load of the right width is the general answer. The
+	// staging slot has to hold the whole source object, which for an aggregate
+	// is more than the eight bytes a scalar needs.
+	n := 8
+	if from != nil {
+		if sz := frontend.Sizeof(from); sz > n {
+			n = sz
+		}
+	}
+	slot := e.scratchSlot(n)
 	e.line("store %s %s, ptr %s, align %d", f, op, slot, alignOfIr(f))
 	v := e.newTmp()
 	e.line("%s = load %s, ptr %s, align %d", v, toIR, slot, alignOfIr(toIR))

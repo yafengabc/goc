@@ -52,8 +52,8 @@ func testImage() *Image {
 	img.Syms["counter"] = SymLoc{Sect: 2, Off: 0}
 
 	img.Fixups = []Fixup{
-		{Sect: 0, Off: 4, Sym: "helper"},                             // call
-		{Sect: 0, Off: 9, Sym: "table", RipAdjust: 4},                // rip-relative
+		{Sect: 0, Off: 4, Sym: "helper"},                               // call
+		{Sect: 0, Off: 9, Sym: "table", RipAdjust: 4},                  // rip-relative
 		{Sect: 0, Off: 16, Sym: "counter", Absolute: true, Wide: true}, // movabs
 	}
 	img.Entry = "main"

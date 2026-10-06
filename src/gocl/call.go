@@ -103,6 +103,19 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 	if repl := common.SpecializePrintfCall(n, e.printfQueries()); repl != nil {
 		return e.callExpr(repl)
 	}
+	// Compiler intrinsics that exist only to carry information to the back end.
+	// They are calls in the C source but instructions (or LLVM intrinsics) in
+	// the output, so they have to be recognised before the ordinary call path
+	// turns them into references to symbols no library defines. See builtin.go.
+	if v, ok := e.markerCall(n); ok {
+		return v
+	}
+	if v, ok := e.overflowCall(n); ok {
+		return v
+	}
+	if v, ok := e.atomicCall(n); ok {
+		return v
+	}
 	// va_start, va_end and va_copy are compiler built-ins in goc, recognised by
 	// name. All three take the cursor's address: the intrinsics write through it.
 	switch n.Name {
@@ -390,5 +403,12 @@ func (e *irEmitter) memberAddr(n *frontend.MemberExpr) string {
 func (e *irEmitter) member(n *frontend.MemberExpr) val {
 	ty := e.tr.exprType(n)
 	p := e.memberAddr(n)
+	// An array member named as a value is a pointer to its first element, the
+	// same decay C applies to every array: "s.data" is a `char *`, not an array
+	// value. Loading it would produce a "[1 x i8]" that no pointer context
+	// accepts.
+	if ty != nil && ty.Kind == frontend.KArr {
+		return val{op: p, ty: frontend.PtrType(ty.Elem)}
+	}
 	return e.load(p, ty)
 }

@@ -99,6 +99,8 @@ extern DWORD  GetEnvironmentVariableW(LPCWSTR name, LPWSTR buf, DWORD n), kernel
 extern BOOL   SetEnvironmentVariableW(LPCWSTR name, LPCWSTR value), kernel32;
 extern DWORD  ExpandEnvironmentStringsW(LPCWSTR src, LPWSTR dst, DWORD n), kernel32;
 
+extern BOOL   SetConsoleCtrlHandler(BOOL (*handler)(DWORD), BOOL add), kernel32;
+
 /* ------------------------------------------------------------------ */
 /* Time                                                                */
 /* ------------------------------------------------------------------ */
@@ -117,6 +119,24 @@ extern LPVOID HeapAlloc(HANDLE heap, DWORD flags, SIZE_T bytes), kernel32;
 extern BOOL   HeapFree(HANDLE heap, DWORD flags, LPVOID mem), kernel32;
 extern LPVOID HeapReAlloc(HANDLE heap, DWORD flags, LPVOID mem, SIZE_T bytes), kernel32;
 extern HANDLE GetProcessHeap(void), kernel32;
+
+/* Page-granular memory. Nim's own allocator reserves and commits with these
+ * instead of the libc heap, so a Nim-generated program cannot link without
+ * them. VirtualQuery/MEMORY_BASIC_INFORMATION are left out: goc has no
+ * matching struct yet, and callers that want them can pass a byte buffer. */
+extern LPVOID VirtualAlloc(LPVOID addr, SIZE_T size, DWORD allocType, DWORD protect), kernel32;
+extern BOOL   VirtualFree(LPVOID addr, SIZE_T size, DWORD freeType), kernel32;
+extern BOOL   VirtualProtect(LPVOID addr, SIZE_T size, DWORD protect, LPDWORD old), kernel32;
+
+#define MEM_COMMIT            0x1000
+#define MEM_RESERVE           0x2000
+#define MEM_DECOMMIT          0x4000
+#define MEM_RELEASE           0x8000
+#define PAGE_NOACCESS         0x01
+#define PAGE_READONLY         0x02
+#define PAGE_READWRITE        0x04
+#define PAGE_WRITECOPY        0x08
+#define PAGE_EXECUTE_READWRITE 0x40
 
 /* ------------------------------------------------------------------ */
 /* SYSTEMTIME / FILETIME (struct layout, LLP64, matches winbase.h)     */

@@ -81,6 +81,13 @@ tests/*/_build/
 # Perf-benchmark dir: keep only the .c sources, ignore built artifacts.
 bench/*
 !bench/*.c
+# The Nim cross-compiler benchmark (bench/nim/) is a documented, reproducible
+# deliverable: keep its report, driver script, and .nim kernel sources, but let
+# the broad bench/* rule still swallow every built artifact (.exe/.asm/.nc_*/.ll).
+!bench/nim/
+!bench/nim/BENCHMARK.md
+!bench/nim/runbench.sh
+!bench/nim/*.nim
 goa/zz_*.tmpl
 src/**/zz_*_test.go.tmpl
 

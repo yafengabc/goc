@@ -218,7 +218,32 @@ func foldConstInit(e frontend.Expr) (int64, bool) {
 			return v, true
 		case "~":
 			return ^v, true
+		case "!":
+			return boolVal(v == 0), true
 		}
+	case *frontend.CondExpr:
+		// a ? b : c -- the condition is itself a constant integer fold.
+		c, ok := foldConstInit(n.Cond)
+		if !ok {
+			return 0, false
+		}
+		if c != 0 {
+			return foldConstInit(n.Then)
+		}
+		return foldConstInit(n.Else)
+	case *frontend.CastExpr:
+		// A cast to an integer (or _Bool) type truncates/sign-extends the
+		// folded operand exactly as the C integer-conversion rules require;
+		// a cast to any other type leaves the bit pattern unchanged (a
+		// (void*)0 null pointer, for instance, keeps the value 0). Without
+		// this case, "((NU)(1) << 62)" -- the definition of Nim's
+		// NIM_STRLIT_FLAG -- failed to fold and its static initialiser was
+		// emitted as 0, which broke every Nim float->string conversion.
+		v, ok := foldConstInit(n.E)
+		if !ok {
+			return 0, false
+		}
+		return foldCastInt(v, n.Typ)
 	case *frontend.Binary:
 		// Every integer constant operator C allows in a static initialiser.
 		// Shifts refuse counts outside [0,63] (x86 masks the count, so the
@@ -294,6 +319,55 @@ func boolVal(b bool) int64 {
 		return 1
 	}
 	return 0
+}
+
+// foldCastInt applies an integer (or _Bool) cast to an already-folded value.
+// Narrower widths truncate and sign-extend back to int64; a 64-bit or unknown
+// width keeps the full value. Pointer/other targets keep the raw value (so a
+// (void*)0 null pointer stays 0). Returns (0, false) only when the target type
+// is missing, which the folder cannot reason about.
+func foldCastInt(v int64, t *frontend.Type) (int64, bool) {
+	if t == nil {
+		return 0, false
+	}
+	switch t.Kind {
+	case frontend.KInt:
+		return truncInt(v, t.Width, t.Signed), true
+	case frontend.KBitInt:
+		if t.Bits <= 0 || t.Bits > 64 {
+			return 0, false
+		}
+		if t.Bits == 64 {
+			return v, true
+		}
+		bits := uint(t.Bits)
+		mask := (int64(1) << bits) - 1
+		u := v & mask
+		if t.Signed && u&(int64(1)<<(bits-1)) != 0 {
+			u |= ^mask
+		}
+		return u, true
+	case frontend.KBool:
+		return boolVal(v != 0), true
+	default:
+		// Keep the bit pattern for pointers and other non-integer targets.
+		return v, true
+	}
+}
+
+// truncInt narrows v to width bytes, sign-extending when signed. width >= 8 (or
+// <= 0, meaning "unknown") passes the value through unchanged.
+func truncInt(v int64, width int, signed bool) int64 {
+	if width <= 0 || width >= 8 {
+		return v
+	}
+	bits := uint(width * 8)
+	mask := (int64(1) << bits) - 1
+	u := v & mask
+	if signed && u&(int64(1)<<(bits-1)) != 0 {
+		u |= ^mask
+	}
+	return u
 }
 
 // foldFloatInit folds the constant initialiser of a global float/double down
@@ -408,6 +482,7 @@ func formatDouble(v float64) string {
 // whether the initialiser *names* something; the caller still has to confirm
 // through funcAddrSym that it really names a function whose code is here.
 func globalInitFuncName(e frontend.Expr) (string, bool) {
+	e = stripInitCasts(e)
 	switch n := e.(type) {
 	case *frontend.Ident:
 		return n.Name, true
@@ -419,6 +494,22 @@ func globalInitFuncName(e frontend.Expr) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// stripInitCasts peels the casts off a global/static initialiser. C writes the
+// address of an object behind a cast more often than not -- Nim's generated C
+// spells it "(NimStrPayload*)&literal" -- and a cast to a pointer type changes
+// nothing about *which* object is named. Every "does this initialiser name
+// something" scan therefore has to look through them first, or the slot is
+// taken for a plain 0 and the address is never bound.
+func stripInitCasts(e frontend.Expr) frontend.Expr {
+	for {
+		c, ok := e.(*frontend.CastExpr)
+		if !ok {
+			return e
+		}
+		e = c.E
+	}
 }
 
 // walkGlobalInit scans a global/static-local initialiser for every pointer
@@ -439,6 +530,10 @@ func walkGlobalInit(d *Data, t *frontend.Type, init frontend.Expr, glab string, 
 	}
 	bi, ok := init.(*frontend.BraceInit)
 	if !ok {
+		// "(NimStrPayload*)&literal" and "void *p = (void*)g" name an object
+		// exactly as the uncast forms do; the cast has to come off before any
+		// of the scans below can recognise it.
+		init = stripInitCasts(init)
 		// A bare function designator naming a function ("void *(*fp)(long) =
 		// malloc;", or a function-pointer member reached through a brace
 		// walk) needs the same startup binding a string literal does.

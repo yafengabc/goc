@@ -1700,3 +1700,21 @@ char *tmpnam(char *s) {
     dst[i++] = '.'; dst[i++] = 't'; dst[i++] = 'm'; dst[i++] = 'p'; dst[i] = 0;
     return dst;
 }
+
+/* _fileno / _setmode -- the io.h pair Windows programs use to switch a stream
+ * between text and binary. goc writes bytes through untouched, so there is no
+ * translation to turn off; the call only has to answer plausibly. The stream
+ * identity is decided by address against the three standard FILEs, which is
+ * the only thing callers ever ask about (_fileno(stdout) and friends at
+ * startup). */
+int _fileno(FILE *f) {
+    if (f == stdin) { return 0; }
+    if (f == stdout) { return 1; }
+    if (f == stderr) { return 2; }
+    return -1;
+}
+
+int _setmode(int fd, int mode) {
+    if (fd < 0) { return -1; }
+    return mode;
+}

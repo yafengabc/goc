@@ -82,6 +82,32 @@ func translateProgram(prog *frontend.Program, lib *common.Program, linux bool, o
 		tr.userDefs[f.Name] = true
 		defined[f.Name] = true
 	}
+	// What a name in a static initialiser can refer to. It has to be collected
+	// before any initialiser is lowered, because lowering happens while the
+	// definitions are still being built: "&g" has to know whether g is an
+	// object (emitted as G_g) or a function (emitted as @g).
+	m.symKind = map[string]string{}
+	for _, f := range prog.Funcs {
+		m.symKind[f.Name] = "func"
+	}
+	if lib != nil {
+		for _, f := range lib.Funcs {
+			m.symKind[f.Name] = "func"
+		}
+		for _, p := range lib.Protos {
+			m.symKind[p.Name] = "func"
+		}
+	}
+	for _, gl := range prog.Globals {
+		m.symKind[gl.Name] = "global"
+	}
+	if lib != nil {
+		for _, lg := range lib.Globals {
+			if _, shadowed := m.symKind[lg.Name]; !shadowed {
+				m.symKind[lg.Name] = "global"
+			}
+		}
+	}
 	// The runtime's globals, when the program's own do not shadow them, are part
 	// of the module for the same reason its functions are -- and they have to be
 	// *defined* here, not merely given a type. Registering the type alone left
@@ -556,10 +582,48 @@ func (m *irMod) constInitAt(e frontend.Expr, t *frontend.Type, top bool) (string
 		}
 		return v, true
 	}
+	// The address of an object, optionally behind a cast: "&g" and
+	// "(NimStrPayload*)&g". C writes the address of a global in a static
+	// initialiser constantly, and LLVM can hold it directly as a constant
+	// expression -- so there is no reason to fall back to zeroinitializer,
+	// which is what left Nim's string constants pointing at nothing.
+	if name := constInitAddrName(e); name != "" {
+		switch m.symKind[name] {
+		case "global":
+			return "@G_" + name, true
+		case "func":
+			return "@" + name, true
+		}
+	}
+	// A bare identifier naming an array decays to the address of its first
+	// element, the same way it does in an expression.
+	if id, ok := e.(*frontend.Ident); ok && m.symKind[id.Name] == "global" {
+		return "@G_" + id.Name, true
+	}
 	return "", false
 }
 
-// negateConst negates an already-rendered integer constant.
+// constInitAddrName reports the object an "&name" in a static initialiser
+// names, peeling the casts C puts in front of it. It answers "" when the
+// expression is not an address-of; a bare identifier is only an address when it
+// names an array, which the caller checks against the symbol table.
+func constInitAddrName(e frontend.Expr) string {
+	for {
+		c, ok := e.(*frontend.CastExpr)
+		if !ok {
+			break
+		}
+		e = c.E
+	}
+	u, ok := e.(*frontend.Unary)
+	if !ok || u.Op != "&" {
+		return ""
+	}
+	if id, ok := u.E.(*frontend.Ident); ok {
+		return id.Name
+	}
+	return ""
+}
 func negateConst(v string) string {
 	if strings.HasPrefix(v, "-") {
 		return v[1:]

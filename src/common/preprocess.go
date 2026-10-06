@@ -159,6 +159,22 @@ func preprocess(src, filename string, linux, builtinOnly bool, incDirs ...string
 	p.macros["__STDC_VERSION__"] = &Macro{Name: "__STDC_VERSION__", Body: []frontend.Token{tokNum(202311, 0)}}
 	p.macros["__DATE__"] = &Macro{Name: "__DATE__", Body: []frontend.Token{tokStr(now.Format("Jan _2 2006"), 0)}}
 	p.macros["__TIME__"] = &Macro{Name: "__TIME__", Body: []frontend.Token{tokStr(now.Format("15:04:05"), 0)}}
+	// GCC/Clang's memory-order constants. They are compiler-predefined rather
+	// than declared anywhere -- GCC puts them in the compiler, not in
+	// <stdatomic.h> -- and they are the only way to spell an order for the
+	// __atomic_* builtins, which goc accepts (see src/frontend/atomic.go). The
+	// values are the GCC enum's, so a program that passes __ATOMIC_ACQUIRE may
+	// be read against GCC's own list.
+	for name, val := range map[string]int64{
+		"__ATOMIC_RELAXED": 0,
+		"__ATOMIC_CONSUME": 1,
+		"__ATOMIC_ACQUIRE": 2,
+		"__ATOMIC_RELEASE": 3,
+		"__ATOMIC_ACQ_REL": 4,
+		"__ATOMIC_SEQ_CST": 5,
+	} {
+		p.macros[name] = &Macro{Name: name, Body: []frontend.Token{tokNum(val, 0)}}
+	}
 	// Vendor extension keywords that real-world headers use but that carry no
 	// meaning for goc's code generator. They are predefined as macros that
 	// expand to nothing, so a declaration such as

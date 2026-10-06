@@ -41,6 +41,10 @@ var keywords = map[string]bool{
 	"char8_t":      true,
 	"inline":       true,
 	"thread_local": true, "_Thread_local": true,
+	// __thread is the GNU spelling of C11 _Thread_local. Real code uses it:
+	// Nim's nimbase.h defines NIM_THREADVAR to __thread for the MinGW/gcc
+	// target, so every Nim-generated translation unit carries it.
+	"__thread":      true,
 	"__has_include": true, "__has_c_attribute": true,
 	"__VA_OPT__": true,
 	"_Atomic":    true,

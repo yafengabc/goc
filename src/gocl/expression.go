@@ -176,7 +176,7 @@ func (e *irEmitter) vaArgSysV(ap, lty string, ty *frontend.Type) val {
 		ovfOff = 8
 		rsvOff = 16
 	)
-	gpRegMax := 48 // 6 integer register slots
+	gpRegMax := 48  // 6 integer register slots
 	fpRegMax := 176 // 8 SSE slots plus the 48-byte GP half (8 * 16 + 48)
 
 	// isFP reports whether this argument type is fetched from the SSE half.

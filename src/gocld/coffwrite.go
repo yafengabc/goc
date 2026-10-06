@@ -95,7 +95,7 @@ type coffRelOut struct {
 // on which names are present, so the table is built as symbols are added and
 // only its length is known at the end.
 type coffWriter struct {
-	strTab  []byte         // string-table payload, without its length dword
+	strTab  []byte           // string-table payload, without its length dword
 	strUsed map[string]int32 // name -> offset, so a shared name is stored once
 
 	// syms is the symbol table in file order, excluding the auxiliary records.
@@ -682,7 +682,7 @@ func (w *coffWriter) emit(secs []*Section, relCount []int) []byte {
 			// wrong place.
 			raw = s.VSize
 		}
-		binary.LittleEndian.PutUint32(h[8:], uint32(s.VSize))  // VirtualSize
+		binary.LittleEndian.PutUint32(h[8:], uint32(s.VSize)) // VirtualSize
 		binary.LittleEndian.PutUint32(h[12:], 0)              // VirtualAddress: the linker assigns it
 		binary.LittleEndian.PutUint32(h[16:], uint32(raw))    // SizeOfRawData
 		if s.Bss {

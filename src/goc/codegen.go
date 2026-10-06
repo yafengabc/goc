@@ -2520,11 +2520,194 @@ func (c *CG) truncTo(aw int, signed bool) {
 // frontend.LookupAtomicBuiltin). The fetch family and atomic_exchange return
 // the value the object held BEFORE the update -- the one thing a C expression
 // cannot produce, because the read and the write have to be indivisible.
+// genMarkerBuiltin lowers the marker builtins (see src/frontend/marker.go).
+// None of them does any runtime work, but __builtin_expect and its relatives
+// still have to *evaluate* their first argument: it is the value they report,
+// and skipping it would drop a call with side effects.
+func (c *CG) genMarkerBuiltin(n *frontend.Call, ms frontend.MarkerSig) (frontend.CType, error) {
+	if n.Name == "__builtin_trap" {
+		// The one marker with a runtime effect: the path is meant to be fatal.
+		c.emit("ud2")
+		return frontend.TInt, nil
+	}
+	if len(n.Args) == 0 {
+		// __builtin_unreachable / __builtin_assume: nothing to emit. The dead
+		// path simply falls through, and whatever the caller assigned before
+		// the call stays in its register or slot.
+		c.resTyp = frontend.TInt
+		c.resW = 4
+		return frontend.TInt, nil
+	}
+	// The branch-hint forms: evaluate and report the first argument, then
+	// discard the rest (the expected probability and the hint are constants).
+	ct, err := c.genExprT(n.Args[0])
+	if err != nil {
+		return frontend.TInt, err
+	}
+	return ct, nil
+}
+
+// genOverflowBuiltin lowers GCC's overflow-checked arithmetic (see
+// src/frontend/overflow.go): the sum/difference/product goes to *res and the
+// call yields 1 when the exact result did not fit. x86 hands back both answers
+// from the one instruction -- the wrapped result in the register and the
+// condition that says it wrapped -- so this is a handful of instructions rather
+// than a library call that would have to redo the arithmetic in a wider type.
+func (c *CG) genOverflowBuiltin(n *frontend.Call, ob frontend.OverflowBuiltin) (frontend.CType, error) {
+	if len(n.Args) != 3 {
+		return frontend.TInt, fmt.Errorf("%s: expected 3 arguments, got %d", n.Name, len(n.Args))
+	}
+	// The width is part of the name (sadd is 32-bit, saddll is 64-bit); the
+	// generic __builtin_add_overflow spelling has to read it off the result
+	// pointer instead.
+	w := ob.Width
+	signed := ob.Signed
+	if w == 0 {
+		pt := c.exprType(n.Args[2])
+		if pt == nil || !pt.IsPtr() || pt.Elem == nil {
+			return frontend.TInt, fmt.Errorf("%s: third argument must be a pointer to the result", n.Name)
+		}
+		w = c.typeWidth(pt.Elem)
+		signed = pt.Elem.Kind == frontend.KInt && pt.Elem.Signed
+	}
+	if w != 1 && w != 2 && w != 4 && w != 8 {
+		return frontend.TInt, fmt.Errorf("%s: no overflow check for a result of width %d", n.Name, w)
+	}
+	wn := map[int]string{1: "byte", 2: "word", 4: "dword", 8: "qword"}[w]
+	acc := map[int]string{1: "al", 2: "ax", 4: "eax", 8: "rax"}[w]
+	entry := c.tmpDepth
+	defer func() { c.tmpDepth = entry }()
+
+	// Every operand is evaluated before the arithmetic starts: the check reads
+	// the flags the operation itself sets, and a call hiding in an argument
+	// would clobber them.
+	slot := make([]int, 3)
+	for i, a := range n.Args {
+		if _, err := c.genExprT(a); err != nil {
+			return frontend.TInt, err
+		}
+		c.tmpDepth++
+		slot[i] = c.tmpSlot(c.tmpDepth)
+		c.emit("mov [rbp%+d], rax", slot[i])
+	}
+	c.emit("mov r10, [rbp%+d]", slot[2])
+
+	switch ob.Op {
+	case "+", "-":
+		mnem := "add"
+		if ob.Op == "-" {
+			mnem = "sub"
+		}
+		c.emit("mov %s, [rbp%+d]", acc, slot[0])
+		c.emit("%s %s, %s [rbp%+d]", mnem, acc, wn, slot[1])
+		// OF is signed overflow. CF is the carry out of the field, which is
+		// unsigned overflow going up and a borrow coming down -- the same flag
+		// covers both directions of the unsigned check.
+		if signed {
+			c.emit("seto r11b")
+		} else {
+			c.emit("setc r11b")
+		}
+		c.emit("mov %s [r10], %s", wn, acc)
+	case "*":
+		if w >= 4 {
+			// One-operand IMUL/MUL widen into rdx:rax and set OF/CF when the
+			// upper half is not the sign extension of the lower (signed) or is
+			// simply not zero (unsigned) -- which is exactly "did not fit".
+			c.emit("mov %s, [rbp%+d]", acc, slot[0])
+			if signed {
+				c.emit("imul %s [rbp%+d]", wn, slot[1])
+				c.emit("seto r11b")
+			} else {
+				c.emit("mul %s [rbp%+d]", wn, slot[1])
+				c.emit("setc r11b")
+			}
+			c.emit("mov %s [r10], %s", wn, acc)
+			break
+		}
+		// A byte or word product has no widening multiply worth relying on, so
+		// it is computed in 32 bits and then tested against the field: sign-
+		// extending the low bits back has to reproduce the product (signed),
+		// or the bits above the field have to be clear (unsigned).
+		c.emit("mov eax, [rbp%+d]", slot[0])
+		if signed {
+			c.emit("imul dword [rbp%+d]", slot[1])
+		} else {
+			c.emit("mul dword [rbp%+d]", slot[1])
+		}
+		// The wrapped product is stored first: the test below needs rax.
+		c.emit("mov %s [r10], %s", wn, acc)
+		c.emit("mov r11d, eax")
+		c.emit("mov eax, r11d")
+		if signed {
+			c.emit("shl eax, %d", 32-8*w)
+			c.emit("sar eax, %d", 32-8*w)
+			c.emit("cmp eax, r11d")
+		} else {
+			// SHR sets ZF on the shifted result, so the zero test is free.
+			c.emit("shr eax, %d", 8*w)
+		}
+		c.emit("setne r11b")
+	default:
+		return frontend.TInt, fmt.Errorf("%s: unknown overflow operation %q", n.Name, ob.Op)
+	}
+	c.emit("movzx eax, r11b")
+	c.resTyp = frontend.TInt
+	c.resSigned = false
+	c.resW = 4
+	return frontend.TInt, nil
+}
+
 func (c *CG) genAtomicBuiltin(n *frontend.Call, ab frontend.AtomicBuiltin) (frontend.CType, error) {
+	// The GCC __atomic_* spellings carry trailing arguments the model has no
+	// use for (a memory_order, plus a weak flag for the compare-exchange), so
+	// they are dropped here and what remains is exactly the __goc_ form's
+	// argument list. Trimming a copy keeps the AST the checker already
+	// validated untouched for every other pass.
+	if ab.GCCOrderArgs > 0 {
+		trimmed := *n
+		trimmed.Args = n.Args[:len(n.Args)-ab.GCCOrderArgs]
+		n = &trimmed
+	}
 	if ab.CAS {
 		return c.genAtomicCAS(n)
 	}
+	if ab.LoadOnly {
+		return c.genAtomicLoad(n)
+	}
 	return c.genAtomicFetch(n, ab.Op)
+}
+
+// genAtomicLoad implements __atomic_load_n(p, mo). An aligned scalar read is
+// indivisible on x86-64, so this is the ordinary load of *p -- the same
+// reasoning stdatomic.h's atomic_load gives -- and the memory_order argument is
+// dropped because there is no reordering barrier to emit. The width comes from
+// the object, so a char-sized atomic loads a byte.
+func (c *CG) genAtomicLoad(n *frontend.Call) (frontend.CType, error) {
+	et := c.atomicPointee(n.Args[0])
+	if et == nil {
+		return frontend.TInt, fmt.Errorf("%s: first argument must be a pointer to an _Atomic integer", n.Name)
+	}
+	aw := c.atomicWidth(et)
+	if aw == 0 {
+		return frontend.TInt, fmt.Errorf("%s: no atomic instruction for an object of width %d", n.Name, c.typeWidth(et))
+	}
+	wn := map[int]string{1: "byte", 2: "word", 4: "dword", 8: "qword"}[aw]
+	acc := map[int]string{1: "al", 2: "ax", 4: "eax", 8: "rax"}[aw]
+	signed := et.Kind == frontend.KInt && et.Signed
+	entry := c.tmpDepth
+	defer func() { c.tmpDepth = entry }()
+
+	if _, err := c.genExprT(n.Args[0]); err != nil {
+		return frontend.TInt, err
+	}
+	c.tmpDepth++
+	addrSlot := c.tmpSlot(c.tmpDepth)
+	c.emit("mov [rbp%+d], rax", addrSlot)
+	c.emit("mov r10, [rbp%+d]", addrSlot)
+	c.emit("mov %s, %s [r10]", acc, wn)
+	c.widenFrom(aw, signed)
+	return frontend.TInt, nil
 }
 
 // atomicPointee returns the integer (or _Bool) type the first argument of an
@@ -2537,7 +2720,10 @@ func (c *CG) atomicPointee(e frontend.Expr) *frontend.Type {
 		return nil
 	}
 	et := pt.Elem
-	if et.Kind != frontend.KInt && et.Kind != frontend.KBool {
+	// Pointers join the integers and _Bool: the locked access is one
+	// instruction wide for an aligned pointer, and a lock-free allocator
+	// (Nim's own, for one) keeps its free lists in atomic pointer slots.
+	if et.Kind != frontend.KInt && et.Kind != frontend.KBool && et.Kind != frontend.KPtr {
 		return nil
 	}
 	return et
@@ -3040,9 +3226,9 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 // to be added -- an object file rather than a whole program -- changes what the
 // generator is allowed to assume rather than what it should produce.
 type genConfig struct {
-	linux   bool
-	opt     int
-	winGUI  bool
+	linux     bool
+	opt       int
+	winGUI    bool
 	skipFuncs map[string]bool
 
 	// relocatable produces one translation unit's worth of code for a later link
@@ -9829,6 +10015,15 @@ func (c *CG) genCallExpr(n *frontend.Call) (frontend.CType, error) {
 	if _, user := c.funcs[n.Name]; !user {
 		if ab, ok := frontend.LookupAtomicBuiltin(n.Name); ok {
 			return c.genAtomicBuiltin(n, ab)
+		}
+		// The marker builtins carry optimiser information and no runtime work:
+		// see src/frontend/marker.go.
+		if ms, ok := frontend.LookupMarkerBuiltin(n.Name); ok {
+			return c.genMarkerBuiltin(n, ms)
+		}
+		// GCC's overflow-checked arithmetic: see src/frontend/overflow.go.
+		if ob, ok := frontend.LookupOverflowBuiltin(n.Name); ok {
+			return c.genOverflowBuiltin(n, ob)
 		}
 	}
 	// Constant-format printf specialisation, in two steps. A format string

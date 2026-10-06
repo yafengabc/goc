@@ -39,12 +39,12 @@ import (
 // constants shared with the writer (elfClass64, emX8664, sht*, shfAlloc, ...)
 // live in elf.go; these are the object-specific ones the parser needs on top.
 const (
-	etRel    = 1 // ET_REL: a relocatable object
-	shtRela  = 4
-	shtRel   = 9
-	sttFunc  = 2
+	etRel      = 1 // ET_REL: a relocatable object
+	shtRela    = 4
+	shtRel     = 9
+	sttFunc    = 2
 	sttSection = 3
-	sttFile  = 4 // STT_FILE: the object's own name, not a thing inside it
+	sttFile    = 4 // STT_FILE: the object's own name, not a thing inside it
 
 	shnUndef = 0
 	shnAbs   = 0xfff1
@@ -176,7 +176,7 @@ func parseELF(src []byte) (*elfObj, error) {
 		es.vsize = rd64(src, int(h)+32)
 		if typ == shtRela || typ == shtRel {
 			es.relOff = rd64(src, int(h)+24)
-			es.relCnt = rd64(src, int(h)+32) / 24 // SHT_RELA entries are 24 bytes
+			es.relCnt = rd64(src, int(h)+32) / 24    // SHT_RELA entries are 24 bytes
 			es.relSec = uint32(rd32(src, int(h)+44)) // sh_info
 		}
 		if typ == shtProgBits && es.bss == false {

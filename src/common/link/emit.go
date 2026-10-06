@@ -147,8 +147,8 @@ func Emit(d *Data) (string, error) {
 				out.WriteString("\tmov rcx, rax\n") // hInstance
 				out.WriteString("\txor rdx, rdx\n") // hPrevInstance = NULL
 				out.WriteString("\tcall " + cmdLineFn + "\n")
-				out.WriteString("\tmov r8, rax\n")   // lpCmdLine
-				out.WriteString("\tmov r9d, 10\n")   // nCmdShow = SW_SHOWDEFAULT
+				out.WriteString("\tmov r8, rax\n") // lpCmdLine
+				out.WriteString("\tmov r9d, 10\n") // nCmdShow = SW_SHOWDEFAULT
 				out.WriteString("\tcall " + d.Entry.Func + "\n")
 			default:
 				out.WriteString("\tcall " + d.Entry.Func + "\n")

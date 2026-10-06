@@ -131,13 +131,13 @@ func (e *irEmitter) doIf(n *frontend.IfStmt) {
 	e.blockLabel(thenL)
 	e.flushPendingLabels()
 	e.stmt(n.Then)
-	e.term("br label %%%s", doneL)
+	e.termOpen("br label %%%s", doneL)
 
 	if n.Else != nil {
 		e.blockLabel(elseL)
 		e.flushPendingLabels()
 		e.stmt(n.Else)
-		e.term("br label %%%s", doneL)
+		e.termOpen("br label %%%s", doneL)
 	}
 	e.blockLabel(doneL)
 	e.flushPendingLabels()
@@ -161,7 +161,7 @@ func (e *irEmitter) doWhile(n *frontend.WhileStmt) {
 	e.stmt(n.Body)
 	e.breakTo = e.breakTo[:len(e.breakTo)-1]
 	e.continueTo = e.continueTo[:len(e.continueTo)-1]
-	e.term("br label %%%s", testL)
+	e.termOpen("br label %%%s", testL)
 
 	e.blockLabel(doneL)
 	e.flushPendingLabels()
@@ -181,7 +181,7 @@ func (e *irEmitter) doDoWhile(n *frontend.DoWhileStmt) {
 	e.stmt(n.Body)
 	e.breakTo = e.breakTo[:len(e.breakTo)-1]
 	e.continueTo = e.continueTo[:len(e.continueTo)-1]
-	e.term("br label %%%s", testL)
+	e.termOpen("br label %%%s", testL)
 
 	e.blockLabel(testL)
 	e.flushPendingLabels()
@@ -222,7 +222,7 @@ func (e *irEmitter) doFor(n *frontend.ForStmt) {
 	e.stmt(n.Body)
 	e.breakTo = e.breakTo[:len(e.breakTo)-1]
 	e.continueTo = e.continueTo[:len(e.continueTo)-1]
-	e.term("br label %%%s", postL)
+	e.termOpen("br label %%%s", postL)
 
 	e.blockLabel(postL)
 	e.flushPendingLabels()
@@ -342,9 +342,29 @@ func caseArms(cases []switchCase) string {
 	return b.String()
 }
 
-// doLabel attaches a C label to the block that follows it.
+// doLabel attaches a C label to the block control lands in when it arrives
+// there. A label can sit in front of a statement that continues the block
+// already open ("x = 1; L: x = 2;") or start a fresh one after a jump
+// ("goto L; ... L: x = 1;"), so the binding is made here rather than deferred:
+// whichever block the following statement is emitted into is the one the label
+// names, and a `goto` that already branched to it can then be resolved.
 func (e *irEmitter) doLabel(n *frontend.LabelStmt) {
-	e.pendingLabels = append(e.pendingLabels, n.Name)
+	// A C label always opens a block of its own. Binding it to the block already
+	// being written would make it share that block's predecessors -- and a block
+	// reached by `goto` from anywhere else in the function arrives along an edge
+	// that no phi in it accounts for, which LLVM's verifier rejects ("PHINode
+	// should have one entry for each predecessor"). Branching the open block to
+	// the new one keeps the fall-through path.
+	if e.closed {
+		e.blockLabel(e.newLabel())
+	} else {
+		nl := e.newLabel()
+		e.term("br label %%%s", nl)
+		e.blockLabel(nl)
+	}
+	// A label chain ("A: B: stmt") binds every name to the same block.
+	e.flushPendingLabels()
+	e.userLabels[n.Name] = e.currentBlock("entry")
 	e.stmt(n.Stmt)
 }
 
@@ -354,7 +374,7 @@ func (e *irEmitter) flushPendingLabels() {
 	if len(e.pendingLabels) == 0 {
 		return
 	}
-	l := e.currentLabel()
+	l := e.currentBlock("entry")
 	for _, cl := range e.pendingLabels {
 		e.userLabels[cl] = l
 	}

@@ -134,16 +134,21 @@ func widthOf(t *frontend.Type) int {
 	return 64
 }
 
-// scratchSlot returns an alloca usable as a conversion staging buffer. The
-// conversions that need one are rare and the slot is reused, so it is created
-// once per function on first use.
+// scratchSlot returns an alloca of at least n bytes usable as a conversion
+// staging buffer. The conversions that need one are rare and the slot is
+// reused, so it is created once per function on first use -- and re-created,
+// larger, when a later conversion needs more room. One fixed eight-byte slot
+// was enough until a struct went through it: the store overwrote whatever
+// followed, and the load read zeros for every member past the first eight
+// bytes, so "S local = gs;" copied the length and lost the pointer.
 func (e *irEmitter) scratchSlot(n int) string {
-	if e.scratch != "" {
+	if e.scratch != "" && e.scratchSize >= n {
 		return e.scratch
 	}
 	slot := e.newTmp()
 	e.entry.WriteString("  " + slot + " = alloca [" + itoa(n) + " x i8], align 16\n")
 	e.scratch = slot
+	e.scratchSize = n
 	return slot
 }
 

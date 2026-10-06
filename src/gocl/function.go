@@ -66,8 +66,9 @@ type irEmitter struct {
 	// C label or a pending goto lands.
 	lastLabel string
 	// scratch is a reusable alloca for the conversions that have to move a
-	// value through memory.
-	scratch string
+	// value through memory, and scratchSize is how many bytes it holds.
+	scratch     string
+	scratchSize int
 	// forwards records branches to a C label that had not been seen yet.
 	forwards []forwardGoto
 }
@@ -184,6 +185,17 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 	}
 	tr.popScope()
 
+	// A `goto` whose target had not been reached yet branched to a placeholder
+	// block. Now that every C label is bound, each placeholder is defined as a
+	// trampoline: one block that branches on to the real target. Writing it here
+	// is what keeps the emitter single-pass -- the branch text was emitted
+	// before the target existed, and LLVM is happy for a block to be defined
+	// after the first reference to it.
+	fwd, err := e.resolveForwardGotos()
+	if err != nil {
+		return "", err
+	}
+
 	var b strings.Builder
 	sig := "define " + m.dso() + e.retTy + " @" + f.Name + "(" + strings.Join(params, ", ")
 	if f.Variadic {
@@ -200,6 +212,7 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 	b.WriteString("entry:\n")
 	b.WriteString(e.entry.String())
 	b.WriteString(e.body.String())
+	b.WriteString(fwd)
 	b.WriteString("}\n")
 	// The attribute goes on the definition, after the body -- which is where
 	// LLVM reads it from. Marking every function is not a compromise: the
@@ -207,6 +220,40 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 	// this function, and a program is one unit for that decision.
 	if e.c.optSize {
 		b.WriteString("\nattributes #0 = { optsize }\n")
+	}
+	return b.String(), nil
+}
+
+// termOpen ends the current block with a branch, but only while the block is
+// still open. A body that already jumped somewhere -- goto, return, break --
+// carries its own terminator, and adding another would silently open a fresh
+// unreachable block instead of falling through.
+func (e *irEmitter) termOpen(format string, args ...interface{}) {
+	if e.closed {
+		return
+	}
+	e.term(format, args...)
+}
+
+// resolveForwardGotos defines the trampoline blocks that forward `goto`s
+// branched to. Each one is the placeholder block the branch named, containing a
+// single branch on to the block the C label turned out to belong to.
+func (e *irEmitter) resolveForwardGotos() (string, error) {
+	if len(e.forwards) == 0 {
+		return "", nil
+	}
+	var b strings.Builder
+	for _, fg := range e.forwards {
+		l, ok := e.userLabels[fg.label]
+		if !ok {
+			// A goto to a label this function never defines. The front end
+			// rejects that, so reaching here means the label was dropped on the
+			// way into the IR -- which is worth a hard error rather than a
+			// branch to nowhere.
+			return "", fmt.Errorf("goto %s: label not emitted in %s", fg.label, e.fname)
+		}
+		b.WriteString(fg.placeholder + ":\n")
+		b.WriteString("  br label %" + l + "\n")
 	}
 	return b.String(), nil
 }

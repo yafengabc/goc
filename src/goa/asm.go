@@ -144,9 +144,9 @@ type Assembler struct {
 	// this unit references but does not define. They become undefined symbols
 	// in the object, for the link to resolve against a sibling object or the
 	// import table.
-	undef    map[string]bool
-	consts   map[string]int64
-	entry    string
+	undef  map[string]bool
+	consts map[string]int64
+	entry  string
 	// subsystem: 3 = console (default), 2 = windows GUI. Driven by the
 	// `subsystem windows` directive; a GUI app must not request a console.
 	subsystem uint16

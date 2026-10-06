@@ -266,6 +266,27 @@ func runLeg(dirSuffix, label string, targetLinux bool, flags []string, ucrunExe 
 			continue
 		}
 
+		// -c stops at a relocatable object and the link is a second step, the
+		// gcc shape. It is also the only way this suite exercises the object
+		// writer: a one-shot build never produces an .o, so skipping the link
+		// would leave every relocation-fixing bug in it untested -- which is
+		// exactly the class of bug that made string literals resolve into .text
+		// once sections moved.
+		obj := filepath.Join(outDir, name) + ".o"
+		prod := filepath.Join(outDir, name)
+		if !targetLinux {
+			prod += ".exe"
+		}
+		largs := []string{obj, "-o", prod}
+		if targetLinux {
+			largs = []string{"-target", "linux", obj, "-o", prod}
+		}
+		if _, lout, lrc, lerr := runCmd(repoRoot, env, goc, largs...); lerr != nil || lrc != 0 {
+			fmt.Fprintf(&sb, "FAIL  %s%s (link): %s\n", label, name, string(lout))
+			fail++
+			continue
+		}
+
 		var got []byte
 		var runRc int
 		if targetLinux {

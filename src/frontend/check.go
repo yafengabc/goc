@@ -1148,6 +1148,16 @@ func (c *checker) checkCall(n *Call, fn *FuncDecl) *Type {
 		if ab, ok := LookupAtomicBuiltin(n.Name); ok {
 			return c.checkAtomicBuiltin(n, fn, ab)
 		}
+		// The marker builtins (__builtin_unreachable, __builtin_expect, ...)
+		// exist only to carry optimiser information: see src/frontend/marker.go.
+		if ms, ok := LookupMarkerBuiltin(n.Name); ok {
+			return c.checkMarkerBuiltin(n, fn, ms)
+		}
+		// GCC's overflow-checked arithmetic (__builtin_saddll_overflow and
+		// friends): see src/frontend/overflow.go.
+		if ob, ok := LookupOverflowBuiltin(n.Name); ok {
+			return c.checkOverflowBuiltin(n, fn, ob)
+		}
 	}
 	// A local variable holding a function pointer shadows a same-named
 	// function (C block scoping hides file-scope names, function names

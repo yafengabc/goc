@@ -23,6 +23,27 @@ type AtomicBuiltin struct {
 	// CAS marks the compare-exchange form, whose signature and result differ:
 	// (object, expected, desired) -> bool, with *expected updated on failure.
 	CAS bool
+	// GCCOrder marks the GCC __atomic_* spelling of the builtin. Those take
+	// trailing arguments the model has no use for -- a memory_order for every
+	// form, plus a "weak" flag in front of the two orders for the
+	// compare-exchange form:
+	//
+	//	__atomic_load_n(p, order)
+	//	__atomic_store_n(p, v, order)
+	//	__atomic_exchange_n(p, v, order)
+	//	__atomic_fetch_add(p, v, order)
+	//	__atomic_compare_exchange_n(p, e, d, weak, succ, fail)
+	//
+	// GCCOrderArgs is how many arguments that is. They are accepted and
+	// ignored, exactly as stdatomic.h's macros do with their _explicit forms.
+	GCCOrderArgs int
+	// NoResult marks a GCC builtin whose C result is discarded (__atomic_store_n
+	// returns void, while __goc_atomic_exchange returns the old value). Only the
+	// GCC spellings that way round the value are marked.
+	NoResult bool
+	// LoadOnly marks __atomic_load_n, whose only argument is the object
+	// pointer: it has no value operand to apply Op to.
+	LoadOnly bool
 }
 
 var atomicBuiltins = map[string]AtomicBuiltin{
@@ -33,6 +54,21 @@ var atomicBuiltins = map[string]AtomicBuiltin{
 	"__goc_atomic_fetch_xor":        {Op: "^"},
 	"__goc_atomic_exchange":         {},
 	"__goc_atomic_compare_exchange": {CAS: true},
+
+	// The GCC __atomic_* family. Real code calls these directly: Nim's
+	// nimbase.h falls back to them when the host has no C11 <stdatomic.h>, and
+	// they are the spelling every GCC/Clang program uses. They differ from the
+	// __goc_ forms only in the trailing arguments and in __atomic_store_n
+	// returning void, so they share one lowering.
+	"__atomic_load_n":             {GCCOrderArgs: 1, LoadOnly: true},
+	"__atomic_store_n":            {GCCOrderArgs: 1, NoResult: true},
+	"__atomic_exchange_n":         {Op: "", GCCOrderArgs: 1},
+	"__atomic_compare_exchange_n": {CAS: true, GCCOrderArgs: 3},
+	"__atomic_fetch_add":          {Op: "+", GCCOrderArgs: 1},
+	"__atomic_fetch_sub":          {Op: "-", GCCOrderArgs: 1},
+	"__atomic_fetch_and":          {Op: "&", GCCOrderArgs: 1},
+	"__atomic_fetch_or":           {Op: "|", GCCOrderArgs: 1},
+	"__atomic_fetch_xor":          {Op: "^", GCCOrderArgs: 1},
 }
 
 // LookupAtomicBuiltin reports whether name is one of the builtins above. Both
@@ -58,8 +94,13 @@ func (c *checker) atomicValueType(n *Call, fn *FuncDecl) *Type {
 		return nil
 	}
 	et := pt.Elem
-	if et.Kind != KInt && et.Kind != KBool {
-		c.errf(0, "%s: atomic operations are only defined on integer types, got %s", n.Name, et)
+	// C11 7.17.7.2 and the GCC __atomic_* builtins both cover every
+	// trivially-copyable scalar, which includes pointers; a lock-free
+	// allocator (Nim's own, for one) keeps its free lists in atomic pointer
+	// slots and needs exactly that. The locked access is one instruction wide
+	// either way, so the model widens rather than restricting.
+	if et.Kind != KInt && et.Kind != KBool && et.Kind != KPtr {
+		c.errf(0, "%s: atomic operations are only defined on integer and pointer types, got %s", n.Name, et)
 		return nil
 	}
 	res := *et
@@ -71,25 +112,49 @@ func (c *checker) atomicValueType(n *Call, fn *FuncDecl) *Type {
 // family and of atomic_exchange is the object's value type; the result of the
 // compare-exchange form is _Bool.
 func (c *checker) checkAtomicBuiltin(n *Call, fn *FuncDecl, ab AtomicBuiltin) *Type {
+	// The GCC spelling appends arguments the model has no use for (see
+	// AtomicBuiltin.GCCOrderArgs); __atomic_load_n has no value operand at
+	// all, so its counted arity is one below the others'.
 	want := 2
 	if ab.CAS {
 		want = 3
 	}
-	if len(n.Args) != want {
-		c.errf(0, "call to %q: expected %d arguments, got %d", n.Name, want, len(n.Args))
+	if ab.LoadOnly {
+		want = 1
+	}
+	total := want + ab.GCCOrderArgs
+	if len(n.Args) != total {
+		c.errf(0, "call to %q: expected %d arguments, got %d", n.Name, total, len(n.Args))
 		for _, a := range n.Args {
 			c.checkExpr(a, fn)
 		}
 		return IntType()
 	}
+	// The trailing arguments are compile-time constants by definition, but they
+	// still have to type-check as expressions.
+	for _, a := range n.Args[want:] {
+		c.checkExpr(a, fn)
+	}
+	// A load takes only the object pointer, so it yields that pointer's value
+	// without consulting an operand.
+	if ab.LoadOnly {
+		vt := c.atomicValueType(n, fn)
+		if vt == nil {
+			return IntType()
+		}
+		return vt
+	}
 	vt := c.atomicValueType(n, fn)
 	// The remaining arguments are ordinary expressions; expected is a pointer
 	// to the value type and desired is a value.
-	for _, a := range n.Args[1:] {
+	for _, a := range n.Args[1:want] {
 		c.checkExpr(a, fn)
 	}
 	if ab.CAS {
 		return &Type{Kind: KBool, Width: 1, Signed: true}
+	}
+	if ab.NoResult {
+		return VoidType()
 	}
 	if vt == nil {
 		return IntType()

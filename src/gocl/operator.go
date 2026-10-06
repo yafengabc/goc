@@ -368,46 +368,63 @@ func (e *irEmitter) assignExpr(n *frontend.AssignExpr) val {
 	p := e.lvalue(n.Lhs)
 	old := e.load(p, t)
 	cur := e.coerce(old, t)
-	rhs := e.coerce(e.eval(n.Rhs), arithCommon(cur.ty, e.tr.exprType(n.Rhs)))
+	// C performs the operation in the common type of the two operands and then
+	// converts the result back to the left operand's type -- "short s; s += 1"
+	// adds as int and truncates on the way back. Doing it in the left operand's
+	// width instead left the right operand widened to the common type and
+	// produced "add i32 %a, %b" with %b an i64, which LLVM rejects.
+	//
+	// Shifts are the exception: C promotes each operand on its own and the
+	// result keeps the left operand's type, which is also what LLVM demands
+	// (both operands of shl/lshr/ashr carry the same width).
+	rt := e.tr.exprType(n.Rhs)
+	shift := n.Op == "<<" || n.Op == ">>"
+	ct := cur.ty
+	if !shift && cur.ty != nil && cur.ty.Kind != frontend.KPtr &&
+		rt != nil && rt.Kind != frontend.KPtr {
+		ct = arithCommon(cur.ty, rt)
+	}
+	lc := e.coerce(cur, ct)
+	rhs := e.coerce(e.eval(n.Rhs), ct)
 	var res val
 	switch n.Op {
 	case "+":
-		if cur.ty != nil && cur.ty.Kind == frontend.KPtr {
-			res = e.ptrAdd(cur, rhs, cur.ty, false)
+		if ct != nil && ct.Kind == frontend.KPtr {
+			res = e.ptrAdd(lc, rhs, ct, false)
 		} else {
-			res = e.arith(cur, rhs, "add", cur.ty)
+			res = e.arith(lc, rhs, "add", ct)
 		}
 	case "-":
-		if cur.ty != nil && cur.ty.Kind == frontend.KPtr {
-			res = e.ptrAdd(cur, rhs, cur.ty, true)
+		if ct != nil && ct.Kind == frontend.KPtr {
+			res = e.ptrAdd(lc, rhs, ct, true)
 		} else {
-			res = e.arith(cur, rhs, "sub", cur.ty)
+			res = e.arith(lc, rhs, "sub", ct)
 		}
 	case "*":
-		res = e.arith(cur, rhs, "mul", cur.ty)
+		res = e.arith(lc, rhs, "mul", ct)
 	case "/":
-		res = e.arith(cur, rhs, "div", cur.ty)
+		res = e.arith(lc, rhs, "div", ct)
 	case "%":
-		res = e.arith(cur, rhs, "rem", cur.ty)
+		res = e.arith(lc, rhs, "rem", ct)
 	case "&":
-		res = e.arith(cur, rhs, "and", cur.ty)
+		res = e.arith(lc, rhs, "and", ct)
 	case "|":
-		res = e.arith(cur, rhs, "or", cur.ty)
+		res = e.arith(lc, rhs, "or", ct)
 	case "^":
-		res = e.arith(cur, rhs, "xor", cur.ty)
+		res = e.arith(lc, rhs, "xor", ct)
 	case "<<", ">>":
 		op := "shl"
 		if n.Op == ">>" {
 			op = "lshr"
-			if cur.ty != nil && cur.ty.Signed {
+			if ct != nil && ct.Signed {
 				op = "ashr"
 			}
 		}
 		r := e.newTmp()
-		e.line("%s = %s %s %s, %s", r, op, e.ty(cur.ty), cur.op, rhs.op)
-		res = val{op: r, ty: cur.ty}
+		e.line("%s = %s %s %s, %s", r, op, e.ty(ct), lc.op, rhs.op)
+		res = val{op: r, ty: ct}
 	default:
-		res = cur
+		res = lc
 	}
 	res = e.coerce(res, t)
 	e.store(p, res)
@@ -565,6 +582,22 @@ func (e *irEmitter) condExpr(n *frontend.CondExpr) val {
 		ct = frontend.PtrType(ct.Elem)
 	}
 	e.term("br i1 %s, label %%%s, label %%%s", c, thenL, elseL)
+
+	// "a ? f() : g()" with two void arms is a statement, not a value: C allows
+	// it, and Nim's generated C uses exactly that shape to call a closure
+	// through one of two spellings. There is nothing to join -- naming void
+	// would emit "phi void", which LLVM rejects -- so the arms are run for
+	// their side effects and the result is a dummy.
+	if ct != nil && ct.Kind == frontend.KVoid {
+		e.blockLabel(thenL)
+		e.discard(n.Then)
+		e.termOpen("br label %%%s", doneL)
+		e.blockLabel(elseL)
+		e.discard(n.Else)
+		e.termOpen("br label %%%s", doneL)
+		e.blockLabel(doneL)
+		return val{op: "0", ty: frontend.IntType()}
+	}
 
 	e.blockLabel(thenL)
 	tv := e.coerce(e.eval(n.Then), ct)

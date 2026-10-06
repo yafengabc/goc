@@ -111,7 +111,7 @@ func isDeclarationStart(tok Token) bool {
 	if tok.Kind == TIdent || tok.Kind == TKeyword {
 		switch tok.Text {
 		case "_Alignas", "alignas", "typeof", "typeof_unqual",
-			"noreturn", "_Noreturn", "thread_local", "_Thread_local":
+			"noreturn", "_Noreturn", "thread_local", "_Thread_local", "__thread":
 			return true
 		}
 	}
@@ -531,7 +531,7 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 			// has no missing-return diagnostic to hook into).
 			p.next()
 			continue
-		case "thread_local", "_Thread_local":
+		case "thread_local", "_Thread_local", "__thread":
 			// C11/C23 thread-local storage. The variable gets a per-thread
 			// instance, laid out in the .tls section and reached through the
 			// FS (Linux) / GS (Windows) segment. Record the flag on the type
@@ -1382,6 +1382,23 @@ func (p *Parser) constMul() (int, error) {
 }
 
 func (p *Parser) constPrim() (int, error) {
+	// A cast to an integer type is still a constant expression when its
+	// operand is: "case ((MyEnum)0):" is what a compiler front end emits for a
+	// Nim/C++-style enum case label, and the cast only narrows the value, so
+	// the folded constant is the operand's. gcc/clang both accept it.
+	//
+	// This must be tried before the plain "(" case below, which would
+	// otherwise recurse into constExpr and choke on the type name -- and
+	// before the sizeof case, which sees "(" type-name and commits to
+	// reading a sizeof operand. The parentheses nest, so recurse through
+	// the whole chain rather than expecting "(" type ")" literally.
+	if p.atPunct("(") {
+		save := p.pos
+		if v, ok := p.constCastExpr(); ok {
+			return v, nil
+		}
+		p.pos = save
+	}
 	if p.atPunct("(") {
 		p.next()
 		v, err := p.constExpr()
@@ -1400,7 +1417,10 @@ func (p *Parser) constPrim() (int, error) {
 		return 0, nil
 	}
 	// _Alignof(Type) inside a constant expression: yields the type's alignment.
-	if p.cur().Text == "_Alignof" {
+	// __alignof__ / __alignof are the GNU spellings gcc/clang also accept, and
+	// real code uses them: Nim's nimbase.h defines NIM_ALIGNOF(x) to
+	// __alignof(x) for the gcc target.
+	if p.cur().Text == "_Alignof" || p.cur().Text == "__alignof__" || p.cur().Text == "__alignof" {
 		p.next()
 		if p.atPunct("(") && (isTypeName(p.peek()) || isQualifier(p.peek())) {
 			p.next()
@@ -1482,6 +1502,52 @@ func (p *Parser) constPrim() (int, error) {
 		}
 	}
 	return 0, fmt.Errorf("line %d: expected integer constant, got %q", p.cur().Line, p.cur().Text)
+}
+
+// constCastExpr folds a possibly parenthesised cast -- "(T)x", "((T)x)",
+// "(((T)x))" -- and reports whether the cursor really held one. Parentheses
+// around a non-cast operand are left for the caller's other cases: only the
+// cast shape is consumed here, so a plain "(1 + 2)" is not silently accepted
+// with the wrong value.
+func (p *Parser) constCastExpr() (int, bool) {
+	if !p.atPunct("(") {
+		return 0, false
+	}
+	// Unwrap redundant parentheses until the cast itself is at the cursor.
+	save := p.pos
+	depth := 0
+	for p.atPunct("(") {
+		p.next()
+		depth++
+	}
+	// The cursor now sits on the candidate type name; it must be followed by
+	// ")" for this to be a cast rather than a parenthesised expression.
+	if !isTypeName(p.cur()) {
+		p.pos = save
+		return 0, false
+	}
+	p.next() // type name
+	if !p.atPunct(")") {
+		p.pos = save
+		return 0, false
+	}
+	p.next() // ')'
+	v, err := p.constPrim()
+	if err != nil {
+		p.pos = save
+		return 0, false
+	}
+	// Consume the remaining closing parentheses. The innermost ")" of the
+	// cast itself was already eaten above; the wrappers' are still ahead, one
+	// per opening paren counted on the way in.
+	for i := 0; i < depth-1; i++ {
+		if !p.atPunct(")") {
+			p.pos = save
+			return 0, false
+		}
+		p.next()
+	}
+	return v, true
 }
 
 // parseParamList parses the (...) of a function declarator. Array parameters
@@ -2414,8 +2480,9 @@ func (p *Parser) parseUnary() (Expr, error) {
 	// _Alignof is a unary operator analogous to sizeof, but yields the alignment
 	// (always a compile-time constant) of a type or a simple variable. It
 	// requires parentheses around its operand, exactly like sizeof.
-	if p.cur().Text == "_Alignof" || p.cur().Text == "alignof" {
-		p.next() // consume "_Alignof" / "alignof"
+	if p.cur().Text == "_Alignof" || p.cur().Text == "alignof" ||
+		p.cur().Text == "__alignof__" || p.cur().Text == "__alignof" {
+		p.next() // consume "_Alignof" / "alignof" / "__alignof__"
 		if !p.atPunct("(") {
 			return nil, fmt.Errorf("line %d: expected '(' after _Alignof", p.cur().Line)
 		}

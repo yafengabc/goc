@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"goa"
 	"goc/common"
-	"gocld"
 	"goc/frontend"
+	"gocld"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -801,8 +801,8 @@ func parseArgs(args []string) (buildCfg, bool) {
 			name, val = arg[:eq], arg[eq+1:]
 		}
 		switch name {
-case "-c":
-		cfg.mode = "object"
+		case "-c":
+			cfg.mode = "object"
 		case "-S":
 			cfg.mode = "asm"
 		case "-E":

@@ -107,7 +107,7 @@ func WriteELFObject(img *Image) []byte {
 type elfWriter struct {
 	img *Image
 
-	strTab  []byte         // .strtab payload
+	strTab  []byte // .strtab payload
 	strUsed map[string]uint32
 
 	symtab []elfSymOut
@@ -153,9 +153,9 @@ func newELFWriter(img *Image) *elfWriter {
 		// entered here too, so a second reference to the same undefined name
 		// shares one index -- which is what makes it one symbol to be defined
 		// elsewhere rather than two.
-		symIndex:  map[string]uint32{},
-		shstrUse:  map[string]uint32{},
-		shstr:     []byte{0},
+		symIndex: map[string]uint32{},
+		shstrUse: map[string]uint32{},
+		shstr:    []byte{0},
 	}
 }
 
