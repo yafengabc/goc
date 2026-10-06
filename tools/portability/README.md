@@ -57,12 +57,13 @@ wsl -d alpine -- sh -c '
 
 | 脚本 | 跑在哪 | 作用 |
 |---|---|---|
-| `win_regress.sh` | Windows | goc 与 gocl 双后端的 PE 回归，当前 8/8 |
-| `lin_build.sh` | Windows | `gocl -target linux` 编译 14 个 ELF 用例 |
-| `lin_run.sh` | alpine | 运行上面编译出的 ELF，比对期望输出，当前 14/14 |
-| `build.sh` | alpine | `gcc -nostdinc` 编全部 19 个 `.c`，归纳实质警告 |
+| `win_regress.sh` | Windows | goc 与 gocl 双后端的 PE 回归，当前 12/12 |
+| `lin_build.sh` | Windows | `gocl -target linux` 编译 16 个 ELF 用例 |
+| `lin_run.sh` | alpine | 运行上面编译出的 ELF，比对期望输出，当前 16/16 |
+| `build.sh` | alpine | `gcc -nostdinc` 编全部 20 个 `.c`，归纳实质警告 |
 | `link_run.sh` | alpine | 打 `libgoclib.a`，链接 `hello.c`，`nm` 确认跑的是 goclib |
 | `sc.c` + `sc_run.sh` | alpine | 专测走 `syscall(2)` 的 8 个包装函数 + `getdents64`，21 项断言 |
+| `tcp.c` / `tcp2.c` | 两个平台 | 环回 TCP 与 UDP 往返、非阻塞、超时、错误码翻译；自己报告结果（退出码 0 且末行 `OK`），因为输出里有内核分配的端口号 |
 | `hello.c` | alpine | 只用 goclib 公共 API 的程序，被 `link_run.sh` 链接 |
 | `brk2.c` | alpine | 探针：`brk(0)` 走编译器内建返回 -1，而 `syscall(12,0)` 返回真实 break |
 
@@ -89,3 +90,9 @@ wsl -d alpine -- sh -c '
 - **`mini_linux.c` / `stdio_linux.c`** —— 前者是裸 `write(2)`，用来把 ELF 后端与
   syscall 桩隔离出来；后者走完整 stdio 路径（缓冲 stdout 需在退出时 flush、
   格式化、`.data` 全局）。
+- **socket 组**（`tcp` `tcp2`）—— 两个平台都跑。它们是这里唯一触到网络栈的用例，
+  因此也是唯一能抓到"选项编号或 `fd_set` 布局对目标而言是错的"这类问题的用例。
+  `tcp.c` 走 bind/listen/connect/accept/send/recv 与 `select`；`tcp2.c` 走 UDP 的
+  `sendto`/`recvfrom`、非阻塞、超时，以及错误码翻译——最后一部分是重点：程序写的
+  是 `if (errno == ECONNREFUSED)`，而 Linux 内核答 111、Winsock 答 10061，这行代码
+  本身看不出翻译有没有生效。

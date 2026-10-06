@@ -55,6 +55,41 @@ build_run_win() {
     check "$label" "$want" "$got"
 }
 
+# Self-reporting cases. A program that prints something the kernel chose -- the
+# port in tcp.c -- cannot be compared against a fixed string, so these report
+# their own verdict: exit code 0 and a final line of "OK". The failure output is
+# printed whole, because which check failed is the interesting part and a
+# one-line summary would hide it.
+build_run_win_ok() {
+    label=$1
+    comp=$2
+    tgt=$3
+    name=$4
+    exe="$OUT/${name}_$5.exe"
+    if [ "$tgt" = "-" ]; then
+        "$comp" "$SRC/$name.c" -o "$exe" > "$OUT/$name.build" 2>&1
+    else
+        "$comp" $tgt "$SRC/$name.c" -o "$exe" > "$OUT/$name.build" 2>&1
+    fi
+    if [ ! -f "$exe" ]; then
+        echo "FAIL $label (编译)"
+        head -3 "$OUT/$name.build" | cut -c1-160 | sed 's/^/     /'
+        fail=$((fail + 1))
+        return
+    fi
+    got=$("$exe" 2>&1)
+    rc=$?
+    last=$(printf '%s\n' "$got" | tail -1)
+    if [ "$rc" -eq 0 ] && [ "$last" = "OK" ]; then
+        echo "pass $label"
+        pass=$((pass + 1))
+    else
+        echo "FAIL $label (rc=$rc)"
+        printf '%s\n' "$got" | sed 's/^/     /'
+        fail=$((fail + 1))
+    fi
+}
+
 echo "########## Windows PE ##########"
 WANT_WIN1=$(printf 't=707\ns=42 abc ff')
 
@@ -64,6 +99,15 @@ for pair in "win1|$WANT_WIN1" "p2|n=42" "p5|$(printf 'raw\nr=4')" "p7|$(printf '
     w=${pair#*|}
     build_run_win "$n  [goc/win] "  "$ROOT/bin/goc.exe"  "-"             "$n" "$w" goc
     build_run_win "$n  [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "$n" "$w" gocl
+done
+
+# The socket cases. Both need loopback, which every machine this runs on has,
+# and both are the only cases here that touch the network stack -- so they are
+# also the only ones that can catch an option number or an fd_set layout being
+# wrong for the target.
+for n in tcp tcp2; do
+    build_run_win_ok "$n [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "$n" goc
+    build_run_win_ok "$n [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows"  "$n" gocl
 done
 
 echo ""

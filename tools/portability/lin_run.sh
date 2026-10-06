@@ -37,6 +37,29 @@ run_one() {
     fi
 }
 
+# Self-reporting case: its output contains a port the kernel chose, so it
+# cannot be compared against a fixed string. It reports its own verdict as
+# exit code 0 and a final line of "OK".
+run_ok() {
+    t=$1
+    if [ ! -x "$DST/$t" ]; then
+        printf 'FAIL %-5s (缺少可执行文件)\n' "$t"
+        fail=$((fail + 1))
+        return
+    fi
+    got=$(cd "$DST" && "./$t" 2>&1)
+    rc=$?
+    last=$(printf '%s\n' "$got" | tail -1)
+    if [ "$rc" -eq 0 ] && [ "$last" = "OK" ]; then
+        printf 'pass %-5s\n' "$t"
+        pass=$((pass + 1))
+    else
+        printf 'FAIL %-5s (rc=%d)\n' "$t" "$rc"
+        printf '%s\n' "$got" | sed 's/^/     /'
+        fail=$((fail + 1))
+    fi
+}
+
 run_one mini "$(printf 'hi from gocl/linux')"
 run_one slin "$(printf 'gocl linux stdio\nanswer=42\ncounter=40 answer=42')"
 run_one p1   "A"
@@ -51,6 +74,9 @@ run_one pe   "plain text"
 run_one pf   "42"
 run_one pg   "n=42"
 run_one vt4  "13013"
+# The socket cases, on the target where the syscalls behind them are native.
+run_ok tcp
+run_ok tcp2
 
 echo ""
 echo "== Linux: pass=$pass fail=$fail =="

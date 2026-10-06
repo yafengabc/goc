@@ -30,6 +30,6 @@ build_one() {
 
 build_one mini "$SRC/mini_linux.c"
 build_one slin "$SRC/stdio_linux.c"
-for t in p1 p2 p5 p6 p7 p8 p9 pb pe pf pg vt4; do
+for t in p1 p2 p5 p6 p7 p8 p9 pb pe pf pg vt4 tcp tcp2; do
     build_one "$t" "$SRC/$t.c"
 done

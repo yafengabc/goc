@@ -20,11 +20,12 @@ echo "=== 编译 hello.c（只用 goclib 的头）==="
 $CC $CFLAGS -c hello.c -o obj/hello.o || exit 1
 
 echo "=== 打成静态库 ==="
+# Every object, by glob rather than by name: the list used to be spelled out
+# and went stale the moment goclib gained a .c file, which showed up as
+# undefined references to symbols the archive obviously contains. A glob cannot
+# fall behind the directory it reads.
 rm -f libgoclib.a
-ar rcs libgoclib.a obj/args.o obj/assert.o obj/bitint.o obj/ctype.o \
-    obj/dir.o obj/errno.o obj/file.o obj/math.o obj/mtx.o obj/os.o obj/rt.o \
-    obj/stdbit.o obj/stdio.o obj/stdlib.o obj/string.o obj/threads.o \
-    obj/time.o obj/uchar.o obj/wchar.o || exit 1
+ar rcs libgoclib.a obj/*.o || exit 1
 echo "libgoclib.a: $(ls -la libgoclib.a | awk '{print $5}') 字节"
 
 echo "=== 链接：程序在前（优先），libgoclib.a 次之，musl 最后 ==="
