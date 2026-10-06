@@ -99,6 +99,15 @@ func emitIRAssembly(ir string, outPath string, opt int, linux bool) error {
 	return nil
 }
 
+// EmitIRAssembly lowers IR to native assembly text -- the AsmPrinter's output --
+// and writes it to outPath. This is the LLVM back end's answer to `gcc -S`: the
+// readable artifact is the assembly the C bodies became, not the entry stub goa
+// assembles. The file is not fed back to goa; it is the final artifact, exactly
+// like the .s a native `-S` build writes.
+func EmitIRAssembly(ir string, outPath string, opt int, linux bool) error {
+	return emitIRAssembly(ir, outPath, opt, linux)
+}
+
 // irPasses names the IR optimisation pipeline for a -O level:
 //
 //	opt 0  no -O      default<O1>   see below

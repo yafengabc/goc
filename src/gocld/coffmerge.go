@@ -381,6 +381,19 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 			// anything else is a link error naming the symbol, because an image
 			// built on a guessed import loads fine and then dies with
 			// STATUS_ENTRYPOINT_NOT_FOUND and no explanation.
+			// The assembly's own `extern Name, dll` declarations are authoritative:
+			// they name the exact library, so an undefined object symbol the stub
+			// already imported needs no further work. This is how a program that
+			// calls a Win32 function goa's closed table does not list -- a user32
+			// MessageBoxA, say -- reaches the right DLL: gocl's externalImports
+			// wrote the `extern` line, and we honour it instead of guessing (and
+			// then failing with "undefined symbol"). The closed table stays as a
+			// fallback for symbols the runtime reaches without an explicit extern.
+			if img.Exts != nil {
+				if _, declared := img.Exts[s.name]; declared {
+					continue
+				}
+			}
 			dll, known := coffImportDLL(s.name)
 			if !known {
 				unresolved = append(unresolved, s.name)

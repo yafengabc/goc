@@ -308,6 +308,37 @@ func parseCOFF(src []byte) (*coffObj, error) {
 	return o, nil
 }
 
+// UndefinedSymbols returns the names of the object's undefined external symbols
+// -- the exact set the linker resolves as DLL imports. A symbol is undefined
+// when it has no section (COFF section number 0) and external storage class;
+// the same gating the merge applies (ignoring file/segment/refptr pseudo
+// records) is repeated here so the two never disagree on what "undefined"
+// means. Callers use this to declare only the imports a program actually
+// reaches, instead of every prototype a header happened to declare.
+func UndefinedSymbols(src []byte) ([]string, error) {
+	o, err := parseCOFF(src)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range o.syms {
+		if s.name == "" || s.secNum < 0 {
+			continue // absolute/segment or the file-name pseudo record
+		}
+		if s.class == scnClassFile || s.secNum > int32(len(o.secs)) {
+			continue // file pseudo-symbol, or a section that does not exist
+		}
+		if s.secNum == 0 && s.class == scnClassExternal {
+			if !seen[s.name] {
+				seen[s.name] = true
+				out = append(out, s.name)
+			}
+		}
+	}
+	return out, nil
+}
+
 // coffSectionName decodes a section header's eight-byte name field. strBase is
 // where the string table starts; a "/N" name is an offset into it measured from
 // there, N counting the table's own length dword as zero.
