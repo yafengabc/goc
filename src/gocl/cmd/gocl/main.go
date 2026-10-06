@@ -309,6 +309,22 @@ func externalImports(prog *frontend.Program, linux bool, obj []byte) []string {
 	// undefined. name -> DLL is a lookup, not an iteration, so a program that
 	// never calls a function never imports it.
 	dllOf := map[string]string{}
+	// The library's prototypes first, then the program's. The order matters for
+	// a program that uses sockets: `accept', `bind', `WSAStartup' and the rest
+	// are declared with their `, ws2_32' annotation in goclib's winsock2.h,
+	// which the program never includes -- it includes <socket.h>, whose names
+	// are goclib's own wrappers. The annotation is therefore only visible to
+	// the library build, and a map seeded from the program alone leaves every
+	// one of them without a DLL, which shows up as a link error listing exactly
+	// the calls the program made (WSAGetLastError, WSAStartup, accept, bind,
+	// ...) rather than as anything to do with imports.
+	//
+	// common.DLLNames is that library-side view: common.Build records every
+	// prototype's DLL while it compiles goclib, and goc's own back end reads
+	// the same map.
+	for name, dll := range common.DLLNames {
+		dllOf[name] = dll
+	}
 	for _, f := range prog.Prototypes {
 		if f.DLL != "" {
 			dllOf[f.Name] = f.DLL
@@ -317,12 +333,10 @@ func externalImports(prog *frontend.Program, linux bool, obj []byte) []string {
 	undefs, err := gocld.UndefinedSymbols(obj)
 	if err != nil {
 		// A parser hiccup must never masquerade as a missing import: fall back
-		// to declaring every DLL prototype (the pre-fix behaviour) so the link
-		// still succeeds.
-		for _, f := range prog.Prototypes {
-			if f.DLL != "" {
-				add("extern " + f.Name + ", " + f.DLL)
-			}
+		// to declaring every known DLL prototype (the pre-fix behaviour) so the
+		// link still succeeds. The merged map, for the same reason as above.
+		for name, dll := range dllOf {
+			add("extern " + name + ", " + dll)
 		}
 	} else {
 		for _, name := range undefs {

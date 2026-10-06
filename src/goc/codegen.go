@@ -248,22 +248,23 @@ func (c *CG) argRegs() []string {
 // for the callee named `name`.
 //
 // A Linux ELF target has no libc: goa turns every extern in externLinux into a
-// `mov rax,N; call __goc_syscall; ret` stub, so the callee is the raw syscall
-// entry, not an ordinary function. Linux syscall argument 4 is r10, not rcx --
-// the `syscall` instruction destroys rcx and r11, so the kernel takes the
-// fourth argument from r10 instead. gocrun's Win32 translator reads exactly
-// the same set (a1..a6 = rdi, rsi, rdx, r10, r8, r9), so both the real kernel
-// and the Windows harness agree on r10.
+// `mov rax,N; mov r10,rcx; call __goc_syscall; ret` stub, so the callee is the
+// raw syscall entry, not an ordinary function. Linux takes its fourth argument
+// from r10 rather than rcx because the `syscall` instruction destroys rcx.
 //
-// Anything else -- a call through a function pointer, or a call to a function
-// goc itself generated -- keeps the ordinary SysV register file, which is also
-// what the prologue at the receiving end unpacks (see the argRegs use in the
-// frame setup). Only the call site changes; the two must not be confused, or
-// every 4+-argument call in the program breaks in the other direction.
+// That move is inside the stub, and used not to be -- this function returned
+// rdi,rsi,rdx,r10,r8,r9 for a name it knew was a syscall. True, and also why
+// the convention belongs to the stub: a caller that does not know the callee is
+// one -- the LLVM back end, which calls these stubs through the ordinary SysV
+// register file -- leaves the fourth argument in rcx, the kernel reads r10, and
+// every call with four or more arguments fails with EFAULT. Found on select(2),
+// setsockopt(2) and recvfrom(2), whose only common feature was their arity.
+//
+// With the move in the stub a syscall is called like any other function, so
+// there is one answer for every call. gocrun's Win32 translator still reads
+// a1..a6 = rdi, rsi, rdx, r10, r8, r9, and the move puts the fourth argument
+// there for it as well.
 func (c *CG) callArgRegs(name string, indirect bool) []string {
-	if c.linux && !indirect && externLinux[name] {
-		return []string{"rdi", "rsi", "rdx", "r10", "r8", "r9"} // Linux syscall
-	}
 	return c.argRegs()
 }
 
@@ -349,6 +350,15 @@ var externLinux = map[string]bool{
 	"__goclib_vfork": true, "__goclib_execve": true, "__goclib_wait4": true,
 	"__goclib_clone": true, "__goclib_futex": true, "__goclib_gettid": true,
 	"__goclib_sched_yield": true, "__goclib_exit_thread": true,
+	// Sockets. select matters here more than most: it is the only entry on this
+	// list with five arguments, so its fifth lands in r8, not rcx -- exactly the
+	// trap the comment above is about.
+	"__goclib_socket": true, "__goclib_connect": true, "__goclib_accept": true,
+	"__goclib_sendto": true, "__goclib_recvfrom": true, "__goclib_shutdown": true,
+	"__goclib_bind": true, "__goclib_listen": true, "__goclib_getsockname": true,
+	"__goclib_getpeername": true, "__goclib_setsockopt": true,
+	"__goclib_getsockopt": true, "__goclib_select": true,
+	"__goclib_fcntl": true,
 }
 
 // ---------------------------------------------------------------------------

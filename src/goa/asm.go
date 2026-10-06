@@ -352,11 +352,36 @@ var linuxSyscalls = map[string]int64{
 	// thread, 231 (exit_group) the whole process -- which is why the library's
 	// exit() uses the other one.
 	"__goclib_clone":        56,
-		"__goclib_futex":        202,
-		"__goclib_gettid":       186,
-		"__goclib_sched_yield":  24,
-		"__goclib_exit_thread":  60,
-	}
+	"__goclib_futex":        202,
+	"__goclib_gettid":       186,
+	"__goclib_sched_yield":  24,
+	"__goclib_exit_thread":  60,
+	// Sockets (goclib/socket.c). Every one carries the __goclib_ prefix for the
+	// reason the others do: goclib defines socket(), bind(), listen() and the
+	// rest as C functions, so `extern socket` would resolve to its own wrapper.
+	// There is no `send' or `recv' entry: Linux has no such syscalls, only
+	// sendto(2) and recvfrom(2), and the wrapper passes a null address.
+	"__goclib_socket":      41,
+	"__goclib_connect":     42,
+	"__goclib_accept":      43,
+	"__goclib_sendto":      44,
+	"__goclib_recvfrom":    45,
+	"__goclib_shutdown":    48,
+	"__goclib_bind":        49,
+	"__goclib_listen":      50,
+	"__goclib_getsockname": 51,
+	"__goclib_getpeername": 52,
+	"__goclib_setsockopt":  54,
+	"__goclib_getsockopt":  55,
+	"__goclib_select":      23,
+	// __goclib_fcntl (72) is here for one reason: the socket layer needs
+	// F_SETFL/O_NONBLOCK to make a socket non-blocking, which is the only
+	// portable way to stop a recv() from waiting forever. Linux has no
+	// ioctlsocket and Winsock has no fcntl. It carries the alias because
+	// fcntl is a libc function under a host compiler and goclib reaches it
+	// through syscall.h either way.
+	"__goclib_fcntl": 72,
+}
 
 // IsLinuxSyscall reports whether name is a raw Linux syscall goa can turn into a
 // `mov rax,N; syscall; ret` stub for an ELF target. gocl uses it to decide which
@@ -644,11 +669,38 @@ func (a *Assembler) emitSyscallStubs() error {
 			a.cur = prev
 			return err
 		}
+		// Linux takes its fourth argument from r10, not rcx, because the
+		// `syscall' instruction destroys rcx and r11 -- so the kernel cannot
+		// read the fourth argument out of rcx the way an ordinary SysV call
+		// would leave it.
+		//
+		// The fix goes here rather than at the call site. It used to live at
+		// the call site: goc's code generator passed the fourth argument in r10
+		// for names it knew were syscalls. That works for goc and silently
+		// breaks every other back end -- the LLVM one calls these stubs through
+		// the ordinary SysV register file, so the fourth argument arrived in
+		// rcx, the kernel read r10, and any call with four or more arguments
+		// failed with EFAULT. Measured on select(2), setsockopt(2) and
+		// recvfrom(2): three calls whose only common feature was their arity.
+		//
+		// Moving rcx into r10 here makes a syscall stub behave like any other
+		// function, so the caller does not need to know it is calling one.
+		if err := a.encode("mov", []Operand{
+			{kind: K_REG, reg: 10}, // r10
+			{kind: K_REG, reg: 1},  // rcx
+		}, "mov r10, rcx"); err != nil {
+			a.cur = prev
+			return err
+		}
 		// Route every syscall through a single __goc_syscall chokepoint instead
 		// of emitting the raw `syscall` instruction. On real Linux the loader
 		// (kernel) provides __goc_syscall; in the Windows test harness the
 		// gocrun loader rewrites __goc_syscall's body to a Win32-backed
 		// translator. Either way the guest runs natively -- no CPU emulation.
+		//
+		// The translator reads its arguments as a1..a6 = rdi, rsi, rdx, r10,
+		// r8, r9, so the move above puts the fourth argument where it expects
+		// to find it too.
 		a.emitByte(0xE8) // call rel32
 		off := a.curOff()
 		a.emitInt32(0)
