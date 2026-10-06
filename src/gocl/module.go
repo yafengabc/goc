@@ -68,6 +68,12 @@ type irMod struct {
 	// the same flag, and the LLVM backend has to agree or the object describes a
 	// different ABI than the C runtime it is linked against.
 	linux bool
+	// tlsOffsets maps a C thread-local global's name to its byte offset inside
+	// the .tls section. The linker lays the variable out there and provides the
+	// __goc_tls_slot helper to reach it; the IR references the variable through
+	// that helper with this offset, so the access code and the storage always
+	// agree on where the variable lives.
+	tlsOffsets map[string]int64
 }
 
 type irGlobal struct {
@@ -84,15 +90,16 @@ type irGlobal struct {
 
 func newIRMod(linux bool) *irMod {
 	m := &irMod{
-		structs: map[string]bool{},
-		structN: map[*frontend.Type]string{},
-		protos:  map[string]bool{},
-		defined: map[string]bool{},
-		extSig:  map[string]bool{},
-		extRet:  map[string]*frontend.Type{},
-		strings: map[string]string{},
-		consts:  map[string]string{},
-		linux:   linux,
+		structs:    map[string]bool{},
+		structN:    map[*frontend.Type]string{},
+		protos:     map[string]bool{},
+		defined:    map[string]bool{},
+		extSig:     map[string]bool{},
+		extRet:     map[string]*frontend.Type{},
+		strings:    map[string]string{},
+		consts:     map[string]string{},
+		linux:      linux,
+		tlsOffsets: map[string]int64{},
 	}
 	return m
 }
@@ -171,6 +178,14 @@ func (m *irMod) String() string {
 	}
 	if len(m.globals) > 0 {
 		b.WriteString("\n")
+	}
+	// A thread-local variable is reached through the linker-provided
+	// __goc_tls_slot helper (see call.go lvalue / expression.go ident), which
+	// returns the variable's per-thread address from its .tls offset. The
+	// helper's body is assembled by the entry stub; this declares it so the IR
+	// can call it.
+	if len(m.tlsOffsets) > 0 {
+		b.WriteString("declare ptr @__goc_tls_slot(i64)\n\n")
 	}
 	for _, p := range m.prototypeLines {
 		b.WriteString(p + "\n")
@@ -716,4 +731,13 @@ func (m *irMod) globalSym(cName string) string {
 		}
 	}
 	return ""
+}
+
+// tlsOffset reports the .tls-section offset of a thread-local global, or false
+// if cName is not one. The offset is exactly the one ComputeTLSLayout assigned
+// and the linker's .tls image used, so the IR's access and the section's storage
+// cannot drift apart.
+func (m *irMod) tlsOffset(cName string) (int64, bool) {
+	off, ok := m.tlsOffsets[cName]
+	return off, ok
 }

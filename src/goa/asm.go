@@ -351,11 +351,11 @@ var linuxSyscalls = map[string]int64{
 	// one output cannot carry both symbols. 60 terminates only the calling
 	// thread, 231 (exit_group) the whole process -- which is why the library's
 	// exit() uses the other one.
-	"__goclib_clone":        56,
-	"__goclib_futex":        202,
-	"__goclib_gettid":       186,
-	"__goclib_sched_yield":  24,
-	"__goclib_exit_thread":  60,
+	"__goclib_clone":       56,
+	"__goclib_futex":       202,
+	"__goclib_gettid":      186,
+	"__goclib_sched_yield": 24,
+	"__goclib_exit_thread": 60,
 	// Sockets (goclib/socket.c). Every one carries the __goclib_ prefix for the
 	// reason the others do: goclib defines socket(), bind(), listen() and the
 	// rest as C functions, so `extern socket` would resolve to its own wrapper.

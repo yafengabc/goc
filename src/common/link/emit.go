@@ -172,6 +172,40 @@ func Emit(d *Data) (string, error) {
 	}
 	out.WriteString(d.Body)
 
+	// __goc_tls_slot returns the per-thread address of a thread-local variable
+	// given its byte offset inside the .tls section. The gocl LLVM back end
+	// reaches every _Thread_local variable through this helper, because LLVM IR
+	// cannot express the platform TLS access directly. It is emitted whenever a
+	// .tls section exists (i.e. whenever the program uses TLS); the native back
+	// end does not call it but the unused definition costs nothing and keeps the
+	// two stubs identical.
+	if len(d.TLSVars) > 0 {
+		out.WriteString("\n__goc_tls_slot:\n")
+		if d.Linux {
+			// On Linux the .tls block is the live (single-threaded) copy, so
+			// the address is simply the section base plus the offset. The
+			// entry stub sets fs base to __tls_start for compatibility, but the
+			// access is an absolute RIP-relative add, matching the native
+			// generator's "lea r10, [rip+TL_name]".
+			out.WriteString("\tmov rax, rdi\n")
+			out.WriteString("\tlea rdx, [rip+__tls_start]\n")
+			out.WriteString("\tadd rax, rdx\n")
+			out.WriteString("\tret\n")
+		} else {
+			// Windows: the TEB's ThreadLocalStoragePointer (gs:0x58) is an
+			// array of per-module TLS block pointers; the module's index lives
+			// in the loader-filled G_goc_tls_index slot. This is the exact
+			// sequence genTLSAddr emits for the native back end.
+			out.WriteString("\tmov rax, rcx\n")
+			out.WriteString("\tmov edx, [rip+G_goc_tls_index]\n")
+			out.WriteString("\txor ecx, ecx\n")
+			out.WriteString("\tmov rcx, gs:[rcx+0x58]\n")
+			out.WriteString("\tmov rcx, [rcx+rdx*8]\n")
+			out.WriteString("\tadd rax, rcx\n")
+			out.WriteString("\tret\n")
+		}
+	}
+
 	// frontend.Program-level (global / static) variables live in writable sections,
 	// referenced via rip. Zero-initialised globals go to .bss (no file bytes,
 	// zero-filled by the loader), which shrinks the on-disk image without

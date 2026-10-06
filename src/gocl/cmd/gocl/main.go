@@ -230,6 +230,13 @@ func linkData(prog *frontend.Program, cfg *Config, claimed map[string]bool, exte
 		// rather than from the object.
 		Imports: externalImports(prog, cfg.Linux, obj),
 		Globals: globals,
+		// Thread-local globals are reached through the linker-provided slot
+		// helper, so they are absent from Globals above. The linker still has to
+		// lay them out in the .tls section and build the image's TLS directory
+		// (or set the Linux fs base); this is the same layout the IR emitter
+		// used, so the access code and the section storage agree on every
+		// offset.
+		TLSVars: gocl.ComputeTLSLayout(prog, common.Store(cfg.Linux), cfg.Linux),
 		// FuncAddr resolves a function designator in a static initialiser. In a
 		// full-LLVM build the function's symbol *is* its address, so this only
 		// has to confirm the object defines it.

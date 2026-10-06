@@ -8,6 +8,7 @@ package gocl
 import (
 	"fmt"
 	"goc/common"
+	"goc/common/link"
 	"goc/frontend"
 	"strconv"
 	"strings"
@@ -40,6 +41,12 @@ func translateProgram(prog *frontend.Program, lib *common.Program, linux bool, o
 	// -Os is a property of the module rather than of one function: it decides
 	// which pipeline runs, and the optsize attribute is what that pipeline reads.
 	m.optSize = opt == 2
+	// Thread-local globals live in the linker-owned .tls section, reached
+	// through the __goc_tls_slot helper. Record each one's offset up front so
+	// every reference in the IR uses the same number the .tls image reserves.
+	for _, tv := range ComputeTLSLayout(prog, lib, linux) {
+		m.tlsOffsets[tv.Name] = int64(tv.Offset)
+	}
 	defined := map[string]bool{}
 	tr := &typeResolver{
 		funcDefs:   map[string]*frontend.FuncDecl{},
@@ -163,11 +170,11 @@ func translateProgram(prog *frontend.Program, lib *common.Program, linux bool, o
 			continue
 		}
 		ty := m.llirType(gl.Typ)
-		// Thread-local storage has no representation in the IR front end's
-		// layout and is owned by goa's own assembler; declare it external so
-		// the LLVM-compiled half can still reference it.
+		// Thread-local storage is owned by the linker: it lays the variable out
+		// in the .tls section and provides __goc_tls_slot to reach it per
+		// thread. The IR references it through that helper (ident / lvalue),
+		// never as a direct global, so no IR symbol is declared here.
 		if gl.IsTLS {
-			m.noteExternGlobal("G_"+gl.Name, ty)
 			continue
 		}
 		init, ok := m.constInit(gl.Init, gl.Typ)
@@ -493,7 +500,8 @@ func (m *irMod) emitLibGlobals(lib *common.Program, need map[string]bool) {
 			continue
 		}
 		if lg.IsTLS {
-			m.noteExternGlobal("G_"+lg.Name, m.llirType(lg.Typ))
+			// Owned by the linker's .tls section, like a program-scope TLS
+			// global; reached through __goc_tls_slot, not declared here.
 			continue
 		}
 		init, ok := m.constInit(lg.Init, lg.Typ)
@@ -505,6 +513,52 @@ func (m *irMod) emitLibGlobals(lib *common.Program, need map[string]bool) {
 			name: "G_" + lg.Name, ty: m.llirType(lg.Typ), init: init,
 		})
 	}
+}
+
+// ComputeTLSLayout assigns every thread-local global a byte offset inside the
+// .tls section, in declaration order across the user program's globals and then
+// the C runtime's reachable globals. The rule mirrors the native generator's
+// tlsPlace exactly -- 8-byte alignment and link.TLSAlignedSize slots -- because
+// two halves of the build (the IR that emits the access code and the linker
+// stub that lays out the section) must agree on where each variable sits or the
+// declared label lands off its own bytes.
+//
+// It is the single source of truth consumed by both translateProgram (which
+// records the offsets in irMod.tlsOffsets for the IR emitter) and the linker
+// stub (which fills link.Data.TLSVars); calling it once here keeps them in
+// lockstep. A name that appears in both the program and the runtime resolves to
+// the program's spelling, so the offset is assigned only once.
+func ComputeTLSLayout(prog *frontend.Program, lib *common.Program, linux bool) []link.TLSVar {
+	var vars []link.TLSVar
+	seen := map[string]bool{}
+	off := 0
+	add := func(g *frontend.DeclStmt) {
+		if g == nil || seen[g.Name] {
+			return
+		}
+		seen[g.Name] = true
+		off = (off + 7) &^ 7
+		vars = append(vars, link.TLSVar{
+			Name:   g.Name,
+			Decl:   g,
+			Offset: off,
+			Label:  "TL_" + g.Name,
+		})
+		off += link.TLSAlignedSize(g.Typ)
+	}
+	for _, g := range prog.Globals {
+		if g.IsTLS {
+			add(g)
+		}
+	}
+	if lib != nil {
+		for _, g := range lib.Globals {
+			if g.IsTLS {
+				add(g)
+			}
+		}
+	}
+	return vars
 }
 
 // collectLibRefs visits every expression in a function body and reports the

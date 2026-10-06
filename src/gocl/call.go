@@ -18,6 +18,11 @@ func (e *irEmitter) lvalue(x frontend.Expr) string {
 		if uid, ok := e.tr.lookupUID(n.Name); ok {
 			return e.slotFor(uid, e.ty(ty))
 		}
+		// A thread-local variable lives in the linker-owned .tls section; its
+		// address is the per-thread slot the __goc_tls_slot helper returns.
+		if off, ok := e.c.tlsOffset(n.Name); ok {
+			return e.tlsAddr(off)
+		}
 		if sym := e.c.globalSym(n.Name); sym != "" {
 			return "@" + sym
 		}

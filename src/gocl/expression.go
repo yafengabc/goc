@@ -400,6 +400,15 @@ func (e *irEmitter) ident(n *frontend.Ident) val {
 		slot := e.slotFor(uid, e.ty(ty))
 		return e.load(slot, ty)
 	}
+	// A thread-local global is reached through the linker-provided
+	// __goc_tls_slot helper, which returns its per-thread address from the
+	// offset ComputeTLSLayout assigned. The array case below routes through
+	// lvalue (and therefore through tlsAddr too), so handling the scalar here
+	// and letting arrays fall through is enough.
+	if off, ok := e.c.tlsOffset(n.Name); ok {
+		addr := e.tlsAddr(off)
+		return e.load(addr, ty)
+	}
 	if sym := e.c.globalSym(n.Name); sym != "" {
 		if ty != nil && ty.Kind == frontend.KArr {
 			return val{op: "@" + sym, ty: frontend.PtrType(ty.Elem)}
@@ -453,6 +462,18 @@ func (e *irEmitter) load(p string, t *frontend.Type) val {
 	v := e.newTmp()
 	e.line("%s = load %s, ptr %s, align %d", v, ty, p, alignOfIr(ty))
 	return val{op: v, ty: t}
+}
+
+// tlsAddr returns the per-thread address of a thread-local variable given its
+// .tls offset. The address comes from __goc_tls_slot, a small assembly helper
+// the entry stub defines: on Windows it indexes the TEB's ThreadLocalStorage
+// pointer with the loader-filled TLS index; on Linux it adds the offset to the
+// .tls base. Computing the address in one place keeps the per-platform segment
+// dance out of the IR.
+func (e *irEmitter) tlsAddr(off int64) string {
+	a := e.newTmp()
+	e.line("%s = call ptr @__goc_tls_slot(i64 %d)", a, off)
+	return a
 }
 
 // store writes value v of type t to the address p.
