@@ -55,6 +55,12 @@ type irMod struct {
 	// functions to shrink, run under O2 -- so this is what -Os now means, and
 	// the pipeline string alone can no longer ask for it.
 	optSize bool
+	// linux selects the ELF target triple and the SysV x86-64 data layout. The
+	// IR front end owns this so the module it emits names the machine LLVM must
+	// lower to -- goc's own code generator switches its whole register file on
+	// the same flag, and the LLVM backend has to agree or the object describes a
+	// different ABI than the C runtime it is linked against.
+	linux bool
 }
 
 type irGlobal struct {
@@ -69,7 +75,7 @@ type irGlobal struct {
 	constant bool
 }
 
-func newIRMod() *irMod {
+func newIRMod(linux bool) *irMod {
 	m := &irMod{
 		structs: map[string]bool{},
 		structN: map[*frontend.Type]string{},
@@ -79,8 +85,21 @@ func newIRMod() *irMod {
 		extRet:  map[string]*frontend.Type{},
 		strings: map[string]string{},
 		consts:  map[string]string{},
+		linux:   linux,
 	}
 	return m
+}
+
+// dso returns the "dso_local" attribute for the Linux target. A static ELF
+// image is one non-preemptible unit: every global and function the module
+// defines or references lives in the same executable, so marking it dso_local
+// tells LLVM to bind references PC-relative (R_X86_64_PC32) instead of through a
+// GOT (R_X86_64_GOTPCRELX), which a no-GOT static image cannot satisfy.
+func (m *irMod) dso() string {
+	if m.linux {
+		return "dso_local "
+	}
+	return ""
 }
 
 // String returns the assembled module: type definitions, then globals, then
@@ -109,12 +128,18 @@ func (m *irMod) Externals() []string {
 }
 
 func (m *irMod) String() string {
-	// The layout string is the x86-64 Windows one: i64 pointers, 16-byte
-	// alignment for aggregates, 80-bit x87 extended precision. It has to
-	// describe the same machine goa's own assembler targets, or a struct laid
-	// out by one half of the compiler would be misread by the other.
-	const layout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
-	const triple = "x86_64-pc-windows-msvc"
+	// The layout string describes the machine goa's own assembler targets, so a
+	// struct laid out by one half of the compiler is read identically by the
+	// other. On Windows it is the m:w (MS ABI) layout; on Linux the SysV one
+	// (m:e), because the two differ in struct-by-value passing and aggregate
+	// alignment -- getting this wrong makes a struct return or a >8-byte
+	// argument land at the wrong offset.
+	layout := "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+	triple := "x86_64-pc-windows-msvc"
+	if m.linux {
+		layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+		triple = "x86_64-pc-linux-gnu"
+	}
 
 	var b strings.Builder
 	b.WriteString("target datalayout = \"" + layout + "\"\n")
@@ -127,14 +152,14 @@ func (m *irMod) String() string {
 	}
 	for _, g := range m.globals {
 		if g.external {
-			b.WriteString("@" + g.name + " = external global " + g.ty + "\n")
+			b.WriteString("@" + g.name + " = external " + m.dso() + "global " + g.ty + "\n")
 			continue
 		}
 		init := g.init
 		if init == "" {
 			init = "zeroinitializer"
 		}
-		b.WriteString("@" + g.name + " = global " + g.ty + " " + init + ", align " +
+		b.WriteString("@" + g.name + " = " + m.dso() + "global " + g.ty + " " + init + ", align " +
 			itoa(alignOfLlir(g.ty)) + "\n")
 	}
 	if len(m.globals) > 0 {
@@ -149,6 +174,18 @@ func (m *irMod) String() string {
 	for _, f := range m.funcBodies {
 		b.WriteString(f)
 		b.WriteString("\n")
+	}
+	// A static ELF image has no GOT or PLT, so the Linux module must ask LLVM for
+	// non-PIE code: a PIC Level and PIE Level of 0 make every reference to a
+	// static symbol a plain PC-relative relocation (R_X86_64_PC32) instead of a
+	// GOTPCRELX one. Without this, x86_64-pc-linux-gnu defaults to PIE and
+	// `&"..string.."` in the codegen becomes a GOT-relative load gocld cannot
+	// resolve (it builds no GOT), failing the link with "unsupported relocation
+	// type 42".
+	if m.linux {
+		b.WriteString("!0 = !{i32 1, !\"PIC Level\", i32 0}\n")
+		b.WriteString("!1 = !{i32 1, !\"PIE Level\", i32 0}\n")
+		b.WriteString("!llvm.module.flags = !{!0, !1}\n")
 	}
 	return b.String()
 }
@@ -362,7 +399,7 @@ func (m *irMod) declareFunc(name, ret string, params []string) {
 		ps = strings.Join(params, ", ")
 	}
 	m.prototypeLines = append(m.prototypeLines,
-		"declare "+ret+" @"+name+"("+ps+")")
+		"declare "+m.dso()+ret+" @"+name+"("+ps+")")
 }
 
 // --- small helpers ----------------------------------------------------------
@@ -437,7 +474,7 @@ func (m *irMod) noteExtern(name string, ret *frontend.Type, params []*frontend.T
 		r = m.llirType(ret)
 	}
 	m.prototypeLines = append(m.prototypeLines,
-		"declare "+r+" @"+name+"("+strings.Join(ps, ", ")+")")
+		"declare "+m.dso()+r+" @"+name+"("+strings.Join(ps, ", ")+")")
 }
 
 // noteExternGlobal declares a global this module reads or writes but does not
@@ -459,7 +496,7 @@ func (m *irMod) noteIntrinsic(name, ret string, params []string) {
 		ret = "void"
 	}
 	m.prototypeLines = append(m.prototypeLines,
-		"declare "+ret+" @"+name+"("+strings.Join(params, ", ")+")")
+		"declare "+m.dso()+ret+" @"+name+"("+strings.Join(params, ", ")+")")
 }
 
 // externRet reports the return type a previous noteExtern recorded, defaulting

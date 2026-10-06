@@ -85,43 +85,38 @@ func (e *irEmitter) eval(x frontend.Expr) val {
 }
 
 // cond evaluates a controlling expression and reduces it to i1.
-// vaArg lowers the va_arg builtin against goc's own va_list model.
 //
-// goc models a va_list as a flat cursor pointer: every variable argument
-// occupies one eight-byte slot, and reading one advances the cursor by eight
-// (see genVaArg, which does the same in registers). That is the same model the
-// native generator uses, so a variadic function behaves identically whichever
-// back end built it.
+// vaArg lowers the va_arg builtin against the target's own va_list layout.
+// llvm.va_start is target-defined and writes different things per ABI:
 //
-// LLVM's own va_arg does not fit here, and the difference is not cosmetic.
-// LLVM's va_list is a target-defined structure and va_arg is an *instruction*
-// -- "vaarg %ap, i32" -- rather than a call, so there is no intrinsic to call;
-// the tuple spelling that older LLVM accepted ("@llvm.va_arg(ptr, [i32, i8*])")
-// is rejected by LLVM 23 ("expected number in address space"). Reading the
-// cursor here also keeps the two back ends agreeing on where an argument lives,
-// which is the whole reason goc models va_list as a plain char* rather than
-// deferring to a second, target-specific opinion.
+//	Windows x64 -- a single pointer to the caller's register save area, every
+//	  variadic argument one eight-byte slot (general registers first, then the
+//	  stack past them). Reading an argument is load cursor / load / advance 8.
 //
-// What does the intrinsic do, then? llvm.va_start on Windows x64 writes a
-// single pointer into the va_list: the address of the register save area the
-// caller built (general-purpose slots first, the overflow area past them), so
-// the cursor that va_start establishes is exactly goc's flat eight-byte cursor
-// and reading an argument means loading that cursor, loading the value, and
-// advancing the cursor by eight.
+//	x86-64 SysV (Linux) -- the 24-byte __va_list_tag { unsigned gp_offset,
+//	  unsigned fp_offset; void *overflow_arg_area; void *reg_save_area; }.
+//	  Integer and floating arguments live in *separate* halves of the register
+//	  save area, each with its own cursor and its own limit (6 GP slots = 48
+//	  bytes, 8 SSE slots = 128 bytes); past either limit the argument comes
+//	  from the overflow area instead, one eight-byte slot at a time.
 //
-// The Windows x64 "structure" view of a va_list ({ unsigned gp_offset; unsigned
-// fp_offset; void *overflow_arg_area; void *reg_save_area; }) is the layout
-// clang's SysV lowering writes -- llvm.va_start stores no such structure here.
-// An earlier version of this function consulted those four fields anyway, so
-// every field read garbage from the single stored pointer and every variadic
-// call that consumed an argument crashed: printf("v=%d", x) crashed where
-// printf("hi") did not.
+// The two cannot be shared: reading gp_offset as if it were the flat cursor
+// makes every variadic call that consumes an argument crash on Linux, while the
+// Windows shape (one pointer) is what the register-half arithmetic would read
+// as garbage. So the read is dispatched on the target, and the comment on each
+// branch records which ABI it implements.
+//
+// LLVM's own va_arg instruction is not an option here: it is a target-defined
+// *instruction* ("vaarg %ap, i32") rather than a call, and the older intrinsic
+// spelling ("@llvm.va_arg(ptr, [i32, i8*])") is rejected by LLVM 23 ("expected
+// number in address space"). Spelling the read out also keeps the two back ends
+// agreeing on where an argument lives, which is why goc does not defer to a
+// second, target-specific opinion.
 func (e *irEmitter) vaArg(n *frontend.VaArgExpr) val {
 	// Every va_list -- a local `va_list ap;` or one that arrived as a
 	// parameter -- is backed by a writable slot (vaListSlot returns its
-	// address), and llvm.va_start stores the cursor into that slot. The slot
-	// is what the cursor lives in; writing it back is what makes a second
-	// va_arg read the next argument.
+	// address). That slot is what va_start fills in; writing back to it is what
+	// makes a second va_arg read the next argument.
 	ap := e.vaListSlot(n.Ap)
 	ty := n.Typ
 	if ty == nil {
@@ -129,17 +124,11 @@ func (e *irEmitter) vaArg(n *frontend.VaArgExpr) val {
 	}
 	lty := e.ty(ty)
 
-	// What llvm.va_start actually fills in on Windows x64 is a single pointer:
-	// the address of the register save area the CALLER built, with every
-	// variadic argument occupying one eight-byte slot (general registers
-	// first, then the stack area past them). That is the flat-cursor model the
-	// native generator uses, so reading an argument means loading the cursor,
-	// loading the value, and advancing the cursor by eight. An earlier version
-	// consulted the 24-byte __va_list_tag structure instead (gp_offset,
-	// fp_offset, overflow_arg_area, reg_save_area) -- the layout clang's SysV
-	// lowering writes -- but llvm.va_start stores no such structure on
-	// Windows, so every field read garbage and every variadic call that
-	// consumed an argument crashed.
+	if e.c.linux {
+		return e.vaArgSysV(ap, lty, ty)
+	}
+
+	// Windows x64: a single cursor pointer into the register save area.
 	cur := e.newTmp()
 	e.line("%s = load ptr, ptr %s, align 8", cur, ap)
 
@@ -166,6 +155,120 @@ func (e *irEmitter) vaArg(n *frontend.VaArgExpr) val {
 	e.line("%s = getelementptr inbounds i8, ptr %s, i64 8", next, cur)
 	e.line("store ptr %s, ptr %s, align 8", next, ap)
 	return val{op: slot, ty: ty}
+}
+
+// vaArgSysV reads one argument out of an x86-64 SysV va_list -- the
+// __va_list_tag llvm.va_start writes on Linux:
+//
+//	struct { unsigned gp_offset, fp_offset; void *overflow_arg_area, *reg_save_area; }
+//
+// A double or float comes from the SSE half of the register save area while it
+// is in range (fp_offset <= 176), otherwise from the overflow area; every other
+// type comes from the GP half while gp_offset <= 48, otherwise from the overflow
+// area. Either way the chosen cursor advances, so the next va_arg reads the next
+// argument.
+func (e *irEmitter) vaArgSysV(ap, lty string, ty *frontend.Type) val {
+	// Field offsets within __va_list_tag: gp_offset and fp_offset are the two
+	// leading unsigned ints (ap+0 and ap+4), the two pointers follow.
+	const (
+		gpOff  = 0
+		fpOff  = 4
+		ovfOff = 8
+		rsvOff = 16
+	)
+	gpRegMax := 48 // 6 integer register slots
+	fpRegMax := 176 // 8 SSE slots plus the 48-byte GP half (8 * 16 + 48)
+
+	// isFP reports whether this argument type is fetched from the SSE half.
+	// float and double promote to double when passed, and both are read back
+	// from the 16-byte-per-slot SSE area, so a float argument occupies a whole
+	// fp_offset step just like a double.
+	isFP := lty == "float" || lty == "double"
+	cursorOff := gpOff
+	limit, step := gpRegMax, 8
+	if isFP {
+		cursorOff, limit, step = fpOff, fpRegMax, 16
+	}
+
+	// cur = load cursor field; ovf = load overflow_arg_area
+	cur := e.newTmp()
+	e.line("%s = load i32, ptr %s, align 4", cur, e.gepStruct(ap, cursorOff))
+	ovf := e.newTmp()
+	e.line("%s = load ptr, ptr %s, align 8", ovf, e.gepStruct(ap, ovfOff))
+	rsv := e.newTmp()
+	e.line("%s = load ptr, ptr %s, align 8", rsv, e.gepStruct(ap, rsvOff))
+
+	// regAddr = reg_save_area + cur. The cursor field is an i32 in the
+	// on-stack __va_list_tag, and a GEP index is i64, so it is widened first.
+	cur64 := e.newTmp()
+	e.line("%s = zext i32 %s to i64", cur64, cur)
+	regAddr := e.newTmp()
+	e.line("%s = getelementptr inbounds i8, ptr %s, i64 %s", regAddr, rsv, cur64)
+
+	// addr = cur < limit ? regAddr : overflow_arg_area
+	useReg := e.newTmp()
+	e.line("%s = icmp ult i32 %s, %d", useReg, cur, limit)
+	addr := e.newTmp()
+	e.line("%s = select i1 %s, ptr %s, ptr %s", addr, useReg, regAddr, ovf)
+
+	// Advance the cursor that was actually used -- and only that one. Both
+	// stores go through the FIELD address, never the tag base: the tag is four
+	// independent fields packed into 24 bytes, so storing the advanced
+	// overflow_arg_area at ap+0 would land on top of gp_offset. The first
+	// va_arg in a function would then return the right value and every later
+	// one would read from a garbage cursor (symptom: the first %d prints and
+	// the second is 0 or garbage).
+	//
+	// The advance is branch-shaped rather than unconditional on purpose: the
+	// register cursor and the overflow cursor are alternatives, and moving both
+	// would skip an argument on whichever path is used second. clang's IR is
+	// the same shape -- a load/advance/store pair inside each arm of the
+	// reg-vs-overflow branch, with the two candidate addresses rejoined by a
+	// phi. Its bound is spelled `icmp ule 40` because the last GP slot starts at
+	// 40, which is the same test as `ult 48` at eight bytes per slot.
+	advCur := e.newTmp()
+	e.line("%s = add i32 %s, %d", advCur, cur, step)
+	advOvf := e.newTmp()
+	e.line("%s = getelementptr inbounds i8, ptr %s, i64 8", advOvf, ovf)
+	// Writing the *unchanged* value on the arm not taken keeps this
+	// branch-free: on the register path the overflow cursor is stored back
+	// exactly as it was read, which is a no-op, and vice versa.
+	curKept := e.newTmp()
+	e.line("%s = select i1 %s, i32 %s, i32 %s", curKept, useReg, advCur, cur)
+	e.line("store i32 %s, ptr %s, align 4", curKept, e.gepStruct(ap, cursorOff))
+	ovfKept := e.newTmp()
+	e.line("%s = select i1 %s, ptr %s, ptr %s", ovfKept, useReg, ovf, advOvf)
+	e.line("store ptr %s, ptr %s, align 8", ovfKept, e.gepStruct(ap, ovfOff))
+
+	// Load the value at the argument's own width from the same address.
+	slot := e.newTmp()
+	switch lty {
+	case "i1":
+		raw := e.newTmp()
+		e.line("%s = load i8, ptr %s, align 1", raw, addr)
+		e.line("%s = trunc i8 %s to i1", slot, raw)
+	case "float":
+		bits := e.newTmp()
+		e.line("%s = load i32, ptr %s, align 4", bits, addr)
+		e.line("%s = bitcast i32 %s to float", slot, bits)
+	case "double":
+		bits := e.newTmp()
+		e.line("%s = load i64, ptr %s, align 8", bits, addr)
+		e.line("%s = bitcast i64 %s to double", slot, bits)
+	default:
+		e.line("%s = load %s, ptr %s, align %d", slot, lty, addr, alignOfIr(lty))
+	}
+	return val{op: slot, ty: ty}
+}
+
+// gepStruct returns a pointer to the field `off` bytes into the byte-addressed
+// object at `p`. The va_list slot is an opaque 24-byte allocation whose real
+// layout is the target's, so it is addressed as bytes rather than through a
+// struct type the emitter would have to know per target.
+func (e *irEmitter) gepStruct(p string, off int) string {
+	g := e.newTmp()
+	e.line("%s = getelementptr inbounds i8, ptr %s, i64 %d", g, p, off)
+	return g
 }
 
 func (e *irEmitter) cond(x frontend.Expr) string {

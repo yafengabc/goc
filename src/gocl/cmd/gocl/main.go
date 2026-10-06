@@ -24,6 +24,7 @@ import (
 	"goc/common"
 	"goc/common/link"
 	"goc/frontend"
+	"gocld"
 
 	"gocl"
 )
@@ -127,7 +128,7 @@ func Compile(cfg *Config) (string, error) {
 		return "", err
 	}
 
-	d, err := linkData(prog, cfg, claimed, externals)
+	d, err := linkData(prog, cfg, claimed, externals, obj)
 	if err != nil {
 		return "", err
 	}
@@ -158,7 +159,7 @@ func Compile(cfg *Config) (string, error) {
 // What it does contribute is the startup work LLVM cannot do -- binding the
 // address of a global into a pointer initialiser, which in IR is a relative
 // constant and in the image has to be a `lea`.
-func linkData(prog *frontend.Program, cfg *Config, claimed map[string]bool, externals []string) (*link.Data, error) {
+func linkData(prog *frontend.Program, cfg *Config, claimed map[string]bool, externals []string, obj []byte) (*link.Data, error) {
 	funcs := map[string]*frontend.FuncDecl{}
 	for _, f := range prog.Funcs {
 		funcs[f.Name] = f
@@ -198,7 +199,7 @@ func linkData(prog *frontend.Program, cfg *Config, claimed map[string]bool, exte
 		// Every external call the program made is now a symbol the LLVM object
 		// references; the stub has to declare the ones that come from the OS
 		// rather than from the object.
-		Imports: externalImports(prog, cfg.Linux),
+		Imports: externalImports(prog, cfg.Linux, obj),
 		Globals: globals,
 		// FuncAddr resolves a function designator in a static initialiser. In a
 		// full-LLVM build the function's symbol *is* its address, so this only
@@ -236,12 +237,19 @@ func linkData(prog *frontend.Program, cfg *Config, claimed map[string]bool, exte
 // externalImports lists the extern declarations the entry stub needs: the ones
 // the program calls that the object itself does not define -- the platform's
 // process and file APIs, and the C library's own imports.
-func externalImports(prog *frontend.Program, linux bool) []string {
+func externalImports(prog *frontend.Program, linux bool, obj []byte) []string {
 	seen := map[string]bool{}
+	// Each import is stored newline-terminated, matching the convention native
+	// goc uses (codegen.go emits "extern %s, %s\n"). emit.go writes the strings
+	// verbatim, one per line; without the trailing newline two externs would
+	// collapse onto one line and goa's `;` comment marker would swallow the
+	// second, leaving its stub undefined.
 	add := func(s string) {
-		if s = strings.TrimSpace(s); s != "" {
-			seen[s] = true
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
 		}
+		seen[s+"\n"] = true
 	}
 	for _, f := range prog.Prototypes {
 		if f.DLL == "" {
@@ -258,8 +266,22 @@ func externalImports(prog *frontend.Program, linux bool) []string {
 		}
 		add("extern " + name + ", " + f.DLL + ";")
 	}
-	if linux {
-		add("extern __goclib_exit, ;")
+	if linux && len(obj) > 0 {
+		// Declare a syscall stub for every undefined symbol the LLVM object
+		// references that goa knows as a raw Linux syscall. The library's own
+		// functions (read, write, exit_group, the __goclib_* aliases, ...) are
+		// undefined in the object and must resolve against a goa stub; anything
+		// else (memcpy, the library's own globals, ...) is defined in the
+		// object and needs no extern. goclib's __goclib_exit is one of those
+		// defined symbols, so it is not declared here either -- the stub calls
+		// it and the object satisfies the reference.
+		if syms, err := gocld.UndefinedELFSymbols(obj); err == nil {
+			for _, name := range syms {
+				if goa.IsLinuxSyscall(name) {
+					add("extern " + name + ", ;")
+				}
+			}
+		}
 	}
 	out := make([]string, 0, len(seen))
 	for s := range seen {

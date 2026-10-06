@@ -36,12 +36,12 @@ func LLVMAvailable() bool { return false }
 // CompileToObject is unavailable here. The receiver is a nil *LLVM from
 // OpenLLVM, which failed, so this is only reachable if a caller constructed one
 // itself -- hence an error naming the platform rather than a nil dereference.
-func (l *LLVM) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
+func (l *LLVM) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, linux bool) error {
 	return errUnsupportedPlatform
 }
 
 // CompileToAssembly is unavailable here. See CompileToObject.
-func (l *LLVM) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
+func (l *LLVM) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, linux bool) error {
 	return errUnsupportedPlatform
 }
 

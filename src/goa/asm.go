@@ -341,10 +341,20 @@ var linuxSyscalls = map[string]int64{
 	// thread, 231 (exit_group) the whole process -- which is why the library's
 	// exit() uses the other one.
 	"__goclib_clone":        56,
-	"__goclib_futex":        202,
-	"__goclib_gettid":       186,
-	"__goclib_sched_yield":  24,
-	"__goclib_exit_thread":  60,
+		"__goclib_futex":        202,
+		"__goclib_gettid":       186,
+		"__goclib_sched_yield":  24,
+		"__goclib_exit_thread":  60,
+	}
+
+// IsLinuxSyscall reports whether name is a raw Linux syscall goa can turn into a
+// `mov rax,N; syscall; ret` stub for an ELF target. gocl uses it to decide which
+// undefined symbols of the LLVM object need an `extern` declaration: the ones
+// that resolve against a goa stub rather than against a definition the object
+// already carries.
+func IsLinuxSyscall(name string) bool {
+	_, ok := linuxSyscalls[name]
+	return ok
 }
 
 func NewAssembler() *Assembler {

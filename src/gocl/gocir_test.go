@@ -108,7 +108,7 @@ func TestLLVMAcceptsGeneratedIR(t *testing.T) {
 		ir = b
 	}
 	obj := t.TempDir() + "/probe.obj"
-	if err := api.CompileToObject(ir, obj, LLVMOptAggressive, ""); err != nil {
+	if err := api.CompileToObject(ir, obj, LLVMOptAggressive, "", false); err != nil {
 		t.Fatalf("LLVM rejected the IR: %v", err)
 	}
 	st, err := os.Stat(obj)
@@ -140,7 +140,7 @@ func TestLLVMRejectsBadIR(t *testing.T) {
 		``,
 	}, "\n")
 	obj := t.TempDir() + "/bad.obj"
-	if err := api.CompileToObject([]byte(bad), obj, LLVMOptNone, ""); err == nil {
+	if err := api.CompileToObject([]byte(bad), obj, LLVMOptNone, "", false); err == nil {
 		t.Fatal("LLVM accepted a module with an unterminated block; " +
 			"the front end's own checks cannot be trusted")
 	} else {

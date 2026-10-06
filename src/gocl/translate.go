@@ -36,7 +36,7 @@ import (
 // is consulted for prototypes and for the reachability walk that decides which
 // runtime code has to be emitted.
 func translateProgram(prog *frontend.Program, lib *common.Program, linux bool, opt int) (string, map[string]bool, []string, error) {
-	m := newIRMod()
+	m := newIRMod(linux)
 	// -Os is a property of the module rather than of one function: it decides
 	// which pipeline runs, and the optsize attribute is what that pipeline reads.
 	m.optSize = opt == 2

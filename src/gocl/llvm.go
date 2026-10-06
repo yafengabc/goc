@@ -213,8 +213,8 @@ func (a *llvmAPI) Version() (int, int, int) {
 //
 // passes names an IR optimisation pipeline ("default<O2>") or is "" to lower
 // the module exactly as the front end wrote it.
-func (a *llvmAPI) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
-	return a.compileToFile(ir, outPath, opt, passes, 1) // 1 = LLVMCodeGenFileTypeObject
+func (a *llvmAPI) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, linux bool) error {
+	return a.compileToFile(ir, outPath, opt, passes, 1, linux) // 1 = LLVMCodeGenFileTypeObject
 }
 
 // CompileToAssembly lowers LLVM IR to native assembly text (the AsmPrinter
@@ -222,8 +222,8 @@ func (a *llvmAPI) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptL
 // kind of textual artifact gcc's `cc -S` produces, only for the LLVM back end
 // instead of the native one. The file is not fed back to goa -- it is the
 // final artifact, exactly like the .asm a native `-S` build writes.
-func (a *llvmAPI) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
-	return a.compileToFile(ir, outPath, opt, passes, 0) // 0 = LLVMCodeGenFileTypeAssembly
+func (a *llvmAPI) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, linux bool) error {
+	return a.compileToFile(ir, outPath, opt, passes, 0, linux) // 0 = LLVMCodeGenFileTypeAssembly
 }
 
 // runPasses runs an IR optimisation pipeline over a module.
@@ -264,19 +264,27 @@ func (a *llvmAPI) errorText(err uintptr) string {
 
 // compileToFile runs the shared IR->target lowering and emits either an object
 // (fileType 1) or assembly text (fileType 0) with LLVMTargetMachineEmitToFile.
-func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, fileType int) error {
+func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, fileType int, linux bool) error {
 	// A NUL-terminated copy: the C API takes a char* and reads to the end.
 	irz := append(append([]byte(nil), ir...), 0)
 	keepIR := &cstrBuf{p: uintptr(unsafe.Pointer(&irz[0])), b: irz}
 
-	// The default triple names the host exactly, which is what we want: the
-	// object is linked into an image goa builds for this machine.
-	tripleMsg, _, _ := a.getDefaultTargetTriple.Call()
-	if tripleMsg == 0 {
-		return fmt.Errorf("goa: LLVMGetDefaultTargetTriple returned null")
+	// The triple names the target. For a Linux image the module already asked
+	// for x86_64-pc-linux-gnu, so honour that rather than the host's Windows
+	// default -- the object's format (ELF vs COFF) and the calling convention
+	// (SysV vs Win64) both follow it. The default target machine is still built
+	// from this triple, so emitting an ELF object from a Windows host works.
+	var triple string
+	if linux {
+		triple = "x86_64-pc-linux-gnu"
+	} else {
+		tripleMsg, _, _ := a.getDefaultTargetTriple.Call()
+		if tripleMsg == 0 {
+			return fmt.Errorf("goa: LLVMGetDefaultTargetTriple returned null")
+		}
+		triple = goString(tripleMsg)
+		a.disposeMessage.Call(tripleMsg)
 	}
-	triple := goString(tripleMsg)
-	a.disposeMessage.Call(tripleMsg)
 	tripleC := newCstr(triple)
 
 	// LLVMGetTargetFromTriple takes (triple, &target, &err). The order of the
@@ -306,9 +314,19 @@ func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLev
 	// as if it were a status code.
 	emptyC := newCstr("")
 	outC := newCstr(outPath)
+	// Relocation model: a static ELF image has no GOT or PLT, so the Linux path
+	// asks for LLVMRelocStatic (1). The default (0) would, for x86_64-pc-linux-gnu,
+	// emit position-independent code that references every static symbol through a
+	// GOTPCRELX relocation -- which a no-libc static image neither needs nor can
+	// resolve. The COFF (Windows) path keeps the default, which already produces
+	// the relocations its import table expects.
+	reloc := 0
+	if linux {
+		reloc = 1 // LLVMRelocStatic
+	}
 	tmv, _, _ := a.createTargetMachine.Call(
 		target, tripleC.ptr(), emptyC.ptr(), emptyC.ptr(),
-		uintptr(uint32(opt)), 0, 0, outC.ptr(), 0)
+		uintptr(uint32(opt)), uintptr(reloc), 0, outC.ptr(), 0)
 	tm := uintptr(tmv)
 	if tm == 0 {
 		return fmt.Errorf("goa: LLVMCreateTargetMachine failed for %s", triple)
@@ -460,16 +478,18 @@ func OpenLLVM() (*LLVM, error) {
 	return &LLVM{api: api}, nil
 }
 
-// CompileToObject compiles IR text to a COFF object at outPath, after running
-// the named IR pipeline ("" for none).
-func (l *LLVM) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
-	return l.api.CompileToObject(ir, outPath, opt, passes)
+// CompileToObject compiles IR text to an object at outPath, after running the
+// named IR pipeline ("" for none). The object format follows the target: a COFF
+// object for Windows, an ELF object for Linux -- the linker half that consumes
+// it agrees because the module named the same triple.
+func (l *LLVM) CompileToObject(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, linux bool) error {
+	return l.api.CompileToObject(ir, outPath, opt, passes, linux)
 }
 
 // CompileToAssembly lowers IR to native assembly text at outPath (the
 // AsmPrinter output). Used by `-fllvm -S`.
-func (l *LLVM) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string) error {
-	return l.api.CompileToAssembly(ir, outPath, opt, passes)
+func (l *LLVM) CompileToAssembly(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, linux bool) error {
+	return l.api.CompileToAssembly(ir, outPath, opt, passes, linux)
 }
 
 // Version returns the linked library's version, for diagnostics.

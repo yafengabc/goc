@@ -4975,11 +4975,13 @@ func (c *CG) findAddressTaken(f *frontend.FuncDecl) map[string]bool {
 		case *frontend.MemberExpr:
 			walkExpr(n.Base)
 		case *frontend.Call:
-			// va_start(ap, ...) and va_end(ap) both require ap's address
-			// (va_start writes the cursor into it), and va_arg needs it too.
-			if n.Name == "va_start" || n.Name == "va_end" {
-				if len(n.Args) > 0 {
-					if id, ok := n.Args[0].(*frontend.Ident); ok {
+			// va_start(ap, ...), va_end(ap) and va_copy(dst, src) all take
+			// their va_list arguments by address (va_start writes the cursor
+			// into it, va_arg needs it, va_copy reads one and writes the
+			// other), and va_arg needs it too.
+			if n.Name == "va_start" || n.Name == "va_end" || n.Name == "va_copy" {
+				for _, a := range n.Args {
+					if id, ok := a.(*frontend.Ident); ok {
 						taken[id.Name] = true
 					}
 				}
@@ -9609,10 +9611,20 @@ func (c *CG) funcAddrSym(name string) (string, bool) {
 // because an argument may itself be a function call whose own argument setup
 // would otherwise clobber the values of earlier arguments.
 func (c *CG) genCallExpr(n *frontend.Call) (frontend.CType, error) {
-	// va_start / va_end are compiler builtins, not real functions. va_start
-	// seeds the va_list cursor with the address of the first variadic slot;
-	// va_end is a no-op in goc's flat-cursor model.
-	if n.Name == "va_start" || n.Name == "va_end" {
+	// va_start / va_end / va_copy are compiler builtins, not real functions.
+	// va_start seeds the va_list cursor with the address of the first variadic
+	// slot; va_end is a no-op in goc's flat-cursor model; va_copy duplicates the
+	// cursor so a second pass over the same arguments starts over.
+	//
+	// va_copy is a builtin rather than a macro in <stdarg.h> because the size
+	// of the copy is ABI-defined. goc's own va_list is a char* cursor on every
+	// target it generates today, so here the copy is eight bytes -- but the
+	// lowering has to be written in terms of the va_list's real size, or the
+	// day va_list becomes the 24-byte SysV __va_list_tag this silently copies
+	// 8 of 24 bytes and the copy shares (and trashes) the original's register
+	// save area. stdarg.h only defines the macro on targets where the pointer
+	// form is correct, so on Linux this name reaches here intact.
+	if n.Name == "va_start" || n.Name == "va_end" || n.Name == "va_copy" {
 		if n.Name == "va_start" {
 			if len(n.Args) < 1 {
 				return frontend.TInt, fmt.Errorf("va_start requires at least the va_list argument")
@@ -9630,6 +9642,22 @@ func (c *CG) genCallExpr(n *frontend.Call) (frontend.CType, error) {
 			}
 			c.emit("lea rax, [rbp%+d]", c.saveBaseOff+8*(c.nFixed+rs))
 			c.emit("mov [r10], rax")
+		} else if n.Name == "va_copy" {
+			// Both cursors are addressed as values. Evaluate the SOURCE
+			// first and keep it in a scratch register across the destination
+			// evaluation: `va_copy(a, b)` must read b before a is written,
+			// otherwise self-copy or aliasing arguments lose the old value.
+			if len(n.Args) < 2 {
+				return frontend.TInt, fmt.Errorf("va_copy requires a destination and a source va_list")
+			}
+			if err := c.genLValue(n.Args[1]); err != nil {
+				return frontend.TInt, err
+			}
+			c.emit("mov r11, [r10]")
+			if err := c.genLValue(n.Args[0]); err != nil {
+				return frontend.TInt, err
+			}
+			c.emit("mov [r10], r11")
 		}
 		c.resTyp = frontend.TInt
 		return frontend.TInt, nil

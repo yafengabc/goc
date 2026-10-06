@@ -60,13 +60,6 @@ func CompileIR(ir string, opt int, linux bool) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gocl needs the LLVM shared library: %w", err)
 	}
-	if linux {
-		// The object format follows the target LLVM reports, and the linker
-		// half has to agree; an ELF build reaches this only once the ELF object
-		// path exists, so say so plainly instead of producing a PE-shaped
-		// object for a Linux image.
-		return nil, fmt.Errorf("the LLVM back end does not emit ELF objects yet, so -target linux is not available")
-	}
 	dir, err := os.MkdirTemp("", "goc-llvm-")
 	if err != nil {
 		return nil, err
@@ -77,7 +70,7 @@ func CompileIR(ir string, opt int, linux bool) ([]byte, error) {
 	if opt >= 3 {
 		level = LLVMOptAggressive
 	}
-	if err := api.CompileToObject([]byte(ir), obj, level, irPasses(opt)); err != nil {
+	if err := api.CompileToObject([]byte(ir), obj, level, irPasses(opt), linux); err != nil {
 		return nil, fmt.Errorf("libLLVM: %w", err)
 	}
 	b, err := os.ReadFile(obj)
@@ -96,16 +89,11 @@ func emitIRAssembly(ir string, outPath string, opt int, linux bool) error {
 	if err != nil {
 		return fmt.Errorf("gocl needs the LLVM shared library: %w", err)
 	}
-	if linux {
-		// The assembler follows the host target the library was built for; a
-		// Linux image would need an ELF triple that this build does not set up.
-		return fmt.Errorf("the LLVM back end does not emit ELF objects yet, so -target linux is not available")
-	}
 	level := LLVMOptDefault
 	if opt >= 3 {
 		level = LLVMOptAggressive
 	}
-	if err := api.CompileToAssembly([]byte(ir), outPath, level, irPasses(opt)); err != nil {
+	if err := api.CompileToAssembly([]byte(ir), outPath, level, irPasses(opt), linux); err != nil {
 		return fmt.Errorf("libLLVM: %w", err)
 	}
 	return nil

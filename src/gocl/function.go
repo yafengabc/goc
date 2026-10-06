@@ -37,6 +37,16 @@ type irEmitter struct {
 	// va_arg and va_end all share, so the front end's `char *` typedef and
 	// llvm.va_start's structure agree on one object.
 	vaSlots map[string]string
+	// vaNames records every identifier that has been used as a va_list, keyed
+	// by name. The front end types va_list as `char *`, which is
+	// indistinguishable from an ordinary string pointer, so the type cannot
+	// tell a caller's `va_list ap` argument from any other `char *`. Knowing
+	// the name is what lets a call that passes one along hand over the right
+	// thing: on Windows x64 the cursor pointer itself, on x86-64 SysV the
+	// pointer to the caller's 24-byte __va_list_tag. Without it, passing a
+	// SysV va_list on loads the first eight bytes of the tag -- two packed
+	// cursor integers -- and hands that to the callee as an address.
+	vaNames map[string]bool
 	entry   strings.Builder
 	body    strings.Builder
 	tmp     int
@@ -142,6 +152,15 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 	}
 	e.paramNames = paramNames
 
+	// Learn the va_list names before emitting anything. Passing a va_list to
+	// another function has to know it is one (see irEmitter.vaNames), and that
+	// question is asked while lowering a call -- which can come before the
+	// va_start/va_arg that would otherwise have registered the name. A forward
+	// reference is normal C (`void f(va_list); void g(va_list ap){ f(ap); }`),
+	// so the whole body is swept first.
+	e.vaNames = map[string]bool{}
+	collectVaListNames(f.Body, e.vaNames)
+
 	params := e.bindParams(f)
 
 	e.stmt(f.Body)
@@ -166,7 +185,7 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 	tr.popScope()
 
 	var b strings.Builder
-	sig := "define " + e.retTy + " @" + f.Name + "(" + strings.Join(params, ", ")
+	sig := "define " + m.dso() + e.retTy + " @" + f.Name + "(" + strings.Join(params, ", ")
 	if f.Variadic {
 		// The ellipsis is what makes this variadic to LLVM, and it has to come
 		// after every named parameter. A function that takes a fixed count is not
@@ -248,24 +267,52 @@ func (e *irEmitter) slotFor(uid int, ty string) string {
 const vaListTy = "[3 x i64]"
 
 // vaListSlot returns the address of the object backing a va_list named by x.
-// Every mention of the same variable -- va_start, each va_arg, va_end -- must
-// land on this one slot, so the mapping is kept by name for the duration of the
-// function.
+// Every mention of the same variable -- va_start, each va_arg, va_end, va_copy
+// -- must land on this one slot, so the mapping is kept by name for the
+// duration of the function.
 //
-// A local `va_list ap;` gets a slot of its own, widened to the Windows x64
-// va_list layout so the intrinsic never scribbles past the eight bytes its
-// `char *` typedef would otherwise give it. A va_list that arrived as a
-// parameter is backed by the alloca bindParams created for it, so its address
-// is returned too: va_arg advances the cursor by writing back through it, and
-// returning a value instead would make every va_arg read the same slot.
+// A local `va_list ap;` gets a slot of its own, widened to 24 bytes so the
+// intrinsics can write a whole target va_list into it whatever that turns out
+// to be.
+//
+// A va_list that arrived as a PARAMETER is where the two ABIs genuinely
+// differ, and getting it wrong is silent rather than fatal -- the callee walks
+// a tag whose tail is garbage and simply prints nothing after the first
+// argument:
+//
+//   - Windows x64: va_list is `char *`, so the parameter holds the cursor
+//     itself. The slot bindParams made is already eight bytes wide and already
+//     holds the right value, so its address is the answer.
+//
+//   - x86-64 SysV: va_list is `struct __va_list_tag[1]`, an array type, so a
+//     parameter decays to a pointer to the tag -- 24 bytes that live in the
+//     CALLER's frame. The pointer is what bindParams received; the address of
+//     the eight-byte slot holding it is not. Handing the slot address to
+//     llvm.va_arg would make every read past the first eight bytes garbage and
+//     would write the advanced cursor into the local copy, leaving the caller's
+//     tag untouched. So the pointer is loaded out first and IT is the address
+//     of the va_list.
 func (e *irEmitter) vaListSlot(x frontend.Expr) string {
 	id, ok := x.(*frontend.Ident)
 	if !ok {
 		return e.lvalue(x)
 	}
+	if e.vaNames == nil {
+		e.vaNames = map[string]bool{}
+	}
+	e.vaNames[id.Name] = true
 	if e.paramNames[id.Name] {
 		if uid, ok := e.tr.lookupUID(id.Name); ok {
-			return e.slotFor(uid, "ptr")
+			slot := e.slotFor(uid, "ptr")
+			if !e.c.linux {
+				return slot
+			}
+			// SysV: `slot` holds a pointer to the caller's 24-byte tag. Load
+			// it so the intrinsics address the tag itself, and so a write-back
+			// lands in the caller's list where the C semantics require.
+			p := e.newTmp()
+			e.line("%s = load ptr, ptr %s, align 8", p, slot)
+			return p
 		}
 		return e.rvalue(x)
 	}
@@ -274,6 +321,31 @@ func (e *irEmitter) vaListSlot(x frontend.Expr) string {
 	}
 	if s, seen := e.vaSlots[id.Name]; seen {
 		return s
+	}
+	// A va_list local that the ordinary local machinery has already given a
+	// slot keeps it -- but only where eight bytes IS the whole va_list.
+	//
+	// On Windows x64 stdarg.h defines va_copy as a plain pointer assignment, so
+	// `va_list m; va_copy(m, ap);` leaves `m` an ordinary `char *` local: one
+	// slot, written by the assignment. Allocating a second slot for it here
+	// would give va_arg(m, T) a DIFFERENT object from the one the copy filled
+	// -- the copy landed in the first, va_arg read and advanced the second, and
+	// the second started life as whatever was on the stack. The result was a
+	// plausible-looking garbage number rather than a diagnosable fault.
+	//
+	// On x86-64 SysV the same reuse is wrong in the opposite direction. There
+	// va_copy is a compiler builtin and `m` is a real 24-byte __va_list_tag; the
+	// eight-byte slot the declaration made is only the first third of it, so
+	// reading a va_arg through that slot would lose overflow_arg_area and
+	// reg_save_area (symptom: the first %d prints, the rest are garbage). So
+	// the widened slot of its own is kept.
+	if !e.c.linux {
+		if uid, ok := e.tr.lookupUID(id.Name); ok {
+			if s, exists := e.slots[uid]; exists {
+				e.vaSlots[id.Name] = s
+				return s
+			}
+		}
 	}
 	slot := e.newTmp()
 	e.entry.WriteString("  " + slot + " = alloca " + vaListTy + ", align 8\n")

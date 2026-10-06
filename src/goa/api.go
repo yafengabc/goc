@@ -89,8 +89,14 @@ func AssembleWithObject(src string, obj []byte, outPath string, elf bool) (int64
 	// resolve against an image that has no main at all.
 	img := a.LinkImage()
 	if len(obj) > 0 {
-		if err := img.IngestCOFFBytes(obj); err != nil {
-			return 0, fmt.Errorf("linking the LLVM object: %w", err)
+		if elf {
+			if err := img.IngestELFBytes(obj); err != nil {
+				return 0, fmt.Errorf("linking the LLVM object: %w", err)
+			}
+		} else {
+			if err := img.IngestCOFFBytes(obj); err != nil {
+				return 0, fmt.Errorf("linking the LLVM object: %w", err)
+			}
 		}
 	}
 	return a.writeImageTo(img, outPath, elf)

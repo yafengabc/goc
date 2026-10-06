@@ -54,6 +54,7 @@ const (
 	elfEhSize      = 64
 	elfPhEntSize   = 56
 	elfShEntSize   = 64
+	elfSymEntSize  = 24 // sizeof(Elf64_Sym)
 	elfTextFileOff = 0x80 // ELF header + one program header, 16-aligned
 )
 
@@ -295,12 +296,23 @@ func (state *Image) BuildELF(outPath string) error {
 	for i, ps := range posts {
 		idx := base + i
 		var typ uint32 = shtProgBits
+		ent := uint64(0)
 		if ps.name == ".symtab" {
 			typ = shtSymTab
+			// One Elf64_Sym per entry. Leaving this zero is what makes the
+			// output unloadable by anything that walks the table properly:
+			// readelf reports "invalid sh_entsize of 0" and gdb refuses the
+			// file outright ("not in executable format"), which costs the
+			// whole symbol table -- and with it any chance of a backtrace --
+			// for a binary that runs fine. It is only fixed up below, where
+			// the index is known.
+			ent = elfSymEntSize
 		} else if ps.name == ".strtab" || ps.name == ".shstrtab" {
 			typ = shtStrTab
 		}
+		b := idx * elfShEntSize
 		putSection(idx, addName(ps.name), typ, 0, 0, uint64(postOff[i]), uint64(len(ps.data)), 1)
+		putU64at(sh, b+56, ent)
 	}
 	// .shstrtab section header: point at the real shstr, written last in the
 	// file (after the section header table, at shstrOff). addName(".shstrtab")

@@ -37,7 +37,7 @@ func compileIRToObject(t *testing.T, api *llvmAPI, irPath string) []byte {
 		t.Fatalf("read IR: %v", err)
 	}
 	objPath := filepath.Join(t.TempDir(), "out.obj")
-	if err := api.CompileToObject(ir, objPath, LLVMOptAggressive, ""); err != nil {
+	if err := api.CompileToObject(ir, objPath, LLVMOptAggressive, "", false); err != nil {
 		t.Fatalf("CompileToObject: %v", err)
 	}
 	obj, err := os.ReadFile(objPath)

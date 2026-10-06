@@ -103,8 +103,8 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 	if repl := common.SpecializePrintfCall(n, e.printfQueries()); repl != nil {
 		return e.callExpr(repl)
 	}
-	// va_start and va_end are compiler built-ins in goc, recognised by name.
-	// Both take the cursor's address: the intrinsics write through it.
+	// va_start, va_end and va_copy are compiler built-ins in goc, recognised by
+	// name. All three take the cursor's address: the intrinsics write through it.
 	switch n.Name {
 	case "va_start":
 		if len(n.Args) == 0 {
@@ -128,6 +128,28 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 		e.c.noteIntrinsic("llvm.va_end", "void", []string{"ptr"})
 		e.line("call void @llvm.va_end(ptr %s)", ap)
 		return val{op: "0", ty: frontend.IntType()}
+	case "va_copy":
+		// C99 7.16.1.1: va_copy makes an independent copy of a va_list, so the
+		// copy can be walked to the end without consuming the original. This is
+		// what lets a formatter measure first and then write.
+		//
+		// The copy size is ABI-defined, which is why this is the one variadic
+		// operation goclib/stdarg.h declines to define as a macro on Linux: on
+		// x86-64 SysV a va_list is a 24-byte __va_list_tag carrying four
+		// cursors, and copying only the first 8 bytes leaves the copy sharing
+		// the original's register save area (and with a null overflow area, so
+		// the first stack argument dereferences null). llvm.va_copy is
+		// target-aware -- it copies the whole object on SysV and the single
+		// pointer on Windows x64 -- so the same intrinsic serves both without a
+		// compile-time branch here.
+		if len(n.Args) < 2 {
+			return val{op: "0", ty: frontend.IntType()}
+		}
+		dst := e.vaListSlot(n.Args[0])
+		src := e.vaListSlot(n.Args[1])
+		e.c.noteIntrinsic("llvm.va_copy", "void", []string{"ptr", "ptr"})
+		e.line("call void @llvm.va_copy(ptr %s, ptr %s)", dst, src)
+		return val{op: "0", ty: frontend.IntType()}
 	}
 	// A call through a function-pointer VARIABLE arrives here as a frontend.Call naming
 	// the variable, not the function it points at. Emitting "call i32 @fn" for
@@ -150,6 +172,22 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 	// function argument". Spelling the types out is always accepted.
 	args := make([]string, 0, len(paramTys)+len(n.Args))
 	for i, a := range n.Args {
+		// An argument that is a known va_list does not go through the ordinary
+		// `char *` read, because on x86-64 SysV a va_list is a 24-byte
+		// __va_list_tag and its first eight bytes are two packed cursor
+		// integers, not a pointer. The callee wants the ADDRESS of that tag
+		// (a SysV va_list parameter is an array type, so it decays to a
+		// pointer), and advancing it must write back into the caller's tag --
+		// which is what the C semantics require and what lets a callee consume
+		// the list. On Windows x64 the value already is the cursor pointer, so
+		// the ordinary read is exactly right and the slot's own address is not
+		// wanted.
+		if e.c.linux {
+			if id, ok := a.(*frontend.Ident); ok && e.vaNames[id.Name] {
+				args = append(args, "ptr "+e.vaListSlot(a))
+				continue
+			}
+		}
 		v := e.eval(a)
 		if i < len(paramTys) {
 			v = e.coerce(v, paramTys[i])
@@ -233,6 +271,16 @@ func (e *irEmitter) indirectCall(n *frontend.IndirectCall) val {
 	fn := e.rvalue(n.Fn)
 	var args []string
 	for _, a := range n.Args {
+		// A va_list argument goes over as the address of the caller's tag on
+		// SysV, for the same reason as in callExpr: the callee's parameter is a
+		// decayed array, and the ordinary `char *` read would hand it the tag's
+		// first eight bytes -- two packed cursors -- instead of an address.
+		if e.c.linux {
+			if id, ok := a.(*frontend.Ident); ok && e.vaNames[id.Name] {
+				args = append(args, "ptr "+e.vaListSlot(a))
+				continue
+			}
+		}
 		v := e.eval(a)
 		v = e.defaultPromote(v)
 		args = append(args, e.ty(v.ty)+" "+v.op)
