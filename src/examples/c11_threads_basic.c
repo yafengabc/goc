@@ -6,10 +6,14 @@
                 distinct code; join them all in order and print. Every value
                 printed is therefore fixed by the join, not by scheduling,
                 which is what makes the output deterministic.
-                Windows-only in the regression suite (see winOnly in
-                tools/gocregress): the Linux leg runs under ucrun, which has
-                no clone/futex.
-   Status     : PASS (goc, Windows)
+                Used to be Windows-only in the regression suite (see winOnly
+                in tools/gocregress): its Linux leg runs under ucrun, which
+                has no clone/futex. With the Linux syscall ABI fix (arg4 in
+                r10, not rcx) this now passes on a REAL Linux kernel -- verified
+                under WSL. It stays in winOnly only because the bundled ucrun
+                Linux leg still cannot run clone/futex; a WSL-based Linux leg
+                would exercise it.
+   Status     : PASS (goc, Windows); PASS (goc -target linux, real kernel / WSL)
    ============================================================ */
 #include <stdio.h>
 #include <threads.h>

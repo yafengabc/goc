@@ -35,9 +35,11 @@ import (
 )
 
 // winOnly are the examples that cannot be exercised on the Linux (ELF64)
-// target and are therefore skipped there. Most import Windows-only DLLs
-// (user32/gdi32/kernel32); c11_threads_basic is here because the Linux leg
-// runs under ucrun, which implements neither clone nor futex.
+// target by THIS harness and are therefore skipped there. Most import
+// Windows-only DLLs (user32/gdi32/kernel32). c11_threads_basic is here only
+// because the Linux leg runs under ucrun, which implements neither clone nor
+// futex -- the program itself now works on a real Linux kernel (verified under
+// WSL after the r10 syscall ABI fix); a WSL-based Linux leg would run it.
 //
 // winOnly also relaxes the golden rule: an entry with no src/expected file is
 // a compile-only smoke test, while one that has a golden (c11_threads_basic)
