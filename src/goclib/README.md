@@ -199,16 +199,20 @@ memset:  test %rdx,%rdx / je .L0 / sub $0x8,%rsp / call memset / add $0x8,%rsp /
 
 ### 5.5 验证脚本
 
-`tmp/gl/` 下（不进 embed，纯测试资产）：
+`tools/portability/`（含用法说明；用例源码在 `tests/portability_cases/`）：
 
-| 脚本 | 作用 |
-|---|---|
-| `build.sh` | gcc `-nostdinc` 编全部 19 个 `.c`，并归纳出实质警告 |
-| `link_run.sh` | 打 `libgoclib.a`，链接 `hello.c`，`nm` 确认跑的是 goclib 而非 musl |
-| `sc.c` + `sc_run.sh` | 专测 5.3 表格里走 `syscall(2)` 的 8 个包装函数 + `getdents64`，21 项断言 |
-| `win_regress.sh` | goc / gocl 双后端的 Windows PE 回归 |
-| `lin_build.sh` + `lin_run.sh` | gocl `-target linux` 的 ELF 回归（在 alpine 里跑） |
-| `brk2.c` | 探针：实测 `brk(0)` 走编译器内建返回 -1，而 `syscall(12,0)` 返回真实 break |
+| 脚本 | 跑在哪 | 作用 |
+|---|---|---|
+| `build.sh` | alpine | gcc `-nostdinc` 编全部 19 个 `.c`，并归纳出实质警告 |
+| `link_run.sh` | alpine | 打 `libgoclib.a`，链接 `hello.c`，`nm` 确认跑的是 goclib 而非 musl |
+| `sc.c` + `sc_run.sh` | alpine | 专测 5.3 表格里走 `syscall(2)` 的 8 个包装函数 + `getdents64`，21 项断言 |
+| `win_regress.sh` | Windows | goc / gocl 双后端的 Windows PE 回归 |
+| `lin_build.sh` + `lin_run.sh` | Windows / alpine | gocl `-target linux` 的 ELF 回归 |
+| `brk2.c` | alpine | 探针：实测 `brk(0)` 走编译器内建返回 -1，而 `syscall(12,0)` 返回真实 break |
+
+`brk2.c` 是那份"brk 不工作"结论的原始证据。`sc.c` 存在是因为 5.3 那张表里的映射
+错了不会有编译错误，只会有运行期的递归或 undefined reference——需要一份只走这条
+路线、逐项断言的测试。
 
 Linux 用例分两段是有原因的：`gocl.exe` 是 Windows 程序，给它 `/mnt/d/...` 路径会报
 "the system cannot find the path specified"（那是 Linux 路径，它按 Windows 文件系统
