@@ -278,10 +278,13 @@ func (tr *typeResolver) exprType(e frontend.Expr) *frontend.Type {
 	case *frontend.CastExpr:
 		return n.Typ
 	case *frontend.Call:
-		// A call's type is the callee's declared return type (nil for
-		// goclib / extern calls, which return int). This is how struct-
-		// returning calls are recognised at argument / assignment / return
-		// positions so their result buffer can be consumed by address.
+		// A call's type is the callee's declared return type. A function
+		// defined in this module or supplied by the C runtime (goclib /
+		// extern) both count -- the latter matters because some library
+		// functions return long (i64 on this target), and treating their
+		// result as int made a comparison against them emit "icmp i32" while
+		// the call itself was "i64", which LLVM rejects. Only a call with no
+		// known declaration falls back to int, which is the common case.
 		if fd, ok := tr.funcDef(n.Name); ok {
 			return fd.Ret
 		}
@@ -289,6 +292,9 @@ func (tr *typeResolver) exprType(e frontend.Expr) *frontend.Type {
 		// function: its result type comes from the pointer's static type.
 		if _, ft, ok := tr.fnPtrVar(n.Name); ok {
 			return ft.Ret
+		}
+		if fd, ok := tr.libFunc(n.Name); ok {
+			return fd.Ret
 		}
 		return nil
 	case *frontend.IndirectCall:

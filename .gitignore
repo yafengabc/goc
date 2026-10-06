@@ -11,6 +11,9 @@
 # source tree and would be swallowed by such a pattern.
 /bin/
 
+# coreutils build products (apps/coreutils/build.sh outputs here).
+apps/coreutils/bin/
+
 # src/examples/ keeps the .c sources plus whatever data files an example
 # embeds; everything else there is a build product: src/examples/*.asm (goc -S
 # output) and src/examples/foo (Linux ELF). Test runs use `goc -o bin/goc-out`

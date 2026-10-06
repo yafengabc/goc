@@ -87,14 +87,28 @@ DIR *opendir(const char *name) {
 struct dirent *readdir(DIR *d) {
     WIN32_FIND_DATAA *fd;
     int i;
-    if (!d || !d->have) return 0;
-    fd = (WIN32_FIND_DATAA *)d->data;
-    d->ent.d_ino = 0;
-    for (i = 0; i < 255 && fd->cFileName[i] != '\0'; i++)
-        d->ent.d_name[i] = fd->cFileName[i];
-    d->ent.d_name[i] = '\0';
-    d->have = FindNextFileA(d->h, d->data) != 0;
-    return &d->ent;
+    /* Skip "." and ".." here for the same reason the Linux reader does: the
+     * header promises a listing is the same on both targets. The promise used
+     * to be kept on one side only -- FindFirstFileA with a "*" pattern does
+     * hand back both entries, so a program that listed a directory saw two
+     * extra names on Windows and none of them on Linux, which is the exact
+     * difference the filter exists to remove. */
+    for (;;) {
+        if (!d || !d->have) return 0;
+        fd = (WIN32_FIND_DATAA *)d->data;
+        d->ent.d_ino = 0;
+        for (i = 0; i < 255 && fd->cFileName[i] != '\0'; i++)
+            d->ent.d_name[i] = fd->cFileName[i];
+        d->ent.d_name[i] = '\0';
+        /* Advance before the test, or a skipped entry is re-read forever. */
+        d->have = FindNextFileA(d->h, d->data) != 0;
+        if (d->ent.d_name[0] == '.') {
+            if (d->ent.d_name[1] == '\0') continue;          /* "." */
+            if (d->ent.d_name[1] == '.' &&
+                d->ent.d_name[2] == '\0') continue;          /* ".." */
+        }
+        return &d->ent;
+    }
 }
 
 int closedir(DIR *d) {

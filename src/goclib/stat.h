@@ -60,6 +60,14 @@ struct stat {
     long          st_pad3;
 };
 
+/* The comment at the top promises st_mtime on both targets, and the Windows
+ * layout above spells it that way -- but the kernel calls it st_mtim_sec, and
+ * this layout is pinned to the kernel's byte offsets, so it cannot be renamed
+ * in place. Without this line, code written against the documented three-field
+ * contract compiles on Windows and fails on Linux with "no such member",
+ * which is the opposite of what a portable header is for. */
+#define st_mtime st_mtim_sec
+
 #endif
 
 #if defined(_WIN32)

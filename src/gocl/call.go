@@ -408,10 +408,16 @@ func (e *irEmitter) memberAddr(n *frontend.MemberExpr) string {
 func (e *irEmitter) member(n *frontend.MemberExpr) val {
 	ty := e.tr.exprType(n)
 	p := e.memberAddr(n)
-	// An array member named as a value is a pointer to its first element, the
-	// same decay C applies to every array: "s.data" is a `char *`, not an array
-	// value. Loading it would produce a "[1 x i8]" that no pointer context
-	// accepts.
+	// An array member decays to a pointer to its first element, exactly as an
+	// array variable does in ident(). `stat(e->d_name, &st)` passes that
+	// address; it does not pass the 256 bytes it points at. Loading it here
+	// handed the callee a value of type `[256 x i8]` where a ptr was expected,
+	// which LLVM rejected with "'%t28' defined with type '[256 x i8]' but
+	// expected 'ptr'" -- so every program that passed a struct's char array to
+	// a function failed to compile on this back end while compiling fine on
+	// the native one. Deciding it here is what C means by array-to-pointer
+	// conversion, and a subscript of the member still reads one element
+	// because Index asks for the base's address, which is the same thing.
 	if ty != nil && ty.Kind == frontend.KArr {
 		return val{op: p, ty: frontend.PtrType(ty.Elem)}
 	}

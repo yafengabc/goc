@@ -268,7 +268,20 @@ func (e *irEmitter) usualArith(l, r val, lty, rty *frontend.Type) (*frontend.Typ
 // arithCommon is C's usual arithmetic conversion: the higher rank wins, a
 // float beats an integer of any width, and two same-width integers take the
 // unsigned one.
+//
+// Before that rule runs, each operand passes through integer promotion: any
+// integer type narrower than int (the C rank-below-int cases -- _Bool, char,
+// short and their unsigned variants) is raised to int. Without it,
+// "unsigned char" - "unsigned char" is evaluated in a one-byte register and the
+// result then zero-extended, so 'a' - 'b' yields 255 instead of -1 and any
+// signed difference over a narrow operand is lost. (Signed narrow types hid the
+// same defect for years: an i8 subtraction that wraps and is then sign-extended
+// happens to match the int result, but the unsigned one does not.) This is the
+// bug that made qsort a no-op -- its comparator returns strcmp's value, which
+// is an unsigned-char difference, so every "less than" test read positive.
 func arithCommon(a, b *frontend.Type) *frontend.Type {
+	a = promoteInt(a)
+	b = promoteInt(b)
 	if a == nil {
 		return b
 	}
@@ -301,6 +314,21 @@ func arithCommon(a, b *frontend.Type) *frontend.Type {
 		return b
 	}
 	return a
+}
+
+// promoteInt raises an integer type narrower than int to int, per C's integer
+// promotions. Pointers, floats, bit-precise integers and nil are left alone:
+// only the rank-below-int integer types (width under int's) get promoted, and
+// the target int can represent every value of each, so the promotion is always
+// to signed int.
+func promoteInt(t *frontend.Type) *frontend.Type {
+	if t == nil {
+		return nil
+	}
+	if t.Kind == frontend.KInt && t.Width < 4 {
+		return frontend.IntType()
+	}
+	return t
 }
 
 // logical lowers && and ||, which short-circuit and therefore cannot be built

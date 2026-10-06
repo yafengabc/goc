@@ -304,6 +304,19 @@ func (e *irEmitter) doSwitch(n *frontend.SwitchStmt) {
 
 	e.term("switch i32 %s, label %%%s [ %s ]", sv, pick(def, doneL), caseArms(real))
 
+	// `break` inside a switch leaves the switch, not an enclosing loop, so
+	// doneL has to be the top of the break stack while the arms are emitted.
+	// It never was, which made a break in a switch jump to the enclosing
+	// while/for instead -- and to nothing at all when there was no enclosing
+	// loop, so the arm merely fell through into the next one.
+	//
+	// strftime is where it showed: its format loop is a while around a switch,
+	// so `%Y` broke out of the loop and every conversion after the first was
+	// dropped -- "%Y-%m-%d" formatted as "2025". `%F` looked correct only
+	// because it writes the whole date inside one arm. `continue` is left
+	// alone on purpose: in C it belongs to the loop, not to the switch, so a
+	// switch must not shadow it.
+	e.breakTo = append(e.breakTo, doneL)
 	for i := range cases {
 		c := &cases[i]
 		e.blockLabel(c.l)
@@ -316,6 +329,7 @@ func (e *irEmitter) doSwitch(n *frontend.SwitchStmt) {
 		// ("expected instruction opcode").
 		e.term("br label %%%s", doneL)
 	}
+	e.breakTo = e.breakTo[:len(e.breakTo)-1]
 	e.blockLabel(doneL)
 	e.flushPendingLabels()
 }

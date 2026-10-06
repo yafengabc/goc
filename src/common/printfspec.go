@@ -82,6 +82,17 @@ func SpecializePrintfCall(n *frontend.Call, q PrintfQueries) *frontend.Call {
 		if fmtIdx == 1 {
 			stream = n.Args[0]
 		}
+		// A single-byte echo would specialise to fwrite(ptr, 1, 1, stream).
+		// LLVM's libcall simplification rewrites exactly that shape into
+		// fputc(*ptr, stream), but the gocl back end had only emitted
+		// fwrite's definition, so the link then failed with an undefined
+		// fputc. Emit fputc directly here so neither the reachability prune
+		// nor the emitter has to know about the rewrite the optimiser will
+		// perform.
+		if len(lit.Bytes) == 1 {
+			first := &frontend.Index{Base: lit, Idx: &frontend.NumLit{Val: 0, Kind: frontend.TInt}}
+			return &frontend.Call{Name: "fputc", Args: []frontend.Expr{first, stream}}
+		}
 		return &frontend.Call{Name: "fwrite", Args: []frontend.Expr{
 			lit,
 			&frontend.NumLit{Val: 1, Kind: frontend.TInt},

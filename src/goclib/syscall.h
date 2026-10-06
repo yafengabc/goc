@@ -121,9 +121,13 @@ extern long nanosleep(const void *req, void *rem);
 extern long unlink(const char *path);
 extern void exit_group(long code);
 
-/* goa's brk stub takes and returns a pointer, which is what is declared above,
- * so on this host the mapping is the identity. */
-#define __goclib_brk(addr)                   ((void *)(addr))
+/* goa's brk stub is a real `mov rax,12; syscall; ret' that advances the kernel
+ * break and returns the new one (or the old one if the request failed). The
+ * allocator needs that value -- __goclib_brk((void*)0) must query the current
+ * break and __goclib_brk(next) must actually move it. An identity cast would
+ * leave heap_cur at NULL and turn the very first malloc into a write to address
+ * 0. So this maps to the stub, exactly as the host route maps to syscall(12,…). */
+#define __goclib_brk(addr)                   brk(addr)
 
 /* ---- under a host compiler: libc, or syscall(2) ---------------------------- */
 
