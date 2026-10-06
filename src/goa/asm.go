@@ -140,6 +140,11 @@ type Assembler struct {
 	syms     map[string]symLoc
 	fixups   []Fixup
 	exts     map[string]string // extern name -> dll (without .dll)
+	// undef holds names declared with a bare `extern` on a PE target: symbols
+	// this unit references but does not define. They become undefined symbols
+	// in the object, for the link to resolve against a sibling object or the
+	// import table.
+	undef    map[string]bool
 	consts   map[string]int64
 	entry    string
 	// subsystem: 3 = console (default), 2 = windows GUI. Driven by the
@@ -170,6 +175,12 @@ type Assembler struct {
 	attAlias map[string]string
 	// attMode switches label qualification over to GAS's rules. See qualify.
 	attMode bool
+	// libSyms names the runtime symbols goa itself defines, as opposed to the
+	// user's code or goclib's. They are reported so a linker can tell a second
+	// copy from a genuine duplicate definition -- see emitSyscallStubs, whose
+	// __goc_syscall every unit that makes a syscall defines, and whose name
+	// cannot be made unique because a loader looks it up.
+	libSyms map[string]bool
 	// pdataRVA and pdataSize describe the Win64 exception directory: the
 	// RUNTIME_FUNCTION array the loader walks during exception dispatch. They
 	// stay zero unless an object carrying unwind info was merged in (goa's own
@@ -361,6 +372,7 @@ func NewAssembler() *Assembler {
 	a := &Assembler{
 		syms:      map[string]symLoc{},
 		exts:      map[string]string{},
+		undef:     map[string]bool{},
 		consts:    map[string]int64{},
 		subsystem: subsysConsole,
 		target:    targetPE,
@@ -653,6 +665,20 @@ func (a *Assembler) emitSyscallStubs() error {
 	a.emitByte(0xC3) // ret
 	a.emitByte(0x90) // nop (patch padding)
 	a.emitByte(0x90) // nop (patch padding)
+	// Report it as one of this object's runtime symbols rather than something
+	// the user wrote.
+	//
+	// The name cannot carry a unit prefix: gocrun's loader looks __goc_syscall
+	// up by that exact name to substitute its Win32-backed translator, so a
+	// per-unit name would leave it looking for a symbol nobody defines. Two
+	// units that both make syscalls therefore both define it, which would be a
+	// duplicate-definition error -- so it is declared instead. The bodies are
+	// identical byte for byte, and none of the five bytes is state, so keeping
+	// one copy is the same program as keeping two; see Image.deduped.
+	if a.libSyms == nil {
+		a.libSyms = map[string]bool{}
+	}
+	a.libSyms["__goc_syscall"] = true
 	a.cur = prev
 	return nil
 }
@@ -694,14 +720,47 @@ func stripComment(ln string) string {
 }
 
 func (a *Assembler) parseExtern(t string) error {
-	// extern Name, dll   (dll optional -> defaults to kernel32)
+	// extern Name, dll   (dll optional)
 	rest := strings.TrimSpace(t[len("extern "):])
 	parts := strings.SplitN(rest, ",", 2)
 	name := strings.TrimSpace(parts[0])
-	dll := "kernel32"
-	if len(parts) == 2 {
-		dll = strings.TrimSpace(parts[1])
+	if len(parts) == 1 {
+		// No DLL named. What that means depends on the target.
+		if a.target == targetPE {
+			// On PE it means a symbol this unit references but does not
+			// define -- a cross-module reference. Defaulting it to kernel32
+			// (which is what an omitted DLL used to mean) turned every such
+			// call into an import: the assembler emitted `call [rip+IAT:add]`
+			// and the linker went looking for add in a system library, so a
+			// program split into translation units could not be linked at all.
+			// The decision belongs to the link, the only stage that knows
+			// whether a sibling object defines it.
+			//
+			// It is deliberately NOT put in exts: exts means "import", and
+			// everything keyed on exts (the PE indirect call form, the Linux
+			// syscall stubs) would treat a plain reference as a library call.
+			a.undef[name] = true
+			return nil
+		}
+		// An ELF target has no DLL imports: a bare extern names either a
+		// syscall, which emitSyscallStubs turns into a `mov rax, <nr>` stub,
+		// or a symbol this unit references but does not define.
+		//
+		// Which one it is cannot be asked of the syntax -- both are written the
+		// same way -- so it is decided by what goa knows. A name in
+		// linuxSyscalls is a syscall; anything else is a cross-module
+		// reference, and the link is the only stage that can say whether a
+		// sibling object defines it. Putting the second kind in exts would ask
+		// emitSyscallStubs for a syscall number that does not exist, and the
+		// compile fails on a perfectly ordinary program split into units.
+		if _, isSyscall := linuxSyscalls[name]; isSyscall {
+			a.exts[name] = "kernel32.dll"
+			return nil
+		}
+		a.undef[name] = true
+		return nil
 	}
+	dll := strings.TrimSpace(parts[1])
 	if !strings.HasSuffix(dll, ".dll") {
 		dll += ".dll"
 	}

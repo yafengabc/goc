@@ -5,6 +5,7 @@ import (
 	"goc/common"
 	"goc/common/link"
 	"goc/frontend"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -112,6 +113,14 @@ type CG struct {
 	staticLabelOf map[int]string
 	staticList    []staticEmit
 	staticSeq     int
+	// staticPrefix distinguishes one unit's function-local statics from another's.
+	// The bare label is G_st<N>_<name>, and N restarts at0 in every unit, so two
+	// units that both declare `static int v` inside a function of the same name
+	// mint the same label -- and a program linked from both would then have two
+	// definitions of one symbol. A unit that will become an object file carries
+	// a prefix that no other unit can produce; a whole program needs none,
+	// because there is only one unit to be unique among.
+	staticPrefix string
 	// Thread-local storage: _Thread_local variables live in a dedicated .tls
 	// section (one instance per thread). c.tlsVars maps a source name to its
 	// layout; c.tlsList collects every TLS declaration (global or static local)
@@ -127,6 +136,17 @@ type CG struct {
 	calls         map[string]bool // functions called that are not defined here
 	need          map[string]bool // goclib functions this program actually uses
 	mainTakesArgs bool            // main declares parameters: the Windows stub must build argc/argv
+	// relocatable relaxes the two assumptions a single-pass build can make.
+	//
+	// A whole-program build has every fact in front of it: main is here, every
+	// called function is either in the C library or a known DLL, so a name it
+	// cannot account for is a mistake worth reporting. An object file has no
+	// such luxury -- it is one translation unit out of several, and the functions
+	// it calls may well be defined in a sibling unit that has not been compiled
+	// yet. So with this set, a missing main and an unaccounted-for call are both
+	// not errors: the first is the linker's business, and the second becomes an
+	// undefined symbol the linker resolves.
+	relocatable bool
 	// entryFn is the program entry function. entryIsGUI records that it is
 	// one of the MSVC GUI entries (WinMain / wWinMain) rather than main, and
 	// entryWide that it is the Unicode one -- which also decides whether the
@@ -141,6 +161,12 @@ type CG struct {
 	// library's file-scope variables join the .data pool -- but only those the
 	// program actually references (libGlobUsed).
 	libEmitted map[string]bool
+	// libSyms is the set of library symbol names this unit's image defines, for
+	// the linker to recognise a second inlined copy as the same library. A
+	// library function's name is its C ABI name, so unlike the compiler's own
+	// labels it cannot be marked by a prefix -- the set is what carries the
+	// information.
+	libSyms map[string]bool
 	// skipFuncs names functions the caller is producing as LLVM IR. They are
 	// neither generated nor pulled in from the C library, but everything they
 	// call still is -- so they seed c.need and genClibFuncs ignores them. That
@@ -1419,7 +1445,7 @@ func (c *CG) genBigLiteral(n *frontend.NumLit, t *frontend.Type) (frontend.CType
 	key := bigLitKey(words, t.Bits)
 	lab, ok := c.bigLab[key]
 	if !ok {
-		lab = fmt.Sprintf("LBIG%d", len(c.bigLits))
+		lab = fmt.Sprintf("%sLBIG%d", c.staticPrefix, len(c.bigLits))
 		c.bigLits = append(c.bigLits, words)
 		c.bigLab[key] = lab
 	}
@@ -1812,7 +1838,7 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 		if n.Kind == frontend.TDouble {
 			lab, ok := c.doubleLab[n.Fval]
 			if !ok {
-				lab = fmt.Sprintf("LD%dx", len(c.doubles))
+				lab = fmt.Sprintf("%sLD%dx", c.staticPrefix, len(c.doubles))
 				c.doubles = append(c.doubles, n.Fval)
 				c.doubleLab[n.Fval] = lab
 			}
@@ -1836,7 +1862,7 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 	case *frontend.StrLit:
 		lab, ok := c.strLab[n]
 		if !ok {
-			lab = fmt.Sprintf("LC%d", len(c.strs))
+			lab = fmt.Sprintf("%sLC%d", c.staticPrefix, len(c.strs))
 			c.strs = append(c.strs, *n)
 			c.strLab[n] = lab
 		}
@@ -2995,15 +3021,74 @@ func newCGFor(prog *frontend.Program, linux bool, opt int) *CG {
 // What comes out is still a complete program: the entry stub, the globals, and
 // every library function the IR side did not claim.
 func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs map[string]bool) (string, error) {
+	return genOpts(prog, genConfig{linux: linux, opt: opt, winGUI: winGUI, skipFuncs: skipFuncs})
+}
+
+// genConfig is what distinguishes one build from another. It exists as a struct
+// rather than as more positional parameters because the list had already grown
+// past what a call site could be read against, and because the next distinction
+// to be added -- an object file rather than a whole program -- changes what the
+// generator is allowed to assume rather than what it should produce.
+type genConfig struct {
+	linux   bool
+	opt     int
+	winGUI  bool
+	skipFuncs map[string]bool
+
+	// relocatable produces one translation unit's worth of code for a later link
+	// rather than a whole program. See CG.relocatable for what that changes.
+	relocatable bool
+
+	// unit names the source being compiled, and only matters with relocatable:
+	// it becomes the prefix that keeps one unit's function-local statics from
+	// colliding with another's. Empty for a whole program, which has one unit
+	// and so has nothing to be unique among.
+	unit string
+}
+
+func genOpts(prog *frontend.Program, cfg genConfig) (string, error) {
+	asm, _, err := genOptsCG(prog, cfg)
+	return asm, err
+}
+
+// LibSyms reports which C library symbols this unit's image defines.
+//
+// The library's exported functions keep their C ABI names, so nothing in the
+// assembly marks them as the library's; the assembler has to be told, or a
+// second unit carrying its own copy of printf looks like a duplicate
+// definition when two units are linked.
+func (c *CG) LibSyms() map[string]bool {
+	if len(c.libSyms) == 0 {
+		return nil
+	}
+	return c.libSyms
+}
+
+// genOptsCG is genOpts, additionally handing back the code generator so a caller
+// that assembles an object file can read what the generator decided -- which C
+// library symbols this unit carries a copy of. A library function's name is
+// fixed by the C ABI, so that set cannot be recovered from the assembly; and the
+// assembler needs it to tell a second inlined copy of printf from a user who
+// defined printf twice.
+func genOptsCG(prog *frontend.Program, cfg genConfig) (string, *CG, error) {
+	linux, opt, winGUI, skipFuncs := cfg.linux, cfg.opt, cfg.winGUI, cfg.skipFuncs
 	ensureLib()
 	if goclibErr != nil {
-		return "", goclibErr
+		return "", nil, goclibErr
 	}
 	if rtdiagMode && rtdiagErr != nil {
-		return "", fmt.Errorf("rtdiag library build failed: %w", rtdiagErr)
+		return "", nil, fmt.Errorf("rtdiag library build failed: %w", rtdiagErr)
 	}
 	c := newCGFor(prog, linux, opt)
 	c.skipFuncs = skipFuncs
+	c.relocatable = cfg.relocatable
+	if cfg.relocatable && cfg.unit != "" {
+		// The prefix has to be something a label can start with and that two
+		// different sources cannot produce between them, so the file name is
+		// reduced to its stem and made unmistakable as a prefix.
+		stem := strings.TrimSuffix(filepath.Base(cfg.unit), filepath.Ext(cfg.unit))
+		c.staticPrefix = "U_" + sanitizeLabel(stem) + "_"
+	}
 	for _, g := range prog.Globals {
 		if g.IsTLS {
 			// Thread-local global: lay it out in the .tls section, not .data.
@@ -3111,7 +3196,7 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 			continue
 		}
 		if err := c.genFunc(f); err != nil {
-			return "", err
+			return "", nil, err
 		}
 	}
 	// Emit every needed built-in C library function through the regular code
@@ -3150,14 +3235,20 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 	// direct OS write -- then carries no flush machinery at all. Without a
 	// C library the stub keeps calling extern exit (legacy behaviour).
 	c.exitSym = "exit"
-	if lib := common.Store(c.linux); lib != nil {
+	// Only a unit that carries the entry stub has anything to exit through.
+	// Pulling __goclib_exit into a unit without an entry put ExitProcess and
+	// the stdio flush chain into every helper module -- and with two or more
+	// of those in a link, every one of them defined a private copy of the same
+	// goclib functions, which is a duplicate-symbol error with no useful
+	// message.
+	if lib := common.Store(c.linux); lib != nil && c.entryFn != "" {
 		if _, ok := lib.Funcs["__goclib_exit"]; ok {
 			c.need["__goclib_exit"] = true
 			c.exitSym = "__goclib_exit"
 		}
 	}
 	if err := c.genClibFuncs(); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if c.exitSym == "__goclib_exit" && c.needsFullExit() {
 		// Upgrade: pull the full C exit (its flush chain is partly there
@@ -3165,7 +3256,7 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 		c.need["exit"] = true
 		c.exitSym = "exit"
 		if err := c.genClibFuncs(); err != nil {
-			return "", err
+			return "", nil, err
 		}
 	}
 	// -O1 and above: structured passes over the whole-program body stream.
@@ -3220,9 +3311,15 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 
 	if c.entryFn == "" {
 		if c.linux && (c.funcs["wWinMain"] || c.funcs["WinMain"]) {
-			return "", fmt.Errorf("wWinMain/WinMain is a Windows entry point; an ELF program must define main()")
+			return "", nil, fmt.Errorf("wWinMain/WinMain is a Windows entry point; an ELF program must define main()")
 		}
-		return "", fmt.Errorf("program has no main()")
+		// An object file is one unit of several: main may be in a sibling. The
+		// linker is what decides whether the program as a whole has one, and it
+		// reports the failure by name if not -- which is a better diagnostic
+		// than this, because it happens after every unit has been seen.
+		if !c.relocatable {
+			return "", nil, fmt.Errorf("program has no main()")
+		}
 	}
 
 	// Every import the program needs: the exit routine for the entry stub,
@@ -3264,7 +3361,16 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 	for name := range importSet {
 		if c.linux {
 			if !externLinux[name] {
-				return "", fmt.Errorf("unknown function %q: not in goclib (%s), and not a Linux syscall goa knows",
+				if c.relocatable {
+					// Not a syscall, but the object may still be linking
+					// against another unit that defines it. Emit an extern with
+					// no library: goa turns that into an ordinary external, and
+					// the object records the name as undefined for the linker to
+					// resolve.
+					imports = append(imports, fmt.Sprintf("extern %s\n", name))
+					continue
+				}
+				return "", nil, fmt.Errorf("unknown function %q: not in goclib (%s), and not a Linux syscall goa knows",
 					name, strings.Join(goclibNames(c.linux), ", "))
 			}
 			// ELF targets have no DLLs: goa turns this into a syscall stub.
@@ -3273,7 +3379,16 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 		}
 		dll, ok := dllFor(name)
 		if !ok {
-			return "", fmt.Errorf("unknown function %q: not in goclib (%s), and no DLL named on its prototype (declare it as 'extern ret %s(args), dllname;')",
+			if c.relocatable {
+				// Same reasoning as the Linux branch above: an unknown callee in
+				// an object file is a callee in another unit, not a mistake.
+				// The name is left undefined rather than bound to a guessed DLL,
+				// because a wrong guess produces an import that loads and then
+				// fails at run time with no explanation.
+				imports = append(imports, fmt.Sprintf("extern %s\n", name))
+				continue
+			}
+			return "", nil, fmt.Errorf("unknown function %q: not in goclib (%s), and no DLL named on its prototype (declare it as 'extern ret %s(args), dllname;')",
 				name, strings.Join(goclibNames(c.linux), ", "), name)
 		}
 		imports = append(imports, fmt.Sprintf("extern %s, %s\n", name, dll))
@@ -3308,10 +3423,11 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 			Wide:      c.entryWide,
 			TakesArgs: c.mainTakesArgs,
 		},
+		UnitPrefix: c.staticPrefix,
 	}
 	for i, s := range c.strs {
 		d.Strings = append(d.Strings, link.StringConst{
-			Label: fmt.Sprintf("LC%d", i),
+			Label: fmt.Sprintf("%sLC%d", c.staticPrefix, i),
 			Text:  string(s.Bytes),
 			Wide:  s.Wide,
 		})
@@ -3334,7 +3450,11 @@ func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs
 			Label:  t.lab,
 		})
 	}
-	return link.Emit(d)
+	asm, err := link.Emit(d)
+	if err != nil {
+		return "", nil, err
+	}
+	return asm, c, nil
 }
 
 // parsedLine is a body instruction split the way the peephole rules need it:
@@ -4903,6 +5023,15 @@ func (c *CG) genClibFuncs() error {
 		sort.Strings(batch) // stable emission order
 		for _, name := range batch {
 			c.libEmitted[name] = true
+			// Remember that this unit carries a copy of the library's symbol.
+			// A unit that inlines printf has no way to rename it -- the name is
+			// the C ABI -- so the linker is told which definitions came from the
+			// library, and treats a second copy as the same library rather than
+			// as the user defining the same name twice.
+			if c.libSyms == nil {
+				c.libSyms = map[string]bool{}
+			}
+			c.libSyms[name] = true
 			if err := c.genFunc(lib.Funcs[name]); err != nil {
 				return err
 			}
@@ -5201,7 +5330,7 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 				// access code generated later can reach it. Address/value
 				// resolution goes through c.tlsVars (checked before staticVars).
 				off := c.tlsPlace(n.Typ)
-				lab := fmt.Sprintf("TL_st%d_%s", c.staticSeq, n.Name)
+				lab := fmt.Sprintf("%sTL_st%d_%s", c.staticPrefix, c.staticSeq, n.Name)
 				c.staticSeq++
 				c.tlsVars[n.Name] = &tlsVarInfo{off: off, lab: lab, typ: n.Typ}
 				c.tlsList = append(c.tlsList, n)
@@ -5218,7 +5347,7 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 				// and queue the emitter entry; the name -> label binding happens
 				// in genStmt's DeclStmt case, where the scope stack is current
 				// and the binding therefore lands in the block that declared it.
-				lab := fmt.Sprintf("G_st%d_%s", c.staticSeq, n.Name)
+				lab := fmt.Sprintf("%sG_st%d_%s", c.staticPrefix, c.staticSeq, n.Name)
 				c.staticSeq++
 				c.globals[lab] = true
 				c.globalLab[lab] = lab
@@ -6581,6 +6710,28 @@ func (c *CG) labelSym(name string) string {
 	s := c.newLabel("lbl_" + name)
 	c.labels[name] = s
 	return s
+}
+
+// sanitizeLabel reduces a file name to something usable inside an assembler
+// label: letters, digits and underscore. A path may hold characters a label
+// cannot (a dot in `a.b.c`, a dash), and on Windows a backslash; keeping them
+// would produce assembly goa cannot parse, which is a far worse failure than
+// two units colliding on an odd name.
+func sanitizeLabel(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return "unit"
+	}
+	return out
 }
 
 // swGroup is one arm of a switch: either "case N:" or "default:", plus the
@@ -8716,7 +8867,7 @@ func (c *CG) genVaArg(n *frontend.VaArgExpr) (frontend.CType, error) {
 func (c *CG) loadDoubleConst(v float64) {
 	lab, ok := c.doubleLab[v]
 	if !ok {
-		lab = fmt.Sprintf("LD%dx", len(c.doubles))
+		lab = fmt.Sprintf("%sLD%dx", c.staticPrefix, len(c.doubles))
 		c.doubles = append(c.doubles, v)
 		c.doubleLab[v] = lab
 	}

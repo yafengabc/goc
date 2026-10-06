@@ -172,8 +172,18 @@ func checkELF(f []byte) (*image, error) {
 			continue
 		}
 		if eEntry >= pVaddr && eEntry < pVaddr+pFilesz {
+			// The image is p_memsz long, not p_filesz: everything past the
+			// file-backed part is .bss, which the loader zero-fills and the
+			// program is entitled to read and write. Sizing the memory by
+			// p_filesz instead truncates the segment exactly where the
+			// zero-initialized data begins, so the first access to a global
+			// that is not explicitly initialised -- stdio's buffers, a
+			// `static int x;`, the heap cursor -- reports an address that is
+			// plainly inside the program as "unmapped".
+			mem := make([]byte, pMemsz)
+			copy(mem, f[pOffset:pOffset+pFilesz])
 			img = image{
-				data:  append([]byte(nil), f[pOffset:pOffset+pFilesz]...),
+				data:  mem,
 				base:  pVaddr,
 				entry: eEntry,
 				shnum: int(eShnum),
@@ -750,6 +760,19 @@ func (c *cpu) step() {
 	}
 
 	switch op {
+	case 0x63: // movsxd r64, r/m32 (sign-extend the 32-bit source)
+		// goa emits this for every `int` -> `long` widening, which is what a
+		// 64-bit store of a narrow value looks like on the way in. It is only
+		// defined with REX.W; without it 0x63 is an arithmetic shift in 32-bit
+		// mode, which this interpreter does not model, so say so rather than
+		// quietly computing something else.
+		if !w {
+			die("movsxd without REX.W at 0x%x", pc)
+		}
+		reg, o := modrm()
+		c.regs[reg] = uint64(int64(int32(getRM(o))))
+		return
+
 	case 0x8d: // lea r64, [rip+disp32] or [base+disp]
 		reg, o := modrm()
 		if !o.isMem {

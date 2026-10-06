@@ -451,7 +451,7 @@ func walkGlobalInit(d *Data, t *frontend.Type, init frontend.Expr, glab string, 
 		if sl, ok := init.(*frontend.StrLit); ok && t.Kind == frontend.KPtr {
 			lab, ok := d.StrLabs[sl]
 			if !ok {
-				lab = fmt.Sprintf("LC%d", len(d.Strings))
+				lab = fmt.Sprintf("%sLC%d", d.UnitPrefix, len(d.Strings))
 				d.Strings = append(d.Strings, StringConst{Label: lab, Text: string(sl.Bytes), Wide: sl.Wide})
 				d.StrLabs[sl] = lab
 			}

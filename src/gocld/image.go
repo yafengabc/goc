@@ -153,11 +153,54 @@ type Image struct {
 	// UWRecs are the unwind records, one per function that has one.
 	UWRecs []*UWFunc
 
+	// deferred makes an ingest hold its undefined names back instead of
+	// reporting them, so that a link over several objects can judge them once
+	// all of them have been read. See Resolve for why that is a link-wide
+	// question rather than a per-object one.
+	deferred bool
+
+	// pending is the undefined-name set deferred mode has accumulated.
+	pending map[string]bool
+
+	// definedIn records which object first defined each symbol, so a second
+	// definition can name both files. A duplicate is a link error rather than a
+	// silent "last one wins": the program would run one of the two with nothing
+	// to say which, and the usual cause -- the same source compiled into two
+	// units, or a helper that lost its `static` -- turns into a bug report
+	// instead of a diagnostic.
+	definedIn map[string]string
+
+	// deduped names the library symbols that arrived more than once because
+	// each unit inlines its own copy of the C library. They are dropped rather
+	// than reported: see isCLibSymbol.
+	deduped map[string]bool
+
+	// FileName is the object's own name, used for the COFF .file symbol so that a
+// duplicate-definition diagnostic can name the two files that collided. Empty
+// is fine -- the symbol then reads ".file" and the diagnostic falls back to
+// position.
+FileName string
+
+// LibSyms names the C library symbols an image defines. The library's
+	// function names are fixed by the C ABI and so carry no marker of their
+	// own; the set is what lets a link of several units see the same function
+	// inlined into two of them and treat the second as another copy rather than
+	// as a duplicate definition. It survives the round trip through an object
+	// file because a link over separately compiled units has no other way to
+	// learn it.
+	LibSyms map[string]bool
+
 	// PdataRVA and PdataSize record where the .pdata section landed, which
 	// the PE header's exception directory points at. Zero when there is none.
 	PdataRVA  int
 	PdataSize int
 }
+
+// DeferUndefined makes later ingests hold their undefined names back instead of
+// reporting them, which is what a link over more than one object needs: a name
+// one object leaves undefined may be defined by the next. Call Resolve once
+// every object has been ingested.
+func (img *Image) DeferUndefined(on bool) { img.deferred = on }
 
 // Container formats.
 const (

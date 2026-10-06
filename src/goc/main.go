@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"goa"
 	"goc/common"
+	"gocld"
 	"goc/frontend"
 	"os"
 	"os/exec"
@@ -23,20 +24,24 @@ import (
 //
 // goc also accepts a large subset of the gcc/clang command line so it can drop
 // into existing build scripts as a drop-in `cc`. Unknown options that have no
-// meaning for a single-translation-unit compiler (optimisation levels, warning
-// flags, standard selection, machine/linker flags, ...) are accepted and
-// ignored rather than rejected. There is no separate linking stage: `goc a.c
-// b.c` parses each file as its own translation unit, merges the declarations
-// (statics stay private to their file, duplicate externals are an error) and
-// compiles the result into one executable -- so goc still cannot consume .o
-// files or link objects together (see src/multi.go).
+// meaning for this compiler (optimisation levels, warning flags, standard
+// selection, machine flags, ...) are accepted and ignored rather than
+// rejected.
+//
+// There IS a separate linking stage (see src/gocld): -c writes a real
+// relocatable object per translation unit -- PE COFF or Linux ELF64, decided
+// by -target -- and any command line containing a .o goes to the linker, which
+// resolves the relocations and writes one executable. `goc a.c b.c` still
+// compiles several translation units and links them in one step; `goc -c a.c
+// b.c` then `goc a.o b.o -o app` is the same build split into two.
 //
 // Usage (goc convenience front-end):
 //
-//	goc file.c                 compile only (emit file.exe)
+//	goc file.c                 compile and link (emit file.exe)
 //	goc a.c b.c                compile several translation units into one exe
 //	goc run file.c [args...]   compile to a temp dir, run with args (go run)
-//	goc -c file.c              compile only (produce file.exe / file)
+//	goc -c file.c              compile to a relocatable object (emit file.o)
+//	goc a.o b.o -o app         link objects into one executable
 //	goc -S file.c              emit assembly only (produce file.asm)
 //	goc -o app file.c          write the executable to app(..exe)
 //	goc -target linux file.c   produce a Linux ELF64 instead
@@ -78,6 +83,23 @@ func Main(args []string) int {
 		fmt.Fprintln(os.Stderr, "goc: no input files")
 		return 1
 	}
+
+	// Inputs that are already objects go straight to the linker, and a mixed
+	// command line (`goc a.o b.c`) is a link stage with a compile stage in
+	// front of it -- which is what a build system does when only some of the
+	// sources changed.
+	if cfg.link || hasObjectInput(cfg.inputs) {
+		out, err := linkObjects(cfg, isCC)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if cfg.mode == "run" && out != "" {
+			return runLinked(out)
+		}
+		return 0
+	}
+
 	outPath, err := buildProgram(cfg, isCC)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -114,15 +136,204 @@ func Main(args []string) int {
 	return 0
 }
 
+// hasObjectInput reports whether any input is an object file rather than a C
+// source. One is enough to send the whole command to the linker stage, because
+// the outputs have to be linked together regardless of how many sources took
+// part: `goc a.o b.c` has to compile b.c and link the result with a.o, and
+// treating the sources as a separate single-unit build would silently drop
+// everything a.o already defined.
+func hasObjectInput(inputs []string) bool {
+	for _, in := range inputs {
+		if strings.EqualFold(filepath.Ext(in), ".o") {
+			return true
+		}
+	}
+	return false
+}
+
+// linkObjects runs the link stage: every .c input is compiled to an object
+// beside its source, and the objects are linked into one executable.
+//
+// The C files are not linked from their in-memory images -- they go through
+// the object file, like any other input. That is the point of having a linker:
+// the intermediate is a real, inspectable, linkable artifact rather than
+// something that exists only inside one process.
+func linkObjects(cfg buildCfg, isCC bool) (string, error) {
+	// Split the inputs. A .c becomes an object next to itself; a .o is taken as
+	// it is. Anything else is passed through, so an .asm or a .s reaches the
+	// assembler rather than being mistaken for a source.
+	var objs []string
+	var temps []string
+	cleanup := func() {
+		for _, t := range temps {
+			// The whole directory, not just the object: each one gets its own
+			// os.MkdirTemp, so removing the file would leave an empty directory
+			// behind in the temp area for every mixed build.
+			os.RemoveAll(filepath.Dir(t))
+		}
+	}
+	for _, in := range cfg.inputs {
+		ext := strings.ToLower(filepath.Ext(in))
+		switch ext {
+		case ".c", ".i":
+			obj, err := compileToObject(in, cfg, isCC)
+			if err != nil {
+				cleanup()
+				return "", err
+			}
+			// compileToObject always writes to a temporary directory, so the
+			// object does not outlive the link. Removing it keeps a build tree
+			// free of the intermediate the caller never asked to keep.
+			temps = append(temps, obj)
+			objs = append(objs, obj)
+		default:
+			objs = append(objs, in)
+		}
+	}
+	if len(objs) == 0 {
+		return "", errors.New("goc: nothing to link")
+	}
+
+	out := cfg.outFile
+	if out == "" {
+		base := strings.TrimSuffix(cfg.inputs[0], filepath.Ext(cfg.inputs[0]))
+		if cfg.linux {
+			out = base
+		} else {
+			out = base + ".exe"
+		}
+	}
+	if dir := filepath.Dir(out); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			cleanup()
+			return "", err
+		}
+	}
+
+	img := gocld.NewImage(gocld.TargetPE)
+	if cfg.linux {
+		img.Target = gocld.TargetELF
+	}
+	// Several objects may be going in, so a name one of them leaves undefined
+	// may be defined by another. Ingest holds those names back rather than
+	// reporting them, and Resolve settles the set once every object has been
+	// read -- otherwise linking a.o and b.o would fail on a symbol b.o defines.
+	img.DeferUndefined(true)
+	for _, o := range objs {
+		data, err := os.ReadFile(o)
+		if err != nil {
+			cleanup()
+			return "", err
+		}
+		if cfg.linux {
+			err = img.IngestELFBytes(data)
+		} else {
+			err = img.IngestCOFFBytes(data)
+		}
+		if err != nil {
+			cleanup()
+			return "", fmt.Errorf("%s: %w", o, err)
+		}
+	}
+	if err := img.Resolve(); err != nil {
+		cleanup()
+		return "", err
+	}
+	img.Subsystem = subsysFor(cfg)
+	img.Entry = entryFor(img)
+
+	n, err := gocld.LinkObject(img, nil, out, cfg.linux)
+	cleanup()
+	if err != nil {
+		return "", err
+	}
+	if !isCC {
+		fmt.Printf("linked %d object%s -> %s (%d bytes)\n", len(objs), pluralS(len(objs)), out, n)
+	}
+	return out, nil
+}
+
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// entryFor picks the program's entry symbol. A COFF object has no entry-point
+// field -- that belongs to the linked image -- so it is recovered by name.
+func entryFor(img *gocld.Image) string {
+	for _, name := range []string{"_start", "__goc_start", "main"} {
+		if _, ok := img.Syms[name]; ok {
+			return name
+		}
+	}
+	return ""
+}
+
+func subsysFor(cfg buildCfg) uint16 {
+	if cfg.winGUI {
+		return 2 // IMAGE_SUBSYSTEM_WINDOWS_GUI
+	}
+	return 3 // IMAGE_SUBSYSTEM_WINDOWS_CUI
+}
+
+// compileToObject compiles one C file to a relocatable object and returns its
+// path. The object is always temporary: reaching here means the command line
+// asked for an executable and mixed an already-compiled object in, so -o names
+// the executable, not this object. Leaving a .o beside the source would be a
+// surprise the caller never asked for.
+func compileToObject(src string, cfg buildCfg, isCC bool) (string, error) {
+	tmp, err := os.MkdirTemp("", "goc-obj-")
+	if err != nil {
+		return "", err
+	}
+	base := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
+	obj := filepath.Join(tmp, base+".o")
+
+	sub := cfg
+	sub.mode = "object"
+	sub.inputs = []string{src}
+	sub.outFile = obj
+	if _, err := buildProgram(sub, isCC); err != nil {
+		os.RemoveAll(tmp)
+		return "", err
+	}
+	return obj, nil
+}
+
+// runLinked executes a freshly linked program, passing through its exit code.
+func runLinked(out string) int {
+	abs, err := filepath.Abs(out)
+	if err != nil {
+		abs = out
+	}
+	rcmd := exec.Command(abs)
+	rcmd.Stdout = os.Stdout
+	rcmd.Stderr = os.Stderr
+	if err := rcmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode()
+		}
+		fmt.Fprintln(os.Stderr, "run failed:", err)
+		return 1
+	}
+	return 0
+}
+
 // buildProgram runs the preprocess -> parse -> check -> gen -> goa pipeline
 // for cfg's single input and returns the executable path. The -E and -S
 // modes write their own outputs and return "". Compile errors terminate the
 // process (exit 1), matching the historical behaviour.
 func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 	for _, p := range cfg.inputs {
-		if strings.HasSuffix(p, ".o") || strings.HasSuffix(p, ".obj") ||
-			strings.HasSuffix(p, ".a") || strings.HasSuffix(p, ".lib") {
-			return "", fmt.Errorf("goc: %s -- goc cannot consume object/library files (no separate linking stage)", p)
+		// An object or archive is a link-stage input, not a source. Reaching
+		// this function with one means the caller sent it down the compile path
+		// anyway, so the diagnostic names the right stage instead of failing
+		// later as a parse error on binary bytes.
+		if ext := strings.ToLower(filepath.Ext(p)); ext == ".o" || ext == ".obj" ||
+			ext == ".a" || ext == ".lib" {
+			return "", fmt.Errorf("goc: %s is an object file -- it goes to the link stage, not the compiler", p)
 		}
 	}
 	if cfg.rtdiag {
@@ -134,7 +345,28 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 	}
 	// Several .c files: each is its own translation unit (its own macros and
 	// type names), and the merged program is compiled as one executable.
+	//
+	// -c is the exception. Merging is right when the sources are one program,
+	// but -c asks for objects, and an object is per translation unit -- merging
+	// would emit one .o holding every source's code, which defeats the point of
+	// the flag and cannot be linked against anything else. So each source is
+	// compiled on its own, named after itself.
 	if len(cfg.inputs) > 1 {
+		if cfg.mode == "object" {
+			for _, in := range cfg.inputs {
+				sub := cfg
+				sub.inputs = []string{in}
+				// -o names one output, which is only meaningful for a single
+				// source; with several, each object is named after its source.
+				if len(cfg.inputs) > 1 {
+					sub.outFile = ""
+				}
+				if _, err := buildProgram(sub, isCC); err != nil {
+					return "", err
+				}
+			}
+			return "", nil
+		}
 		return buildMulti(cfg, isCC)
 	}
 
@@ -179,7 +411,13 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 // path and the multi-file one (which parses each .c separately and merges the
 // translation units before calling this).
 func emitProgram(prog *frontend.Program, cfg buildCfg, isCC bool) (string, error) {
-	if errs := frontend.Check(prog); len(errs) > 0 {
+	// An object file is one translation unit of several, so it is checked as
+	// one: main may live in a sibling, and the link is what settles the entry.
+	check := frontend.Check
+	if cfg.mode == "object" {
+		check = frontend.CheckUnit
+	}
+	if errs := check(prog); len(errs) > 0 {
 		var b strings.Builder
 		b.WriteString("type error(s):")
 		for _, e := range errs {
@@ -187,7 +425,13 @@ func emitProgram(prog *frontend.Program, cfg buildCfg, isCC bool) (string, error
 		}
 		return "", errors.New(b.String())
 	}
-	asm, err := genWith(prog, cfg.linux, cfg.opt, cfg.winGUI, nil)
+	asm, cg, err := genOptsCG(prog, genConfig{
+		linux:       cfg.linux,
+		opt:         cfg.opt,
+		winGUI:      cfg.winGUI,
+		relocatable: cfg.mode == "object",
+		unit:        cfg.inputs[0],
+	})
 	if err != nil {
 		return "", fmt.Errorf("codegen error: %w", err)
 	}
@@ -207,6 +451,41 @@ func emitProgram(prog *frontend.Program, cfg buildCfg, isCC bool) (string, error
 			fmt.Printf("assembly written to %s\n", asmPath)
 		}
 		return "", nil
+	}
+
+	// -c stops here and writes a relocatable object instead of an executable.
+	// This is the gcc meaning of the flag and the whole point of having one:
+	// the object holds the machine code, the symbols this unit defines and the
+	// relocations still to apply, and nothing has decided an address yet. A
+	// later `gocld a.o b.o` (or `goc a.o b.o`) resolves them.
+	//
+	// Nothing is lost by stopping before the entry stub is placed: the stub
+	// lives in whichever object ends up providing the entry, and the linker
+	// picks it by name.
+	if cfg.mode == "object" {
+		objPath := outPath
+		if objPath == "" || !strings.HasSuffix(strings.ToLower(objPath), ".o") {
+			objPath = strings.TrimSuffix(objPath, filepath.Ext(objPath)) + ".o"
+		}
+		if dir := filepath.Dir(objPath); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return "", err
+			}
+		}
+		n, err := goa.AssembleObject(asm, objPath, cfg.linux, cg.LibSyms())
+		if err != nil {
+			return "", fmt.Errorf("goa failed: %w", err)
+		}
+		if !isCC {
+			// A temporary object is an intermediate the caller never sees, so
+			// only the source is worth naming -- printing a temp path is noise.
+			dst := objPath
+			if strings.HasPrefix(filepath.Dir(objPath), os.TempDir()) {
+				dst = filepath.Base(objPath)
+			}
+			fmt.Printf("compiled %s -> %s (%d bytes)\n", cfg.inputs[0], dst, n)
+		}
+		return objPath, nil
 	}
 
 	// Hand the assembly to goa, our own assembler -- linked into this binary,
@@ -309,7 +588,7 @@ func runCmd(args []string) int {
 
 	cfg, _ := parseArgs(buildArgs)
 	cfg.inputs = inputs
-	cfg.mode = "compile" // the run below is runCmd's job
+	cfg.mode = "link" // produce an executable; running it is the job below
 	if cfg.linux {
 		fmt.Fprintln(os.Stderr, "goc run: cannot execute a Linux ELF on this host (drop -target linux, or use -c and run it on Linux)")
 		return 1
@@ -361,7 +640,8 @@ func runCmd(args []string) int {
 
 // buildCfg holds the result of parsing the command line.
 type buildCfg struct {
-	mode   string // run | compile | asm | preprocess
+	mode   string // link (default) | object (-c) | asm | preprocess | run
+	link   bool   // inputs are objects: link them instead of compiling
 	linux  bool
 	winGUI bool // -mwindows: PE subsystem 2 (GUI), no console window
 	opt    int  // optimisation level from -O<level> (0 = none)
@@ -416,7 +696,14 @@ func optFromSuffix(s string) int {
 
 // parseArgs turns os.Args[1:] into a buildCfg, tolerating gcc/clang options.
 func parseArgs(args []string) (buildCfg, bool) {
-	cfg := buildCfg{mode: "compile"} // plain `goc file.c` never auto-runs
+	// "link" is the default: compile every input and link one executable.
+	//
+	// It has to be a value of its own, distinct from the -c mode below. Both
+	// used to be "compile", back when -c only meant "do not run the result" --
+	// so the two paths were the same path. Now -c stops after the object and
+	// this goes on to link it, and one name for both silently turns every
+	// plain `goc hello.c` into an object-file build.
+	cfg := buildCfg{mode: "link"}
 	self := filepath.Base(os.Args[0])
 	isCC := self == "cc" || self == "cc.exe" || strings.HasPrefix(self, "cc.")
 
@@ -514,8 +801,8 @@ func parseArgs(args []string) (buildCfg, bool) {
 			name, val = arg[:eq], arg[eq+1:]
 		}
 		switch name {
-		case "-c":
-			cfg.mode = "compile"
+case "-c":
+		cfg.mode = "object"
 		case "-S":
 			cfg.mode = "asm"
 		case "-E":
@@ -576,6 +863,13 @@ func parseArgs(args []string) (buildCfg, bool) {
 //	When asmMode is true and outFile is an explicit (non-directory) file, that
 //	file is the assembly output directly (gcc: "cc -S -o file.s"), and the
 //	executable path is unused.
+//
+//	With no -o, -c names the object after the source (a.c -> a.o) the way gcc
+//	does. The caller turns the returned executable path into the .o path, so the
+//	.exe suffix here is replaced rather than appended to.
+//
+//	An explicit name ending in .o is used verbatim for the object, so
+//	`-c -o build/a.o` lands where it says.
 func outputPaths(srcPath, outFile string, linux, asmMode bool) (asmPath, outPath string) {
 	if outFile == "" {
 		base := strings.TrimSuffix(srcPath, filepath.Ext(srcPath))
@@ -597,6 +891,12 @@ func outputPaths(srcPath, outFile string, linux, asmMode bool) (asmPath, outPath
 	// gcc-style output file.
 	if asmMode {
 		return outFile, "" // -S -o file.s: the file is the assembly itself
+	}
+	// -c -o file.o: the name is the object's, used verbatim. Adding .exe here and
+	// stripping it again further down would be a round trip through a suffix
+	// this output does not have.
+	if strings.HasSuffix(strings.ToLower(outFile), ".o") {
+		return outFile, outFile
 	}
 	if linux {
 		return strings.TrimSuffix(outFile, filepath.Ext(outFile)) + ".asm", outFile
@@ -626,7 +926,8 @@ private to its file.
 Options:
   run             compile to a temp dir, run with the given arguments;
                   the program's exit code is passed through
-  -c              compile to an executable (no auto-run)
+  -c              compile only: write a relocatable .o per translation unit,
+                  no linking (PE and Linux ELF objects alike)
   -S              emit the back end's textual output only (native .asm, or
                   LLVM assembly .s when -fllvm is given); no linking
   -E              preprocess only, write the translation unit to stdout/-o
@@ -644,8 +945,9 @@ Options:
   --version       show version
   --help          show this help
 
-Note: goc compiles its inputs into one complete executable; it has no separate
-linking stage, so it cannot consume .o files or link several objects.
+Inputs may mix .c sources and .o objects. Any .o sends the command to the link
+stage: the sources are compiled to temporary objects first, then everything is
+linked into one executable.
 `)
 }
 

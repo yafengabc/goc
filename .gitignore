@@ -83,3 +83,9 @@ bench/*
 !bench/*.c
 goa/zz_*.tmpl
 src/**/zz_*_test.go.tmpl
+
+# Files the file-I/O examples write into the working directory when run by
+# hand. run_tests.sh sends their output to bin/goc-out/, but a bare
+# `./bin/goc.exe src/examples/io_test.c` from the repo root drops them here.
+goc_io_test.txt
+goc_freopen.txt

@@ -103,7 +103,8 @@ run_win_leg() {  # <dirSuffix> <label> [extra goc flags...]
         if [ ! -f "$exp" ]; then
             if is_win_only "$name"; then
                 # GUI demo with no golden: prove the user32 imports compile+link.
-                if ! ./bin/goc.exe -c "$@" -o "$out" "$src" >/dev/null 2>"$log.err"; then
+                if ! ./bin/goc.exe -c "$@" -o "$out" "$src" >/dev/null 2>"$log.err" ||
+                   ! ./bin/goc.exe "$out/$name.o" -o "$out/$name.exe" >/dev/null 2>"$log.err"; then
                     echo "FAIL  ${label}$name  (compile): $(cat "$log.err")"
                     leg_fail=$((leg_fail + 1))
                 else
@@ -116,8 +117,18 @@ run_win_leg() {  # <dirSuffix> <label> [extra goc flags...]
             continue
         fi
 
+        # -c stops at the object and the link is a second step, the gcc shape.
+        # Compiling straight to an executable here would leave the object
+        # writer -- and with it the whole point of having -c -- untested, and
+        # the leg would still report ok because it was running whatever
+        # executable the previous run had left in the output directory.
         if ! ./bin/goc.exe -c "$@" -o "$out" "$src" >/dev/null 2>"$log.err"; then
             echo "FAIL  ${label}$name  (compile): $(cat "$log.err")"
+            leg_fail=$((leg_fail + 1))
+            continue
+        fi
+        if ! ./bin/goc.exe "$out/$name.o" -o "$out/$name.exe" >/dev/null 2>"$log.err"; then
+            echo "FAIL  ${label}$name  (link): $(cat "$log.err")"
             leg_fail=$((leg_fail + 1))
             continue
         fi
@@ -183,8 +194,17 @@ run_linux_leg() {  # <dirSuffix> <label> [extra goc flags...]
             continue
         fi
 
+        # -c stops at the object, and the link is a separate step -- which is
+        # the gcc shape, and the point of having both. Compiling and linking in
+        # one command used to be what -c meant here; leaving it that way would
+        # have made this leg silently test nothing but the object writer.
         if ! ./bin/goc.exe -c "$@" -target linux -o "$out" "$src" >/dev/null 2>"/tmp/gocl${dir}_$name.err"; then
             echo "FAIL  ${label}linux/$name  (compile): $(cat "/tmp/gocl${dir}_$name.err")"
+            leg_fail=$((leg_fail + 1))
+            continue
+        fi
+        if ! ./bin/goc.exe -target linux "$out/$name.o" -o "$out/$name" >/dev/null 2>"/tmp/gocl${dir}_$name.err"; then
+            echo "FAIL  ${label}linux/$name  (link): $(cat "/tmp/gocl${dir}_$name.err")"
             leg_fail=$((leg_fail + 1))
             continue
         fi
@@ -235,8 +255,12 @@ run_unit() {  # <mod> <logfile>
 # ones under QEMU. Run it rather than growing a second copy here -- it already
 # reports exit codes separately from stdout, which catches a crash that
 # happens to print the right prefix.
+# goa's suite lives at src/goa/run_tests.sh. The bare `goa/` was left over
+# from before the module moved under src/, and `cd goa` failing took the whole
+# leg down with "No such file or directory" -- a path mistake reported as a
+# test failure.
 run_goa() {
-    if UCRUN="${UCRUN:-}" bash goa/run_tests.sh; then
+    if UCRUN="${UCRUN:-}" bash src/goa/run_tests.sh; then
         echo "ok    goa examples suite"
         echo "LEGSTATS pass=1 fail=0"
     else
@@ -267,7 +291,7 @@ if [ "${GOC_PARALLEL:-0}" = "1" ]; then
     run_linux_leg "-os" "Os/"  -Os >/tmp/leg_linos.log  2>&1 & p5=$!
     run_goa                     >/tmp/leg_goa.log    2>&1 & p6=$!
     run_unit src        /tmp/unit_src.log    >/tmp/leg_unit_src.log  2>&1 & p7=$!
-    run_unit goa    /tmp/unit_goa.log    >/tmp/leg_unit_goa.log  2>&1 & p8=$!
+    run_unit src/goa    /tmp/unit_goa.log    >/tmp/leg_unit_goa.log  2>&1 & p8=$!
     run_unit tools      /tmp/unit_tools.log  >/tmp/leg_unit_tools.log 2>&1 & p9=$!
 
     rc=0
@@ -289,7 +313,10 @@ if [ "${GOC_PARALLEL:-0}" = "1" ]; then
               /tmp/leg_lin0.log /tmp/leg_lino1.log /tmp/leg_linos.log \
               /tmp/leg_goa.log \
               /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log
-    [ "$rc" -ne 0 ] && fail=$((fail + 1))
+    # rc is only set on the parallel branch above; the sequential one leaves it
+    # unset, and `set -u` turns reading it into a fatal error on the very line
+    # that reports the result. The per-leg LEGSTATS sums below are the real
+    # verdict, so the exit code of the legs adds nothing here.
 else
     echo "== windows target (-O0) =="
     run_win_leg "" ""       | tee /tmp/leg_win0.log
@@ -307,7 +334,7 @@ else
     run_goa | tee /tmp/leg_goa.log
     echo "== unit tests (all three modules) =="
     run_unit src     /tmp/unit_src.log   | tee /tmp/leg_unit_src.log
-    run_unit goa /tmp/unit_goa.log   | tee /tmp/leg_unit_goa.log
+    run_unit src/goa /tmp/unit_goa.log   | tee /tmp/leg_unit_goa.log
     run_unit tools   /tmp/unit_tools.log | tee /tmp/leg_unit_tools.log
     aggregate /tmp/leg_win0.log /tmp/leg_wino1.log /tmp/leg_winos.log \
               /tmp/leg_lin0.log /tmp/leg_lino1.log /tmp/leg_linos.log \

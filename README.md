@@ -7,15 +7,28 @@
               └─[goc -target linux]─[goa -f elf]─> foo    Linux ELF64，只用 syscall
 ```
 
+`goc -c` 停在中间，产出真正可重定位的目标文件；`gocld`（已编进 `goc.exe`）
+是独立的链接阶段：
+
+```
+  foo.c ──[goc -c]──> foo.o ──[gocld]──> foo.exe
+                        (COFF / ELF64)     └─ .o 也可以来自别处，按需混入 .c
+```
+
 ```bash
 bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面目录结构）
 
-./bin/goc.exe src/examples/hello.c                   # 编译并运行（Windows）
-./bin/goc.exe -c src/examples/hello.c                # 只编译
+./bin/goc.exe src/examples/hello.c                   # 编译并链接（Windows）
+./bin/goc.exe -c src/examples/hello.c                # 只编译：出 hello.o
 ./bin/goc.exe -S src/examples/hello.c                # 只输出汇编（hello.asm）
 ./bin/goc.exe -c -o bin/goc-out src/examples/hello.c # 产物集中到 bin/goc-out/，不污染源码树
-./bin/goc.exe -c -target linux src/examples/hello.c  # 出 Linux ELF64（无后缀）
+./bin/goc.exe -c -target linux src/examples/hello.c  # 出 Linux ELF64 对象（无后缀）
 ./bin/goc.exe a.c b.c -o app.exe                     # 多个 .c 编成一个可执行
+
+# 分开的两步，和 gcc 一样
+./bin/goc.exe -c a.c && ./bin/goc.exe -c b.c         # a.o  b.o
+./bin/goc.exe a.o b.o -o app.exe                     # 链接
+./bin/goc.exe -c a.c && ./bin/goc.exe a.o b.c -o app.exe   # 也可以混着来
 ```
 
 多个 `.c` 各自是一个**独立的翻译单元**（宏、typedef、struct 标签互不干扰），
@@ -23,9 +36,17 @@ bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面�
 内部名），两个文件都定义的同名外部符号则是重复定义错误。汇编器 goa 已编译进
 goc 二进制，不需要旁边放 `goa.exe`（独立的 `bin/goa.exe` 仍然保留，供手写汇编使用）。
 
+链接阶段处理三件事：**重定位**（RIP 相对位移、`_BitInt` 的 sret 隐藏指针、
+64 位绝对地址）、**符号合并**（跨单元的未定义符号由提供它的那一份定义）、
+**goclib 副本去重**（goc 没有库阶段，每个用 `printf` 的单元都自带一份完整实现，
+链接时保留一份、其余丢弃——它们的静态状态本就是单元私有的）。目前不做死代码
+消除，被丢弃副本的字节仍留在 `.text` 里。
+
 Windows 产物只导入 **Windows 系统 DLL**（kernel32/user32/gdi32
 导出，按程序实际调用取子集；每个 API 的归属 DLL 写在同名头文件的 `extern ... , dll` 原型里，例如
-`winbase.h` 里的 `extern BOOL CloseHandle(HANDLE), kernel32;`）；Linux 产物是静态 ELF，一条动态链接都没有，只用
+`winbase.h` 里的 `extern BOOL CloseHandle(HANDLE), kernel32;`）；这份归属关系由
+`.o` 自己带出去（一个 `.goc_dll:` 静态符号），所以隔了对象文件链接也一样准，
+不需要链接器猜。Linux 产物是静态 ELF，一条动态链接都没有，只用
 syscall（`write` / `read` / `brk` / `exit_group`）。两头都没有 msvcrt / glibc，
 也没有 gcc。
 
@@ -96,7 +117,7 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 ├── src/examples/  src/expected/                      # goc 回归套件的数据（gocregress 的输入）
 │   └── examples/multi/                                 #   多文件链接用例
 ├── tools/                                              # 验证工具（go 模块 tools）
-│   ├── elfcheck                                        #   ELF 结构校验（不再解释执行）
+│   ├── elfcheck                                        #   ELF 校验 + 解释执行（--structure-only 只校验结构）
 │   ├── msgboxcheck                                     #   驱动 GUI 对话框并断言
 │   └── ucrun.py  peun.py                               #   ELF / PE 的 Unicorn(QEMU) 运行器
 ├── bin/                                                # 产物（goc / goc-standalone / goa / ...）
@@ -235,7 +256,8 @@ printf 的已知边界：
 
 还没到的地方：
 
-- **单编译单元，没有链接器**：不能消费 `.o`，也不能把多个 TU 链到一起
+- 链接器只做重定位解析与符号合并，没有真正的死代码消除（被去重的
+  库函数副本字节仍留在 `.text` 里）；也没有静态库归档（`.a`）
 - 没有 `long long`、VLA、复合字面量、`_Generic` 等 C99+ 特性
 - 没有数组指定初始化器 `[i] = v`
 - 库只有上面那 45 个函数

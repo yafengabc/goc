@@ -53,10 +53,13 @@ echo "== gocl (LLVM back end) =="
 (cd src/gocl && go build -trimpath -ldflags="-s -w" -o "../../bin/gocl$EXE" ./cmd/gocl)
 
 echo "== gocld (linker) =="
-# A library, so building it is a compile check rather than a product. It is here
-# because goa depends on it, and a goa that fails to build is a goc that fails
-# to build -- the error surfaces one package earlier this way.
+# Both halves matter. `go build ./...` is a compile check on the library, which
+# goa depends on -- a gocld that fails to build is a goa that fails to build,
+# and the error surfaces one package earlier this way. The cmd build is the
+# product: a standalone linker you can run on .o files directly, the way cc
+# would invoke one.
 (cd src/gocld && go build ./...)
+(cd src/gocld && go build -trimpath -ldflags="-s -w" -o "../../bin/gocld$EXE" ./cmd/gocld)
 
 echo "== goc (self-contained) =="
 # The same compiler with the C library embedded: no goclib/ needed beside the
@@ -86,5 +89,5 @@ echo "== tools =="
 # and, when named cc, behaves like gcc (compile to an executable, no auto-run).
 cp -f "bin/goc$EXE" "bin/cc$EXE"
 
-echo "done: bin/goc$EXE, bin/gocl$EXE, bin/goc-standalone$EXE, bin/cc$EXE, bin/goa$EXE,"
-echo "      bin/elfcheck$EXE, bin/msgboxcheck$EXE"
+echo "done: bin/goc$EXE, bin/gocl$EXE, bin/gocld$EXE, bin/goc-standalone$EXE,"
+echo "      bin/cc$EXE, bin/goa$EXE, bin/elfcheck$EXE, bin/msgboxcheck$EXE"

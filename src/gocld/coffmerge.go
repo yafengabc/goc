@@ -81,6 +81,38 @@ func (img *Image) IngestCOFFBytes(src []byte) error {
 	return img.ingestParsedCOFF(o, src)
 }
 
+// isCLibSymbol reports whether name is one of the goc C library's own symbols.
+// The library's globals carry a G_ prefix and its internal helpers a __goclib_
+// one, precisely so they can be told apart from the user's -- which is what lets
+// a link of several units see two copies of printf and recognise them as the
+// same library rather than as a user who defined printf twice.
+//
+// The prefix covers everything but the library's *exported* functions, whose
+// names are fixed by the C ABI (fwrite, memcpy) and so cannot be marked. Those
+// are recognised from the table each object carries instead; see
+// coffLibSymPrefix.
+//
+// That table lists the function names only, but a function carries private
+// labels of its own: goa qualifies a `.Lfoo` with its function's name, so a
+// branch target inside fwrite is a global symbol named `fwrite.Lfoo`. Two units
+// that each inline fwrite both define it, and the second would be reported as a
+// duplicate definition of a name the user never wrote. A qualified name is
+// therefore recognised by its owner: if the part before the dot is the library's,
+// so is everything hanging off it. Naming the owner is enough -- a library
+// function cannot itself have a dot in its name, since the C ABI does not allow
+// one -- and it keeps the rule in one place rather than teaching the writer to
+// enumerate labels it does not know about.
+func isCLibSymbol(name string, objLib map[string]bool) bool {
+	if objLib[name] {
+		return true
+	}
+	if strings.HasPrefix(name, "G_") || strings.HasPrefix(name, "__goclib_") {
+		return true
+	}
+	owner, rest, qualified := strings.Cut(name, ".")
+	return qualified && strings.HasPrefix(rest, "L") && objLib[owner]
+}
+
 // refptrLoc is where an object's .refptr slot for an undefined data symbol
 // ended up: which merged section holds it, and at what offset.
 type refptrLoc struct {
@@ -248,6 +280,63 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 	// at the end, because an image built on a guessed import loads fine and then
 	// dies with STATUS_ENTRYPOINT_NOT_FOUND and no explanation.
 	var unresolved []string
+	// The object's own name, for a duplicate-definition diagnostic. COFF records
+	// it as the .file symbol (storage class 103); an object without one is
+	// identified by position instead, which is still enough to say which two.
+	objName := ""
+	for _, s := range o.syms {
+		if s.class == scnClassFile {
+			objName = s.name
+			break
+		}
+	}
+	// The library-symbol table the writer rode along in (see WriteCOFFObject).
+	// It is what makes a second inlined copy of printf recognisable as the same
+	// library rather than as a duplicate definition -- and a link over
+	// separately compiled units has no other way to know.
+	objLib := map[string]bool{}
+	for _, s := range o.syms {
+		rest, ok := strings.CutPrefix(s.name, coffLibSymPrefix)
+		if !ok || s.class != scnClassStatic {
+			continue
+		}
+		for _, n := range strings.Split(rest, ",") {
+			if n != "" {
+				objLib[n] = true
+			}
+		}
+	}
+	// The import table the writer rode along in, read back the same way (see
+	// coffDllSymPrefix). These are the names this object expects the loader to
+	// resolve, so they are claims about the program rather than definitions:
+	// they go into Exts, which is what buildIData turns into .idata, and they
+	// are deliberately not added to img.Syms -- an imported name has no address
+	// in the image, only a slot in the IAT.
+	//
+	// A name defined by a sibling object wins over an import claim from another,
+	// which is why this only fills in names nothing else has claimed. The
+	// duplicate-definition check further down reports a real collision between
+	// two definitions; an import that happens to share a name with one of them
+	// is not a collision, just a linker that had more information than the
+	// object did.
+	for _, s := range o.syms {
+		rest, ok := strings.CutPrefix(s.name, coffDllSymPrefix)
+		if !ok || s.class != scnClassStatic {
+			continue
+		}
+		for _, pair := range strings.Split(rest, ",") {
+			name, dll, found := strings.Cut(pair, "=")
+			if !found || name == "" || dll == "" {
+				continue
+			}
+			if img.Exts == nil {
+				img.Exts = map[string]string{}
+			}
+			if _, dup := img.Exts[name]; !dup {
+				img.Exts[name] = dll
+			}
+		}
+	}
 	for _, s := range o.syms {
 		if s.name == "" || s.secNum < 0 {
 			// secNum < 0 covers segment symbols (-1 = absolute, e.g. @feat.00)
@@ -311,6 +400,47 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 			continue
 		}
 		si := int(s.secNum)
+		// A name two objects both define is an error, not a silent "last one
+		// wins": the program would run one of the two with nothing to say which.
+		//
+		// Only external linkage qualifies. A static symbol -- which is what a
+		// COFF section definition is -- is private to its object, and every
+		// object has a `.text`; treating those as duplicates would make every
+		// link of more than one object fail.
+		if s.class == scnClassExternal {
+			if _, dup := img.Syms[s.name]; dup {
+				if isCLibSymbol(s.name, objLib) {
+					// The same C library, inlined into more than one unit.
+					//
+					// goc has no library stage: each unit that calls printf
+					// carries its own copy of the functions it needs, so a
+					// program in which two units print has two printf. Their
+					// code is identical, and their static state (stdio
+					// buffers, the heap cursor, rand_state) is private to the
+					// copy -- no unit ever reaches another's -- so keeping one
+					// copy and pointing every reference at it is behaviourally
+					// the same as the inline-each-way layout, and it is what
+					// stops the second copy from looking like a duplicate.
+					//
+					// The first one wins so that which copy survives is decided
+					// by link order rather than by hash iteration.
+					if img.deduped == nil {
+						img.deduped = map[string]bool{}
+					}
+					img.deduped[s.name] = true
+					continue
+				}
+				first := img.definedIn[s.name]
+				if first == "" {
+					first = "an earlier object"
+				}
+				return fmt.Errorf("duplicate definition of symbol %q: defined in %s and in %s", s.name, first, objName)
+			}
+			if img.definedIn == nil {
+				img.definedIn = map[string]string{}
+			}
+			img.definedIn[s.name] = objName
+		}
 		img.Syms[s.name] = SymLoc{Sect: sectOf[si], Off: baseOf[si] + int(s.value)}
 	}
 
@@ -382,6 +512,16 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 					key = coffNoOpAnchor
 				case img.definesSymbol(sym.name):
 					key = sym.name
+				case img.deferred:
+					// A link over several objects: this name may still be
+					// defined by one that has not been read yet. Deciding now
+					// would fix the reference to an import slot, and a later
+					// object defining the name could not undo it -- the fixup
+					// is already written. Keep the bare name and let the
+					// import pass below re-point whatever is still undefined
+					// once every object is in.
+					key = sym.name
+					img.AddPending(map[string]bool{sym.name: true})
 				default:
 					key = "IAT:" + sym.name
 				}
@@ -491,11 +631,169 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 	}
 	// Report undefined names only after the whole object has been read, so one
 	// pass names everything that is missing instead of stopping at the first.
-	if len(unresolved) > 0 {
+	//
+	// A name is only really missing if no object in the link defines it. When
+	// several objects are being linked, that can only be judged once all of them
+	// have been read, so the check is deferred to Resolve rather than made here:
+	// reporting it per object would call `add` undefined while linking a.o and
+	// b.o, even though b.o is the one that defines it.
+	if len(unresolved) > 0 && !img.deferred {
 		sort.Strings(unresolved)
 		return fmt.Errorf("coff: undefined symbol(s): %s", strings.Join(unresolved, ", "))
 	}
+	if len(unresolved) > 0 {
+		// Remember them for the link-wide pass. img.pending holds the names
+		// this object left undefined; a later object may still define one.
+		if img.pending == nil {
+			img.pending = map[string]bool{}
+		}
+		for _, n := range unresolved {
+			img.pending[n] = true
+		}
+	}
 	return nil
+}
+
+// Resolve is the link-wide half of symbol resolution: it settles the names that
+// individual objects left undefined, once every object has been read.
+//
+// The split exists because "undefined" is not a property of an object but of
+// the link. A single object on its own genuinely has an unresolved call if the
+// name is in no library; three objects together may well define it in the third.
+// Deciding per object -- which is what a one-object link has to do -- reports
+// the second case as an error, so a program split into translation units could
+// never be linked at all.
+//
+// What is left after this pass is a name no object defines and no import table
+// claims, and that is a real error: it is reported by name, because an image
+// built on a guessed import loads fine and then dies with
+// STATUS_ENTRYPOINT_NOT_FOUND and no explanation.
+func (img *Image) Resolve() error {
+	if len(img.pending) == 0 {
+		return nil
+	}
+	// Two things can still be true of a name no object defines: a Win32 entry
+	// point the import table can claim, or nothing at all. The import decision
+	// was deferred to here for the same reason the undefined report was -- a
+	// sibling object read later may define the name -- so it is made now, once
+	// every object is in. A name that becomes an import is not missing; the
+	// rest genuinely has nowhere to come from.
+	var missing []string
+	for name := range img.pending {
+		if img.definesSymbol(name) {
+			continue
+		}
+		// Only PE has an import table to fall back on. An ELF program has no
+		// DLL imports at all -- a syscall is a stub goa emits inline -- so a
+		// name nothing defines is simply missing, and offering it a Win32
+		// library would be a category error.
+		if img.Target == TargetPE {
+			if dll, known := coffImportDLL(name); known {
+				if img.Exts == nil {
+					img.Exts = map[string]string{}
+				}
+				img.Exts[name] = dll + ".dll"
+				continue
+			}
+		}
+		missing = append(missing, name)
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("undefined symbol(s): %s", strings.Join(missing, ", "))
+	}
+	img.pending = nil
+	// Import thunks are a PE mechanism -- an ELF object routes a syscall through
+	// the stub goa already emitted, with no indirection to add.
+	if img.Target == TargetPE {
+		return img.emitImportThunks()
+	}
+	return nil
+}
+
+// emitImportThunks generates one `jmp [rip+slot]` per import and routes calls
+// to them. ingestParsedCOFF does this per object, but a deferred link only
+// learns which names are imports at the very end, by which point the earlier
+// objects' fixups already name the bare symbol -- so the thunks are built here
+// and the still-bare call sites are pointed at them.
+func (img *Image) emitImportThunks() error {
+	if len(img.Exts) == 0 {
+		return nil
+	}
+	text := img.textSection()
+	if text == nil {
+		return nil
+	}
+	thunk := func(name string) int {
+		if loc, ok := img.Syms["thunk:"+name]; ok {
+			return loc.Off
+		}
+		off := text.VSize
+		// FF 25 <rel32>: jmp qword ptr [rip+disp]
+		text.Data = append(text.Data, 0xFF, 0x25, 0, 0, 0, 0)
+		text.VSize += 6
+		img.Fixups = append(img.Fixups, Fixup{
+			Sect: sectionIndexOf(img, text), Off: off + 2, Sym: "IAT:" + name,
+		})
+		img.Syms["thunk:"+name] = SymLoc{Sect: sectionIndexOf(img, text), Off: off}
+		return off
+	}
+	// Only a call or jmp may be routed through a thunk: its target must be
+	// code, and an IAT slot holds data. Anything else (a lea/mov RIP-relative
+	// taking a function's address) keeps naming the slot itself, which is what
+	// address-of means.
+	for i := range img.Fixups {
+		f := &img.Fixups[i]
+		if f.Sect != sectionIndexOf(img, text) || f.Absolute || f.Wide {
+			continue
+		}
+		name := f.Sym
+		if _, isImport := img.Exts[name]; !isImport {
+			continue
+		}
+		if !isCallOrJmp(text.Data, f.Off) {
+			continue
+		}
+		off := thunk(name)
+		// Rewrite the call into a call of the thunk: E8/E9 rel32 with the
+		// thunk's address, which is a fixed displacement from the field.
+		f.Sym = "thunk:" + name
+		f.RipAdjust = 0
+		f.Addend = off - f.Off
+	}
+	return nil
+}
+
+// isCallOrJmp reports whether the rel32 field at off is the target of a near
+// call (E8) or jmp (E9), the two forms whose target must be code.
+func isCallOrJmp(data []byte, off int) bool {
+	i := off - 1
+	for i >= 0 && data[i] == 0x0F {
+		i--
+	}
+	return i >= 0 && i < len(data) && (data[i] == 0xE8 || data[i] == 0xE9)
+}
+
+func (img *Image) textSection() *Section {
+	for _, s := range img.Sections {
+		if s.Name == ".text" {
+			return s
+		}
+	}
+	return nil
+}
+
+// AddPending records names an object left undefined, for Resolve to settle.
+func (img *Image) AddPending(names map[string]bool) {
+	if len(names) == 0 {
+		return
+	}
+	if img.pending == nil {
+		img.pending = map[string]bool{}
+	}
+	for n := range names {
+		img.pending[n] = true
+	}
 }
 
 // symbolAt returns the syms[i] entry. The symbol table is stored in raw order,

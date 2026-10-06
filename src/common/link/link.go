@@ -150,6 +150,12 @@ type Data struct {
 
 	Entry Entry
 
+	// UnitPrefix distinguishes this unit's compiler-minted labels -- string
+	// literals, statics -- from another unit's. A whole program has one unit and
+	// needs none; a unit on its way to becoming an object file does, or two
+	// objects in one link would both define LC0.
+	UnitPrefix string
+
 	// Linux selects an ELF image rather than a PE.
 	Linux bool
 	// WinGUI selects the GUI subsystem on a PE, which is what makes the

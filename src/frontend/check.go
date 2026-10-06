@@ -23,6 +23,9 @@ type checker struct {
 	scopes  []*cScope
 	errs    []error
 	swDepth int // how many switch statements enclose the statement being checked
+	// unit marks a single translation unit being checked on its way to an object
+	// file, where the program as a whole has no main yet. See CheckUnit.
+	unit bool
 }
 
 func (c *checker) push() { c.scopes = append(c.scopes, &cScope{vars: map[string]*Type{}}) }
@@ -66,10 +69,27 @@ func (c *checker) errf(line int, format string, a ...any) {
 
 // Check walks the whole program and returns every diagnostic found. A normal
 // (successful) run returns a nil or empty slice.
-func Check(prog *Program) []error {
+func Check(prog *Program) []error { return check(prog, false) }
+
+// CheckUnit is Check for a single translation unit on its way to becoming an
+// object file.
+//
+// It differs in exactly one rule: a missing main is not an error. A whole
+// program must define one, but a translation unit is one piece of several, and
+// the piece that defines main is rarely the piece that defines the functions
+// this one calls. Rejecting a.c for having no main would make it impossible to
+// compile a program whose main.c is a separate file -- which is the ordinary
+// shape of a C program, not an unusual one.
+//
+// The entry point is the linker's to settle, and it can only settle it after
+// every unit has been seen. Reporting it here would report it too early.
+func CheckUnit(prog *Program) []error { return check(prog, true) }
+
+func check(prog *Program, unit bool) []error {
 	c := &checker{
 		funcs:  map[string]*FuncDecl{},
 		protos: map[string]*FuncDecl{},
+		unit:   unit,
 	}
 	for _, f := range prog.Funcs {
 		c.funcs[f.Name] = f
@@ -108,10 +128,14 @@ func Check(prog *Program) []error {
 	// /SUBSYSTEM:WINDOWS program has no main at all). Check does not know the
 	// target, so it accepts all three and codegen rejects a GUI entry when
 	// targeting Linux, where the entry really must be main.
+	//
+	// A translation unit on its way to an object file is exempt: main belongs to
+	// some unit in the program, not necessarily this one, and the linker is the
+	// stage that can tell whether the program has one at all.
 	if _, ok := c.funcs["main"]; !ok {
 		_, wide := c.funcs["wWinMain"]
 		_, ansi := c.funcs["WinMain"]
-		if !wide && !ansi {
+		if !wide && !ansi && !c.unit {
 			c.errf(0, "program has no main()")
 		}
 	}

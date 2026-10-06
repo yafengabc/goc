@@ -3,6 +3,9 @@ package goa
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+
+	"gocld"
 )
 
 // AssembleSource assembles asm source text and writes a runnable executable to
@@ -62,6 +65,71 @@ func AssembleATT(src, outPath string, elf bool) (int64, error) {
 		return 0, err
 	}
 	return a.writeImage(outPath, elf)
+}
+
+// AssembleObject assembles src and writes it as a relocatable object file
+// rather than a linked executable. It returns the size of the file written.
+//
+// This is what makes `-c` mean "produce an object". The image is handed to the
+// linker with its fixups still pending: the sections hold the machine code, the
+// symbol table holds what this object defines, and the relocation table holds
+// the places whose value depends on where a symbol lands. Deciding those
+// addresses is a later step, and doing it here would make the object
+// inseparable from the program that happens to be linked today.
+//
+// elf selects the container, and it has to: an object is not a portable thing.
+// A Windows object is COFF and a Linux one is ELF64, and a linker handed the
+// wrong one says so immediately rather than producing a program that cannot
+// start. Which is why this is a parameter and not a guess -- the target decides
+// the format, all the way down.
+//
+// The result is standard, so `objdump -h/-t/-r` reads it and any aware tool can
+// consume it. Undefined symbols -- a call into the C library, an imported
+// Windows API, a reference to a sibling unit -- are recorded as such, which is
+// how the object says what it still needs.
+func AssembleObject(src, outPath string, elf bool, libSyms map[string]bool) (int64, error) {
+	a := NewAssembler()
+	if elf {
+		a.target = targetELF
+	}
+	if err := a.Assemble(src); err != nil {
+		return 0, err
+	}
+	img := a.LinkImage()
+	// The object's own name, so a link that finds two units defining the same
+	// symbol can say which two rather than "an earlier object".
+	img.FileName = filepath.Base(outPath)
+	// Which definitions are the C library's. goc has no library stage -- a unit
+	// inlines the library functions it calls -- so a program in which two units
+	// print has two copies of printf, and the linker needs to be able to tell
+	// that from a user who defined printf twice.
+	//
+	// goa's own runtime symbols join the set: they are marked the same way for
+	// the same reason, and their names cannot be prefixed because a loader looks
+	// them up by name.
+	//
+	// Merged into a fresh map rather than into libSyms, which belongs to the
+	// caller: the set is per object, and writing into the caller's would make
+	// the second object out of one compilation claim the first one's symbols.
+	if len(libSyms) > 0 || len(a.libSyms) > 0 {
+		img.LibSyms = make(map[string]bool, len(libSyms)+len(a.libSyms))
+		for name := range libSyms {
+			img.LibSyms[name] = true
+		}
+		for name := range a.libSyms {
+			img.LibSyms[name] = true
+		}
+	}
+	var obj []byte
+	if elf {
+		obj = gocld.WriteELFObject(img)
+	} else {
+		obj = gocld.WriteCOFFObject(img)
+	}
+	if err := os.WriteFile(outPath, obj, 0644); err != nil {
+		return 0, err
+	}
+	return int64(len(obj)), nil
 }
 
 // AssembleWithObject assembles src and then merges a COFF object into the same

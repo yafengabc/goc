@@ -44,6 +44,7 @@ const (
 	shtRel   = 9
 	sttFunc  = 2
 	sttSection = 3
+	sttFile  = 4 // STT_FILE: the object's own name, not a thing inside it
 
 	shnUndef = 0
 	shnAbs   = 0xfff1
@@ -73,6 +74,7 @@ type elfsym struct {
 	shndx  uint16 // 0 = undefined, 0xfff1 = absolute, else 1-based section
 	isFunc bool
 	isSect bool // STT_SECTION: names "address of section N"
+	isFile bool // STT_FILE: names the object, not anything in it
 }
 
 // elfsec is one parsed section header plus its contents.
@@ -231,6 +233,7 @@ func parseELF(src []byte) (*elfObj, error) {
 			shndx:  uint16(shndx),
 			isFunc: info&0xf == sttFunc,
 			isSect: info&0xf == sttSection,
+			isFile: info&0xf == sttFile,
 		})
 	}
 	o.symKey = make([]string, len(o.syms))
@@ -238,6 +241,27 @@ func parseELF(src []byte) (*elfObj, error) {
 }
 
 func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
+	// The C library symbol table the writer rode along in (see WriteELFObject).
+	// Read before the sections, because recognising a library symbol is what
+	// tells a second inlined copy of printf from a user who defined printf
+	// twice, and that decision is made while the symbols go in.
+	//
+	// The section is non-allocated, so the loop below skips it anyway; it is
+	// read here rather than treated as an ordinary section precisely because it
+	// is metadata, not content.
+	objName := ""
+	objLib := map[string]bool{}
+	for _, es := range o.secs {
+		if es.name != elfLibSecName {
+			continue
+		}
+		for _, n := range strings.Split(string(es.data), ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				objLib[n] = true
+			}
+		}
+	}
+
 	// Map an ELF section name to a goa section. Unmapped but allocated sections
 	// are routed to .rdata so their bytes are not lost; everything else
 	// (non-alloc) is dropped.
@@ -331,6 +355,13 @@ func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
 	// --- symbols ---
 	for i, s := range o.syms {
 		switch {
+		case s.isFile:
+			// STT_FILE names the object rather than anything in it. Read here
+			// because a duplicate-definition diagnostic quotes it, and a
+			// diagnostic that says "an earlier object" when both names were
+			// sitting in the files costs the reader a step of looking.
+			objName = s.name
+			o.symKey[i] = ""
 		case s.isSect:
 			// A section symbol's value is the section's own address, which
 			// after merging is baseOf[shndx] -- NOT zero. The object keeps each
@@ -375,7 +406,36 @@ func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
 			if s.shndx >= 1 && int(s.shndx) <= len(o.secs) {
 				gi := sectOf[s.shndx]
 				if gi >= 0 {
+					// A name two objects both define is an error, unless both
+					// are the same C library inlined twice -- see isCLibSymbol
+					// for why those are equivalent rather than conflicting.
+					// The ELF rules mirror the COFF ones, and the reasoning is
+					// written there rather than repeated.
+					if _, dup := img.Syms[s.name]; dup {
+						if isCLibSymbol(s.name, objLib) {
+							if img.deduped == nil {
+								img.deduped = map[string]bool{}
+							}
+							img.deduped[s.name] = true
+							o.symKey[i] = s.name
+							continue
+						}
+						first := img.definedIn[s.name]
+						if first == "" {
+							first = "an earlier object"
+						}
+						if objName == "" {
+							objName = "this object"
+						}
+						return fmt.Errorf("duplicate definition of symbol %q: defined in %s and in %s", s.name, first, objName)
+					}
 					img.Syms[s.name] = SymLoc{Sect: gi, Off: baseOf[s.shndx] + int(s.value)}
+					if img.definedIn == nil {
+						img.definedIn = map[string]string{}
+					}
+					if s.name != "" {
+						img.definedIn[s.name] = objName
+					}
 					o.symKey[i] = s.name
 				}
 			}
@@ -415,8 +475,23 @@ func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
 				return fmt.Errorf("elf: relocation %d of %s references an unresolved symbol", r, es.name)
 			}
 			if o.syms[symIdx].shndx == shnUndef && !img.definesSymbol(key) {
-				unresolved = append(unresolved, key)
-				continue
+				// A link over several objects cannot judge this name yet: the
+				// object that defines it may not have been read. Note it for
+				// Resolve to settle, but keep going -- the relocation still has
+				// to be recorded, because by then the name will be defined and
+				// the field will want the address.
+				//
+				// Dropping it here is the tempting mistake, and it produces a
+				// program that links cleanly and calls the next instruction
+				// instead: the field keeps whatever placeholder bytes it had,
+				// there is no relocation left to complain, and the bug surfaces
+				// as a wrong answer rather than as a link error.
+				if img.deferred {
+					img.AddPending(map[string]bool{key: true})
+				} else {
+					unresolved = append(unresolved, key)
+					continue
+				}
 			}
 			at := tsBase + off
 			switch typ {

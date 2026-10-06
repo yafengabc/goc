@@ -29,8 +29,8 @@ func TestParseArgsGccCompat(t *testing.T) {
 	if isCC {
 		t.Fatal("invoked as goc but detected as cc")
 	}
-	if cfg.mode != "compile" {
-		t.Errorf("mode = %q, want compile", cfg.mode)
+	if cfg.mode != "object" {
+		t.Errorf("mode = %q, want object", cfg.mode)
 	}
 	if !cfg.linux {
 		t.Error("target linux not captured")
