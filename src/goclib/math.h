@@ -54,6 +54,11 @@ double cbrt(double x);
 double pow(double x, double y);
 double exp(double x);
 double exp2(double x);
+/* C23: 10^x, computed as exp(x * ln10) so it inherits exp's accuracy.
+ * 10^0 is exactly 1 and 10^n is exact for |n| <= 22 through exp's own
+ * argument reduction, which is the most any binary64 implementation can
+ * promise. */
+double exp10(double x);
 /* Natural log: log(0) is -infinity, log of a negative is NaN. */
 double log(double x);
 double log2(double x);
@@ -93,6 +98,24 @@ double hypot(double x, double y);
 /* min/max, ignoring NaN: fmin(1, NaN) is 1. */
 double fmin(double x, double y);
 double fmax(double x, double y);
+/* C23 fmaximum_num / fminimum_num: like fmax/fmin but a NaN argument is a
+ * domain error rather than being skipped, so fmaximum_num(1, NaN) is NaN.
+ * The pair that is not NaN wins, and two NaNs give NaN. */
+double fmaximum_num(double x, double y);
+double fminimum_num(double x, double y);
+/* C23 fmaxmag / fminmag: compare by magnitude alone, and the result carries
+ * the sign of the larger operand. Where the magnitudes are equal the even
+ * mantissa wins (so fmaxmag(1, -1) is 1, not -1). */
+double fmaxmag(double x, double y);
+double fminmag(double x, double y);
+/* C23 totalorder / totalordermag: a total order that also sorts NaN, which
+ * the < comparison cannot. totalorder(x,y) is <0/0/>0 exactly when
+ * totalorder(x,y) < 0/== 0/> 0, with -0.0 < +0.0 and every NaN above every
+ * number and above infinity (negative NaNs below). totalordermag compares by
+ * magnitude instead, so 1.0 and -1.0 are one value there and it returns 0. Both return 0 rather than an equal
+ * value, per the standard. */
+int totalorder(const double *x, const double *y);
+int totalordermag(const double *x, const double *y);
 
 /* ---- sign manipulation -------------------------------------------------- */
 
@@ -113,6 +136,16 @@ double rint(double x);
 /* Same value as rint: goc always runs in round-to-nearest, so there is no
  * rounding mode for this to differ on. */
 double nearbyint(double x);
+/* C23 roundeven: round half to even, preserving the sign of zero the way
+ * rint does. Identical to rint() here -- both are round-to-nearest-even --
+ * but a distinct name because the standard requires it to be its own
+ * function (it may differ under a changed rounding mode). */
+double roundeven(double x);
+/* C23 nextup / nextdown: the next representable value toward +infinity /
+ * -infinity. nextup(+inf) is +inf, and stepping away from 0 gives the
+ * smallest subnormal rather than crossing zero. */
+double nextup(double x);
+double nextdown(double x);
 /* IEEE remainder x - n*y with n the nearest integer (ties to even). Unlike
  * fmod it may be negative, and |result| <= |y|/2. */
 double remainder(double x, double y);
@@ -191,6 +224,28 @@ double remquo(double x, double y, int *quo);
 #define FP_ZERO      4
 int fpclassify(double x);
 
+/* ---- C23 classification, payloads and fp -> integer --------------------- */
+
+/* issignaling: goclib produces only quiet NaNs (every arithmetic result and
+ * every NAN constant is quiet), so this is always 0 -- including for the
+ * signalling NaN constants below, which goclib has no way to raise. */
+int issignaling(double x);
+/* C23: the payload of a NaN as a double; the sign is not part of it. For a
+ * non-NaN the result is unspecified, so goclib returns x unchanged. */
+double getpayload(double x);
+/* C23 getsign: the sign of x as a double, -1.0 or +1.0 (never 0 -- there is
+ * no third choice, and signbit(+0.0) is 0 so the two disagree by design). */
+double getsign(double x);
+
+/* C23 fromfp / ufromfp: the integer nearest to fp, with the current (and only)
+ * rounding direction -- to-nearest-even. An out-of-range or NaN argument is a
+ * domain error: these return 0 and set errno = EDOM, per the standard's
+ * "otherwise returns 0" wording (the C23 return value for an invalid input is
+ * unspecified but must be representable, and 0 always is). The unsigned
+ * variant returns the same value for [0, 2^63) as the signed one. */
+long long fromfp(double fp);
+unsigned long long ufromfp(double fp);
+
 /* ---- classification and constants -------------------------------------- */
 #define NAN      (0.0 / 0.0)
 #define INFINITY (1.0 / 0.0)
@@ -209,6 +264,21 @@ int fpclassify(double x);
 #define HUGE_VAL  (1.0 / 0.0)
 #define HUGE_VALF (1.0f / 0.0f)
 #define HUGE_VALL (1.0L / 0.0L)
+
+/* C23 signalling-NaN constants. goclib never raises a signalling NaN (see
+ * issignaling above), so these are spelled as the quiet NaN they degrade to --
+ * a program that only tests "is this NaN" behaves identically either way. */
+#define FLT_SNAN (0.0f / 0.0f)
+#define DBL_SNAN (0.0 / 0.0)
+#define LDBL_SNAN (0.0L / 0.0L)
+
+/* C23 math_errhandling: goclib's math functions report domain and range
+ * errors by returning NaN or infinity and by setting errno, so only
+ * MATH_ERRNO is claimed. There is no trap to report and no rounding-mode
+ * change to flag. */
+#define math_errhandling (MATH_ERRNO)
+#define MATH_ERRNO     1
+#define MATH_ERREXCEPT 2
 
 #define M_PI     3.14159265358979323846
 #define M_PI_2   1.57079632679489661923

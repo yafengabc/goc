@@ -998,3 +998,308 @@ int fpclassify(double x) {
     if ((u.i & 0x7FF0000000000000ULL) == 0) return FP_SUBNORMAL;
     return FP_NORMAL;
 }
+
+/* ===================== C23 additions to <math.h> =========================
+ *
+ * Everything above is C89/C99. This block is ISO/IEC 9899:2024 (C23), which
+ * added a rounding-direction-agnostic total order over the floating types, a
+ * magnitude-wise max/min that keeps the sign, NaN-propagating extrema, the
+ * successor functions, 10^x, and the fp->integer conversion family. goclib
+ * has no long double and evaluates float as an effective double, so only the
+ * double spellings exist -- the f/l variants would be the same function under
+ * different names, and the header says so.
+ */
+
+/* fmaximum_num / fminimum_num. Unlike fmax/fmin, a NaN argument is an error
+ * rather than something to step over: if either is a NaN the result is a NaN.
+ * This is the "_num" half of C23's new maxima family -- the "_mag" half
+ * compares by magnitude, the plain one propagates the NaN. So the NaN tests
+ * come first and return NaN, and only then does the ordinary comparison run.
+ * The returned NaN is (x + y), which is a NaN when either side already is and
+ * costs nothing when the tests above let us through. */
+double fmaximum_num(double x, double y) {
+    if (isnan(x) || isnan(y)) return x + y;
+    return (x > y) ? x : y;
+}
+
+double fminimum_num(double x, double y) {
+    if (isnan(x) || isnan(y)) return x + y;
+    return (x < y) ? x : y;
+}
+
+/* fmaxmag / fminmag compare |x| against |y| and hand back the operand that
+ * won, sign included. On an exact magnitude tie the standard hands the result
+ * to the operand with the even low-order mantissa bit -- that is what makes
+ * the answer independent of which argument came first.
+ *
+ * "Even" means the low-order mantissa bit is zero, so the test is bit 0 of the
+ * pattern -- NOT a bit of the exponent field. (Reading the exponent's low bit
+ * instead makes 1.0 and 3.0 both "even" and 1.5 "odd", which happens to look
+ * right for the first two and is wrong in general: it orders by exponent, not
+ * by mantissa.)
+ *
+ * The bit is taken from the low half as a 32-bit value: `bits & 1ULL` on the
+ * full 64-bit pattern reads as 0 for every input under the current goc, so
+ * every tie would fall the same way.
+ *
+ * When both mantissas are even -- which is the case for x and -x, and the only
+ * case the standard leaves open -- the tie is broken by totalordermag, so the
+ * negative one wins fmaxmag. That matches what a magnitude-wise comparison
+ * means and makes fmaxmag(-1, 1) and fmaxmag(1, -1) both answer 1. */
+static int even_mantissa(double x) {
+    union DU u;
+    u.d = x;
+    return (int)((unsigned int)u.i & 1u);
+}
+
+/* totalordermag on a tie: negative first, then smaller magnitude. */
+static int mag_precedes(double x, double y) {
+    double ax, ay;
+    int xs, ys;
+    xs = signbit(x);
+    ys = signbit(y);
+    if (xs != ys) return xs;          /* the negative one comes first */
+    ax = fabs(x);
+    ay = fabs(y);
+    return (ax < ay);
+}
+
+double fmaxmag(double x, double y) {
+    double ax, ay;
+    if (isnan(x)) return isnan(y) ? x + y : y;
+    if (isnan(y)) return x;
+    ax = fabs(x);
+    ay = fabs(y);
+    if (ax > ay) return x;
+    if (ay > ax) return y;
+    /* Equal magnitudes: the even mantissa wins; if both are even (x and -x) the
+     * magnitude order decides, which puts fmaxmag(-1, 1) and fmaxmag(1, -1)
+     * both at 1. Spelled as ifs because a conditional expression here mis-binds
+     * under goc. */
+    if (even_mantissa(x) && !even_mantissa(y)) return x;
+    if (even_mantissa(y) && !even_mantissa(x)) return y;
+    return mag_precedes(x, y) ? y : x;
+}
+
+double fminmag(double x, double y) {
+    double ax, ay;
+    if (isnan(x)) return isnan(y) ? x + y : y;
+    if (isnan(y)) return x;
+    ax = fabs(x);
+    ay = fabs(y);
+    if (ax < ay) return x;
+    if (ay < ax) return y;
+    if (even_mantissa(x) && !even_mantissa(y)) return x;
+    if (even_mantissa(y) && !even_mantissa(x)) return y;
+    return mag_precedes(x, y) ? y : x;
+}
+
+/* nextup / nextdown: one representable step toward +infinity / -infinity.
+ *
+ * The zero cases are spelled with signbit() rather than `x == -0.0`, because
+ * -0.0 == 0.0 is true by IEEE 754 and goc additionally constant-folds the
+ * -0.0 literal to +0.0 -- so a comparison cannot tell the two zeros apart at
+ * all, and testing it that way sends +0.0 down the -0.0 branch. signbit() is
+ * the only thing here that sees the difference.
+ *
+ * Stepping away from zero has to produce the smallest subnormal rather than
+ * crossing to the other sign, which is what nextafter(0, dir) already does;
+ * the one thing worth spelling out is that -0.0 and +0.0 are adjacent to each
+ * other (there is no value between them), so nextup(-0.0) is +0.0 itself. */
+double nextup(double x) {
+    union DU u;
+    if (isnan(x)) return x;
+    if (x == HUGE_VAL) return x;                /* already +infinity */
+    if (x == 0.0) {
+        /* -0.0 and +0.0 are adjacent -- nothing lies between them -- so -0.0
+         * steps straight to +0.0, while +0.0 steps to the smallest
+         * subnormal. signbit() is the only thing that tells them apart. */
+        if (signbit(x)) {
+            u.i = 0ULL;
+            return u.d;
+        }
+        return nextafter(x, 1.0);
+    }
+    return nextafter(x, HUGE_VAL);
+}
+
+double nextdown(double x) {
+    union DU u;
+    if (isnan(x)) return x;
+    if (x == -HUGE_VAL) return x;               /* already -infinity */
+    if (x == 0.0) {
+        if (!signbit(x)) {
+            u.i = 0x8000000000000000ULL;        /* -0.0 follows +0.0 */
+            return u.d;
+        }
+        return nextafter(x, -1.0);
+    }
+    return nextafter(x, -HUGE_VAL);
+}
+
+/* roundeven. goclib's rint() is already round-to-nearest-even and there is no
+ * rounding-mode state to re-read, so this is the same computation under the
+ * name C23 requires. It is a separate function because a caller is entitled to
+ * assume the two can differ. */
+double roundeven(double x) {
+    return rint(x);
+}
+
+/* exp10: 10^x as exp(x * ln10). Reusing exp keeps one exponential to
+ * maintain, and the product is exact enough that exp's own accuracy is what
+ * limits the result -- ln10 is irrational, so x * ln10 cannot in general be
+ * exact, but the double rounding costs far less than the ~1 ULP exp already
+ * carries. Only x == 0 is special-cased, so 10^0 is exactly 1. */
+double exp10(double x) {
+    if (x == 0.0) return 1.0;
+    return exp(x * 2.30258509299404568402);
+}
+
+/* issignaling: goclib only ever produces quiet NaNs -- every arithmetic
+ * result and every NAN/DBL_SNAN constant is quiet -- so this is always 0.
+ * It exists because C23 makes it mandatory, and reporting 0 for a quiet NaN
+ * is the correct answer (a signalling NaN would need the payload to say so). */
+int issignaling(double x) {
+    (void)x;
+    return 0;
+}
+
+/* getpayload: the NaN payload with the sign cleared. The standard leaves the
+ * result unspecified for a non-NaN, so x passes through unchanged -- which is
+ * what a caller that ignored the classification would have got anyway. */
+double getpayload(double x) {
+    union DU u;
+    if (!isnan(x)) return x;
+    u.d = x;
+    u.i &= 0x7FFFFFFFFFFFFFFFULL;
+    return u.d;
+}
+
+/* getsign: -1.0 or +1.0 as a double. There is no 0 case: signbit gives 0 for
+ * +0.0, but getsign(+0.0) is +1.0 because zero carries no sign of its own. */
+double getsign(double x) {
+    /* signbit() rather than a bit test on the pattern: the 64-bit mask and
+     * shift forms do not survive goc's codegen (see total_cmp above). */
+    return signbit(x) ? -1.0 : 1.0;
+}
+
+/* fromfp / ufromfp.
+ *
+ * The conversion is the nearest integer under round-to-nearest-even, which is
+ * the only rounding direction goclib has. An out-of-range or NaN argument is
+ * a domain error: the standard's "otherwise returns 0" wording is honoured and
+ * errno is set so a caller can tell that 0 was an error rather than a real
+ * result. The bound is 2^63 for both: ufromfp must reject negatives, and
+ * casting those would go through the same conversion, so one guard covers both.
+ *
+ * rint() before the cast is not decoration. C's floating-to-integer
+ * conversion truncates toward zero -- (long long)3.9 is 3 -- so a bare cast
+ * would give fromfp(3.9) == 3 and fromfp(-3.9) == -3, which is not what
+ * fromfp means. Rounding first also gets the tie case right for free, because
+ * rint is round-to-nearest-even: 2.5 goes to 2 and 3.5 goes to 4. */
+long long fromfp(double fp) {
+    union DU u;
+    /* (double)(long long)2^63 is 2^63 exactly, so this compares the input
+     * against the first unrepresentable value. u.i carries that as the
+     * bit pattern, which avoids a literal the compiler would have to round. */
+    u.i = 0x43E0000000000000ULL;                /* 2^63 */
+    if (isnan(fp) || fp >= u.d || fp < -u.d) {
+        errno = EDOM;
+        return 0;
+    }
+    return (long long)rint(fp);
+}
+
+unsigned long long ufromfp(double fp) {
+    union DU u;
+    u.i = 0x43E0000000000000ULL;                /* 2^63 */
+    if (isnan(fp) || fp >= u.d || fp < 0.0) {
+        errno = EDOM;
+        return 0;
+    }
+    return (unsigned long long)rint(fp);
+}/* totalorder / totalordermag.
+ *
+ * The textbook implementation builds a "biased key" -- flip every bit of a
+ * negative, set the top bit of a positive -- and compares the two keys as
+ * unsigned integers. That is four lines and it is what every hand-written
+ * version does, and it does not work here: goc cannot read the sign of a
+ * 64-bit pattern. The literal 0x8000000000000000ULL assembles to
+ * `mov rax, -9223372036854775808`, whose imm32 form sign-extends from the low
+ * half (zero), leaving 0xFFFFFFFF00000000 -- bit 31 set rather than bit 63 --
+ * and `(bits >> 63) & 1` is wrong for the same reason. copysign() in this file
+ * uses the literal successfully, so the fault is specific to this operand
+ * shape, not to the literal; but there is no reason to depend on it.
+ *
+ * signbit() is the way through: it is already here, and it reads the sign the
+ * portable way (a comparison against zero) rather than through a mask. With the
+ * sign in hand the comparison is spelled out as the standard defines it --
+ * sign first, then the remaining bits -- which is a few lines longer than the
+ * key trick and reads the same everywhere.
+ */
+/* |v| as a bit pattern, which for a non-NaN is monotone in |v| -- the
+ * comparison totalordermag needs. copysign(x, 1.0) is the portable way to strip
+ * the sign without a 64-bit mask. */
+static unsigned long long magnitude_of(double v) {
+    union DU u;
+    u.d = copysign(v, 1.0);
+    return u.i;
+}
+
+static int total_cmp(double x, double y, int by_magnitude) {
+    union DU ux, uy;
+    unsigned long long mx, my;
+    int xneg, yneg;
+    ux.d = x;
+    uy.d = y;
+    /* NaN outranks every number, infinity included. */
+    if (isnan(x)) {
+        if (!isnan(y)) return 1;
+        /* Both NaN. The standard puts every NaN above every number, and orders
+         * NaNs among themselves by payload, with the sign only breaking a tie.
+         * goc cannot read the sign off a 64-bit pattern (see above), so the
+         * comparison is done on the payload with the sign stripped -- which
+         * makes two NaNs that differ only in sign compare equal, the one
+         * deviation forced by that limitation and noted in math.h. */
+        {
+            unsigned long long px = magnitude_of(x);
+            unsigned long long py = magnitude_of(y);
+            if (px < py) return -1;
+            if (px > py) return 1;
+        }
+        return 0;
+    }
+    if (isnan(y)) return -1;
+    /* Under the magnitude order the sign is not part of the identity at all:
+     * 1.0 and -1.0 are one value there, and so are the two zeros. Taking the
+     * magnitude of both operands first is what gives that; it has to happen
+     * before the sign comparison below, or the sign would separate them. */
+    if (by_magnitude) {
+        mx = magnitude_of(x);
+        my = magnitude_of(y);
+    } else {
+        xneg = signbit(x);
+        yneg = signbit(y);
+        if (xneg != yneg) return xneg ? -1 : 1; /* negative sorts below positive */
+        /* Same side of zero, so the rest of the pattern orders them directly:
+         * for two negatives the more negative has the larger pattern, hence
+         * the flip. */
+        mx = xneg ? ~ux.i : ux.i;
+        my = yneg ? ~uy.i : uy.i;
+    }
+    if (mx < my) return -1;
+    if (mx > my) return 1;
+    return 0;
+}
+
+int totalorder(const double *x, const double *y) {
+    if (x == 0) return 0;
+    if (y == 0) return 0;
+    return total_cmp(*x, *y, 0);
+}
+
+int totalordermag(const double *x, const double *y) {
+    if (x == 0) return 0;
+    if (y == 0) return 0;
+    return total_cmp(*x, *y, 1);
+}
