@@ -367,10 +367,18 @@ func (tr *typeResolver) binaryType(n *frontend.Binary) *frontend.Type {
 		// but a surrounding expression still needs a width to resolve against.
 		return frontend.IntType()
 	case "==", "!=", "<", ">", "<=", ">=":
-		// A comparison's result is i1, but its operands share the usual
-		// arithmetic common type; that is the width-sensitive operand type a
-		// surrounding expression needs.
-		return arithCommon(lt, rt)
+		// A comparison's result type is int in C, whatever the operands are.
+		// Returning the common operand type here instead (which this did, to
+		// give a surrounding expression "a width to resolve against") made
+		// "(a != b)" look like a double, and then "long v; v += (a != b)"
+		// resolved its common type as double and emitted
+		//   sitofp i64 -> double, fadd double, fptosi double -> i64
+		// for what is an integer add. The emitter widens each operand to the
+		// common type on its own, so nothing here needs the operand type --
+		// a width-sensitive surrounding expression gets int, which is what
+		// C says the comparison yields, and integer promotion of int is a
+		// no-op anyway.
+		return frontend.IntType()
 	case "+", "-":
 		if lt != nil && lt.IsPtr() && rt != nil && rt.IsPtr() {
 			if n.Op == "-" {

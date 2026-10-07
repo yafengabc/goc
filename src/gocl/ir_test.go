@@ -394,3 +394,33 @@ func irFrom(t *testing.T, opt int) string {
 	}
 	return ir
 }
+
+// A comparison's C result type is int whatever the operands are. When
+// binaryType answered with the operand common type instead, "v += (a != b)"
+// over doubles resolved its own common type as double and emitted
+//
+//	sitofp i64 -> double; fadd double; fptosi double -> i64
+//
+// for what is an integer add: three extra conversions per evaluation plus an
+// integer-to-float round trip that a wide accumulator cannot always survive.
+// Measured on a 1e8-iteration loop that read one volatile double per pass, it
+// cost 0.46s against clang -O2 and gcc -O2's 0.20s; with the type fixed, 0.06s
+// -- LLVM then sees the loop invariant it was being denied.
+//
+// The result is unchanged either way, so nothing that checks the computed
+// answer can catch a regression here. Only the shape can.
+func TestIRComparisonResultIsInt(t *testing.T) {
+	ir, _ := irFromSource(t, `
+long v;
+double a, b;
+void f(void){ v += (a != b); }
+`)
+	for _, bad := range []string{"sitofp", "uitofp", "fptosi", "fptoui"} {
+		if strings.Contains(ir, bad) {
+			t.Errorf("\"v += (a != b)\" emitted %s: an integer add was routed through floating point:\n%s", bad, ir)
+		}
+	}
+	if !strings.Contains(ir, "add i64") {
+		t.Errorf("\"v += (a != b)\" has no integer add:\n%s", ir)
+	}
+}
