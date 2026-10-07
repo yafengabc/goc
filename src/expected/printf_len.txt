@@ -1,0 +1,11 @@
+d=-42 ld=-43 lld=-44
+u=42 lu=43 llu=44
+x=12ab lx=12ab llx=12ab
+X=12AB lX=12AB llX=12AB
+o=1411 lo=1411 llo=1411
+hd=-7 hhd=-8 hu=9
+zd=-9 zu=9
+jd=-10 ju=10
+min=-9223372036854775808 max=18446744073709551615
+shift=4503599627370496 shiftu=9223372036854775808
+mixed=1/2/3/four

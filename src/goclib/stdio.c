@@ -70,14 +70,19 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             if (*p == '*') { prec = va_arg(ap, int); p++; }
             else { while (*p >= '0' && *p <= '9') { prec = prec * 10 + (*p - '0'); p++; } }
         }
-        /* length modifiers select long/short forms; every va slot is 8
-         * bytes, so skipping the whole run is enough (same as the asm).
-         * "l" in front of s or c is NOT skippable: %ls/%lc take a wchar_t
-         * array / a wchar_t, not a char* / an int. */
-        int wide = 0;
+        /* Length modifiers. `wide` (a single `l`) only reinterprets %s/%c as
+         * %ls/%lc; the integer conversions need the whole run, because the run
+         * is what says how wide the argument is: `l` selects long, `ll`
+         * selects long long, and `z`/`j`/`t` select size_t / intmax_t /
+         * ptrdiff_t. h/hh select short/char, but the default argument
+         * promotions have already widened those to int by the time the
+         * argument is stored, so they are read back as int. */
+        int wide = 0, longs = 0, sizeT = 0, imax = 0;
         while (*p == 'l' || *p == 'h' || *p == 'L' ||
                *p == 'z' || *p == 'j' || *p == 't') {
-            if (*p == 'l') wide = 1;
+            if (*p == 'l') { longs++; wide = 1; }
+            else if (*p == 'z' || *p == 't') sizeT = 1;
+            else if (*p == 'j') imax = 1;
             p++;
         }
         char spec = *p++;
@@ -121,24 +126,41 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             field[fl++] = (char)c;
         } else if (spec == 'd' || spec == 'i' || spec == 'u' ||
                    spec == 'o' || spec == 'x' || spec == 'X') {
-            /* integers: read as int, which is what the default argument
-             * promotions make a %d/%i/%u/%o/%x/%X argument. Reading a `long`
-             * instead -- which looks harmless on x86-64, where every vararg
-             * fills an eight-byte slot -- reads EIGHT bytes out of a FOUR-byte
-             * slot on a 32-bit target, so the upper half is whatever the stack
-             * happened to hold: printf("%d", 0) printed 4294967296 there. */
-            unsigned long v;
+            /* The width of the read follows the length modifier. It cannot be
+             * one width for every conversion, because the two ends of the
+             * range disagree about how wide a slot is:
+             *
+             *   %d   -- the default argument promotions deliver an int. On
+             *           x86-64 that int arrives in an eight-byte slot, so
+             *           reading eight bytes looked harmless, but on a 32-bit
+             *           target the slot is four bytes and the upper half came
+             *           from whatever was next to it: printf("%d", 0) printed
+             *           4294967296 there.
+             *   %lld -- the argument really is eight bytes, so reading four
+             *           keeps only the low half: printf("%lld", 1LL << 52)
+             *           printed 0.
+             *
+             * Both are the same bug seen from opposite ends -- one hard-coded
+             * width for conversions whose widths differ -- so the fix has to
+             * be a per-conversion choice, not a different single width. */
+            unsigned long long v;
             if (spec == 'd' || spec == 'i') {
-                int sv = va_arg(ap, int);
-                if (sv < 0 && spec != 'u') {
+                long long sv;
+                if (longs >= 2 || imax)       sv = va_arg(ap, long long);
+                else if (longs == 1 || sizeT) sv = va_arg(ap, long);
+                else                          sv = va_arg(ap, int);
+                if (sv < 0) {
                     field[fl++] = '-';
-                    v = (unsigned long)(-(long)sv);
+                    /* -(LLONG_MIN) overflows, so the magnitude goes through
+                     * -(sv + 1) + 1 rather than through -sv. */
+                    v = (unsigned long long)(-(sv + 1)) + 1ull;
                 } else {
-                    v = (unsigned long)(unsigned int)sv;
+                    v = (unsigned long long)sv;
                 }
-                if (spec == 'u') v = (unsigned long)(unsigned int)sv;
             } else {
-                v = va_arg(ap, unsigned int);
+                if (longs >= 2 || imax)       v = va_arg(ap, unsigned long long);
+                else if (longs == 1 || sizeT) v = va_arg(ap, unsigned long);
+                else                          v = va_arg(ap, unsigned int);
             }
         /* convert in the chosen base */
         int base = 10;
