@@ -1,4 +1,5 @@
 #include "goclib.h"
+#include <stdint.h>
 
 /* ----------------------------- <string.h> ------------------------------- */
 
@@ -282,4 +283,17 @@ void *memccpy(void *dest, const void *src, int c, size_t n) {
         if (s[i] == want) return (void *)(d + i + 1);
     }
     return 0;
+}
+
+/* memalignment (C23): the largest power of two dividing the address. Reading
+ * (a & 1) tells us the lowest bit; each time it is zero we fold the address
+ * right by one and double the result. A null pointer (a == 0) returns 1, which
+ * is the safe degenerate the standard prescribes. uintptr_t comes from stdint.h,
+ * included at the top of this file. */
+size_t memalignment(const void *p) {
+    uintptr_t a = (uintptr_t)p;
+    if (a == 0) return 1;
+    size_t r = 1;
+    while ((a & 1) == 0) { a >>= 1; r <<= 1; }
+    return r;
 }

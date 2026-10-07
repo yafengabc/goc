@@ -58,5 +58,9 @@ void  *memrchr(const void *s, int c, size_t n);
 /* memccpy copies src->dest, stopping after the first byte == (unsigned char)c.
  * Returns dest + (index_of_c + 1), or NULL if c is not found within n bytes. */
 void  *memccpy(void *dest, const void *src, int c, size_t n);
+/* memalignment (C23): the largest power of two that evenly divides p. A null
+ * pointer returns 1. Useful for checking whether a buffer sits on the boundary
+ * a hot loop needs before committing to a wider load/store path. */
+size_t memalignment(const void *p);
 
 #endif /* GOC_STRING_H */

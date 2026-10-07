@@ -41,6 +41,33 @@ void *realloc(void *ptr, size_t size) {
 #endif
 }
 
+/* reallocarray (C23): like realloc(ptr, nmemb*size) but refuses to wrap the
+ * multiplication. The check `size > (size_t)-1 / nmemb` catches every overflow
+ * without doing nmemb*size ourselves (which would itself overflow). errno is the
+ * library's private numbering, so ENOMEM (7) is what strerror maps to "Cannot
+ * allocate memory". */
+void *reallocarray(void *ptr, size_t nmemb, size_t size) {
+    if (nmemb != 0 && size > (size_t)-1 / nmemb) {
+        errno = ENOMEM;
+        return 0;
+    }
+    return realloc(ptr, nmemb * size);
+}
+
+/* free_sized / free_aligned_sized (C23): the size/alignment are a caller
+ * assertion the standard uses to pick a faster free path; goc's heap does not
+ * need them, so both reduce to free. Passing the wrong size is undefined, as
+ * the standard says -- we just don't depend on it being right. */
+void free_sized(void *ptr, size_t size) {
+    (void)size;
+    free(ptr);
+}
+void free_aligned_sized(void *ptr, size_t alignment, size_t size) {
+    (void)alignment;
+    (void)size;
+    free(ptr);
+}
+
 /* goc's heap allocator returns 16-byte aligned blocks, which satisfies every
  * request with alignment <= 16 exactly (the common case, including typical
  * SIMD alignments). Larger power-of-two alignments are not strictly honoured

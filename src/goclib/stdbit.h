@@ -90,6 +90,20 @@ unsigned int stdc_bit_width_ull(unsigned long long x);
 unsigned long long stdc_bit_floor_ull(unsigned long long x);
 unsigned long long stdc_bit_ceil_ull(unsigned long long x);
 
+/* C23 rotation (7.18). `shift` is always unsigned int; each value is rotated
+ * within its own width. goc has no rotate built-in, so these are plain shifts
+ * (see stdbit.c for the width-bounded implementations). */
+unsigned char       stdc_rotate_left_uc(unsigned char value, unsigned int shift);
+unsigned short      stdc_rotate_left_us(unsigned short value, unsigned int shift);
+unsigned int        stdc_rotate_left_ui(unsigned int value, unsigned int shift);
+unsigned long       stdc_rotate_left_ul(unsigned long value, unsigned int shift);
+unsigned long long  stdc_rotate_left_ull(unsigned long long value, unsigned int shift);
+unsigned char       stdc_rotate_right_uc(unsigned char value, unsigned int shift);
+unsigned short      stdc_rotate_right_us(unsigned short value, unsigned int shift);
+unsigned int        stdc_rotate_right_ui(unsigned int value, unsigned int shift);
+unsigned long       stdc_rotate_right_ul(unsigned long value, unsigned int shift);
+unsigned long long  stdc_rotate_right_ull(unsigned long long value, unsigned int shift);
+
 #define stdc_leading_zeros(x) _Generic((x), unsigned char: stdc_leading_zeros_uc(x), unsigned short: stdc_leading_zeros_us(x), unsigned int: stdc_leading_zeros_ui(x), unsigned long: stdc_leading_zeros_ul(x))
 #define stdc_leading_ones(x) _Generic((x), unsigned char: stdc_leading_ones_uc(x), unsigned short: stdc_leading_ones_us(x), unsigned int: stdc_leading_ones_ui(x), unsigned long: stdc_leading_ones_ul(x))
 #define stdc_trailing_zeros(x) _Generic((x), unsigned char: stdc_trailing_zeros_uc(x), unsigned short: stdc_trailing_zeros_us(x), unsigned int: stdc_trailing_zeros_ui(x), unsigned long: stdc_trailing_zeros_ul(x))
@@ -104,4 +118,6 @@ unsigned long long stdc_bit_ceil_ull(unsigned long long x);
 #define stdc_bit_width(x) _Generic((x), unsigned char: stdc_bit_width_uc(x), unsigned short: stdc_bit_width_us(x), unsigned int: stdc_bit_width_ui(x), unsigned long: stdc_bit_width_ul(x))
 #define stdc_bit_floor(x) _Generic((x), unsigned char: stdc_bit_floor_uc(x), unsigned short: stdc_bit_floor_us(x), unsigned int: stdc_bit_floor_ui(x), unsigned long: stdc_bit_floor_ul(x))
 #define stdc_bit_ceil(x) _Generic((x), unsigned char: stdc_bit_ceil_uc(x), unsigned short: stdc_bit_ceil_us(x), unsigned int: stdc_bit_ceil_ui(x), unsigned long: stdc_bit_ceil_ul(x))
+#define stdc_rotate_left(value, shift) _Generic((value), unsigned char: stdc_rotate_left_uc(value, shift), unsigned short: stdc_rotate_left_us(value, shift), unsigned int: stdc_rotate_left_ui(value, shift), unsigned long: stdc_rotate_left_ul(value, shift))
+#define stdc_rotate_right(value, shift) _Generic((value), unsigned char: stdc_rotate_right_uc(value, shift), unsigned short: stdc_rotate_right_us(value, shift), unsigned int: stdc_rotate_right_ui(value, shift), unsigned long: stdc_rotate_right_ul(value, shift))
 #endif /* GOC_STDBIT_H */

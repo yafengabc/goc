@@ -87,4 +87,16 @@ _Noreturn void quick_exit(int code);
  * non-zero value when a command processor is available. */
 int system(const char *command);
 
+/* ---- C23 additions ------------------------------------------------------ */
+/* reallocarray: realloc(ptr, nmemb*size) with overflow-checked multiplication.
+ * On overflow it sets errno to ENOMEM and returns NULL, exactly like the
+ * standard, so a caller cannot accidentally allocate a wrapped-small block. */
+void *reallocarray(void *ptr, size_t nmemb, size_t size);
+/* free_sized / free_aligned_sized (C23 7.22.3.3/.4): sized deallocation. The
+ * size / alignment arguments are a contract the caller makes about the block
+ * that was returned by malloc/calloc/realloc/aligned_alloc; the allocator
+ * ignores them and frees ptr exactly as free(ptr) would. */
+void free_sized(void *ptr, size_t size);
+void free_aligned_sized(void *ptr, size_t alignment, size_t size);
+
 #endif /* GOC_STDLIB_H */

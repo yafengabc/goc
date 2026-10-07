@@ -104,3 +104,63 @@ bool stdc_has_single_bit_ull(unsigned long long x){ return x != 0 && (x & (x - 1
 unsigned int stdc_bit_width_ull(unsigned long long x){ return sbw64(x); }
 unsigned long long stdc_bit_floor_ull(unsigned long long x){ if (x == 0) return 0; return (unsigned long)((unsigned long)1 << (sbw64(x) - 1u)); }
 unsigned long long stdc_bit_ceil_ull(unsigned long long x){ if (x <= 1u) return (unsigned long)1; return (unsigned long)((unsigned long)1 << sbw64((unsigned long)(x - 1u))); }
+
+/* ---- C23 rotation (7.18) -------------------------------------------------
+ *
+ * goc has no rotate built-in, so each width is rotated with a width-bounded
+ * pair of shifts. `s` is masked into [0, width) first: when the masked shift
+ * is 0 the result is the identity (correct -- rotating by the full width is a
+ * no-op), and the `(width - s)` companion shift is then never 0, so no operand
+ * is ever shifted by its own width (which would be undefined). Operands are
+ * unsigned, so right shifts are logical. */
+static unsigned char rotl8(unsigned char x, unsigned int s) {
+    unsigned int m = s & 7;
+    if (m == 0) return x;            /* rotate by the full width is identity */
+    return (unsigned char)((x << m) | (x >> (8 - m)));
+}
+static unsigned char rotr8(unsigned char x, unsigned int s) {
+    unsigned int m = s & 7;
+    if (m == 0) return x;
+    return (unsigned char)((x >> m) | (x << (8 - m)));
+}
+static unsigned short rotl16(unsigned short x, unsigned int s) {
+    unsigned int m = s & 15;
+    if (m == 0) return x;
+    return (unsigned short)((x << m) | (x >> (16 - m)));
+}
+static unsigned short rotr16(unsigned short x, unsigned int s) {
+    unsigned int m = s & 15;
+    if (m == 0) return x;
+    return (unsigned short)((x >> m) | (x << (16 - m)));
+}
+static unsigned int rotl32(unsigned int x, unsigned int s) {
+    unsigned int m = s & 31;
+    if (m == 0) return x;
+    return (x << m) | (x >> (32 - m));
+}
+static unsigned int rotr32(unsigned int x, unsigned int s) {
+    unsigned int m = s & 31;
+    if (m == 0) return x;
+    return (x >> m) | (x << (32 - m));
+}
+static unsigned long long rotl64(unsigned long long x, unsigned int s) {
+    unsigned int m = s & 63;
+    if (m == 0) return x;
+    return (x << m) | (x >> (64 - m));
+}
+static unsigned long long rotr64(unsigned long long x, unsigned int s) {
+    unsigned int m = s & 63;
+    if (m == 0) return x;
+    return (x >> m) | (x << (64 - m));
+}
+
+unsigned char stdc_rotate_left_uc(unsigned char x, unsigned int s) { return rotl8(x, s); }
+unsigned char stdc_rotate_right_uc(unsigned char x, unsigned int s) { return rotr8(x, s); }
+unsigned short stdc_rotate_left_us(unsigned short x, unsigned int s) { return rotl16(x, s); }
+unsigned short stdc_rotate_right_us(unsigned short x, unsigned int s) { return rotr16(x, s); }
+unsigned int stdc_rotate_left_ui(unsigned int x, unsigned int s) { return rotl32(x, s); }
+unsigned int stdc_rotate_right_ui(unsigned int x, unsigned int s) { return rotr32(x, s); }
+unsigned long stdc_rotate_left_ul(unsigned long x, unsigned int s) { return (unsigned long)rotl64((unsigned long long)x, s); }
+unsigned long stdc_rotate_right_ul(unsigned long x, unsigned int s) { return (unsigned long)rotr64((unsigned long long)x, s); }
+unsigned long long stdc_rotate_left_ull(unsigned long long x, unsigned int s) { return rotl64(x, s); }
+unsigned long long stdc_rotate_right_ull(unsigned long long x, unsigned int s) { return rotr64(x, s); }
