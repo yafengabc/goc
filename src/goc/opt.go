@@ -1125,22 +1125,29 @@ var f2IdxRegSkip bool
 // sibFold collapses the address-computation idiom that genLValue emits for
 // array indexing
 //
-//	imul r11, K       ; index * element_width (K is 1/2/4/8)
-//	add  r10, r11     ; base + scaled index
-//	mov  D, [r10]     ; (or mov [r10], S) -- the element load / store
+//		imul r11, K       ; index * element_width (K is 1/2/4/8)   [legacy codegen]
+//		add  r10, r11     ; base + scaled index
+//	  -- or --
+//		lea  r10, [r10 + r11*K]   ; base + scaled index            [current codegen]
+//	  -- followed by --
+//		mov  D, [r10]     ; (or mov [r10], S) -- the element load / store
 //
 // into a single SIB memory operand
 //
 //	mov  D, [r10+r11*K]
 //
-// A signed index was movsxd'd into r11 before the imul, so a negative index
-// has already been sign-extended and the 64-bit two's-complement scaled add
-// wraps exactly like the SIB scale (which uses the full 64-bit index register
-// times the scale); the fold is therefore safe for negative indices too.
+// A signed index was movsxd'd into r11 before the address computation, so a
+// negative index has already been sign-extended and the 64-bit two's-complement
+// scaled add wraps exactly like the SIB scale (which uses the full 64-bit index
+// register times the scale); the fold is therefore safe for negative indices
+// too. The two address shapes are equivalent: both leave r10 = base+index*K with
+// the index still in r11. `lea` writes no flags, so it is strictly safer than
+// the imul/add pair (which set CF/OF); the same register-reuse / gap / window
+// discipline still applies.
 //
 // Correctness discipline (mirrors slotCache's window model):
-//   - only the exact three-instruction idiom, strictly adjacent, all
-//     instInstr lines;
+//   - only the exact idiom (imul+add or lea), strictly adjacent to the
+//     load/store, all instInstr lines;
 //   - the load/store must address plain [r10] (no displacement) and its
 //     destination / source must not reference r10 or r11 (a load into the
 //     base register would destroy the SIB base; a store whose source is the
@@ -1150,44 +1157,68 @@ var f2IdxRegSkip bool
 //     allowed only when neither register is read again before it is next
 //     written;
 //   - flags: imul/add write flags, so no flag-reading instruction may sit
-//     between the fold point and the next flag-writing instruction;
+//     between the fold point and the next flag-writing instruction (lea sets
+//     no flags, so this is automatically satisfied for the lea shape);
 //   - windows break at labels, calls, jumps, returns and inline asm.
 func sibFold(insts []Inst) []Inst {
 	out := make([]Inst, 0, len(insts))
 	reAdd := []byte("\tadd r10, r11")
 	reImul := []byte("\timul r11, ")
+	reLea := []byte("\tlea r10, [r10 + r11*")
 	for i := 0; i < len(insts); i++ {
 		in := insts[i]
-		if in.Kind != instInstr || !strings.HasPrefix(in.Text, string(reImul)) {
+		if in.Kind != instInstr {
 			out = append(out, in)
 			continue
 		}
-		k, err := strconv.Atoi(strings.TrimSpace(in.Text[len(reImul):]))
-		if err != nil || (k != 1 && k != 2 && k != 4 && k != 8) {
+		// Identify the address-computation instruction and the K scale.
+		k := -1
+		storeOffset := 0 // instructions from `in` to the consuming load/store
+		switch {
+		case strings.HasPrefix(in.Text, string(reImul)):
+			if kk, err := strconv.Atoi(strings.TrimSpace(in.Text[len(reImul):])); err == nil &&
+				(kk == 1 || kk == 2 || kk == 4 || kk == 8) {
+				k = kk
+				storeOffset = 2 // imul, add, then store
+			}
+		case strings.HasPrefix(in.Text, string(reLea)):
+			// "lea r10, [r10 + r11*K]" -- K is the trailing integer before ']'.
+			// A displaced form "lea r10, [r10 + r11*K ± disp]" is left alone:
+			// folding its follow-up load would discard the displacement.
+			s := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(in.Text, string(reLea))), "]")
+			if kk, err := strconv.Atoi(s); err == nil &&
+				(kk == 1 || kk == 2 || kk == 4 || kk == 8) {
+				k = kk
+				storeOffset = 1 // lea, then store
+			}
+		}
+		if k < 0 {
 			out = append(out, in)
 			continue
 		}
-		if i+2 >= len(insts) || insts[i+1].Kind != instInstr ||
-			!strings.HasPrefix(insts[i+1].Text, string(reAdd)) {
-			out = append(out, in)
-			continue
+		// The imul shape needs `add r10, r11` immediately after it.
+		if storeOffset == 2 {
+			if i+1 >= len(insts) || insts[i+1].Kind != instInstr ||
+				!strings.HasPrefix(insts[i+1].Text, string(reAdd)) {
+				out = append(out, in)
+				continue
+			}
 		}
-		// The store that consumes the scaled address normally sits
-		// immediately after the `add r10, r11`. But codegen emits the
-		// store's source load *between* the add and the store (e.g.
-		//   imul r11,4 / add r10,r11 / mov rax,[slot] / mov dword [r10],eax),
-		// which breaks the strict three-instruction adjacency. Allow exactly
-		// one gap instruction provided it neither touches r10/r11 nor reads
-		// flags (the deleted imul/add set them) -- it is kept verbatim so the
-		// store still gets its source.
-		storeIdx := i + 2
+		// The store that consumes the scaled address normally sits right after
+		// the address computation. But codegen may emit the store's source
+		// load *between* the address step and the store (e.g. imul r11,4 / add
+		// r10,r11 / mov rax,[slot] / mov dword [r10],eax), which breaks strict
+		// adjacency. Allow exactly one gap instruction provided it neither
+		// touches r10/r11 nor reads flags -- it is kept verbatim so the store
+		// still gets its source.
+		storeIdx := i + storeOffset
 		gapIdx := -1
 		if _, ok := sibFoldMov(insts[storeIdx].Text, k); !ok {
-			if i+3 < len(insts) && insts[i+2].Kind == instInstr &&
-				sibFoldGapSafe(insts[i+2]) && insts[i+3].Kind == instInstr {
-				if _, ok2 := sibFoldMov(insts[i+3].Text, k); ok2 {
-					gapIdx = i + 2
-					storeIdx = i + 3
+			if i+storeOffset+1 < len(insts) && insts[i+storeOffset].Kind == instInstr &&
+				sibFoldGapSafe(insts[i+storeOffset]) && insts[i+storeOffset+1].Kind == instInstr {
+				if _, ok2 := sibFoldMov(insts[i+storeOffset+1].Text, k); ok2 {
+					gapIdx = i + storeOffset
+					storeIdx = i + storeOffset + 1
 				}
 			}
 		}
@@ -1205,7 +1236,7 @@ func sibFold(insts []Inst) []Inst {
 			out = append(out, insts[gapIdx]) // keep the source load
 		}
 		out = append(out, Inst{Kind: instInstr, Text: folded})
-		i = storeIdx // drop the imul, the add, the optional gap, and the store
+		i = storeIdx // drop the address step, the optional gap, and the store
 	}
 	return out
 }
@@ -1349,7 +1380,7 @@ func writesReg(t, reg string) bool {
 	parts := strings.SplitN(t, " ", 2)
 	op := parts[0]
 	switch op {
-	case "mov", "movsxd", "movzx", "movslq", "add", "sub", "imul", "lea", "and", "or", "xor", "inc", "dec",
+	case "mov", "movsxd", "movsx", "movzx", "movslq", "add", "sub", "imul", "lea", "and", "or", "xor", "inc", "dec",
 		"neg", "not", "shl", "shr", "sar", "sal", "rol", "ror", "pop",
 		"movq", "movd", "movmskpd", "movmskps",
 		"cvttsd2si", "cvtsd2si", "cvttss2si", "cvtss2si":

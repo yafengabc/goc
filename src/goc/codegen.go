@@ -759,26 +759,76 @@ func (c *CG) slotWidth(t *frontend.Type) int {
 // takes. width 8 (or any non-narrow value) is a no-op.
 func (c *CG) extendInt(width int, signed bool) {
 	switch width {
-	case 1: // char or bool
-		if signed {
-			c.emit("shl rax, 56")
-			c.emit("sar rax, 56")
-		} else {
-			c.emit("and rax, 0xff")
-		}
-	case 2: // short
-		if signed {
-			c.emit("shl rax, 48")
-			c.emit("sar rax, 48")
-		} else {
-			c.emit("and rax, 0xffff")
-		}
+	case 1, 2: // char/bool or short: a single sign/zero-extending move
+		c.extendRegNarrow("rax", width, signed)
 	case 4: // int
 		if signed {
 			c.emitWrap("shl rax, 32")
 			c.emitWrap("sar rax, 32")
+		} else {
+			// T1.6 (C5-b): mark the zero-extending half too. Only a marked pair
+			// is visible to elimRedundantExt, so without this the unsigned form
+			// could never be dropped or collapsed at all.
+			c.emitWrap("shl rax, 32")
+			c.emitWrap("shr rax, 32")
 		}
 		// case 8 for long/pointer is no-op, fall through
+	}
+}
+
+// narrowSubReg maps a 64-bit GP register to its low-byte (8-bit) and low-word
+// (16-bit) sub-register spellings, for emitting a single sign/zero-extending
+// move in extendRegNarrow.
+var narrowSubReg = map[string][2]string{
+	"rax": {"al", "ax"}, "rbx": {"bl", "bx"}, "rcx": {"cl", "cx"},
+	"rdx": {"dl", "dx"}, "rsi": {"sil", "si"}, "rdi": {"dil", "di"},
+	"r8": {"r8b", "r8w"}, "r9": {"r9b", "r9w"}, "r10": {"r10b", "r10w"},
+	"r11": {"r11b", "r11w"}, "r12": {"r12b", "r12w"}, "r13": {"r13b", "r13w"},
+	"r14": {"r14b", "r14w"}, "r15": {"r15b", "r15w"},
+}
+
+// extendRegNarrow sign/zero-extends the low width bytes of reg to the full
+// 64-bit register using a single movsx/movzx, replacing the old
+// `shl reg, N*8 ; sar/shr reg, N*8` shift pair (or `and reg, mask`). goc loads a
+// char/short into the register's low byte/word, so the whole extension is one
+// instruction (3 bytes vs ~8, and one fewer uop). It is emitted directly by
+// codegen -- not by a peephole pass -- so it helps every -O level, including
+// -O0, and carries none of the flag-discipline risk a late peephole would.
+func (c *CG) extendRegNarrow(reg string, width int, signed bool) {
+	sub, ok := narrowSubReg[reg]
+	if !ok {
+		// Unknown register: fall back to the shift idiom so behaviour is
+		// preserved (callers only pass GP index/accumulator registers).
+		switch width {
+		case 1:
+			if signed {
+				c.emit("shl " + reg + ", 56")
+				c.emit("sar " + reg + ", 56")
+			} else {
+				c.emit("and " + reg + ", 0xff")
+			}
+		case 2:
+			if signed {
+				c.emit("shl " + reg + ", 48")
+				c.emit("sar " + reg + ", 48")
+			} else {
+				c.emit("and " + reg + ", 0xffff")
+			}
+		}
+		return
+	}
+	if width == 1 {
+		if signed {
+			c.emit("movsx %s, %s", reg, sub[0])
+		} else {
+			c.emit("movzx %s, %s", reg, sub[0])
+		}
+	} else { // width 2
+		if signed {
+			c.emit("movsx %s, %s", reg, sub[1])
+		} else {
+			c.emit("movzx %s, %s", reg, sub[1])
+		}
 	}
 }
 
@@ -2134,21 +2184,7 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 		// low byte/half-word, not the low dword.
 		if n.Typ != nil && n.Typ.Kind == frontend.KInt && (n.Typ.Width == 1 || n.Typ.Width == 2) &&
 			t == frontend.TInt {
-			if n.Typ.Signed {
-				if n.Typ.Width == 1 {
-					c.emit("shl rax, 56")
-					c.emit("sar rax, 56")
-				} else {
-					c.emit("shl rax, 48")
-					c.emit("sar rax, 48")
-				}
-			} else {
-				if n.Typ.Width == 1 {
-					c.emit("and eax, 0xFF")
-				} else {
-					c.emit("and eax, 0xFFFF")
-				}
-			}
+			c.extendRegNarrow("rax", n.Typ.Width, n.Typ.Signed)
 		} else if t == frontend.TInt && n.Typ != nil && n.Typ.Kind == frontend.KInt && n.Typ.Width == 4 {
 			c.canonInt(n.Typ.Signed)
 		}
@@ -7588,24 +7624,13 @@ func (c *CG) genLValue(e frontend.Expr) error {
 			case iw == 8 || ip:
 				// long / pointer / ptrCapable index: full 64-bit value.
 				c.emit("mov r11, %s", idxReg)
-			case iw == 1 && is:
-				// signed char index: the home register carries only the raw
-				// low 8 bits (loadVar extends on read), so copy then sign-extend
-				// -- a plain full-width copy would drag garbage upper bits into
-				// the 64-bit SIB index (same bug class as a non-F2 short load).
+			case iw == 1 || iw == 2:
+				// narrow index: the home register carries only the raw low
+				// 8/16 bits (loadVar extends on read), so copy then sign/zero
+				// extend -- a plain full-width copy would drag garbage upper bits
+				// into the 64-bit SIB index (same bug class as a non-F2 short load).
 				c.emit("mov r11, %s", idxReg)
-				c.emit("shl r11, 56")
-				c.emit("sar r11, 56")
-			case iw == 1:
-				c.emit("mov r11, %s", idxReg)
-				c.emit("and r11, 0xff")
-			case iw == 2 && is:
-				c.emit("mov r11, %s", idxReg)
-				c.emit("shl r11, 48")
-				c.emit("sar r11, 48")
-			default: // iw == 2 unsigned short
-				c.emit("mov r11, %s", idxReg)
-				c.emit("and r11, 0xffff")
+				c.extendRegNarrow("r11", iw, is)
 			}
 		} else if iw == 4 && is && !ip {
 			// N11: sign-extend a signed int index from the slot's low dword
@@ -7622,15 +7647,20 @@ func (c *CG) genLValue(e frontend.Expr) error {
 		// else keeps the 8-byte slot stride. goa supports imul-with-immediate,
 		// so a single scaled multiply replaces the old triple doubling-add.
 		ew := c.elemWidthOf(n.Base)
+		// Scale 1/2/4/8 are the only encodable SIB scales; for those a single
+		// scaled-index LEA computes base+index*ew with no separate multiply or
+		// add (this is what sibFold / LLVM produce for a bare var index too,
+		// e.g. s[n] -> lea r10,[r10+r11*1]). Any other element width -- rare,
+		// only for non-power-of-two structs -- keeps the imul/add fallback.
+		scaledOk := ew == 1 || ew == 2 || ew == 4 || ew == 8
 		if idxReg != "" && idxConst != 0 {
 			disp := idxConst * int64(ew)
-			if ew == 1 || ew == 2 || ew == 4 || ew == 8 {
+			if scaledOk {
 				// F2-EXT: fold var±const directly into a scaled-index LEA,
 				// recovering the single-instruction addressing sibFold would
 				// otherwise produce for a bare var index (a[j+1] -> lea into
 				// [base + r11*ew ± disp]) instead of materialising var±const
-				// as a spilled value. Scale 1/2/4/8 are the only encodable
-				// SIB scales; any other element width falls back below.
+				// as a spilled value.
 				sign := "+"
 				adisp := disp
 				if disp < 0 {
@@ -7648,8 +7678,12 @@ func (c *CG) genLValue(e frontend.Expr) error {
 				}
 			}
 		} else {
-			c.emit("imul r11, %d", ew)
-			c.emit("add r10, r11")
+			if scaledOk {
+				c.emit("lea r10, [r10 + r11*%d]", ew)
+			} else {
+				c.emit("imul r11, %d", ew)
+				c.emit("add r10, r11")
+			}
 		}
 		return nil
 	case *frontend.MemberExpr:

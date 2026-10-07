@@ -1049,8 +1049,9 @@ int main(){
   return v;
 }`)
 	// "(p + n)[0]" must stride by 1 byte and load 1 byte out of the
-	// unsigned char* -- the old code defaulted the element width to 8.
-	if !strings.Contains(asm, "imul r11, 1") {
+	// unsigned char* -- the old code defaulted the element width to 8. The
+	// scaling is emitted as a scaled-index LEA (codegen), not imul.
+	if !strings.Contains(asm, "lea r10, [r10 + r11*1]") {
 		t.Errorf("(p + n)[i] on an unsigned char* did not stride by 1: %q", asm)
 	}
 	if !strings.Contains(asm, "mov al, [r10]") {
@@ -1064,7 +1065,7 @@ int main(){
   v = (a + 2)[0];
   return v;
 }`)
-	if !strings.Contains(asm, "imul r11, 4") {
+	if !strings.Contains(asm, "lea r10, [r10 + r11*4]") {
 		t.Errorf("(a + 2)[0] on an int* did not stride by 4: %q", asm)
 	}
 	if !strings.Contains(asm, "mov eax, [r10]") {
@@ -1135,7 +1136,7 @@ func TestStringLiteralSubscript(t *testing.T) {
 	}
 	// "hello"[1] must step 1 byte, not 8.
 	asm = genAsm(t, `int main(){ return "hello"[1]; }`)
-	if !strings.Contains(asm, "imul r11, 1") {
+	if !strings.Contains(asm, "lea r10, [r10 + r11*1]") {
 		t.Errorf(`"hello"[1] did not stride by 1: %q`, asm)
 	}
 }

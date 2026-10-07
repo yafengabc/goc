@@ -261,14 +261,18 @@ func TestF2IndexRegDirect(t *testing.T) {
 	if !strings.Contains(asm, "movsxd r11, ") {
 		t.Fatalf("F2 must consume the index from its home register:\n%s", asm)
 	}
-	// the SIB fold should fire on the loop's a[i] LOAD and, since the
-	// store-path gap (the rhs source load) is now tolerated, also on the
-	// a[i] = i STORE.
+	// sibFold must fold the codegen-emitted `lea r10, [r10 + r11*4]` into a
+	// SIB memory operand on the loop's a[i] LOAD, and (since the store-path gap
+	// -- the rhs source load -- is tolerated) also on the a[i] = i STORE.
 	if !strings.Contains(asm, "[r10+r11*4]") {
 		t.Fatalf("sibFold must fold the loop's a[i] loads:\n%s", asm)
 	}
 	if !strings.Contains(asm, "mov dword [r10+r11*4]") && !strings.Contains(asm, "mov [r10+r11*4]") {
 		t.Fatalf("sibFold must also fold the loop's a[i] = i store:\n%s", asm)
+	}
+	// the scaling is done in codegen via LEA, so no imul should survive.
+	if strings.Contains(asm, "imul r11, 4") {
+		t.Fatalf("index scaling must use lea, not imul:\n%s", asm)
 	}
 }
 
@@ -293,7 +297,8 @@ func TestF2SwitchOff(t *testing.T) {
 }
 
 // sibFold disabled (independent switch, end-to-end): with the switch on, the
-// imul/add idiom survives the -O2 pipeline.
+// codegen-emitted `lea r10, [r10 + r11*4]` must survive the -O2 pipeline
+// unchanged (sibFold is what would otherwise fold it into a SIB operand).
 func TestSibFoldSwitchOff(t *testing.T) {
 	old := sibFoldSkip
 	sibFoldSkip = true
@@ -306,8 +311,8 @@ func TestSibFoldSwitchOff(t *testing.T) {
     return a[7];
 }`
 	asm := genAsmOpt(t, src, 3)
-	if strings.Count(asm, "imul r11,") == 0 {
-		t.Fatalf("with sibFoldSkip the idiom must survive the pipeline:\n%s", asm)
+	if strings.Count(asm, "lea r10, [r10 + r11*4]") == 0 {
+		t.Fatalf("with sibFoldSkip the index-scaling lea must survive the pipeline:\n%s", asm)
 	}
 	if strings.Contains(asm, "[r10+r11*4]") {
 		t.Fatalf("with sibFoldSkip no SIB operand may appear:\n%s", asm)
@@ -337,8 +342,8 @@ func TestF2NarrowIndex(t *testing.T) {
 		!strings.Contains(asm, "mov r11, r9") {
 		t.Fatalf("F2 must consume a register-cached short index from its home register:\n%s", asm)
 	}
-	// the narrow index must be sign-extended into r11 (signed short -> shl/sar 48)
-	if !strings.Contains(asm, "shl r11, 48") || !strings.Contains(asm, "sar r11, 48") {
+	// the narrow index must be sign-extended into r11 (signed short -> movsx r11, r11w)
+	if !strings.Contains(asm, "movsx r11, r11w") {
 		t.Fatalf("F2 must sign-extend a short index into r11 (no raw full-width copy):\n%s", asm)
 	}
 }

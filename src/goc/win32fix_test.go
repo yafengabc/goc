@@ -31,8 +31,8 @@ func readGoclib(t *testing.T, name string) string {
 // byte emission).
 func TestCastUnsignedCharZeroExtend(t *testing.T) {
 	asm := genAsm(t, `int main(void) { int x = 0x1234; return (unsigned char)x; }`)
-	if !strings.Contains(asm, "and eax, 0xFF") {
-		t.Errorf("cast to unsigned char missing `and eax, 0xFF` masking:\n%s", asm)
+	if !strings.Contains(asm, "movzx rax, al") {
+		t.Errorf("cast to unsigned char missing `movzx rax, al` zero-extension:\n%s", asm)
 	}
 }
 
@@ -40,8 +40,8 @@ func TestCastUnsignedCharZeroExtend(t *testing.T) {
 // 16 bits.
 func TestCastUnsignedShortZeroExtend(t *testing.T) {
 	asm := genAsm(t, `int main(void) { int x = 0x5678; return (unsigned short)x; }`)
-	if !strings.Contains(asm, "and eax, 0xFFFF") {
-		t.Errorf("cast to unsigned short missing `and eax, 0xFFFF` masking:\n%s", asm)
+	if !strings.Contains(asm, "movzx rax, ax") {
+		t.Errorf("cast to unsigned short missing `movzx rax, ax` zero-extension:\n%s", asm)
 	}
 }
 
