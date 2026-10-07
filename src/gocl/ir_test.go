@@ -575,3 +575,82 @@ void f(void){ v += (a != b); }
 		t.Errorf("\"v += (a != b)\" has no integer add:\n%s", ir)
 	}
 }
+
+// TestIREntryStubAlignsStackOnX8664Linux pins the stub that makes the ELF
+// entry point correct on x86-64.
+//
+// The eight bytes it corrects are invisible until something spills an SSE
+// register: the kernel enters _start with rsp 16-byte aligned, while LLVM's
+// prologue is written for being entered by `call`, which has pushed a return
+// address and left rsp 8 mod 16. _start's own `pushq` then lands it back on
+// 8 mod 16, and every call it makes from there hands the callee a stack that is
+// off by eight. Nothing on the integer path notices; a variadic function's
+// prologue spills the float save area with `movaps`, which faults on an
+// unaligned address, so printf("%f", 1.5) died with SIGSEGV before printing
+// anything.
+//
+// No test that runs a program and compares its output can be relied on to catch
+// the stub's disappearance either -- an integer-only test suite passes
+// throughout -- so the assertion is on the shape of the module.
+func TestIREntryStubAlignsStackOnX8664Linux(t *testing.T) {
+	const src = "int main(void) { return 0; }"
+	ir := irFromSourceTarget(t, src, "x86_64", true)
+	for _, want := range []string{
+		`module asm ".globl __goc_entry"`,
+		`module asm "__goc_entry:"`,
+		`module asm "  andq $-16, %rsp"`,
+		`module asm "  callq _start"`,
+	} {
+		if !strings.Contains(ir, want) {
+			t.Errorf("x86-64 Linux IR has no %s: the entry point is _start itself, so every\n"+
+				"function in the program runs with a stack eight bytes off:\n%s", want, ir)
+		}
+	}
+	// The `and` is what makes the stub right whether or not the kernel's
+	// alignment promise holds; a fixed subtraction would depend on it.
+	if strings.Contains(ir, `subq $8, %rsp`) && !strings.Contains(ir, "andq $-16, %rsp") {
+		t.Errorf("entry stub subtracts a fixed 8 instead of realigning:\n%s", ir)
+	}
+
+	// Windows is entered through the PE loader with the stack already in the
+	// shape the prologue expects, and AArch64/ARM/RISC-V enter a function with
+	// the stack pointer the caller left -- no return address is pushed -- so
+	// none of them may grow a stub that would be a no-op at best.
+	for _, tc := range []struct {
+		name  string
+		arch  string
+		linux bool
+	}{
+		{"Windows x86-64", "x86_64", false},
+		{"Linux aarch64", "aarch64", true},
+		{"Linux arm", "arm", true},
+		{"Linux riscv64", "riscv64", true},
+	} {
+		got := irFromSourceTarget(t, src, tc.arch, tc.linux)
+		if strings.Contains(got, "__goc_entry") {
+			t.Errorf("%s IR has an entry realignment stub: %s does not push a return\n"+
+				"address, so there is no eight-byte skew to correct:\n%s", tc.name, tc.arch, got)
+		}
+	}
+}
+
+// TestIRWindowsDefinesFltused pins the symbol a COFF module that touches
+// floating point has to provide.
+//
+// LLVM names `_fltused` when it lowers such a module, and a gocl program links
+// nothing but the object LLVM just wrote -- so without a definition the link
+// ends at "undefined symbol(s): _fltused" for every program that formats a
+// double, while the same source links fine on Linux and fine under `goc`.
+// It is a global spelled in the IR because goc prefixes a C global with "G_",
+// which would define G__fltused and leave the reference unresolved.
+func TestIRWindowsDefinesFltused(t *testing.T) {
+	const src = "int main(void) { return 0; }"
+	win := irFromSourceTarget(t, src, "x86_64", false)
+	if !strings.Contains(win, "@_fltused =") {
+		t.Errorf("Windows IR does not define _fltused: a module that uses floating point\n"+
+			"will fail to link with an undefined-symbol error:\n%s", win)
+	}
+	if lin := irFromSourceTarget(t, src, "x86_64", true); strings.Contains(lin, "_fltused") {
+		t.Errorf("Linux IR defines _fltused: nothing names it there, so it is dead bytes:\n%s", lin)
+	}
+}

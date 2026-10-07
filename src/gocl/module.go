@@ -259,6 +259,15 @@ func (m *irMod) String() string {
 	var b strings.Builder
 	b.WriteString("target datalayout = \"" + layout + "\"\n")
 	b.WriteString("target triple = \"" + triple + "\"\n\n")
+	// Module-level assembly has to follow the two target lines: the parser
+	// reads a `module asm` as a top-level entity and refuses it before
+	// `target datalayout` has been seen.
+	for _, line := range m.entryAlignAsm() {
+		b.WriteString(line + "\n")
+	}
+	if len(m.entryAlignAsm()) > 0 {
+		b.WriteString("\n")
+	}
 	for _, t := range m.typeLines {
 		b.WriteString(t + "\n")
 	}
@@ -278,6 +287,10 @@ func (m *irMod) String() string {
 			itoa(alignOfLlir(g.ty)) + "\n")
 	}
 	if len(m.globals) > 0 {
+		b.WriteString("\n")
+	}
+	if s := m.windowsFltused(); s != "" {
+		b.WriteString(s)
 		b.WriteString("\n")
 	}
 	// A thread-local variable is reached through the linker-provided
@@ -1002,6 +1015,78 @@ func (m *irMod) tlsOffset(cName string) (int64, bool) {
 // sortedSyscallStubs lists the syscalls this module defines, sorted so the same
 // program always lowers to the same bytes of IR (and so a diff of two dumps is
 // readable).
+// windowsFltused defines the one symbol a Windows module that touches floating
+// point is expected to provide, or "" where the target does not ask for it.
+//
+// LLVM names `_fltused` when it lowers a COFF module that uses the SSE
+// registers: the reference is how MSVC's linker decides whether to pull the
+// floating-point support out of the CRT, and it is emitted whether or not
+// anything is going to satisfy it. MinGW answers it from libmingwex. A gocl
+// program links nothing but the object LLVM just wrote, so on Windows every
+// program that formats a double died at
+//
+//	gocl: linking the LLVM object: coff: undefined symbol(s): _fltused
+//
+// while the same source ran fine on Linux -- and, because the native back end
+// never names the symbol, fine under `goc` too.
+//
+// It is a global in the IR rather than a C variable in goclib because the name
+// has to reach the COFF symbol table exactly as spelled: goc prefixes a C
+// global's symbol with "G_", so `int _fltused;` would define G__fltused and
+// leave the reference unresolved. Four bytes, and only off Linux.
+func (m *irMod) windowsFltused() string {
+	if m.linux {
+		return ""
+	}
+	return "@_fltused = " + m.dso() + "global i32 1, align 4"
+}
+
+// entryAlignAsm is the module-level assembly that becomes the ELF entry point
+// in place of _start, or nil when the entry point is not ours to wrap.
+//
+// It exists because of an eight-byte disagreement about the stack. The SysV
+// ABI has the CALLER push the return address, so a function entered by `call`
+// sees rsp congruent to 8 modulo 16 -- and LLVM writes its prologues for
+// exactly that: the C `_start` opens with `pushq %rax` to bring rsp back onto
+// a 16-byte boundary. The kernel pushes nothing. It enters with rsp already
+// 16-byte aligned, so that same `pushq` leaves it at 8 modulo 16, and every
+// call `_start` goes on to make hands its callee a stack that is off by eight.
+//
+// Nothing notices until a callee spills an SSE register: `movaps` faults on an
+// unaligned address, so a program whose printf formats a double -- on x86-64
+// va_arg reads the float save area, which the variadic prologue fills with
+// movaps -- dies with SIGSEGV before printing anything. Integer-only programs
+// ran for months because no instruction on that path cares, which is also why
+// no amount of integer testing would have found this.
+//
+// Realigning before the call is the whole fix: `_start` then sees exactly the
+// stack shape LLVM compiled it for. `and` rather than a fixed subtraction so
+// the stub is right whether or not the kernel's alignment promise holds.
+//
+// It is x86-64-only on purpose. The eight bytes come from `call` pushing a
+// return address; AArch64, ARM and RISC-V enter a function with the stack
+// pointer the caller left, so for them the kernel's entry already is the shape
+// the prologue expects and there is nothing to correct.
+func (m *irMod) entryAlignAsm() []string {
+	if !m.linux || !m.nativeLink || m.arch != "x86_64" {
+		return nil
+	}
+	return []string{
+		`module asm ".text"`,
+		`module asm ".globl __goc_entry"`,
+		`module asm ".p2align 4, 0x90"`,
+		`module asm "__goc_entry:"`,
+		`module asm "  andq $-16, %rsp"`,
+		`module asm "  callq _start"`,
+		// _start ends in __goclib_exit and does not return. This is the
+		// landing for the case it ever did, and it exits through the C
+		// library rather than through a hard-coded syscall number so the
+		// trap number stays in one place (syscalls.go).
+		`module asm "  xorl %edi, %edi"`,
+		`module asm "  callq __goclib_exit"`,
+	}
+}
+
 func (m *irMod) sortedSyscallStubs() []string {
 	out := make([]string, 0, len(m.syscallStubs))
 	for name := range m.syscallStubs {

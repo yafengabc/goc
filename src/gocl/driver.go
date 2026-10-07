@@ -437,11 +437,19 @@ func linkNativeELF(obj []byte, outPath string) error {
 // pickEntry names the symbol the loader jumps to.
 //
 // An ELF relocatable object has no entry field -- that belongs to the linked
-// image -- so the entry is recovered by name. `_start` leads the list, which is
-// the one the generated entry stub defines; `main` is the fallback, so an
-// object whose startup was dropped still links and says which symbol it wanted.
+// image -- so the entry is recovered by name.
+//
+// `__goc_entry` leads: where the module generated one (see
+// irMod.entryAlignAsm) it is the real entry and `_start` is merely what it
+// calls. Taking `_start` there would skip the stack realignment and hand every
+// function in the program a stack that is eight bytes off, which only shows up
+// as a SIGSEGV once something spills an SSE register.
+//
+// `_start` is next -- the entry stub on a target that needs no correction --
+// and `main` is the fallback, so an object whose startup was dropped still
+// links and says which symbol it wanted.
 func pickEntry(img *gocld.Image) string {
-	for _, name := range []string{"_start", "__goc_start", "main"} {
+	for _, name := range []string{"__goc_entry", "_start", "__goc_start", "main"} {
 		if _, ok := img.Syms[name]; ok {
 			return name
 		}
