@@ -31,9 +31,18 @@ bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面�
 ./bin/goc.exe -c a.c && ./bin/goc.exe a.o b.c -o app.exe   # 也可以混着来
 ```
 
-多个 `.c` 各自是一个**独立的翻译单元**（宏、typedef、struct 标签互不干扰），
-声明合并后一起编译：`static` 的符号只在本文件可见（重名时自动改成每文件唯一的
-内部名），两个文件都定义的同名外部符号则是重复定义错误。汇编器 goa 已编译进
+多个 `.c` 各自是一个**独立的翻译单元**（宏、typedef、struct 标签互不干扰）。
+一次编译多个 `.c` 时它们各自产出目标文件、随后一起链接；也可以先`-c` 再单独链接，
+两种方式下 `static` 的符号都只在本文件可见，两个文件都定义的同名**外部**符号
+才是重复定义错误。
+
+`static` 符号写进目标文件时会带上对象自己的名字（`unit.o`里的 `scale` 记作
+`unitscale`）并标记为内部链接（COFF 的 `IMAGE_SYM_CLASS_STATIC` / ELF 的
+`STB_LOCAL`）。改名是必须的：重定位按**符号名**解析引用，两个单元各有一份同名
+`static` 函数时若不改名，要么被报成重复定义，要么一个对象的调用落到另一个对象的
+函数上——后者更坏，程序能链接、能运行，只是算出错误的答案。
+
+汇编器 goa 已编译进
 goc 二进制，不需要旁边放 `goa.exe`（独立的 `bin/goa.exe` 仍然保留，供手写汇编使用）。
 
 链接阶段处理四件事：**重定位**（RIP 相对位移、`_BitInt` 的 sret 隐藏指针、
@@ -228,7 +237,24 @@ printf 的已知边界：
   且没有指数形式。
 - 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界检查（缓冲区归调用方管）。
 - 没有 `%e %a %n`。
-- 库里没有 `scanf`、没有文件 I/O、没有 `math.h`、没有 `time.h`。
+- `scanf` / `sscanf` / `fscanf` / `vscanf` 家族已实现，支持 `%d %i %u %o %x %s %c %f %lf %g %%`
+  与 `l h z j t` 长度修饰符。浮点转换支持科学计数法（`sscanf("1e3", "%lf", &d)` 得 1000）。
+- 文件 I/O 已实现：`FILE *`、`fopen`/`fopen_s`/`_wfopen`/`freopen`/`tmpfile`、
+  `fread`/`fwrite`/`fgets`/`fputs`/`fgetc`/`fputc`/`ungetc`、
+  `fseek`/`ftell`/`rewind`/`fflush`/`fclose`、`feof`/`ferror`/`clearerr`、
+  `remove`/`rename`/`perror`。
+- `math.h` 已实现（含 `sqrt` `pow` `exp` `log` `sin` `cos` `tan` `asin` `acos`
+  `atan` `atan2` `sinh` `cosh` `tanh` `hypot` `cbrt` `expm1` `log1p` `log2` `log10`
+  `fmod` `fabs` `floor` `ceil` `round` `trunc` `fma` `copysign` `nan`
+  `fpclassify` `signbit` `isnan` 等，以及 C23 的 `fmaximum_num`/`fminimum_num`
+  族）。**缺 `long double` 取整族**：`lround`/`llround` 等没有。
+- `time.h` 已实现：`time`/`clock`/`timespec_get`/`localtime`/`gmtime`/`mktime`/
+  `strftime`/`difftime`/`asctime`/`ctime`。
+- `dirent.h` 已实现：`opendir`/`readdir`/`closedir`/`rewinddir`/`stat`/`mkdir`/`rmdir`。
+- `signal.h`、`threads.h`（`thrd_`/`mtx_`/`tss_`/`call_once`）、`uchar.h`、
+  C23 `stdbit.h` 均已实现。
+- socket 层可用 `<socket.h>` 的 POSIX 拼写（Windows 走 `ws2_32`，Linux 走 syscall）。
+  `winsock2.h` 是 `socket.c` 的内部实现，**不要直接 include**。
 
 ## 支持的语言子集
 
@@ -271,7 +297,7 @@ printf 的已知边界：
 还没到的地方：
 
 - 链接器只做重定位解析与符号合并，没有真正的死代码消除（被去重的
-  库函数副本字节仍留在 `.text` 里）；也没有静态库归档（`.a`）
+  库函数副本字节仍留在 `.text` 里）；也没有静态库归档（`.a`——只吃裸 `.o`）
 - 资源只做到 PE 的 `.rsrc`：能从 `windres` 之类的 `.o` 读入、合并、写进 exe。
   不解析 `.rc` 源文件，不生成资源，也不做 ELF 侧（ELF 根本没有资源节）
 - 没有 `long long`、VLA、复合字面量、`_Generic` 等 C99+ 特性
