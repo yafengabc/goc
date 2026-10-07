@@ -121,6 +121,14 @@ func isCLibSymbol(name string, objLib map[string]bool) bool {
 	return qualified && strings.HasPrefix(rest, "L") && objLib[owner]
 }
 
+// hasSym reports whether the image already defines name. It is the two-value
+// form of the map lookup, spelled out so the stack-probe aliasing below reads
+// as a question ("do we already have this?") rather than as map plumbing.
+func hasSym(img *Image, name string) bool {
+	_, ok := img.Syms[name]
+	return ok
+}
+
 // refptrLoc is where an object's .refptr slot for an undefined data symbol
 // ended up: which merged section holds it, and at what offset.
 type refptrLoc struct {
@@ -153,20 +161,31 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 		img.Syms[coffNoOpAnchor] = SymLoc{Sect: sectionIndexOf(img, text), Off: text.VSize - 1}
 	}
 
-	// LLVM lowers a stack frame larger than a page into a call to the C
-	// runtime's stack-probe helper, ___chkstk_ms, with the frame size in
-	// RAX. A goc image links no C runtime, so the reference has to resolve
-	// here or the link fails with "undefined symbol: ___chkstk_ms".
+	// LLVM lowers a stack frame larger than a page into a call to the stack
+	// probe helper, with the frame size in RAX. A goc image links no C
+	// runtime, so the reference has to resolve here or the link fails with
+	// "undefined symbol: __chkstk".
 	//
-	// LLVM's Win64 large-frame prologue is "mov eax,size; call ___chkstk_ms;
-	// sub rsp,rax": the helper must only touch the guard pages (probe) and
-	// leave both rsp and rax intact -- rsp for the caller's own sub rsp,rax,
-	// rax because it still holds the frame size for that sub. The earlier
-	// helpers either read rcx (which the caller never sets, so the probe
-	// walked the stack for a garbage size) or subtracted pages themselves
-	// (double allocation), both ending in STATUS_STACK_OVERFLOW (0xC00000FD).
-	// r10/r11 are volatile per the Windows ABI, so they are free scratch.
-	if _, ok := img.Syms["___chkstk_ms"]; !ok {
+	// LLVM spells this helper two ways. Older releases emitted ___chkstk_ms
+	// (the MSVC CRT name); the current one emits __chkstk. They are the same
+	// routine and, as the disassembly of a large frame shows, use the same
+	// convention:
+	//
+	//     mov eax, 0x1238 ; call __chkstk ; sub rsp, rax ; ...
+	//
+	// The helper only touches the guard pages (probe) and leaves both rsp and
+	// rax intact -- rsp for the caller's own `sub rsp, rax`, rax because it
+	// still holds the frame size for that sub. An earlier helper here either
+	// read rcx (which the caller never sets, so the probe walked the stack for
+	// a garbage size) or subtracted pages itself (double allocation); both
+	// ended in STATUS_STACK_OVERFLOW (0xC00000FD). r10/r11 are volatile per
+	// the Windows ABI, so they are free scratch.
+	//
+	// One body therefore serves either name, and it is registered under both.
+	// Registering only ___chkstk_ms leaves a current-LLVM object referencing
+	// __chkstk with nothing to bind to, and the link fails on a symbol the
+	// program never mentions.
+	if _, ok := img.Syms["___chkstk_ms"]; !ok && !hasSym(img, "__chkstk") {
 		if pad := align(text.VSize, 16) - text.VSize; pad > 0 {
 			padSection(text, pad)
 		}
@@ -196,7 +215,19 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 		// mov rsp, r10 ; ret
 		text.Data = append(text.Data, 0x4C, 0x89, 0xD4, 0xC3)
 		text.VSize += 4
-		img.Syms["___chkstk_ms"] = SymLoc{Sect: sectionIndexOf(img, text), Off: start}
+		loc := SymLoc{Sect: sectionIndexOf(img, text), Off: start}
+		img.Syms["___chkstk_ms"] = loc
+		img.Syms["__chkstk"] = loc
+	}
+	// Alias the two spellings unconditionally, outside the guard above. The
+	// guard is keyed on ___chkstk_ms, so if that name is already present --
+	// synthesised for an earlier object in the same link, say -- the body is
+	// skipped and a bare __chkstk reference would still be reported missing.
+	// Doing it here covers every path into this function.
+	if !hasSym(img, "__chkstk") {
+		if ms, ok := img.Syms["___chkstk_ms"]; ok {
+			img.Syms["__chkstk"] = ms
+		}
 	}
 
 	// --- sections ---

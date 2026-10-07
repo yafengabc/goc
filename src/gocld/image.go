@@ -182,6 +182,13 @@ type Image struct {
 	// emits, so a single linker serves every backend instead of one per ISA.
 	Machine uint16
 
+	// Class is the ELF file class of the ingested object: elfClass64 (2) for a
+	// 64-bit object, elfClass32 (1) for a 32-bit one, 0 when no ELF was read
+	// (a PE/COFF image). It selects the container width the ELF writer emits,
+	// so an ARM32 or i386 object links into an ELF32 and an AArch64/x86-64 one
+	// into an ELF64 from the same code path.
+	Class uint8
+
 	// Entry is the symbol at the image's entry point.
 	Entry string
 

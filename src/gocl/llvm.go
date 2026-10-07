@@ -44,14 +44,14 @@ import (
 type llvmAPI struct {
 	dll *syscall.LazyDLL
 
-	getVersion                            *syscall.LazyProc
-	disposeMessage                        *syscall.LazyProc
-	getDefaultTargetTriple                *syscall.LazyProc
-	initializeX86TargetInfo               *syscall.LazyProc
-	initializeX86Target                   *syscall.LazyProc
-	initializeX86TargetMC                 *syscall.LazyProc
-	initializeX86AsmPrinter               *syscall.LazyProc
-	initializeX86AsmParser                *syscall.LazyProc
+	getVersion              *syscall.LazyProc
+	disposeMessage          *syscall.LazyProc
+	getDefaultTargetTriple  *syscall.LazyProc
+	initializeX86TargetInfo *syscall.LazyProc
+	initializeX86Target     *syscall.LazyProc
+	initializeX86TargetMC   *syscall.LazyProc
+	initializeX86AsmPrinter *syscall.LazyProc
+	initializeX86AsmParser  *syscall.LazyProc
 	// Non-x86 backends. The libLLVM build linked here ships AArch64, ARM and
 	// RISCV too, so we register all of them: a target the compiler never
 	// selects costs nothing once initialised, and registering it is what makes

@@ -1018,6 +1018,18 @@ func (m *irMod) sortedSyscallStubs() []string {
 //     the inputs is still necessary: an asm block that does not name an
 //     operand is free to have the register allocator reuse that register.
 //
+// On a 32-bit target (arm, riscv32) one extra step is required: the front
+// end types long as 64-bit regardless of target, so a syscall prototype
+// carries i64 arguments even here, and an i64 value occupies a register
+// pair on a 32-bit machine -- it cannot sit in the single register an asm
+// constraint names. Left alone, LLVM silently honours the constraint for
+// the low half only and the register the syscall actually reads gets a
+// value that was never intended (a `write` whose buffer came out as NULL
+// and a link that still succeeded -- the fault appears only at run time,
+// inside the trap). The stub therefore truncates every i64 argument to i32
+// first; the low half is exactly the value the kernel reads, and the asm
+// registers are all 32-bit singles again.
+//
 // The result comes back in the same register the first argument went in, which
 // is the `=r,0` read-write idiom rather than a shared-register pair, so the
 // first input is bound with a matching constraint instead of naming x0 twice.
@@ -1032,8 +1044,12 @@ func (m *irMod) emitSyscallStub(name string) string {
 	}
 	params := m.stubParams[name]
 	retTy := m.llirType(ret)
+	// 32-bit targets: i64 parameters cannot bind to a single asm register
+	// (see the comment above), so they are truncated to i32 before the call.
+	is32 := m.arch == "arm" || m.arch == "riscv32"
 
 	var ps, ins []string
+	var pre []string
 	for i, p := range params {
 		if p == nil {
 			p = frontend.IntType()
@@ -1044,12 +1060,17 @@ func (m *irMod) emitSyscallStub(name string) string {
 		// LLVM read "%0" as a (nonexistent) type and report "invalid type for
 		// function argument" against the parameter.
 		ps = append(ps, pty+" %"+itoa(i))
+		op := pty + " %" + itoa(i)
+		if is32 && pty == "i64" {
+			pre = append(pre, fmt.Sprintf("  %%a%d = trunc i64 %%%d to i32", i, i))
+			op = "i32 %a" + itoa(i)
+		}
 		// The operand type is spelled out, not left to be inferred. LLVM
 		// rejects an inline-asm call whose operand list has a bare "%0" with
 		// "invalid type for function argument": there is no declaration to
 		// infer from when the constraint pins the operand to a register, so
 		// the type has to be there.
-		ins = append(ins, pty+" %"+itoa(i))
+		ins = append(ins, op)
 	}
 	tmpl, cons, numOperand := syscallAsm(m.arch, num, len(params))
 	// x86-64 has to pass the syscall number in as an immediate operand rather
@@ -1064,12 +1085,22 @@ func (m *irMod) emitSyscallStub(name string) string {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "define %s%s @%s(%s) {\n", m.dso(), retTy, name, strings.Join(ps, ", "))
+	// The truncation instructions go before the asm call: the kernel reads the
+	// 32-bit low half, which is exactly what the truncated value is.
+	for _, p := range pre {
+		b.WriteString(p)
+		b.WriteString("\n")
+	}
 	// The template is embedded as-is: its \0A is the IR escape for the newline
 	// that separates the two assembler statements, and running it through %q
 	// would turn that into a literal backslash and hand the assembler the four
 	// characters "\0A" instead of a line break.
-	fmt.Fprintf(&b, "  %%r = call i64 asm sideeffect \"%s\", \"%s\"(%s)\n",
-		tmpl, cons, strings.Join(ins, ", "))
+	asmTy := "i64"
+	if is32 {
+		asmTy = "i32"
+	}
+	fmt.Fprintf(&b, "  %%r = call %s asm sideeffect \"%s\", \"%s\"(%s)\n",
+		asmTy, tmpl, cons, strings.Join(ins, ", "))
 	// A syscall reports -errno as a negative long. Narrowing to the
 	// prototype's return type keeps the value a libc caller expects: the low
 	// half of a sign-extended 64-bit -errno is the same negative int, and a
@@ -1082,11 +1113,24 @@ func (m *irMod) emitSyscallStub(name string) string {
 		// is simply not returned.
 		b.WriteString("  ret void\n")
 	case retTy == "i64":
-		b.WriteString("  ret i64 %r\n")
+		if is32 {
+			// The result is a 32-bit value in r0; sign-extend back to the
+			// prototype's 64-bit long (ssize_t semantics: -errno stays
+			// negative in 64 bits, a count stays positive).
+			b.WriteString("  %r64 = sext i32 %r to i64\n  ret i64 %r64\n")
+		} else {
+			b.WriteString("  ret i64 %r\n")
+		}
 	case retTy == "ptr":
-		b.WriteString("  %p = inttoptr i64 %r to ptr\n  ret ptr %p\n")
+		if is32 {
+			// A 32-bit pointer result (mmap and friends): zero-extend the
+			// low half to 64 bits before inttoptr.
+			b.WriteString("  %r64 = zext i32 %r to i64\n  %p = inttoptr i64 %r64 to ptr\n  ret ptr %p\n")
+		} else {
+			b.WriteString("  %p = inttoptr i64 %r to ptr\n  ret ptr %p\n")
+		}
 	case strings.HasPrefix(retTy, "i"):
-		fmt.Fprintf(&b, "  %%n = trunc i64 %%r to %s\n  ret %s %%n\n", retTy, retTy)
+		fmt.Fprintf(&b, "  %%n = trunc %s %%r to %s\n  ret %s %%n\n", asmTy, retTy, retTy)
 	default:
 		fmt.Fprintf(&b, "  ret %s %%r\n", retTy)
 	}

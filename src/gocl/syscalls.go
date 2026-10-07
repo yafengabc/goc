@@ -1,4 +1,4 @@
-﻿package gocl
+package gocl
 
 // Linux syscall numbers, per architecture.
 //
