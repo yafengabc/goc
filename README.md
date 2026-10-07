@@ -75,15 +75,19 @@ syscall（`write` / `read` / `brk` / `exit_group`）。两头都没有 msvcrt / 
 GitHub Release 由 `v*` tag 触发，产出版本化 zip（如
 `goc-v0.0.1-windows-x86_64.zip` 与 `goc-v0.0.1-linux-x86_64.zip`）。
 
-zip 里是**开箱即用**的工具链目录，但**必须整目录一起解压**：`goc.exe` 在运行时
-要从磁盘读 C 标准库源码（`goclib/`），只拷走 exe 会立刻失败并给出
-「cannot find the goclib C library」——它不静默出错，但也编不了任何东西。
-goc 自带汇编器（goa 已编译进二进制），所以 zip 里那份独立 `goa` 只是给手写
-汇编用的，goc 编译 C 不再需要它。
+zip 里是开箱即用的工具链目录。C 标准库源码（`goclib/`）已经 **embed 进二进制**
+（`src/libembed.go`），所以 **`goc.exe` 单文件就能工作**——拷到空目录、清空 PATH
+也能编译运行，不需要旁边有 `goclib/`，也不再读 `GOCLIB_PATH` 环境变量。
 
-查找顺序见 `goc/libfs.go`：`GOCLIB_PATH` 环境变量 → exe 旁边的目录 →
-exe 的上级目录 → 当前工作目录及其各级上级。所以 zip 里的目录结构是固定的，
-不要只取单个文件；想让多个编译器共用一份库，设 `GOCLIB_PATH` 指向它即可。
+实测（2026-10-07）：`goc.exe` 4.9 MB，只导入 `kernel32.dll`；编一个用到
+`math.h` / `string.h` / `stdlib.h` 的程序，脱离仓库目录、PATH 只留系统目录，
+输出正确。
+
+`gocl` 多一个文件：它依赖 `libLLVM.dll`（约 14 MB，放在 exe 旁边）。两个文件
+一起拷走即可，同样不需要 `goclib/`。
+
+zip 里那份独立 `goa` 是给手写汇编用的（`src/goa` 是独立 go 模块），goc 编译 C
+不再需要它——汇编器已编译进 `goc` 二进制。
 
 Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 `goc` / `goa` / `goclib/`，均附 `README.md` / `LICENSE`，另有一份
@@ -94,8 +98,9 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 ```
 .
 ├── src/                                            # 自包含入口（go 模块 goc/selfcontained）
-│   ├── main.go                                        #   embed goclib/，产出单文件编译器
-│   └── go.mod
+│   ├── goc.go                                         #   -tags goc   → bin/goc.exe
+│   ├── gocl.go                                        #   -tags gocl  → bin/gocl.exe
+│   └── libembed.go                                   #   内嵌的 goclib/（两个 tag 共用）
 ├── src/frontend/                                   # C 前端（go 模块 goc/frontend，零依赖）
 │   ├── lexer.go  parser.go  ast.go  types.go          #   词法 / 语法 / AST / 类型
 │   ├── check.go  print.go  ufcs.go                     #   语义检查、print/数组重写、UFCS
@@ -119,18 +124,15 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 │   └── driver.go                                       #   驱动（flags / 构建流程）
 ├── src/goc/                                        # 编译器主体（go 模块 goc）
 │   ├── codegen.go  cpp.go  multi.go  opt.go            #   自研 x86-64 代码生成
-│   ├── libfs.go                                        #   在磁盘上定位 goclib/（见下）
 │   └── llvm*.go                                        #   LLVM 后端（-fllvm）
-├── src/                                           # 自包含入口（go 模块 goc/selfcontained）
-│   ├── goc.go                                         #   -tags goc   → bin/goc.exe
-│   ├── gocl.go                                        #   -tags gocl  → bin/gocl.exe
-│   └── libembed.go                                    #   内嵌的 goclib/（两个 tag 共用）
-├── goclib/                                             # 自带的 C 库（go 模块 goc 与 gocl 共用）
-│   ├── os.c                                            #   5 个平台原语，唯一碰 OS 的文件
-│   ├── stdio.c  stdlib.c  string.c  ctype.c            #   45 个库函数
+├── src/goclib/                                     # 自带的 C 库（embed 进两个编译器）
+│   ├── os.c                                            #   6 个平台原语，唯一碰 OS 的文件
+│   ├── stdio.c  stdlib.c  string.c  ctype.c  math.c    #   21 个 .c / 10.3k 行 / 484 个函数
+│   │   time.c  file.c  dir.c  threads.c  socket.c ...
 │   ├── goclib.h                                        #   伞头
-│   ├── stddef.h  stdarg.h  stdio.h  stdlib.h           #   内置标准头（可被 #include）
-│   │   string.h  ctype.h
+│   ├── stddef.h  stdarg.h  stdio.h  stdlib.h           #   26 个内置标准头（可被 #include）
+│   │   string.h  ctype.h  math.h  time.h  stdatomic.h
+│   │   threads.h  stdbit.h  stdckdint.h  uchar.h  wchar.h ...
 │   ├── windows.h  windef.h  winbase.h  wingdi.h  winuser.h
 │   └── README.md                                       #   库的实现机制
 ├── src/goa/                                            # goa：汇编器（独立 go 模块）
@@ -187,18 +189,61 @@ Windows 上没法 exec ELF，所以本机这一腿交给 **QEMU 的 CPU 核心**
 `run_tests_linux.sh` **直接执行**所有 Linux ELF 目标（不走任何模拟），真实内核 +
 真实 SSE2 + 真实栈随机化，这才是双目标最硬的证明。
 
+## 多架构（gocl）
+
+`gocl`（LLVM 后端）有 `-arch`，可选五种指令集：
+
+```
+gocl -arch aarch64 -target linux hi.c -o hi.elf
+```
+
+| `-arch` | 当前状态（2026-10-07 实测） |
+| --- | --- |
+| `x86_64` | ✅ 默认，完整可用（PE 与 ELF64） |
+| `aarch64` | ✅ 出合法 ARM64 ELF64（`e_machine=0xb7`） |
+| `arm` | ✅ 出 ELF32（`e_machine=0x28`）；见下方 `__udivdi3` 说明 |
+| `riscv64` / `riscv32` | 🚧 进行中 |
+
+多架构要求 `libLLVM.dll` 里含对应后端。判断方法很直接——`objdump -p` 看它导出
+哪些 `LLVMInitialize*TargetInfo`：
+
+```bash
+objdump -p bin/libLLVM.dll | grep -o "LLVMInitialize[A-Za-z0-9]*TargetInfo" | sort -u
+```
+
+仓库当前带的那份导出 `X86` / `AArch64` / `ARM` / `RISCV` 四个。缺哪个后端，
+`-arch` 就会报 `libLLVM does not export LLVMInitialize…TargetInfo`——这是产物
+边界，不是代码边界；换一份含该后端的 `libLLVM.dll` 即可，不用改 gocl 任何代码。
+
+两点现状值得记：
+
+- **arm 的 `__udivdi3`**：不涉及 64 位除法的程序正常出 ELF32；一旦走到（比如
+  `printf` 内部的 64 位除法），链接会报 `undefined symbol(s): __udivdi3`。这是
+  LLVM 为 ARM 生成的编译器内建调用，goclib 目前没提供这个运行时函数。
+- **`elfcheck --structure-only` 只认 x86-64**（硬编码 `want 0x3e`），拿它校验
+  aarch64 产物会误报。产物本身是合法的 ARM64 ELF。
+
+`goc`（自研后端）只有 x86-64，不接受 `-arch`。
+
 ## goclib：自带的 C 库
 
-`printf` 不是编译器里的一段魔法字符串，而是一个真正的库。整套库是**纯 C**，
-按标准头拆成四个文件，全部 platform-specific 的东西收在第五个文件里：
+整套库是**纯 C**，按标准头拆成 21 个 `.c`（约 10351 行），全部 platform-specific
+的东西收在 `os.c` 里。当前导出 **484 个函数**（含内部实现符号；想知道某个函数
+到底有没有，让编译器去调一个不存在的名字，它会把整个可用清单打进错误信息）。
 
-| 文件 | 内容 | 个数 |
-| --- | --- | --- |
-| `os.c` | 平台原语：`__goclib_write` / `_read` / `_exit` / `_heap_alloc` / `_heap_free` | 5 |
-| `stdio.c` | `printf` `sprintf` `puts` `putchar` `getchar` | 5 |
-| `stdlib.c` | `malloc` `free` `calloc` `atoi` `abs` `strtol` `rand` `srand` `exit` | 9 |
-| `string.c` | `strlen` `strcpy` `strncpy` `strcmp` `strncmp` `strcat` `strncat` `strchr` `strrchr` `strstr` `strspn` `strcspn` `strpbrk` `strtok` `memset` `memcpy` `memmove` `memcmp` | 18 |
-| `ctype.c` | `isalpha` `isdigit` `isalnum` `isspace` `isupper` `islower` `isxdigit` `ispunct` `isprint` `isgraph` `iscntrl` `tolower` `toupper` | 13 |
+| 文件 | 内容 |
+| --- | --- |
+| `os.c` | 平台原语（唯一碰 OS 的文件，见下表） |
+| `stdio.c` | `printf` 全家、`scanf` 全家、`FILE *` 文件 I/O |
+| `stdlib.c` | `malloc`/`free`/`calloc`/`realloc`/`atoi`/`strtol`/`rand`/`srand`/`exit`/`qsort`/`bsearch`/`div` 等 |
+| `string.c` | `strlen`/`strcpy`/`strncpy`/`strcmp`/`strncmp`/`strcat`/`strncat`/`strchr`/`strrchr`/`strstr`/`strspn`/`strcspn`/`strpbrk`/`strtok`/`strdup`/`strndup`/`memset`/`memcpy`/`memmove`/`memcmp`/`memchr`/`memrchr`/`memccpy` 等 |
+| `ctype.c` | `isalpha` `isdigit` `isalnum` `isspace` `isupper` `islower` `isxdigit` `ispunct` `isprint` `isgraph` `iscntrl` `tolower` `toupper` |
+| `math.c` | C89–C23 数学函数（见下） |
+| `time.c` | `time`/`clock`/`timespec_get`/`localtime`/`gmtime`/`mktime`/`strftime`/`difftime` 等 |
+| `file.c` `dir.c` | 文件与目录（`fopen`/`fread`/`fwrite`/`fseek`/`opendir`/`readdir`/`stat`/`mkdir`/`rmdir`） |
+| `wchar.c` `uchar.c` | 宽字符与 Unicode 转换 |
+| `stdbit.c` `bitint.c` | C23 `<stdbit.h>`、`_BitInt(N)` 大整数运行时 |
+| `socket.c` `mtx.c` `threads.c` `signal.c` `errno.c` `assert.c` `args.c` `rt.c` | socket、互斥量、线程、信号、errno、assert 等 |
 
 平台差异封在每个文件顶部的 `#if defined(_WIN32) / #elif defined(__linux__)` 里
 （Windows 走 kernel32、Linux 走 syscall）—— 跟普通 C 库用 `#ifdef` 隔离平台相关
@@ -206,15 +251,16 @@ Windows 上没法 exec ELF，所以本机这一腿交给 **QEMU 的 CPU 核心**
 goc 启动时会注入 `_WIN32`/`_WIN64` 或 `__linux__`/`__linux`，所以库源码自己不需要
 在命令行上被告知目标平台。
 
-只有 `os.c` 里的 5 个原语碰操作系统：
+只有 `os.c` 里的 6 个原语碰操作系统：
 
 | 原语 | Windows（kernel32 extern 直调） | Linux（goa syscall 桩） |
 | --- | --- | --- |
 | `__goclib_write(buf,len)` | `GetStdHandle`+`WriteFile` | `write`(fd=1) |
+| `__goclib_read(buf,len)` | `GetStdHandle`+`ReadFile` | `read`(fd=0) |
 | `__goclib_exit(code)` | `ExitProcess` | `exit_group`(231) |
 | `__goclib_heap_alloc(size)` | `GetProcessHeap`+`HeapAlloc` | `brk` bump allocator（16B 对齐） |
 | `__goclib_heap_free(p)` | `HeapFree` | 空操作（进程退出一起还） |
-| `__goclib_read(buf,len)` | `GetStdHandle`+`ReadFile` | `read`(fd=0) |
+| `__goclib_heap_realloc(p,size)` | `HeapReAlloc` | 分配新块 + 拷贝 |
 
 Windows 侧原语只建立在 kernel32 之上，所以**依赖表里依然没有 msvcrt**；Linux 侧
 只依赖 syscall。Win 侧 extern 的归属 DLL 写在内置头文件的原型里（如 `winbase.h` 的
@@ -258,12 +304,17 @@ printf 的已知边界：
 
 ## 支持的语言子集
 
-- **标量类型**：`char` `short` `int` `long` 及其 `signed`/`unsigned` 组合、`float`、
-  `double`、`_Bool`、`void`；`long double` 落到 `double`
+- **标量类型**：`char` `short` `int` `long` `long long` 及其 `signed`/`unsigned`
+  组合、`float`、`double`、`_Bool`、`void`；`long double` 落到 `double`
 - **聚合类型**：`struct`（嵌套、按值传参、按值返回、成员为数组或结构体）、`union`、
   `enum`、多维数组、指针、函数指针、`typedef`
 - **位域**：MSVC 布局规则（跨存储单元分配、`:0` 强制开新单元、无名位域做填充），
   读写走读-改-写
+- **`_Generic`**（C11 类型分派，含字面量后缀定型：已实现，无消息无）
+- **`_Alignas`/`_Alignof`**（已实现）
+- **`_Thread_local`**：**goa 原生 TLS**（TLS 目录 + `gs:[0x58]`），不是软模拟
+- **`_Atomic`**（C11）：标量原子，`++`/`--` 发 `lock xadd`，其余走 `lock cmpxchg` 重试循环
+- **`_BitInt(N)`**：任意位宽整数，goclib 大整数运行时（schoolbook + Karatsuba 乘、Knuth D 除、十进制转换）
 - **方法（UFCS）**：`x.f(args)` / `p->f(args)` 在成员 `f` 不存在时按方法解析——定义
   普通函数 `T_f`（首参为 `struct T` 值或 `struct T*` 指针，T 是 x 的 struct 标签）
   即可写成 `x.f(args)`；指针接收者收到 `&x`（`p->f` 直接收 `p`），值接收者收到 `x`
@@ -274,8 +325,12 @@ printf 的已知边界：
   走 `int_print`、单参 `long` 走 `long_print`，其余才回退 `printf` 拼格式串；带换行、
   返回输出字符数，用户声明的 `print` 函数优先。数组打印 `print(a)` → `[1, 2, 3]`
   与自定义 `T_print` / `T_array_print` 方法见下面「print 内建」一节
-- **初始化**：`{}` 初始化列表（嵌套、指定初始化器 `.field =`、数组长度推断）、
-  字符数组用字符串字面量初始化、`char *p = "str"`（含全局）
+- **复合字面量**（C99，块作用域）：`&(struct P){1,2}` 可用
+- **数组指定初始化器**（C99）：`int a[5] = {[2]=7, [4]=9}`
+- **C23 实用子集**：`bool`/`true`/`false`、`typeof`、`nullptr`、`constexpr`、
+  `_Static_assert`、`enum E : int`、`u8` 前缀、二进制字面量 `0b`、数字分隔符 `'`
+  、`#embed`、`__has_include`、`__VA_OPT__`、`#elifdef`/`#elifndef`/`#warning`、
+  `[[...]]` 属性、`stdckdint.h`、`stdbit.h`
 - **存储类与限定符**：`static`（局部持久化，且只初始化一次）、`extern`、`typedef`；
   `const` / `volatile` / `restrict` 接受为限定符，`register` / `auto` 接受为 no-op
   （编译器不做优化，含义上无事可做）
@@ -296,13 +351,15 @@ printf 的已知边界：
 
 还没到的地方：
 
+- **VLA**（变长数组）：`int a[n]` 一律解析拒绝
 - 链接器只做重定位解析与符号合并，没有真正的死代码消除（被去重的
-  库函数副本字节仍留在 `.text` 里）；也没有静态库归档（`.a`——只吃裸 `.o`）
+  库函数副本字节仍留在 `.text` 里）；也没有静态库归档（`.a`——只吃裸 `.o`，
+  `ar` 出来的报 `machine 0x3c21 is not AMD64`）
 - 资源只做到 PE 的 `.rsrc`：能从 `windres` 之类的 `.o` 读入、合并、写进 exe。
   不解析 `.rc` 源文件，不生成资源，也不做 ELF 侧（ELF 根本没有资源节）
-- 没有 `long long`、VLA、复合字面量、`_Generic` 等 C99+ 特性
-- 没有数组指定初始化器 `[i] = v`
-- 库只有上面那 45 个函数
+- `printf` 的 `%e` `%a` `%n` 没有；`%g` 是简化版（按小数位计数，不切科学计数法）
+- `math.h` 缺 `long double` 取整族（`lround`/`llround`）；`round`/`trunc` 有
+- `winsock2.h` 是 `socket.c` 的内部实现，用户应 include `<socket.h>`（POSIX 拼写）
 
 ## print 内建：为体积优化的输出
 
