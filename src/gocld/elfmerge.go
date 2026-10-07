@@ -59,6 +59,34 @@ const (
 	rX8664PC64  = 24 // S + A - P (64-bit PC-relative)
 )
 
+// ELF machine types the linker accepts. ELF32 machines (EM_386, EM_ARM) arrive
+// with the 32-bit ELF reader in a later phase; they are listed so parseELF
+// rejects an unknown machine with a clear message instead of misreading it.
+const (
+	em386     = 3    // EM_386
+	emARM     = 40   // EM_ARM
+	emAArch64 = 0xB7 // EM_AARCH64
+	emRISCV   = 0xF3 // EM_RISCV
+)
+
+// AArch64 ELF relocation types we accept. The numeric values are fixed by the
+// AArch64 ELF psABI and were read back from a real object with readelf; a
+// hand-typed table that disagrees with the tool is the usual way these get
+// wrong, which is why they are spelled out rather than derived.
+const (
+	rAARCH64None                = 0
+	rAARCH64_ABS64              = 0x101
+	rAARCH64_PREL32             = 0x105
+	rAARCH64_ADR_PREL_PG_HI21   = 0x113
+	rAARCH64_ADD_ABS_LO12_NC    = 0x115
+	rAARCH64_LDST8_ABS_LO12_NC  = 0x111
+	rAARCH64_LDST16_ABS_LO12_NC = 0x112
+	rAARCH64_LDST32_ABS_LO12_NC = 0x11d
+	rAARCH64_LDST64_ABS_LO12_NC = 0x11e
+	rAARCH64_JUMP26             = 0x11a
+	rAARCH64_CALL26             = 0x11b
+)
+
 // rd64 reads a little-endian u64 from b at off, or 0 past the end.
 func rd64(b []byte, off int) uint64 {
 	if off < 0 || off+8 > len(b) {
@@ -93,11 +121,12 @@ type elfsec struct {
 
 // elfObj is a parsed ELF64 relocatable object.
 type elfObj struct {
-	secs   []elfsec
-	syms   []elfsym
-	strOff uint64 // file offset of .strtab
-	strSz  uint64
-	symKey []string // fixup key for each symbol index
+	secs    []elfsec
+	syms    []elfsym
+	strOff  uint64 // file offset of .strtab
+	strSz   uint64
+	symKey  []string // fixup key for each symbol index
+	machine uint16   // e_machine: selects the relocation encoding
 }
 
 // IngestELF merges the object at path into the assembler.
@@ -116,6 +145,7 @@ func (img *Image) IngestELFBytes(src []byte) error {
 	if err != nil {
 		return err
 	}
+	img.Machine = o.machine
 	return img.ingestParsedELF(o, src)
 }
 
@@ -132,8 +162,13 @@ func parseELF(src []byte) (*elfObj, error) {
 	if rd16(src, 16) != etRel {
 		return nil, fmt.Errorf("elf: not a relocatable object (e_type=%d)", rd16(src, 16))
 	}
-	if rd16(src, 18) != emX8664 {
-		return nil, fmt.Errorf("elf: machine 0x%x is not x86-64", rd16(src, 18))
+	m := rd16(src, 18)
+	switch m {
+	case emX8664, emAArch64, emRISCV, em386, emARM:
+		// accepted; a machine that has no relocation engine yet errors from
+		// the relocation switch with a clear message rather than here.
+	default:
+		return nil, fmt.Errorf("elf: unsupported ELF machine 0x%x", m)
 	}
 	shoff := rd64(src, 40)
 	shnum := int(rd16(src, 60))
@@ -165,7 +200,7 @@ func parseELF(src []byte) (*elfObj, error) {
 		return string(shstr[off:end])
 	}
 
-	o := &elfObj{}
+	o := &elfObj{machine: uint16(m)}
 	for i := 0; i < shnum; i++ {
 		h := shoff + uint64(i)*uint64(shentsz)
 		typ := uint32(rd32(src, int(h)+4))
@@ -355,6 +390,20 @@ func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
 	// --- symbols ---
 	for i, s := range o.syms {
 		switch {
+		case strings.HasPrefix(s.name, "$"):
+			// An ARM/AArch64 mapping symbol -- $a, $t, $d, $x and the numbered
+			// forms like $d.2 -- marks the bytes that follow it as code or as
+			// data, the way the ARM ELF ABI defines them. They are always
+			// local, never referenced by a relocation, and there is no C
+			// identifier that can collide with one.
+			//
+			// They must be dropped rather than entered into the symbol table.
+			// An AArch64 object has one in every section that holds code or
+			// data, so a linker that counts them sees "$d" defined once by
+			// .text and again by .rodata and stops with a duplicate-definition
+			// error naming a symbol the source never mentioned. Treating them
+			// as markers is what every real linker does.
+			o.symKey[i] = ""
 		case s.isFile:
 			// STT_FILE names the object rather than anything in it. Read here
 			// because a duplicate-definition diagnostic quotes it, and a
@@ -494,37 +543,59 @@ func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
 				}
 			}
 			at := tsBase + off
-			switch typ {
-			case rX8664None:
-				// padding, no-op
-			case rX8664PC32, rX8664PLT32:
-				// PC-relative: the field wants S + A - P, with P the field's own
-				// address and the "next instruction" already folded into A (-4 for
-				// a call/jmp, 0 for a RIP-relative data ref). goa instead measures
-				// from the byte after the field -- S + Addend - (P + 4) -- so the
-				// addend has to be shifted by the field width or every PC-relative
-				// reference lands 4 bytes low (a `call write` reaching write-4).
-				img.Fixups = append(img.Fixups, Fixup{
-					Sect: tsGi, Off: at, Sym: key, Addend: int(addend) + 4,
-				})
-			case rX8664PC64:
-				// Same rule with an 8-byte field. (The large code model that needs
-				// this is not exercised by goclib today.)
-				img.Fixups = append(img.Fixups, Fixup{
-					Sect: tsGi, Off: at, Sym: key, Addend: int(addend) + 8, Wide: true,
-				})
-			case rX8664_64:
-				img.Fixups = append(img.Fixups, Fixup{
-					Sect: tsGi, Off: at, Sym: key, Addend: int(addend),
-					Absolute: true, Wide: true,
-				})
-			case rX8664_32, rX8664_32S:
-				img.Fixups = append(img.Fixups, Fixup{
-					Sect: tsGi, Off: at, Sym: key, Addend: int(addend),
-					Absolute: true,
-				})
+			switch o.machine {
+			case emX8664:
+				switch typ {
+				case rX8664None:
+					// padding, no-op
+				case rX8664PC32, rX8664PLT32:
+					// PC-relative: the field wants S + A - P, with P the field's own
+					// address and the "next instruction" already folded into A (-4 for
+					// a call/jmp, 0 for a RIP-relative data ref). goa instead measures
+					// from the byte after the field -- S + Addend - (P + 4) -- so the
+					// addend has to be shifted by the field width or every PC-relative
+					// reference lands 4 bytes low (a `call write` reaching write-4).
+					img.Fixups = append(img.Fixups, Fixup{
+						Sect: tsGi, Off: at, Sym: key, Addend: int(addend) + 4,
+					})
+				case rX8664PC64:
+					// Same rule with an 8-byte field. (The large code model that needs
+					// this is not exercised by goclib today.)
+					img.Fixups = append(img.Fixups, Fixup{
+						Sect: tsGi, Off: at, Sym: key, Addend: int(addend) + 8, Wide: true,
+					})
+				case rX8664_64:
+					img.Fixups = append(img.Fixups, Fixup{
+						Sect: tsGi, Off: at, Sym: key, Addend: int(addend),
+						Absolute: true, Wide: true,
+					})
+				case rX8664_32, rX8664_32S:
+					img.Fixups = append(img.Fixups, Fixup{
+						Sect: tsGi, Off: at, Sym: key, Addend: int(addend),
+						Absolute: true,
+					})
+				default:
+					return fmt.Errorf("elf: unsupported x86-64 relocation type %d for %s (%s)", typ, es.name, key)
+				}
+			case emAArch64:
+				switch typ {
+				case rAARCH64None:
+					// padding, no-op
+				case rAARCH64_ABS64, rAARCH64_PREL32, rAARCH64_ADR_PREL_PG_HI21,
+					rAARCH64_ADD_ABS_LO12_NC, rAARCH64_LDST8_ABS_LO12_NC,
+					rAARCH64_LDST16_ABS_LO12_NC, rAARCH64_LDST32_ABS_LO12_NC,
+					rAARCH64_LDST64_ABS_LO12_NC, rAARCH64_CALL26, rAARCH64_JUMP26:
+					// AArch64 relocations are bit-field patches into instruction
+					// words; they cannot live in the x86 Fixup model. Defer them to
+					// applyReloc, which knows each type's encoding.
+					img.Relocs = append(img.Relocs, Reloc{
+						Machine: emAArch64, Type: typ, Sect: tsGi, Off: at, Sym: key, Addend: addend,
+					})
+				default:
+					return fmt.Errorf("elf: unsupported AArch64 relocation type %d for %s (%s)", typ, es.name, key)
+				}
 			default:
-				return fmt.Errorf("elf: unsupported relocation type %d for %s (%s)", typ, es.name, key)
+				return fmt.Errorf("elf: unsupported machine 0x%x for relocation in %s", o.machine, es.name)
 			}
 		}
 	}

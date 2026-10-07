@@ -399,6 +399,18 @@ func IsLinuxSyscall(name string) bool {
 	return ok
 }
 
+// LinuxSyscallNumber returns the raw Linux syscall number for name.
+//
+// goa's own assembler turns a syscall into a `mov rax,N; syscall` stub, so a
+// caller that emits the stub itself -- the LLVM back end, which now owns the
+// entry point and the syscalls for every non-x86_64 target and links through
+// gocld with no assembler in the loop -- needs the number this table holds, not
+// just the fact that the name is a syscall.
+func LinuxSyscallNumber(name string) (int64, bool) {
+	n, ok := linuxSyscalls[name]
+	return n, ok
+}
+
 func NewAssembler() *Assembler {
 	a := &Assembler{
 		syms:      map[string]symLoc{},

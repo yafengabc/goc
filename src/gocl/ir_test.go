@@ -50,7 +50,7 @@ func irFromSource(t *testing.T, src string) (string, map[string]bool) {
 	}
 	// No runtime is linked here: the fragments guard only the user-code surface
 	// this compiler lowers. translateProgram(nil lib) emits exactly that.
-	ir, claimed, _, err := translateProgram(prog, nil, false, 1)
+	ir, claimed, _, err := translateProgram(prog, nil, false, 1, "")
 	if err != nil {
 		t.Fatalf("generate IR: %v", err)
 	}
@@ -388,7 +388,7 @@ func irFrom(t *testing.T, opt int) string {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	ir, _, _, err := translateProgram(prog, nil, false, opt)
+	ir, _, _, err := translateProgram(prog, nil, false, opt, "")
 	if err != nil {
 		t.Fatalf("translate: %v", err)
 	}

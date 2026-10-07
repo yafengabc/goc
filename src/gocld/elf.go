@@ -144,6 +144,19 @@ func (state *Image) BuildELF(outPath string) error {
 		}
 	}
 
+	// Non-x86 relocations (AArch64 bit-field fixups, ...) are applied the same
+	// way as the x86 Fixups: after layout, with each symbol's resolved address.
+	for _, r := range state.Relocs {
+		t, ok := symVA[r.Sym]
+		if !ok {
+			return fmt.Errorf("undefined symbol referenced: %s", r.Sym)
+		}
+		s := state.Sections[r.Sect]
+		if err := applyReloc(s, r, t, elfBase+secOff[s]); err != nil {
+			return err
+		}
+	}
+
 	entryVA, ok := symVA[state.Entry]
 	if !ok {
 		return fmt.Errorf("entry symbol %q not defined", state.Entry)
@@ -239,7 +252,7 @@ func (state *Image) BuildELF(outPath string) error {
 	buf[7] = elfOSABISysV
 	buf[8] = 0 // ABI version
 	putU16at(buf, 16, etExec)
-	putU16at(buf, 18, emX8664)
+	putU16at(buf, 18, state.Machine)
 	putU32at(buf, 20, elfVersion)
 	putU64at(buf, 24, uint64(entryVA))
 	putU64at(buf, 32, elfEhSize)     // e_phoff

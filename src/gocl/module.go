@@ -1,6 +1,8 @@
 package gocl
 
 import (
+	"fmt"
+	"goa"
 	"goc/frontend"
 	"sort"
 	"strconv"
@@ -68,12 +70,40 @@ type irMod struct {
 	// the same flag, and the LLVM backend has to agree or the object describes a
 	// different ABI than the C runtime it is linked against.
 	linux bool
+	// arch names the instruction set: "x86_64" (default), "aarch64", "arm"
+	// (armv7), "riscv64", "riscv32". It chooses the target triple and the data
+	// layout; the libLLVM build linked here ships all of them, so selecting one
+	// is purely a matter of naming the right triple rather than recompiling
+	// anything.
+	arch string
 	// tlsOffsets maps a C thread-local global's name to its byte offset inside
 	// the .tls section. The linker lays the variable out there and provides the
 	// __goc_tls_slot helper to reach it; the IR references the variable through
 	// that helper with this offset, so the access code and the storage always
 	// agree on where the variable lives.
 	tlsOffsets map[string]int64
+	// nativeLink records that this build links through gocld with no assembler
+	// in the loop, which means this module also owns the entry point and every
+	// raw syscall (see UsesNativeLink). When it is false the x86-64/goa path
+	// is in use: the entry stub, the syscall stubs and the TLS storage all
+	// arrive from goa's assembler, and the IR must leave them alone rather than
+	// define a second copy of a symbol that would then be defined twice.
+	nativeLink bool
+	// syscallStubs names the raw Linux syscalls this module DEFINES rather than
+	// declares. On a target whose entry point and syscalls are both generated
+	// here (every non-x86_64 Linux target: see injectEntryStub) there is no goa
+	// assembler in the loop to synthesise `mov rax,N; syscall`, so the call the
+	// C runtime makes to, say, `write` has to be satisfied by a body in this
+	// module. noteExtern records the name here and emitSyscallStub writes the
+	// body.
+	syscallStubs map[string]bool
+	// stubRet / stubParams keep the signature the first call site used, which
+	// is the C runtime's own prototype for that syscall. The stub must match
+	// the call exactly (LLVM checks operand count and types against a defined
+	// function), so the signature is recorded rather than guessed from the
+	// syscall number.
+	stubRet    map[string]*frontend.Type
+	stubParams map[string][]*frontend.Type
 }
 
 type irGlobal struct {
@@ -88,18 +118,25 @@ type irGlobal struct {
 	constant bool
 }
 
-func newIRMod(linux bool) *irMod {
+func newIRMod(linux bool, arch string) *irMod {
+	if arch == "" {
+		arch = "x86_64"
+	}
 	m := &irMod{
-		structs:    map[string]bool{},
-		structN:    map[*frontend.Type]string{},
-		protos:     map[string]bool{},
-		defined:    map[string]bool{},
-		extSig:     map[string]bool{},
-		extRet:     map[string]*frontend.Type{},
-		strings:    map[string]string{},
-		consts:     map[string]string{},
-		linux:      linux,
-		tlsOffsets: map[string]int64{},
+		structs:      map[string]bool{},
+		structN:      map[*frontend.Type]string{},
+		protos:       map[string]bool{},
+		defined:      map[string]bool{},
+		extSig:       map[string]bool{},
+		extRet:       map[string]*frontend.Type{},
+		strings:      map[string]string{},
+		consts:       map[string]string{},
+		linux:        linux,
+		arch:         arch,
+		tlsOffsets:   map[string]int64{},
+		syscallStubs: map[string]bool{},
+		stubRet:      map[string]*frontend.Type{},
+		stubParams:   map[string][]*frontend.Type{},
 	}
 	return m
 }
@@ -141,6 +178,53 @@ func (m *irMod) Externals() []string {
 	return out
 }
 
+// archLayoutTriple returns the LLVM data layout and target triple for an
+// architecture and OS. The data layout must match what the rest of the compiler
+// (and goa's assembler, on x86-64) assumes, or struct-by-value returns and
+// >8-byte arguments land at the wrong offset. The libLLVM build linked here
+// ships x86_64, aarch64, arm, riscv64 and riscv32, so any of these triples is
+// valid.
+func archLayoutTriple(arch string, linux bool) (string, string) {
+	vendorOS := "-pc-windows-msvc"
+	if linux {
+		vendorOS = "-pc-linux-gnu"
+	}
+	switch arch {
+	case "aarch64":
+		// AArch64 is LP64 and uniform: every integer/vector type aligns to its
+		// size, and the n32:64 rule keeps 64-bit accesses naturally aligned.
+		if linux {
+			return "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128", "aarch64" + vendorOS
+		}
+		return "e-m:w-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128", "aarch64" + vendorOS
+	case "arm":
+		// ARMv7: a 32-bit pointer machine. The layout differs from AArch64 in
+		// the explicit p:32:32 and the S64 stack alignment.
+		if linux {
+			return "e-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64", "arm" + vendorOS
+		}
+		return "e-m:w-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64", "arm" + vendorOS
+	case "riscv64":
+		// RV64 is LP64 with a RISC-V-specific layout string.
+		if linux {
+			return "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128", "riscv64" + vendorOS
+		}
+		return "e-m:w-p:64:64-i64:64-i128:128-n32:64-S128", "riscv64" + vendorOS
+	case "riscv32":
+		// RV32 is ILP32: the only difference from RV64 is the 32-bit pointer
+		// (p:32:32) and the native 32-bit alignment (n32, no 64-bit GPRs).
+		if linux {
+			return "e-m:e-p:32:32-i64:64-i128:128-n32-S128", "riscv32" + vendorOS
+		}
+		return "e-m:w-p:32:32-i64:64-i128:128-n32-S128", "riscv32" + vendorOS
+	default: // x86_64
+		if linux {
+			return "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", "x86_64" + vendorOS
+		}
+		return "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", "x86_64" + vendorOS
+	}
+}
+
 func (m *irMod) String() string {
 	// The layout string describes the machine goa's own assembler targets, so a
 	// struct laid out by one half of the compiler is read identically by the
@@ -148,12 +232,13 @@ func (m *irMod) String() string {
 	// (m:e), because the two differ in struct-by-value passing and aggregate
 	// alignment -- getting this wrong makes a struct return or a >8-byte
 	// argument land at the wrong offset.
-	layout := "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
-	triple := "x86_64-pc-windows-msvc"
-	if m.linux {
-		layout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
-		triple = "x86_64-pc-linux-gnu"
-	}
+	// The layout string and triple name the machine the module lowers to. Each
+	// architecture has its own data layout, and within an architecture Windows
+	// and Linux differ in the aggregate ABI (m:w vs m:e) and the vendor/OS
+	// field. Getting the layout wrong makes a struct-by-value return or a
+	// >8-byte argument land at the wrong offset -- the same failure mode goa's
+	// own assembler would hit, so the two halves must agree.
+	layout, triple := archLayoutTriple(m.arch, m.linux)
 
 	var b strings.Builder
 	b.WriteString("target datalayout = \"" + layout + "\"\n")
@@ -195,6 +280,14 @@ func (m *irMod) String() string {
 	}
 	for _, f := range m.funcBodies {
 		b.WriteString(f)
+		b.WriteString("\n")
+	}
+	// The generated syscall bodies go after the C functions. They are appended
+	// as `define` (not `declare`), so they must be part of the module rather
+	// than something the linker supplies -- that is the whole point on the
+	// targets where gocld links the object without goa.
+	for _, name := range m.sortedSyscallStubs() {
+		b.WriteString(m.emitSyscallStub(name))
 		b.WriteString("\n")
 	}
 	// A static ELF image has no GOT or PLT, so the Linux module must ask LLVM for
@@ -535,6 +628,33 @@ func (m *irMod) noteExtern(name string, ret *frontend.Type, params []*frontend.T
 	if m.defined[name] {
 		return
 	}
+	// A raw Linux syscall is not something the C library defines and not
+	// something this module is willing to leave undefined: on the targets
+	// where this back end also owns the entry point there is no assembler in
+	// the link to synthesise the `mov rax,N; syscall` stub that goa used to
+	// provide, so the body is generated here (see emitSyscallStub) instead.
+	//
+	// The number has to be the target's, not x86-64's: `write` is 1 on x86-64
+	// and 64 on AArch64, and a stub that loads the wrong one runs to completion
+	// producing nothing. A name this architecture has no number for is left as
+	// a plain declare, so the link reports the missing symbol by name instead
+	// of the program trapping inside a wrong syscall.
+	//
+	// The signature is taken from the first call site, which is the C
+	// runtime's own prototype for that syscall -- goclib calls write() through
+	// a real declaration, and every call site agrees on it. Recording it rather
+	// than deriving one from the syscall number is what keeps the generated
+	// body type-compatible with the call that reaches it.
+	if m.linux && m.nativeLink && goa.IsLinuxSyscall(name) {
+		if _, ok := archSyscallNumber(m.arch, name); ok {
+			if !m.syscallStubs[name] {
+				m.syscallStubs[name] = true
+				m.stubRet[name] = ret
+				m.stubParams[name] = params
+			}
+			return
+		}
+	}
 	key := name + "/" + itoa(len(params))
 	if m.extSig[key] {
 		return
@@ -859,4 +979,208 @@ func (m *irMod) globalSym(cName string) string {
 func (m *irMod) tlsOffset(cName string) (int64, bool) {
 	off, ok := m.tlsOffsets[cName]
 	return off, ok
+}
+
+// --- generated syscall stubs -------------------------------------------------
+
+// sortedSyscallStubs lists the syscalls this module defines, sorted so the same
+// program always lowers to the same bytes of IR (and so a diff of two dumps is
+// readable).
+func (m *irMod) sortedSyscallStubs() []string {
+	out := make([]string, 0, len(m.syscallStubs))
+	for name := range m.syscallStubs {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// emitSyscallStub writes one raw Linux syscall as a real function body.
+//
+// goclib reaches the kernel through plain C calls -- `write(fd, buf, n)`,
+// `_exit(code)` -- and on x86-64 those were satisfied by goa emitting a
+// `mov rax,N; syscall` stub. For the targets whose entry point is generated
+// here there is no assembler in the link, so the stub is generated here
+// instead, as inline assembly in the module LLVM compiles.
+//
+// Two things make it correct rather than merely plausible:
+//
+//   - The signature is the C library's own prototype, recorded from the call
+//     site (see noteExtern), so this is an ordinary call-compatible function
+//     rather than a variadic trampoline. LLVM checks a call against a defined
+//     function's real operand list, so a guessed `i64(i64,i64,i64,i64,i64,i64)`
+//     would not match the call the library makes.
+//
+//   - The arguments are named as inline-assembly inputs but never moved. On
+//     every Unix Linux ABI the C calling convention already places the first
+//     six integer/pointer arguments in exactly the registers the trap reads
+//     them from, so the body only has to load the number and trap. Declaring
+//     the inputs is still necessary: an asm block that does not name an
+//     operand is free to have the register allocator reuse that register.
+//
+// The result comes back in the same register the first argument went in, which
+// is the `=r,0` read-write idiom rather than a shared-register pair, so the
+// first input is bound with a matching constraint instead of naming x0 twice.
+func (m *irMod) emitSyscallStub(name string) string {
+	num, ok := archSyscallNumber(m.arch, name)
+	if !ok {
+		num = 0
+	}
+	ret := m.stubRet[name]
+	if ret == nil {
+		ret = frontend.IntType()
+	}
+	params := m.stubParams[name]
+	retTy := m.llirType(ret)
+
+	var ps, ins []string
+	for i, p := range params {
+		if p == nil {
+			p = frontend.IntType()
+		}
+		pty := m.llirType(p)
+		// A function parameter is written "<type> %name". The "%0: <type>"
+		// form belongs to instructions and allocas, and using it here made
+		// LLVM read "%0" as a (nonexistent) type and report "invalid type for
+		// function argument" against the parameter.
+		ps = append(ps, pty+" %"+itoa(i))
+		// The operand type is spelled out, not left to be inferred. LLVM
+		// rejects an inline-asm call whose operand list has a bare "%0" with
+		// "invalid type for function argument": there is no declaration to
+		// infer from when the constraint pins the operand to a register, so
+		// the type has to be there.
+		ins = append(ins, pty+" %"+itoa(i))
+	}
+	tmpl, cons, numOperand := syscallAsm(m.arch, num, len(params))
+	// x86-64 has to pass the syscall number in as an immediate operand rather
+	// than baking it into the template: LLVM inline asm reads a literal "$N" in
+	// the template as a reference to operand N, so a hardcoded "$60" is an
+	// operand 60 that does not exist ("Invalid $ operand number"). The number
+	// therefore arrives as the first input and the template names it "$1" --
+	// operand 0 is the output, so the first input is operand 1.
+	if numOperand != "" {
+		ins = append([]string{numOperand}, ins...)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "define %s%s @%s(%s) {\n", m.dso(), retTy, name, strings.Join(ps, ", "))
+	// The template is embedded as-is: its \0A is the IR escape for the newline
+	// that separates the two assembler statements, and running it through %q
+	// would turn that into a literal backslash and hand the assembler the four
+	// characters "\0A" instead of a line break.
+	fmt.Fprintf(&b, "  %%r = call i64 asm sideeffect \"%s\", \"%s\"(%s)\n",
+		tmpl, cons, strings.Join(ins, ", "))
+	// A syscall reports -errno as a negative long. Narrowing to the
+	// prototype's return type keeps the value a libc caller expects: the low
+	// half of a sign-extended 64-bit -errno is the same negative int, and a
+	// successful count is positive in both.
+	switch {
+	case retTy == "void":
+		// A void syscall (exit_group, exit, _exit) is the common one on the
+		// termination path: the trap does not come back, and the wrapper has
+		// nothing to hand its own caller. The asm still yields a value, which
+		// is simply not returned.
+		b.WriteString("  ret void\n")
+	case retTy == "i64":
+		b.WriteString("  ret i64 %r\n")
+	case retTy == "ptr":
+		b.WriteString("  %p = inttoptr i64 %r to ptr\n  ret ptr %p\n")
+	case strings.HasPrefix(retTy, "i"):
+		fmt.Fprintf(&b, "  %%n = trunc i64 %%r to %s\n  ret %s %%n\n", retTy, retTy)
+	default:
+		fmt.Fprintf(&b, "  ret %s %%r\n", retTy)
+	}
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// syscallAsm returns the inline-assembly template, the constraint string and
+// the immediate operand (empty when the number is baked into the template) for
+// one syscall on the given target.
+//
+// The template loads the syscall number into the register the kernel reads it
+// from and executes the trap. The constraints name the argument registers (so
+// the allocator cannot move an argument out from under the trap) and declare
+// the scratch registers the kernel destroys -- a stub that omitted the clobbers
+// would let the caller read whatever the allocator happened to leave there.
+func syscallAsm(arch string, num int64, nargs int) (tmpl, cons, numOperand string) {
+	// asmNL is the IR escape for the newline that separates the two assembler
+	// statements in an inline-asm template. It has to reach LLVM as the three
+	// characters \ 0 A: in a double-quoted Go string "\0A" would be a NUL
+	// octal escape followed by 'A', and the assembler would receive that
+	// instead of a line break.
+	const asmNL = `\0A`
+	n := strconv.FormatInt(num, 10)
+	// Per architecture: where the arguments arrive, where the result comes
+	// back, which registers the kernel destroys, and the instruction pair.
+	argRegs, outReg, scratch := []string(nil), "", []string(nil)
+	// arg0AliasOut records that the first argument arrives in the very
+	// register the result is returned in -- true everywhere except x86-64,
+	// where arguments start at rdi and the result is rax. That one register
+	// has to be bound with a matching constraint; naming it twice is a
+	// constraint the verifier rejects.
+	arg0AliasOut := false
+	// numIsImm records that the number has to be passed in rather than written
+	// into the template. x86-64 needs it: LLVM inline asm reads a literal "$N"
+	// in the template as a reference to operand N, so `movq $60, %rax` is read
+	// as "operand 60", which does not exist. The immediate therefore arrives as
+	// the first input and the template names it "$1" (operand 0 is the output,
+	// so the first input is operand 1).
+	numIsImm := false
+	switch arch {
+	case "x86_64":
+		// SysV hands the first six integer/pointer arguments to rdi, rsi, rdx,
+		// r10, r8, r9 -- r10, not rcx, because the `syscall` instruction
+		// itself destroys rcx and r11. The number goes in rax and the kernel
+		// returns the result in rax, so the number and the result share it.
+		argRegs = []string{"rdi", "rsi", "rdx", "r10", "r8", "r9"}
+		outReg, scratch = "rax", []string{"rcx", "r11"}
+		tmpl = "movq $1, %rax" + asmNL + "syscall"
+		numIsImm = true
+	case "aarch64":
+		argRegs = []string{"x0", "x1", "x2", "x3", "x4", "x5"}
+		outReg = "x0"
+		scratch = []string{"x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17"}
+		tmpl = "movz x8, #" + n + asmNL + "svc #0"
+		arg0AliasOut = true
+	case "riscv64", "riscv32":
+		// The RISC-V kernel returns in a0 and preserves everything else the
+		// caller can see, so only the number register and the temporaries the
+		// kernel borrows are clobbered. `li` is a pseudo-instruction the
+		// assembler expands, so the whole 16-bit range needs no special case.
+		argRegs = []string{"a0", "a1", "a2", "a3", "a4", "a5"}
+		outReg = "a0"
+		scratch = []string{"a7", "t0", "t1", "t2", "t3", "t4", "t5", "t6"}
+		tmpl = "li a7, " + n + asmNL + "ecall"
+		arg0AliasOut = true
+	case "arm":
+		// ARM's EABI passes at most four arguments in registers and the rest
+		// on the stack, so this is right for the syscalls the C library
+		// actually calls with four or fewer operands (all but mmap/select).
+		argRegs = []string{"r0", "r1", "r2", "r3", "r4", "r5"}
+		outReg = "r0"
+		scratch = []string{"r7", "r12"}
+		tmpl = "mov r7, #" + n + asmNL + "svc #0"
+		arg0AliasOut = true
+	default:
+		return "", "", ""
+	}
+	cl := []string{"={" + outReg + "}"}
+	if numIsImm {
+		// The number is the first input, so the arguments shift down by one and
+		// the template refers to it as "$1".
+		cl = append(cl, "i")
+		numOperand = "i64 " + n
+	}
+	for i := 0; i < nargs && i < len(argRegs); i++ {
+		if i == 0 && arg0AliasOut {
+			cl = append(cl, "0")
+			continue
+		}
+		cl = append(cl, "{"+argRegs[i]+"}")
+	}
+	for _, r := range scratch {
+		cl = append(cl, "~{"+r+"}")
+	}
+	return tmpl, strings.Join(cl, ","), numOperand
 }

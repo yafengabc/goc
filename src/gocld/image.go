@@ -106,6 +106,29 @@ type Fixup struct {
 	Short bool
 }
 
+// Reloc is a pending non-x86 relocation -- an AArch64 bit-field fixup, say --
+// that the x86-style Fixup model (a relative distance or an absolute address)
+// cannot express. Like Fixups it is recorded during ingest and applied after
+// the section layout gives every symbol an address, but its application reads
+// the relocation type and patches instruction words the way the target ISA's
+// ABI prescribes.
+type Reloc struct {
+	// Machine is the ELF e_machine this relocation belongs to (EM_AARCH64 ...),
+	// so applyReloc knows which encoding rules to use.
+	Machine uint16
+	// Type is the raw relocation type (R_AARCH64_ADR_PREL_PG_HI21 ...).
+	Type uint32
+	// Sect is the index of the section holding the patch site.
+	Sect int
+	// Off is the byte offset of the field within that section.
+	Off int
+	// Sym is the symbol key the field references (a plain name, or a
+	// "__secbase_N" synthetic key for a section-relative reference).
+	Sym string
+	// Addend is the constant addend from the relocation entry.
+	Addend int64
+}
+
 // UWFunc is one function's unwind bookkeeping, captured while its prologue was
 // assembled: where it lives, and the shape of the frame it set up.
 //
@@ -149,6 +172,15 @@ type Image struct {
 	// Fixups are the relocations still to apply, applied once the section
 	// layout gives every symbol an address.
 	Fixups []Fixup
+
+	// Relocs are pending non-x86 relocations (AArch64 bit-field fixups, ...),
+	// applied after layout by applyReloc. Empty for an x86-64 image.
+	Relocs []Reloc
+
+	// Machine is the ELF e_machine of the ingested ELF object (0 for a PE/COFF
+	// image). It selects the relocation encoding and the e_machine the writer
+	// emits, so a single linker serves every backend instead of one per ISA.
+	Machine uint16
 
 	// Entry is the symbol at the image's entry point.
 	Entry string

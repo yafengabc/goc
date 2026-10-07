@@ -36,8 +36,13 @@ import (
 // tests, which exercise fragments without the runtime present). Its function table
 // is consulted for prototypes and for the reachability walk that decides which
 // runtime code has to be emitted.
-func translateProgram(prog *frontend.Program, lib *common.Program, linux bool, opt int) (string, map[string]bool, []string, error) {
-	m := newIRMod(linux)
+func translateProgram(prog *frontend.Program, lib *common.Program, linux bool, opt int, arch string) (string, map[string]bool, []string, error) {
+	m := newIRMod(linux, arch)
+	// Whether this build links through gocld alone decides if the module owns
+	// the entry point and the raw syscalls. It is recorded before any body is
+	// generated, because a call the C library makes to `write` is turned into a
+	// generated stub or left as a declare depending on the answer.
+	m.nativeLink = UsesNativeLink(linux, arch, prog, lib)
 	// -Os is a property of the module rather than of one function: it decides
 	// which pipeline runs, and the optsize attribute is what that pipeline reads.
 	m.optSize = opt == 2

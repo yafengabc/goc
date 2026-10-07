@@ -52,6 +52,26 @@ type llvmAPI struct {
 	initializeX86TargetMC                 *syscall.LazyProc
 	initializeX86AsmPrinter               *syscall.LazyProc
 	initializeX86AsmParser                *syscall.LazyProc
+	// Non-x86 backends. The libLLVM build linked here ships AArch64, ARM and
+	// RISCV too, so we register all of them: a target the compiler never
+	// selects costs nothing once initialised, and registering it is what makes
+	// LLVMCreateTargetMachine for that architecture succeed instead of
+	// dereferencing a null machine description.
+	initializeAArch64TargetInfo           *syscall.LazyProc
+	initializeAArch64Target               *syscall.LazyProc
+	initializeAArch64TargetMC             *syscall.LazyProc
+	initializeAArch64AsmPrinter           *syscall.LazyProc
+	initializeAArch64AsmParser            *syscall.LazyProc
+	initializeARMTargetInfo               *syscall.LazyProc
+	initializeARMTarget                   *syscall.LazyProc
+	initializeARMTargetMC                 *syscall.LazyProc
+	initializeARMAsmPrinter               *syscall.LazyProc
+	initializeARMAsmParser                *syscall.LazyProc
+	initializeRISCVTargetInfo             *syscall.LazyProc
+	initializeRISCVTarget                 *syscall.LazyProc
+	initializeRISCVTargetMC               *syscall.LazyProc
+	initializeRISCVAsmPrinter             *syscall.LazyProc
+	initializeRISCVAsmParser              *syscall.LazyProc
 	getTargetFromTriple                   *syscall.LazyProc
 	createTargetMachine                   *syscall.LazyProc
 	disposeTargetMachine                  *syscall.LazyProc
@@ -154,6 +174,21 @@ func (a *llvmAPI) bind() error {
 		{"LLVMInitializeX86TargetMC", &a.initializeX86TargetMC},
 		{"LLVMInitializeX86AsmPrinter", &a.initializeX86AsmPrinter},
 		{"LLVMInitializeX86AsmParser", &a.initializeX86AsmParser},
+		{"LLVMInitializeAArch64TargetInfo", &a.initializeAArch64TargetInfo},
+		{"LLVMInitializeAArch64Target", &a.initializeAArch64Target},
+		{"LLVMInitializeAArch64TargetMC", &a.initializeAArch64TargetMC},
+		{"LLVMInitializeAArch64AsmPrinter", &a.initializeAArch64AsmPrinter},
+		{"LLVMInitializeAArch64AsmParser", &a.initializeAArch64AsmParser},
+		{"LLVMInitializeARMTargetInfo", &a.initializeARMTargetInfo},
+		{"LLVMInitializeARMTarget", &a.initializeARMTarget},
+		{"LLVMInitializeARMTargetMC", &a.initializeARMTargetMC},
+		{"LLVMInitializeARMAsmPrinter", &a.initializeARMAsmPrinter},
+		{"LLVMInitializeARMAsmParser", &a.initializeARMAsmParser},
+		{"LLVMInitializeRISCVTargetInfo", &a.initializeRISCVTargetInfo},
+		{"LLVMInitializeRISCVTarget", &a.initializeRISCVTarget},
+		{"LLVMInitializeRISCVTargetMC", &a.initializeRISCVTargetMC},
+		{"LLVMInitializeRISCVAsmPrinter", &a.initializeRISCVAsmPrinter},
+		{"LLVMInitializeRISCVAsmParser", &a.initializeRISCVAsmParser},
 		{"LLVMGetTargetFromTriple", &a.getTargetFromTriple},
 		{"LLVMCreateTargetMachine", &a.createTargetMachine},
 		{"LLVMDisposeTargetMachine", &a.disposeTargetMachine},
@@ -181,17 +216,27 @@ func (a *llvmAPI) bind() error {
 	return nil
 }
 
-// initTargets registers the x86 backend.
+// initTargets registers every backend the linked libLLVM ships.
 //
 // LLVMInitializeX86TargetMC is the one that is easy to miss: without it the
 // target has no machine description, LLVMTargetHasAsmBackend reports false, and
 // LLVMCreateTargetMachine then dereferences a null pointer. It is absent from
-// the sequence most documentation lists.
+// the sequence most documentation lists. The same rule holds for the other
+// architectures, so each gets TargetInfo + Target + TargetMC + AsmPrinter.
 func (a *llvmAPI) initTargets() error {
 	for _, p := range []*syscall.LazyProc{
 		a.initializeX86TargetInfo, a.initializeX86Target,
 		a.initializeX86TargetMC, a.initializeX86AsmPrinter,
 		a.initializeX86AsmParser,
+		a.initializeAArch64TargetInfo, a.initializeAArch64Target,
+		a.initializeAArch64TargetMC, a.initializeAArch64AsmPrinter,
+		a.initializeAArch64AsmParser,
+		a.initializeARMTargetInfo, a.initializeARMTarget,
+		a.initializeARMTargetMC, a.initializeARMAsmPrinter,
+		a.initializeARMAsmParser,
+		a.initializeRISCVTargetInfo, a.initializeRISCVTarget,
+		a.initializeRISCVTargetMC, a.initializeRISCVAsmPrinter,
+		a.initializeRISCVAsmParser,
 	} {
 		p.Call()
 	}
@@ -262,6 +307,24 @@ func (a *llvmAPI) errorText(err uintptr) string {
 	return s
 }
 
+// moduleTriple extracts the `target triple = "..."` line from IR text. The IR
+// front end writes this from the requested -arch, so it is the single place
+// that decides the architecture LLVM lowers to; reading it back here means the
+// code generator and the data layout always agree. Returns "" if no such line
+// is present, in which case the caller falls back to its own default.
+func moduleTriple(ir []byte) string {
+	const key = "target triple = \""
+	i := strings.Index(string(ir), key)
+	if i < 0 {
+		return ""
+	}
+	j := strings.IndexByte(string(ir)[i+len(key):], '"')
+	if j < 0 {
+		return ""
+	}
+	return string(ir)[i+len(key) : i+len(key)+j]
+}
+
 // compileToFile runs the shared IR->target lowering and emits either an object
 // (fileType 1) or assembly text (fileType 0) with LLVMTargetMachineEmitToFile.
 func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLevel, passes string, fileType int, linux bool) error {
@@ -274,8 +337,16 @@ func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLev
 	// default -- the object's format (ELF vs COFF) and the calling convention
 	// (SysV vs Win64) both follow it. The default target machine is still built
 	// from this triple, so emitting an ELF object from a Windows host works.
+	// The module already names its target with `target triple = "..."`, and
+	// that string is the authority for which architecture to lower to: the IR
+	// front end set it from the requested -arch (aarch64, arm, riscv64, ...)
+	// together with the data layout, so honouring it here is what keeps the
+	// codegen and the layout in agreement. Only when the module carries no
+	// triple (it always does today) do we fall back to the old x86/linux rule.
 	var triple string
-	if linux {
+	if t := moduleTriple(ir); t != "" {
+		triple = t
+	} else if linux {
 		triple = "x86_64-pc-linux-gnu"
 	} else {
 		tripleMsg, _, _ := a.getDefaultTargetTriple.Call()

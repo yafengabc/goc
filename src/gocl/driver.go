@@ -39,6 +39,11 @@ type Config struct {
 	Linux  bool
 	WinGUI bool // -mwindows: PE subsystem 2 (GUI), no console window
 	Opt    int  // optimisation level, 0 = none
+	// Arch is the instruction set to compile for: "x86_64" (default), "aarch64",
+	// "arm" (armv7), "riscv64", "riscv32". It names the LLVM target triple and
+	// data layout the IR is lowered to, and on a Linux target decides whether
+	// the program links through gocld alone or through goa's assembler.
+	Arch string
 	// DumpIR keeps the LLVM IR beside the output, so a failing build can be
 	// read at the level LLVM actually saw.
 	DumpIR bool
@@ -122,7 +127,7 @@ func Compile(cfg *Config) (string, error) {
 	}
 
 	// One owner: the whole program, runtime included, goes down the IR path.
-	ir, claimed, externals, err := TranslateProgram(prog, cfg.Linux, cfg.Opt)
+	ir, claimed, externals, err := TranslateProgram(prog, cfg.Linux, cfg.Opt, cfg.Arch)
 	if err != nil {
 		return "", err
 	}
@@ -152,6 +157,20 @@ func Compile(cfg *Config) (string, error) {
 	}
 	if err != nil {
 		return "", err
+	}
+
+	// The linker decision is the same one the IR generator used, so the two
+	// halves cannot disagree about who owns `_start`. Where this back end owns
+	// the entry point and the syscalls outright (every non-x86_64 Linux
+	// target, and x86-64 Linux without TLS), the object is linked straight by
+	// gocld with no assembler in the loop; everywhere else the goa path lays
+	// out the image and supplies the entry stub.
+	if UsesNativeLink(cfg.Linux, cfg.Arch, prog, common.Store(cfg.Linux)) {
+		outPath := outputPath(cfg)
+		if err := linkNativeELF(obj, outPath); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("(ELF binary: run it on Linux/%s): %s", cfg.Arch, outPath), nil
 	}
 
 	d, err := linkData(prog, cfg, claimed, externals, obj)
@@ -387,6 +406,48 @@ func goaAssemble(asm string, obj []byte, outPath string, linux bool) (int64, err
 	return goa.AssembleWithObject(asm, obj, outPath, linux)
 }
 
+// linkNativeELF links the IR object into a runnable ELF with gocld, with no
+// assembler anywhere in the loop.
+//
+// The three steps are the ones the native back end already takes for x86-64
+// Linux (src/goc/main.go): read the object, settle the symbol table, write the
+// image with an entry named. What the native path additionally has is the
+// assembly entry stub; here `_start` came out of the IR as an ordinary defined
+// function, so pickEntry finds it in the object it just read and the linker has
+// nothing left to synthesise.
+func linkNativeELF(obj []byte, outPath string) error {
+	img := gocld.NewImage(gocld.TargetPE)
+	img.Target = gocld.TargetELF
+	// Only one object goes in, but deferring the undefined-symbol report is
+	// still the right call: it makes the check happen once, in Resolve, after
+	// everything has been read, rather than partway through ingest.
+	img.DeferUndefined(true)
+	if err := img.IngestELFBytes(obj); err != nil {
+		return err
+	}
+	if err := img.Resolve(); err != nil {
+		return err
+	}
+	img.Entry = pickEntry(img)
+	_, err := gocld.LinkObject(img, nil, outPath, true)
+	return err
+}
+
+// pickEntry names the symbol the loader jumps to.
+//
+// An ELF relocatable object has no entry field -- that belongs to the linked
+// image -- so the entry is recovered by name. `_start` leads the list, which is
+// the one the generated entry stub defines; `main` is the fallback, so an
+// object whose startup was dropped still links and says which symbol it wanted.
+func pickEntry(img *gocld.Image) string {
+	for _, name := range []string{"_start", "__goc_start", "main"} {
+		if _, ok := img.Syms[name]; ok {
+			return name
+		}
+	}
+	return ""
+}
+
 func preprocessOnly(cfg *Config) error {
 	var b strings.Builder
 	for _, path := range cfg.Inputs {
@@ -499,6 +560,17 @@ func parseArgs(args []string) (*Config, error) {
 			default:
 				return nil, fmt.Errorf("unknown target %q (want linux or windows)", args[i])
 			}
+		case a == "-arch" || a == "--arch":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("%s needs an argument", a)
+			}
+			i++
+			switch args[i] {
+			case "x86_64", "aarch64", "arm", "riscv64", "riscv32":
+				cfg.Arch = args[i]
+			default:
+				return nil, fmt.Errorf("unknown arch %q (want x86_64, aarch64, arm, riscv64, riscv32)", args[i])
+			}
 		case strings.HasPrefix(a, "-m") && strings.Contains(a, "windows"):
 			cfg.WinGUI = true
 		case a == "-dump-ir":
@@ -538,6 +610,7 @@ const usage = `usage: gocl [options] file.c [file2.c ...]
   -O, -O1..-O3, -Os, -Oz, -Ofast
                    optimisation level
   -target linux    emit an ELF binary instead of a PE
+  -arch <isa>      instruction set: x86_64 (default), aarch64, arm, riscv64, riscv32
   -mwindows        PE GUI subsystem (pairs with wWinMain or WinMain)
   -dump-ir         keep the LLVM IR beside the output
   -S, -c           stop before linking: write the AsmPrinter's .s (the C

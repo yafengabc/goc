@@ -1,6 +1,9 @@
 package gocld
 
-import "fmt"
+import (
+	"encoding/binary"
+	"fmt"
+)
 
 // Applying one relocation: the field's final value is written into the section
 // bytes, and a mistake here is invisible until the program crashes in a way
@@ -63,6 +66,54 @@ func applyFixup(s *Section, f Fixup, target, sym2, base int) error {
 	}
 	for i := 0; i < size; i++ {
 		s.Data[f.Off+i] = byte(disp >> (8 * i))
+	}
+	return nil
+}
+
+// applyReloc patches one non-x86 relocation into place. symVA is the resolved
+// address of r.Sym; base is the load address of the section holding the field,
+// so the field's own address P is base + r.Off. The encodings follow the
+// AArch64 ELF psABI and were verified against a real object run under Unicorn
+// (tmp/archtest/run_a64.py is the reference this ports from).
+func applyReloc(s *Section, r Reloc, symVA int, base int) error {
+	if r.Off < 0 || r.Off+8 > len(s.Data) {
+		return fmt.Errorf("reloc out of range for %s", r.Sym)
+	}
+	S := symVA
+	A := int(r.Addend)
+	P := base + r.Off
+	get := func() uint32 { return binary.LittleEndian.Uint32(s.Data[r.Off:]) }
+	put := func(v uint32) { binary.LittleEndian.PutUint32(s.Data[r.Off:], v) }
+	switch r.Type {
+	case rAARCH64_ABS64:
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], uint64(S+A))
+		copy(s.Data[r.Off:], b[:])
+	case rAARCH64_PREL32:
+		binary.LittleEndian.PutUint32(s.Data[r.Off:], uint32(S+A-P))
+	case rAARCH64_ADR_PREL_PG_HI21:
+		page := ((S + A) &^ 0xfff) - (P &^ 0xfff)
+		imm21 := int64(page) >> 12
+		w := get()
+		immlo := uint32(imm21 & 0x3)
+		immhi := uint32((imm21 >> 2) & 0x1ffff)
+		w = (w &^ 0x60ffffe0) | (immlo << 29) | (immhi << 5)
+		put(w)
+	case rAARCH64_ADD_ABS_LO12_NC, rAARCH64_LDST8_ABS_LO12_NC,
+		rAARCH64_LDST16_ABS_LO12_NC, rAARCH64_LDST32_ABS_LO12_NC,
+		rAARCH64_LDST64_ABS_LO12_NC:
+		imm12 := uint32((S + A) & 0xfff)
+		w := get()
+		w = (w &^ 0x3ffc00) | (imm12 << 10)
+		put(w)
+	case rAARCH64_CALL26, rAARCH64_JUMP26:
+		offset := (S + A) - P
+		imm26 := int64(offset) >> 2
+		w := get()
+		w = (w &^ 0x3ffffff) | uint32(imm26&0x3ffffff)
+		put(w)
+	default:
+		return fmt.Errorf("applyReloc: unsupported AArch64 type %#x", r.Type)
 	}
 	return nil
 }

@@ -239,6 +239,29 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 		}
 		args = append(args, e.ty(v.ty)+" "+v.op)
 	}
+	// A call may pass fewer arguments than the callee's prototype declares, and
+	// the entry stub is exactly that case: `_start` calls `main()` with no
+	// operands while the program defines `int main(int argc, char **argv)`.
+	// LLVM rejects a call whose operand count does not match a defined function
+	// ("call to function must have the correct number of arguments"), so the
+	// missing parameters are filled with zero here.
+	//
+	// Zero is the right filler and not a guess: the kernel's argc/argv are not
+	// threaded down to the C entry point on this path (a known limitation, the
+	// same one the native generator's `call main` has), so a program that reads
+	// them was never going to see real values. What matters is that the module
+	// verifies and the program runs.
+	for i := len(n.Args); i < len(paramTys); i++ {
+		pt := paramTys[i]
+		// An aggregate parameter has no single zero-valued operand to write --
+		// a struct or an array needs an alloca plus a memcpy. Nothing in the
+		// entry path passes one, so stop rather than invent a lowering.
+		if pt == nil || pt.Kind == frontend.KStruct ||
+			pt.Kind == frontend.KUnion || pt.Kind == frontend.KArr {
+			break
+		}
+		args = append(args, e.ty(pt)+" "+e.c.zeroOf(pt))
+	}
 	argText := ""
 	if len(args) > 0 {
 		argText = strings.Join(args, ", ")
