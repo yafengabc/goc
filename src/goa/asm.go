@@ -181,6 +181,12 @@ type Assembler struct {
 	// __goc_syscall every unit that makes a syscall defines, and whose name
 	// cannot be made unique because a loader looks it up.
 	libSyms map[string]bool
+	// staticSyms names symbols the front end declared `static` at file scope.
+	// They are recorded so WriteCOFFObject files them as
+	// IMAGE_SYM_CLASS_STATIC: internal linkage is the one property of a symbol
+	// that decides whether two objects may each define it, and it is not
+	// recoverable from anything else in the image.
+	staticSyms map[string]bool
 	// pdataRVA and pdataSize describe the Win64 exception directory: the
 	// RUNTIME_FUNCTION array the loader walks during exception dispatch. They
 	// stay zero unless an object carrying unwind info was merged in (goa's own
@@ -662,6 +668,21 @@ func (a *Assembler) emitSyscallStubs() error {
 			return fmt.Errorf("extern %q: not a Linux syscall known to goa; an ELF target has no DLL imports", n)
 		}
 		a.defineSym(n)
+		// Every stub in this table is goa's own, not the user's code, and each
+		// one is a fixed `mov rax, N; syscall; ret` with no state in it. Two
+		// units in one link both define whichever stubs they use -- goc has no
+		// library stage -- and the second copy would otherwise be a duplicate
+		// definition. Keeping one is the same program: the bodies are byte for
+		// byte identical and nothing is shared between them. See Image.deduped,
+		// which is where the duplicate is dropped rather than reported.
+		//
+		// The name cannot be prefixed either: `extern brk` in goclib is a
+		// declaration of the kernel's, and a per-unit spelling would leave the
+		// declaration referring to a symbol nobody defines.
+		if a.libSyms == nil {
+			a.libSyms = map[string]bool{}
+		}
+		a.libSyms[n] = true
 		if err := a.encode("mov", []Operand{
 			{kind: K_REG, reg: 0},   // rax
 			{kind: K_IMM, imm: num}, // syscall number

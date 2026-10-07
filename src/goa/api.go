@@ -67,6 +67,19 @@ func AssembleATT(src, outPath string, elf bool) (int64, error) {
 	return a.writeImage(outPath, elf)
 }
 
+// AssembleOpts carries the symbol classification the assembly text cannot
+// express. Both sets are nil for a caller that has nothing to say, and both
+// mean "no special treatment": a nil LibSyms makes every second definition an
+// error, a nil InternalSyms makes every symbol externally linked.
+type AssembleOpts struct {
+	// LibSyms names the symbols that are a copy of the goc C library rather
+	// than the user's own definitions. See AssembleObject.
+	LibSyms map[string]bool
+	// InternalSyms names the symbols the front end saw declared `static` at
+	// file scope. See AssembleObject.
+	InternalSyms map[string]bool
+}
+
 // AssembleObject assembles src and writes it as a relocatable object file
 // rather than a linked executable. It returns the size of the file written.
 //
@@ -87,8 +100,15 @@ func AssembleATT(src, outPath string, elf bool) (int64, error) {
 // consume it. Undefined symbols -- a call into the C library, an imported
 // Windows API, a reference to a sibling unit -- are recorded as such, which is
 // how the object says what it still needs.
-func AssembleObject(src, outPath string, elf bool, libSyms map[string]bool) (int64, error) {
+//
+// The two symbol sets are facts only the front end holds. `static` and "this is
+// a copy of the C library" are both invisible in the assembly text -- a static
+// function and an extern one are the same label goa is asked to define -- so they
+// have to be handed in rather than recovered.
+func AssembleObject(src, outPath string, elf bool, opts AssembleOpts) (int64, error) {
+	libSyms := opts.LibSyms
 	a := NewAssembler()
+	a.staticSyms = opts.InternalSyms
 	if elf {
 		a.target = targetELF
 	}

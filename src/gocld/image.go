@@ -56,6 +56,20 @@ type Section struct {
 type SymLoc struct {
 	Sect int
 	Off  int
+
+	// Static marks internal linkage: the symbol is private to its object file
+	// and two objects may each define the same name without conflicting. It
+	// only affects how a *relocatable* object records the symbol --
+	// IMAGE_SYM_CLASS_STATIC instead of EXTERNAL -- because that is the one
+	// place the distinction is written down. The linker does not need it:
+	// mergeSyms reads each object's own storage class back out of the file and
+	// drops a STATIC definition before the duplicate check, which is the only
+	// place the distinction can matter.
+	//
+	// The zero value means external, so a symbol that never went through the
+	// object's writer (an import thunk, a synthesized stub) is external by
+	// default and stays linkable.
+	Static bool
 }
 
 // A pending relocation's field shape. The booleans are not independent: wide

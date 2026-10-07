@@ -353,14 +353,22 @@ func buildProgram(cfg buildCfg, isCC bool) (string, error) {
 	// compiled on its own, named after itself.
 	if len(cfg.inputs) > 1 {
 		if cfg.mode == "object" {
+			// -o naming one output file is only meaningful for a single
+			// source; with several, each object is named after its own source.
+			// But a *directory* is a different thing: gcc puts every object
+			// inside it, and so must we, or `-c a.c b.c -o build/` would
+			// scatter .o files next to the sources and leave build/ empty.
+			// gcc spells this -o is a directory iff it exists as one or ends
+			// in a separator, and outputPaths already implements that rule --
+			// it just needs the path handed through instead of dropped.
+			multiOut := ""
+			if cfg.outFile != "" && (strings.HasSuffix(cfg.outFile, string(os.PathSeparator)) || isDir(cfg.outFile)) {
+				multiOut = cfg.outFile
+			}
 			for _, in := range cfg.inputs {
 				sub := cfg
 				sub.inputs = []string{in}
-				// -o names one output, which is only meaningful for a single
-				// source; with several, each object is named after its source.
-				if len(cfg.inputs) > 1 {
-					sub.outFile = ""
-				}
+				sub.outFile = multiOut
 				if _, err := buildProgram(sub, isCC); err != nil {
 					return "", err
 				}
@@ -472,7 +480,10 @@ func emitProgram(prog *frontend.Program, cfg buildCfg, isCC bool) (string, error
 				return "", err
 			}
 		}
-		n, err := goa.AssembleObject(asm, objPath, cfg.linux, cg.LibSyms())
+		n, err := goa.AssembleObject(asm, objPath, cfg.linux, goa.AssembleOpts{
+			LibSyms:      cg.LibSyms(),
+			InternalSyms: cg.InternalSyms(),
+		})
 		if err != nil {
 			return "", fmt.Errorf("goa failed: %w", err)
 		}

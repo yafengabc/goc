@@ -32,6 +32,7 @@ package gocld
 import (
 	"encoding/binary"
 	"errors"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -399,6 +400,40 @@ func WriteCOFFObject(img *Image) []byte {
 	if objFile == "" {
 		objFile = ".file"
 	}
+
+	// Internal-linkage symbols get renamed to carry this object's name.
+	//
+	// The storage class alone is not enough. COFF resolves a relocation by
+	// symbol *name*, so if this object and a sibling both defined `scale` --
+	// perfectly legal, because each declared its own static copy -- then both
+	// would file a definition under one name. The linker would either call it a
+	// duplicate or, worse, let one object's references land on the other's
+	// function: the program links cleanly and computes the wrong answers.
+	// Renaming at write time makes the name unique per object, which is what
+	// every real toolchain does with a local symbol's mangled name, and the
+	// relocation targets below are rewritten to match.
+	//
+	// The prefix is the object's own name, so it is reproducible: the same
+	// source assembled twice gives byte-identical objects, which the sort below
+	// depends on.
+	staticRename := make(map[string]string)
+	if len(img.Syms) > 0 {
+		prefix := sanitizeObjName(objFile)
+		if prefix != "" {
+			for name, loc := range img.Syms {
+				if !loc.Static {
+					continue
+				}
+				staticRename[name] = prefix + name
+			}
+		}
+	}
+	objName := func(sym string) string {
+		if n, ok := staticRename[sym]; ok {
+			return n
+		}
+		return sym
+	}
 	w.addSymbol(coffSymOut{
 		name:   objFile,
 		class:  scnClassFile,
@@ -488,10 +523,19 @@ func WriteCOFFObject(img *Image) []byte {
 			continue
 		}
 		w.addSymbol(coffSymOut{
-			name:   name,
+			name:   objName(name),
 			value:  int32(loc.Off),
 			secNum: num,
-			class:  scnClassExternal,
+			// IMAGE_SYM_CLASS_STATIC for internal linkage, EXTERNAL otherwise.
+			// Together with the rename above this is what makes two units'
+			// same-named statics coexist: the names differ, so nothing collides,
+			// and the class records the reason for anyone reading the object.
+			class: func() byte {
+				if loc.Static {
+					return scnClassStatic
+				}
+				return scnClassExternal
+			}(),
 			// typeForSection is indexed by the COFF section number, not the
 			// Image's: Unmapped sections are dropped, so the two numbering
 			// schemes differ and using the wrong one reads another section's
@@ -516,12 +560,42 @@ func WriteCOFFObject(img *Image) []byte {
 		w.relocs = append(w.relocs, coffRelOut{
 			secNum: n,
 			off:    f.Off,
-			symIdx: w.symSlot(coffExternName(f.Sym)),
+			symIdx: w.symSlot(objName(coffExternName(f.Sym))),
 			typ:    typ,
 		})
 	}
 
 	return w.emit(secs, relCount)
+}
+
+// sanitizeObjName turns an object's file name into a prefix that can be glued
+// onto a C identifier: the extension and directory are dropped, and anything a
+// symbol name may not contain becomes '_'. An object with no usable name gets an
+// empty prefix, which leaves internal-linkage symbols alone -- better a
+// duplicate-definition error the linker names precisely than a prefix that
+// silently made them unique in a way nothing could explain.
+func sanitizeObjName(file string) string {
+	base := filepath.Base(file)
+	// Only a dot that has something before it ends the stem. A leading dot is
+	// part of the name -- ".o" is not "unit.o" with the unit missing -- and
+	// treating it as an extension would reduce a real name to "".
+	if dot := strings.LastIndexByte(base, '.'); dot > 0 {
+		base = base[:dot]
+	}
+	if base == "" {
+		return ""
+	}
+	var b strings.Builder
+	for i := 0; i < len(base); i++ {
+		ch := base[i]
+		switch {
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9', ch == '_':
+			b.WriteByte(ch)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
 }
 
 // coffExternName strips the linker's internal prefixes from a fixup target, so

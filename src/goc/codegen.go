@@ -121,6 +121,16 @@ type CG struct {
 	// a prefix that no other unit can produce; a whole program needs none,
 	// because there is only one unit to be unique among.
 	staticPrefix string
+	// internalSyms names the file-scope symbols declared `static`: functions and
+	// variables both. They go into the object as IMAGE_SYM_CLASS_STATIC so a
+	// program linked from two units that each declare `static int scale(...)`
+	// keeps both copies instead of reporting the second as a duplicate.
+	//
+	// It is only consulted when relocatable is set. A whole program has one unit
+	// per name by definition, and a one-shot build merges everything into one
+	// object anyway, so marking them there would change existing output for no
+	// reason.
+	internalSyms map[string]bool
 	// Thread-local storage: _Thread_local variables live in a dedicated .tls
 	// section (one instance per thread). c.tlsVars maps a source name to its
 	// layout; c.tlsList collects every TLS declaration (global or static local)
@@ -3296,6 +3306,39 @@ func (c *CG) LibSyms() map[string]bool {
 	return c.libSyms
 }
 
+// InternalSyms names the file-scope symbols this unit declared `static`. Like
+// LibSyms it is a fact only the front end holds -- `static` is not visible in
+// the assembly text, since both a static and an extern function are just a label
+// goa is asked to define. The assembler records it so the object can file those
+// symbols as IMAGE_SYM_CLASS_STATIC, which is what lets two units each declare
+// their own `static int scale(...)` without the second looking like a duplicate
+// definition.
+//
+// Returns nil unless this build is a relocatable one: a whole program is one
+// unit per name by construction, and marking symbols there would change output
+// that is already correct.
+func (c *CG) InternalSyms() map[string]bool {
+	if !c.relocatable || len(c.internalSyms) == 0 {
+		return nil
+	}
+	return c.internalSyms
+}
+
+// markInternal records one file-scope symbol as internal-linkage.
+//
+// The map is created on demand rather than in the constructor because the
+// multi-file whole-program path never reads it back and would otherwise pay for
+// an allocation per build to hold a set nothing consumes.
+func (c *CG) markInternal(name string) {
+	if !c.relocatable {
+		return
+	}
+	if c.internalSyms == nil {
+		c.internalSyms = map[string]bool{}
+	}
+	c.internalSyms[name] = true
+}
+
 // genOptsCG is genOpts, additionally handing back the code generator so a caller
 // that assembles an object file can read what the generator decided -- which C
 // library symbols this unit carries a copy of. A library function's name is
@@ -3337,6 +3380,12 @@ func genOptsCG(prog *frontend.Program, cfg genConfig) (string, *CG, error) {
 		c.globals[g.Name] = true
 		c.globalLab[g.Name] = "G_" + g.Name
 		c.globalTyp[g.Name] = g.Typ
+		// The label, not the source name: a variable's symbol in the object is
+		// "G_"+name (see globalLab), while a function's is its bare name. Marking
+		// the source name would miss every variable and rename no function.
+		if g.Storage == "static" {
+			c.markInternal("G_" + g.Name)
+		}
 	}
 	// The built-in C library joins the program: its file-scope variables
 	// (rand_state, ...) share the global pool unless the user declared their
@@ -3376,6 +3425,9 @@ func genOptsCG(prog *frontend.Program, cfg genConfig) (string, *CG, error) {
 	for _, f := range prog.Funcs {
 		c.funcs[f.Name] = true
 		c.funcDefs[f.Name] = f
+		if f.Storage == "static" {
+			c.markInternal(f.Name)
+		}
 		if f.Name == "main" && len(f.Params) > 0 {
 			// main(int argc, char **argv) -- the Windows entry stub must
 			// parse the command line before calling it. main(void) skips

@@ -252,14 +252,13 @@ func runLeg(dirSuffix, label string, targetLinux bool, flags []string, ucrunExe 
 		if targetLinux {
 			cargs = append(cargs, "-target", "linux")
 		}
-		// A single file picks up its own name from -o <dir>; a multi-file
-		// build has no single source to name itself after, so pass the
-		// explicit output file instead.
-		outArg := outDir
-		if len(srcs) > 1 {
-			outArg = filepath.Join(outDir, name)
-		}
-		cargs = append(cargs, "-o", outArg)
+		// -o is always the output directory, including for a multi-source case.
+		// gcc spells that as the directory itself (its objects then land
+		// inside), which is also what goc does: with one source it names the
+		// single object after the file, with several it names each one after
+		// its own source. Passing a file path for the multi-source case would
+		// instead ask for one object with no name of its own.
+		cargs = append(cargs, "-o", outDir)
 		cargs = append(cargs, srcs...)
 		_, cerr, rc, err := runCmd(repoRoot, env, goc, cargs...)
 		if err != nil || rc != 0 {
@@ -274,14 +273,29 @@ func runLeg(dirSuffix, label string, targetLinux bool, flags []string, ucrunExe 
 		// would leave every relocation-fixing bug in it untested -- which is
 		// exactly the class of bug that made string literals resolve into .text
 		// once sections moved.
-		obj := filepath.Join(outDir, name) + ".o"
+		// A multi-source case compiles to one object per source, each named
+		// after the file, so the link has to be handed all of them. The
+		// names are derived from the sources rather than globbed: the output
+		// directory is shared by every case in the run, so a glob would also
+		// pick up the previous case's objects and link those in.
+		var objs []string
+		if len(srcs) > 1 {
+			objs = make([]string, 0, len(srcs))
+			for _, s := range srcs {
+				base := strings.TrimSuffix(filepath.Base(s), filepath.Ext(s))
+				objs = append(objs, filepath.Join(outDir, base+".o"))
+			}
+		} else {
+			objs = []string{filepath.Join(outDir, name) + ".o"}
+		}
 		prod := filepath.Join(outDir, name)
 		if !targetLinux {
 			prod += ".exe"
 		}
-		largs := []string{obj, "-o", prod}
+		largs := append([]string{}, objs...)
+		largs = append(largs, "-o", prod)
 		if targetLinux {
-			largs = []string{"-target", "linux", obj, "-o", prod}
+			largs = append([]string{"-target", "linux"}, largs...)
 		}
 		if _, lout, lrc, lerr := runCmd(repoRoot, env, goc, largs...); lerr != nil || lrc != 0 {
 			fmt.Fprintf(&sb, "FAIL  %s%s (link): %s\n", label, name, string(lout))

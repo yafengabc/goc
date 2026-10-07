@@ -126,6 +126,10 @@ type elfWriter struct {
 	// records in .symtab's sh_info. Computed while encoding.
 	firstGlobal uint32
 
+	// staticPrefix renames internal-linkage symbols so two objects may each
+	// define one under the same source-level name. See collectSymbols.
+	staticPrefix string
+
 	shstr    []byte
 	shstrUse map[string]uint32
 }
@@ -141,6 +145,11 @@ type elfSymOut struct {
 func newELFWriter(img *Image) *elfWriter {
 	return &elfWriter{
 		img: img,
+		// The object's own name localises internal-linkage symbols, the way
+		// the COFF writer does. An object with no usable name gets an empty
+		// prefix, which leaves them alone: a duplicate-definition diagnostic
+		// naming both files beats a rename nothing can account for.
+		staticPrefix: sanitizeObjName(img.FileName),
 		// The string tables open with a NUL, because offset 0 means "no name"
 		// in both of them: the null symbol's st_name and the NULL section's
 		// sh_name. Starting the payload at offset 0 would make the first real
@@ -357,12 +366,29 @@ func (w *elfWriter) collectSymbols(secs []*elfSecOut) {
 		})
 	}
 
-	// Defined symbols. The linker's internal prefixes are skipped for the same
-	// reason the COFF writer skips them: `IAT:x` is an import-address slot and
-	// `thunk:x` a jump stub, both of which exist only in a linked image. An
-	// object names the bare symbol and lets the link decide which of the two
-	// forms applies.
-	var defined []string
+	// Internal-linkage symbols are renamed to carry this object's name, exactly
+	// as in the COFF writer, and for the same reason: a relocation names its
+	// target by symbol, so two objects each holding their own `static int
+	// scale(...)` would otherwise collide on one name -- either a spurious
+	// duplicate diagnostic or, worse, one object's references resolving to the
+	// other's function. They are also filed STB_LOCAL rather than STB_GLOBAL,
+	// which is ELF's spelling of the same fact.
+	rename := func(name string) string {
+		if w.img.Syms[name].Static {
+			if w.staticPrefix == "" {
+				return name
+			}
+			return w.staticPrefix + name
+		}
+		return name
+	}
+
+	// Defined symbols, split by linkage. ELF requires every STB_LOCAL symbol
+	// to precede every STB_GLOBAL one -- sh_info records where the globals
+	// start -- so the two groups are emitted separately rather than sorted
+	// together. Locals are sorted by their *original* name, which is what
+	// keeps the output reproducible: the prefix is a constant for the object.
+	var locals, globals []string
 	for name := range w.img.Syms {
 		if strings.HasPrefix(name, "IAT:") || strings.HasPrefix(name, "thunk:") {
 			continue
@@ -370,28 +396,41 @@ func (w *elfWriter) collectSymbols(secs []*elfSecOut) {
 		if _, isDef := w.symIndex[name]; isDef {
 			continue
 		}
-		defined = append(defined, name)
-	}
-	sort.Strings(defined)
-	for _, name := range defined {
-		loc := w.img.Syms[name]
-		si, ok := w.secIdx[loc.Sect]
-		if !ok {
-			// The symbol lives in a section that was not emitted (Unmapped).
-			// Its address still means something inside this object, but there
-			// is nothing to anchor it to, and writing it as undefined would be a
-			// lie -- it would look like something this object expects a linker
-			// to supply. The unwind tables are the only sections in this state
-			// and nothing refers to their symbols from outside.
-			continue
+		if w.img.Syms[name].Static {
+			locals = append(locals, name)
+		} else {
+			globals = append(globals, name)
 		}
-		w.addSymbol(elfSymOut{
-			name:  name,
-			info:  elfStbGlobal<<4 | elfSttObject,
-			shndx: uint16(si),
-			value: uint64(loc.Off),
-		})
-		w.symIndex[name] = uint32(len(w.symtab) - 1)
+	}
+	sort.Strings(locals)
+	sort.Strings(globals)
+	for _, group := range []struct {
+		names []string
+		bind  byte
+	}{
+		{locals, elfStbLocal},
+		{globals, elfStbGlobal},
+	} {
+		for _, name := range group.names {
+			loc := w.img.Syms[name]
+			si, ok := w.secIdx[loc.Sect]
+			if !ok {
+				// The symbol lives in a section that was not emitted (Unmapped).
+				// Its address still means something inside this object, but there
+				// is nothing to anchor it to, and writing it as undefined would
+				// be a lie -- it would look like something this object expects a
+				// linker to supply. The unwind tables are the only sections in
+				// this state and nothing refers to their symbols from outside.
+				continue
+			}
+			w.addSymbol(elfSymOut{
+				name:  rename(name),
+				info:  group.bind<<4 | elfSttObject,
+				shndx: uint16(si),
+				value: uint64(loc.Off),
+			})
+			w.symIndex[name] = uint32(len(w.symtab) - 1)
+		}
 	}
 
 	// Undefined symbols: what the object references and does not define. A

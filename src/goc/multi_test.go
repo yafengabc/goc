@@ -5,8 +5,11 @@ package compiler
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
+
+	"gocld"
 )
 
 // writeUnit drops a .c file into dir and returns its path.
@@ -164,4 +167,99 @@ int main(void){ Pair p; p.a = shared_helper(shared_counter); return p.a + GREEN;
 	if _, err := buildProgram(cfg, true); err != nil {
 		t.Fatalf("buildProgram: %v", err)
 	}
+}
+
+// Two units that each declare their own `static` function and their own
+// `static` array under the same names must both survive being written as
+// objects, and each must be filed with internal linkage.
+//
+// This is the object-file path, and both halves of the fix are load-bearing.
+// The symbols must be renamed per object, or a link sees one name defined
+// twice; and they must be marked STATIC, or the rename misfiles the symbol as
+// linkable. Getting only the class right produces a duplicate-definition error.
+// Getting only the rename right links and runs, but mislabels the symbol.
+// Getting neither produces the worst case -- a program that links cleanly and
+// computes the wrong answer, because one unit's calls land on the other's
+// function.
+//
+// The variable is here because its symbol is "G_"+name while a function's is
+// its bare name: marking the source name would catch every variable and no
+// function at all, which fails in a way that reads like a bug in the linker.
+func TestMultiUnitStaticWrittenAsInternalInObjects(t *testing.T) {
+	dir := t.TempDir()
+	src := writeUnit(t, dir, "unit.c", `
+static int base[3] = {1, 2, 3};
+static int scale(int x){ return x * 2; }
+int shared_helper(int x){ return scale(x) + base[0]; }
+`)
+	objDir := filepath.Join(dir, "obj")
+	if err := os.MkdirAll(objDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// -o naming an existing directory is how "write into this directory" is
+	// spelled, and it is the only form that has to work for a relocatable build:
+	// an object is named after its translation unit, and with several sources
+	// there is no single name to give it.
+	if _, err := buildProgram(buildCfg{mode: "object", inputs: []string{src}, outFile: objDir}, true); err != nil {
+		t.Fatalf("buildProgram: %v", err)
+	}
+
+	obj := filepath.Join(objDir, "unit.o")
+	raw, err := os.ReadFile(obj)
+	if err != nil {
+		t.Fatalf("reading the object: %v", err)
+	}
+	syms, err := gocld.ParseObject(raw)
+	if err != nil {
+		t.Fatalf("parsing the object: %v", err)
+	}
+
+	got := map[string]symInfo{}
+	for _, s := range syms {
+		if s.Name != "" {
+			got[s.Name] = symInfo{class: s.Class}
+		}
+	}
+
+	// Both internal symbols carry the object's stem, and both are STATIC.
+	// The exact renamed spelling is not asserted -- what matters is that it is
+	// per-object and marked internal, so that a sibling unit's identically
+	// named static cannot collide with it.
+	renamed := 0
+	for name, info := range got {
+		if !strings.Contains(name, "scale") && !strings.Contains(name, "base") {
+			continue
+		}
+		if name == "scale" || name == "G_base" {
+			t.Errorf("internal symbol %q was written unmangled; two objects defining it would collide", name)
+			continue
+		}
+		if info.class != gocld.SymClassStatic {
+			t.Errorf("symbol %q: storage class = %d, want STATIC(%d)", name, info.class, gocld.SymClassStatic)
+		}
+		renamed++
+	}
+	if renamed != 2 {
+		t.Errorf("found %d renamed internal symbols, want 2 (scale and G_base); table has %v", renamed, keysOf(got))
+	}
+
+	// The external one must keep its bare name and stay external, or a sibling
+	// unit could not link against it.
+	if info, ok := got["shared_helper"]; !ok {
+		t.Error("shared_helper missing or renamed; it must stay linkable across units")
+	} else if info.class != gocld.SymClassExternal {
+		t.Errorf("shared_helper: storage class = %d, want EXTERNAL(%d)", info.class, gocld.SymClassExternal)
+	}
+}
+
+// symInfo is the storage class of one symbol, which is all this test needs.
+type symInfo struct{ class int }
+
+func keysOf(m map[string]symInfo) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

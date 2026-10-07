@@ -325,7 +325,62 @@ func parseCOFF(src []byte) (*coffObj, error) {
 // when it has no section (COFF section number 0) and external storage class;
 // the same gating the merge applies (ignoring file/segment/refptr pseudo
 // records) is repeated here so the two never disagree on what "undefined"
-// means. Callers use this to declare only the imports a program actually
+// COFF storage classes, as the values appear in a symbol table record.
+// Exported because whether a symbol is internal is the one property of it that
+// decides whether two objects may define the same name, and a caller checking an
+// object we wrote has no other way to see that we got it right.
+const (
+	SymClassExternal = int(scnClassExternal)
+	SymClassStatic   = int(scnClassStatic)
+	SymClassFile     = int(scnClassFile)
+)
+
+// ObjectSymbol is one entry of a relocatable object's symbol table, as read
+// back from the file. It is the exported view of what the writer decided:
+// Name is what the object calls the symbol (already renamed if it was internal)
+// and Class says whether anything outside the object may refer to it.
+type ObjectSymbol struct {
+	Name string
+	// Class is one of SymClassExternal, SymClassStatic or SymClassFile.
+	Class int
+	// Section is the 1-based section the symbol is defined in, or 0 when it is
+	// undefined (a reference the linker must satisfy).
+	Section int
+	// Value is the offset within the section.
+	Value int64
+}
+
+// ParseObject reads a relocatable COFF object's symbol table.
+//
+// It exists so a caller that produced an object can check what was written
+// without re-implementing the reader. The primary use is internal linkage: a
+// `static` symbol has to be written STATIC, and only the file records that.
+func ParseObject(src []byte) ([]ObjectSymbol, error) {
+	o, err := parseCOFF(src)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ObjectSymbol, 0, len(o.syms))
+	for _, s := range o.syms {
+		if s.name == "" {
+			// The section definitions, and the segment symbols a fully-linked
+			// image carries. Their names are section names rather than C
+			// identifiers and mean nothing to a caller looking for symbols it
+			// can refer to.
+			continue
+		}
+		out = append(out, ObjectSymbol{
+			Name:    s.name,
+			Class:   int(s.class),
+			Section: int(s.secNum),
+			Value:   int64(s.value),
+		})
+	}
+	return out, nil
+}
+
+// UndefinedSymbols returns the names a COFF object references but does not
+// define. Callers use this to declare only the imports a program actually
 // reaches, instead of every prototype a header happened to declare.
 func UndefinedSymbols(src []byte) ([]string, error) {
 	o, err := parseCOFF(src)

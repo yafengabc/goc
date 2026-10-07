@@ -39,7 +39,11 @@ func (a *Assembler) LinkImage() *gocld.Image {
 		img.Sections[i] = ns
 	}
 	for name, loc := range a.syms {
-		img.Syms[name] = gocld.SymLoc{Sect: loc.sect, Off: loc.off}
+		img.Syms[name] = gocld.SymLoc{
+			Sect:   loc.sect,
+			Off:    loc.off,
+			Static: a.staticSyms[name],
+		}
 	}
 	for _, f := range a.fixups {
 		nf := gocld.Fixup{
