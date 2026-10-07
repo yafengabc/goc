@@ -32,11 +32,10 @@ export GOTMPDIR="$TMP"
 [ -n "${GOCACHE:-}" ] || export GOCACHE="$HOME/.cache/go-build"
 
 echo "== building goc =="
-# ./cmd/goc, not "." -- src/goc is a library package (package compiler) since the
-# split, and `go build -o bin/goc.exe .` would leave a Go archive there. The
-# failure looks nothing like the cause: every example then fails as if the
-# compiler itself were broken.
-(cd src/goc && go build -trimpath -ldflags="-s -w" -o ../../bin/goc.exe ./cmd/goc) || { echo "BUILD FAILED"; exit 1; }
+# -tags goc: build the self-contained compiler from src/, which is where the
+# entry point and the embedded C library now live. The old ./cmd/goc is gone --
+# there is no second, disk-reading build of the compiler to shadow this one.
+(cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc.exe -tags goc .) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
 (cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa.exe ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }

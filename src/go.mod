@@ -1,16 +1,28 @@
-// The self-contained toolchain: package compiler plus the C library embedded
-// in the binary. See main.go for why this exists alongside src/goc, which
-// builds the same compiler reading the library from disk.
+// The self-contained toolchain: one entry point that builds either compiler --
+// goc's own x86-64 back end or gocl's LLVM back end -- with the C library
+// embedded in the binary.
 //
-// This module depends on src/goc; src/goc does not depend on this one. A
-// second compiler (src/gocl, planned) will follow the same shape -- depend on
-// goc/frontend and on the shared pipeline pieces -- and this one is the working
-// example of that arrangement.
+// One module, two binaries, selected by a build tag:
+//
+//	-tags goc    -> goc.go   calls goc's compiler.Main
+//	-tags gocl   -> gocl.go  calls gocl's driver Main
+//
+// The embedded library and its adapter live in libembed.go, which carries no
+// tag so both drivers share it. Embedding is the only build now: an earlier
+// arrangement also produced per-module binaries that read goclib/ from disk,
+// which is a fine trade during development (edit the library, rebuild nothing)
+// and the wrong one for shipping. Those entry points are gone; goc.go's header
+// records what the self-contained build is for.
+//
+// This module depends on src/goc and src/gocl; neither depends on this one.
 module goc/selfcontained
 
 go 1.21
 
-require goc v0.0.0
+require (
+	goc v0.0.0
+	gocl v0.0.0
+)
 
 require (
 	goa v0.0.0 // indirect
@@ -19,11 +31,13 @@ require (
 	gocld v0.0.0 // indirect: goa reaches the linker
 )
 
-// The three replaces below all point inside the repository. Each name is
-// dotless, which Go only tolerates for a module resolved locally -- the tidy
-// error "malformed module path: missing dot in first path element" is what a
-// missing replace looks like, and it is the only symptom.
+// The replaces below all point inside the repository. Each name is dotless,
+// which Go only tolerates for a module resolved locally -- the tidy error
+// "malformed module path: missing dot in first path element" is what a missing
+// replace looks like, and it is the only symptom.
 replace goc => ./goc
+
+replace gocl => ./gocl
 
 replace goc/common => ./common
 

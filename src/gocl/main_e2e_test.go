@@ -1,4 +1,4 @@
-// End-to-end tests for the gocl command.
+// End-to-end tests for the gocl compiler.
 //
 // These drive the built binary rather than calling into the package, because
 // the thing worth testing is the whole chain: preprocess, parse, check, lower to
@@ -10,8 +10,13 @@
 // The tests skip when no libLLVM is configured. A missing library is not a
 // failure: gocl reports it when a program is compiled, and the point of these
 // tests is the code path after that point.
+//
+// This lived under cmd/gocl/ while that was a main package. The entry point
+// moved to src/ (build tag gocl), so the test moved here: an external test
+// package needs a non-test package to sit beside, and package gocl is the one
+// that now carries the driver.
 
-package main_test
+package gocl_test
 
 import (
 	"os"
@@ -38,9 +43,18 @@ func compilerPath(t *testing.T) string {
 		t.Fatal(err)
 	}
 	for i := 0; i < 6; i++ {
-		p := filepath.Join(dir, "bin", name)
-		if _, err := os.Stat(p); err == nil {
-			return p
+		// Only the repository's own bin/ counts. Walking up from src/gocl
+		// passes src/ itself, and a stale src/bin/gocl.exe left by an
+		// earlier `go build ./...` sits closer than bin/gocl.exe -- so a
+		// plain upward walk silently tests the stale copy. It fails
+		// confusingly: the error names goclib.h line 51 while the file that
+		// actually broke is stdarg.h, which reads like a library regression
+		// rather than an expired build artifact.
+		if filepath.Base(dir) != "src" {
+			p := filepath.Join(dir, "bin", name)
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {

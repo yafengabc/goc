@@ -55,7 +55,7 @@ gcc  -O2 -I "D:\Program Files\nim-2.2.12\lib" .nc_sieve/*.c -o k_sieve_gcc.exe
 
 **修复**（完全复用原生后端的 TLS 设施）：
 - `src/gocl/translate.go`：新增 `ComputeTLSLayout`，按原生 `tlsPlace` 规则（8 字节对齐 + `link.TLSAlignedSize` 槽宽）给每个 TLS 全局分配 `.tls` 偏移，并填入 `irMod.tlsOffsets`；两个全局循环不再为 TLS 声明 IR 符号。
-- `src/gocl/cmd/gocl/main.go`：`linkData` 用同一 `ComputeTLSLayout` 填 `Data.TLSVars`，保证 IR 访问偏移与链接器 `.tls` 布局一致。
+- `src/gocl/driver.go`：`linkData` 用同一 `ComputeTLSLayout` 填 `Data.TLSVars`，保证 IR 访问偏移与链接器 `.tls` 布局一致。
 - `src/gocl/expression.go` / `src/gocl/call.go`：访问 TLS 全局时不再 `load @G_x`，而是经运行时 helper `__goc_tls_slot(off)` 拿到 per-thread 地址（Win 走 `gs:0x58`+index，Linux 走 `__tls_start`+off）。
 - `src/common/link/emit.go`：当 `len(d.TLSVars) > 0` 时把 `__goc_tls_slot` 汇编进入口 stub；`.tls` 段与 `G_goc_tls_index`、TLS 目录由既有逻辑产出。
 - 验证：`readtls`（非递归读）、`fibtls`（递归+TLS 读）、`tlstest`（多类型+写入回读）、`tlsaddr`（取地址写回）、以及原始 Nim `k_fib` 在 gocl 下**全部正确**；goc（原生）对应用例无回归。

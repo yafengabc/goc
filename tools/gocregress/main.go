@@ -79,7 +79,9 @@ func main() {
 	os.MkdirAll(filepath.Join(repoRoot, "bin"), 0o755)
 
 	fmt.Println("== building goc ==")
-	if err := buildTool("src/goc", "bin/goc.exe", "./cmd/goc"); err != nil {
+	// From src/ with -tags goc: that is where the entry point and the embedded
+	// C library live now. The old src/goc/cmd/goc is gone.
+	if err := buildToolArgs("src", "bin/goc.exe", "", "-tags", "goc"); err != nil {
 		fmt.Println("BUILD FAILED:", err)
 		os.Exit(1)
 	}
@@ -387,15 +389,31 @@ func runUnit(mod string) (string, int, int, int) {
 // ---------------------------------------------------------------------------
 
 // buildTool builds one module's command into out. The package argument is the
-// command's directory relative to the module root, and it is not always ".":
-// src/goc is a library package (package compiler) whose main lives in
-// cmd/goc, so building "." there produces a Go archive -- a file that starts
-// with "!<arch>" -- and every later compile then fails with a shell-level
-// "syntax error near unexpected token" that says nothing about the compiler.
+// command's directory relative to the module root. It matters that it is a real
+// main package: building "." inside a library package (package compiler, say)
+// produces a Go archive -- a file that starts with "!<arch>" -- and every later
+// compile then fails with a shell-level "syntax error near unexpected token"
+// that says nothing about the compiler. Passing "" for pkg builds "." with the
+// extra args, which is what the tag-selected self-contained compilers need.
 func buildTool(dir, out, pkg string) error {
+	return buildToolArgs(dir, out, pkg)
+}
+
+// buildToolArgs is buildTool with extra go build arguments, for the builds that
+// need a build tag (the self-contained compilers are selected by -tags goc /
+// -tags gocl and take no package path).
+func buildToolArgs(dir, out, pkg string, extra ...string) error {
 	env := childEnv()
-	_, stderr, rc, err := runCmd(filepath.Join(repoRoot, dir), env, "go",
-		"build", "-trimpath", "-ldflags=-s -w", "-o", filepath.Join(repoRoot, out), pkg)
+	args := []string{"build", "-trimpath", "-ldflags=-s -w"}
+	args = append(args, extra...)
+	if pkg != "" {
+		args = append(args, "-o", filepath.Join(repoRoot, out), pkg)
+	} else {
+		// go build writes the executable to the current directory under the
+		// package name, so the output path still has to be spelled out.
+		args = append(args, "-o", filepath.Join(repoRoot, out), ".")
+	}
+	_, stderr, rc, err := runCmd(filepath.Join(repoRoot, dir), env, "go", args...)
 	if err != nil {
 		return err
 	}
@@ -584,7 +602,7 @@ func resolveRoot(explicit string) (string, error) {
 		}
 		dir = parent
 	}
-	return "", fmt.Errorf("could not find repo root (looked for run_tests.sh + src/main.go); pass -root")
+	return "", fmt.Errorf("could not find repo root (looked for run_tests.sh + src/goc/main.go); pass -root")
 }
 
 // nativePath converts a MSYS/Cygwin-style path (/d/projects/goc) to the native

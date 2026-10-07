@@ -24,11 +24,9 @@ export GOTMPDIR="$TMP"
 
 echo "== building goc =="
 mkdir -p bin
-# ./cmd/goc, not "." -- src/goc is a library package (package compiler) since the
-# split, and `go build -o bin/goc .` would leave a Go archive there. The failure
-# looks nothing like the cause: every example then reports
-# "(compile): ./bin/goc: Permission denied", which reads as a broken compiler.
-(cd src/goc && go build -trimpath -ldflags="-s -w" -o ../../bin/goc ./cmd/goc) || { echo "BUILD FAILED"; exit 1; }
+# From src/ with -tags goc: that is where the entry point and the embedded C
+# library live now. The old src/goc/cmd/goc is gone.
+(cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc -tags goc .) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
 (cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }

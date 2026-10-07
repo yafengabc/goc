@@ -14,7 +14,6 @@
 # pattern relative to the package directory, so a goclib left behind in src/
 # would silently drop the whole C library from the binary -- a link error
 # naming printf, not a build error.
-
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -45,12 +44,24 @@ fi
 
 mkdir -p bin
 
-echo "== gocl (LLVM back end) =="
-# The second compiler: same front end, LLVM as the code generator. It needs
-# libLLVM at run time, so it cannot be part of the ordinary build the way goc is
-# -- the binary builds fine without the library and reports the missing library
-# when a program is compiled, which is where the failure is actually meaningful.
-(cd src/gocl && go build -trimpath -ldflags="-s -w" -o "../../bin/gocl$EXE" ./cmd/gocl)
+echo "== goc (own x86-64 back end, -tags goc) =="
+# The whole toolchain in one executable: front end, code generator, assembler,
+# and the C library it compiles against -- the library is embedded, so the
+# binary needs nothing beside it. The tag picks which code generator src/ wires
+# in: goc's own emitter here, gocl's LLVM back end below. Both share the
+# embedded library (src/libembed.go) and the drivers live in package goc /
+# package gocl respectively.
+(cd src && go build -trimpath -ldflags="-s -w" -o "../bin/goc$EXE" -tags goc .)
+
+echo "== gocl (LLVM back end, -tags gocl) =="
+# gocl the same way: the identical driver (gocl.Main) reached from the second
+# entry point. It still needs libLLVM.dll beside the binary, which the release
+# copy step keeps there -- the binary builds fine without it and reports the
+# missing library when a program is actually compiled.
+#
+# Only gocl needs the stamp: goc's driver derives its version from git at run
+# time, while gocl's lives in package gocl, so -X is what fills it in.
+(cd src && go build -trimpath -ldflags="-s -w -X gocl.version=$VERSION" -o "../bin/gocl$EXE" -tags gocl .)
 
 echo "== gocld (linker) =="
 # Both halves matter. `go build ./...` is a compile check on the library, which
@@ -61,21 +72,12 @@ echo "== gocld (linker) =="
 (cd src/gocld && go build ./...)
 (cd src/gocld && go build -trimpath -ldflags="-s -w" -o "../../bin/gocld$EXE" ./cmd/gocld)
 
-echo "== goc (self-contained) =="
-# The same compiler with the C library embedded: no goclib/ needed beside the
-# binary. goc itself reads the library from disk, which is what lets a
-# developer edit it without rebuilding the compiler.
-(cd src && go build -trimpath -ldflags="-s -w" -o "../bin/goc-standalone$EXE" .)
-
 echo "== goc/frontend =="
 # The front end is a library; building it is just a compile check, which is
 # worth doing on its own so a front-end error is not reported as a goc build
 # failure. The separate module also means goc and (later) gocl can require it
 # without depending on each other.
 (cd src/frontend && go build ./...)
-
-echo "== goc =="
-(cd src/goc && go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "../../bin/goc$EXE" ./cmd/goc)
 
 echo "== goa =="
 (cd src/goa && go build -trimpath -ldflags="-s -w" -o "../../bin/goa$EXE" ./cmd/goa)
@@ -85,9 +87,9 @@ echo "== tools =="
 (cd tools && go build -o "../bin/msgboxcheck$EXE" ./msgboxcheck)
 
 # cc.exe: a gcc/clang-compatible alias of goc. Build scripts can invoke it as a
-# drop-in C compiler; it honours the gcc flag conventions accepted in main.go
+# drop-in C compiler; it honours the gcc flag conventions accepted in goc.go
 # and, when named cc, behaves like gcc (compile to an executable, no auto-run).
 cp -f "bin/goc$EXE" "bin/cc$EXE"
 
-echo "done: bin/goc$EXE, bin/gocl$EXE, bin/gocld$EXE, bin/goc-standalone$EXE,"
-echo "      bin/cc$EXE, bin/goa$EXE, bin/elfcheck$EXE, bin/msgboxcheck$EXE"
+echo "done: bin/goc$EXE, bin/gocl$EXE, bin/gocld$EXE, bin/cc$EXE,"
+echo "      bin/goa$EXE, bin/elfcheck$EXE, bin/msgboxcheck$EXE"

@@ -28,6 +28,15 @@ import (
 //
 // Dir() per level, not filepath.Join(dir, ".."): Join cleans the ".." away and
 // returns the same directory, so the loop would never climb.
+// findUp walks up from the working directory looking for bin/name, and returns
+// "" when it reaches the root without a hit. name is the bare file name: the
+// bin directory is this function's business, so callers must not pass "bin/..."
+// (that made it look for bin/bin/... and never match, which is why the three
+// volume tests below skipped instead of running).
+//
+// src/ is skipped. Walking up from src/gocl passes src/ itself, and a stale
+// src/bin/gocl.exe from an earlier `go build ./...` sits closer than the real
+// bin/gocl.exe -- so the tests would silently exercise an expired artifact.
 func findUp(t *testing.T, name string) string {
 	t.Helper()
 	wd, err := os.Getwd()
@@ -35,9 +44,11 @@ func findUp(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	for dir, i := wd, 0; i < 6; i++ {
-		p := filepath.Join(dir, "bin", name)
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
+		if filepath.Base(dir) != "src" {
+			p := filepath.Join(dir, "bin", name)
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				return p
+			}
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -80,7 +91,7 @@ func exePath(t *testing.T) string {
 	if runtime.GOOS != "windows" {
 		name = "gocl"
 	}
-	if p := findUp(t, filepath.Join("bin", name)); p != "" {
+	if p := findUp(t, name); p != "" {
 		return p
 	}
 	wd, _ := os.Getwd()

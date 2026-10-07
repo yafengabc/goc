@@ -107,12 +107,15 @@ Windows zip 含 `goc.exe` / `cc.exe` / `goa.exe` / `goclib/`，Linux zip 含
 │   ├── translate.go  function.go  statement.go          #   前端 AST → LLVM IR
 │   ├── expression.go  operator.go  call.go  types.go
 │   ├── module.go  compile.go  backend.go  util.go
-│   └── cmd/gocl/main.go                                 #   入口（bin/gocl.exe）
+│   └── driver.go                                       #   驱动（flags / 构建流程）
 ├── src/goc/                                        # 编译器主体（go 模块 goc）
 │   ├── codegen.go  cpp.go  multi.go  opt.go            #   自研 x86-64 代码生成
 │   ├── libfs.go                                        #   在磁盘上定位 goclib/（见下）
-│   ├── llvm*.go                                        #   LLVM 后端（-fllvm）
-│   └── cmd/goc/main.go                                 #   薄入口：package compiler 的 main
+│   └── llvm*.go                                        #   LLVM 后端（-fllvm）
+├── src/                                           # 自包含入口（go 模块 goc/selfcontained）
+│   ├── goc.go                                         #   -tags goc   → bin/goc.exe
+│   ├── gocl.go                                        #   -tags gocl  → bin/gocl.exe
+│   └── libembed.go                                    #   内嵌的 goclib/（两个 tag 共用）
 ├── goclib/                                             # 自带的 C 库（go 模块 goc 与 gocl 共用）
 │   ├── os.c                                            #   5 个平台原语，唯一碰 OS 的文件
 │   ├── stdio.c  stdlib.c  string.c  ctype.c            #   45 个库函数
