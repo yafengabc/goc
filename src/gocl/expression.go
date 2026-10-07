@@ -275,6 +275,25 @@ func (e *irEmitter) cond(x frontend.Expr) string {
 	if x == nil {
 		return "true"
 	}
+	// "x != x" -- how math.h spells isnan(x) -- is answered here, before eval
+	// splits it into two loads. Lowered the ordinary way it becomes
+	// "fcmp une %t17, %t18" over two temporaries, and LLVM rewrites that
+	// self-compare to "fcmp uno x, 0.0" during InstCombine -- a rewrite that
+	// does not survive being carried into the phi that a short-circuit || or
+	// if produces. Measured with opt default<O1>, the identical function
+	// returns 1 when the two tests are combined with "or i1" and 0 when they
+	// are combined with the phi: fmaximum_num(NAN, 1) answered 1.0 and
+	// isnan() was false for every value a program could name.
+	//
+	// Naming the shape here leaves nothing to rewrite, which is what clang
+	// does for isnan too. Only the exact shape -- the same variable on both
+	// sides of "!=" -- is redirected; a genuine "a != b" is left alone.
+	if id, ok := floatSelfNe(x); ok {
+		v := e.rvalue(id)
+		t := e.newTmp()
+		e.line("%s = fcmp uno %s %s, 0.0", t, e.ty(e.tr.exprType(id)), v)
+		return t
+	}
 	// The value's IR type decides, not the C type: a comparison already yields
 	// an i1 even though C types it as int, and re-comparing that against zero
 	// would both be redundant and type-wrong.
@@ -431,7 +450,10 @@ func (e *irEmitter) ident(n *frontend.Ident) val {
 	// `printf_lite_with(vfmt_i, ...)` took the program down: the formatter was
 	// handed a null function pointer and called through it.
 	if e.tr.isFuncName(n.Name) {
-		return val{op: "@" + n.Name, ty: frontend.PtrType(e.fnPtrTy(n.Name))}
+		// irFuncSym, so the address names the symbol the function was defined
+		// under; a renamed libfunc taken by pointer would otherwise decay to a
+		// reference to a symbol the module never defines.
+		return val{op: "@" + irFuncSym(n.Name), ty: frontend.PtrType(e.fnPtrTy(n.Name))}
 	}
 	// A name with no storage at all. The checker's own view is that this can
 	// only be reached when the operand is an integer (an enum member whose
@@ -480,4 +502,31 @@ func (e *irEmitter) tlsAddr(off int64) string {
 func (e *irEmitter) store(p string, v val) {
 	ty := e.ty(v.ty)
 	e.line("store %s %s, ptr %s, align %d", ty, v.op, p, alignOfIr(ty))
+}
+
+// floatSelfNe recognises "x != x" on a floating operand -- the shape math.h
+// gives isnan() -- and hands back the variable being tested.
+//
+// Only the exact shape counts: the same variable spelled the same way on both
+// sides of a float "!=". A genuine "a != b", a comparison between two different
+// variables, and an integer self-compare all return false and are lowered the
+// ordinary way.
+func floatSelfNe(x frontend.Expr) (frontend.Expr, bool) {
+	b, ok := x.(*frontend.Binary)
+	if !ok || b.Op != "!=" || b.L == nil || b.R == nil {
+		return nil, false
+	}
+	// Ident nodes are distinct objects even when they name the same variable,
+	// so the names have to be compared. Any other node kind is compared by
+	// pointer, which is exactly "the same expression written twice".
+	li, lok := b.L.(*frontend.Ident)
+	ri, rok := b.R.(*frontend.Ident)
+	if lok && rok {
+		if li.Name != ri.Name {
+			return nil, false
+		}
+	} else if b.L != b.R {
+		return nil, false
+	}
+	return b.L, true
 }

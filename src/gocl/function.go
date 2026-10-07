@@ -197,7 +197,10 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 	}
 
 	var b strings.Builder
-	sig := "define " + m.dso() + e.retTy + " @" + f.Name + "(" + strings.Join(params, ", ")
+	// irFuncSym, not f.Name: the definition has to carry the same spelling the
+	// call sites use, and for the two libfuncs LLVM would rewrite that is not
+	// the C name. See llvmMisrecognizedMaxMin.
+	sig := "define " + m.dso() + e.retTy + " @" + irFuncSym(f.Name) + "(" + strings.Join(params, ", ")
 	if f.Variadic {
 		// The ellipsis is what makes this variadic to LLVM, and it has to come
 		// after every named parameter. A function that takes a fixed count is not

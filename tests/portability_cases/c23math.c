@@ -43,17 +43,18 @@ static int close_to(double got, double want, double rel) {
 }
 
 int main(void) {
-    /* Does this toolchain have a NaN at all?
+    /* No NaN probe here.
      *
-     * gocl's constant folding turns 0.0/0.0 -- which is what NAN expands to --
-     * into 0.0, and a bit pattern of 0x7FF8000000000000 assigned through a union
-     * comes out an ordinary number too, so on that back end isnan() is false
-     * for every value the program can name. That is a defect in gocl's folding,
-     * not in the functions under test, so the NaN cases are gated on the probe:
-     * where there is no NaN they are skipped, and where there is one they are
-     * the ordinary C23 requirements. Probe both spellings so a toolchain that
-     * only manages one of them still runs the checks. */
-    int have_nan = (NAN != NAN) || (nan("") != nan(""));
+     * There used to be one, gating every NaN case behind "does this toolchain
+     * have a NaN at all". It was written for a gocl defect in which the float
+     * "!=" operator was lowered to the LLVM predicate "fcmp one" -- ordered, not
+     * equal -- instead of "une". Ordered means a NaN pair is not equal, so
+     * x != x folded to false and isnan(), which math.h spells (x) != (x),
+     * answered false for every value in the program. Both NaN spellings and a
+     * union-loaded bit pattern were affected, which is what made it look like
+     * the back end could not represent a NaN at all. It could: the constants
+     * were correct all along and it was the comparison that discarded them.
+     * operator.go maps "!=" to une now, so the cases below run everywhere. */
 
     /* ---- nextup / nextdown ---- */
     /* Compared as bit patterns, not as "1.0 + 2^-52". The arithmetic form looks
@@ -76,7 +77,7 @@ int main(void) {
     /* Infinity is a fixed point, and a NaN is returned unchanged. */
     CHK(nextup(HUGE_VAL) == HUGE_VAL, "nextup(+inf) is +inf");
     CHK(nextdown(-HUGE_VAL) == -HUGE_VAL, "nextdown(-inf) is -inf");
-    if (have_nan) CHK(isnan(nextup(NAN)) && isnan(nextdown(NAN)),
+    CHK(isnan(nextup(NAN)) && isnan(nextdown(NAN)),
                         "nextup/nextdown(NaN) is NaN");
     /* A round trip: nextup then nextdown returns the original. */
     CHK(bits(nextdown(nextup(3.25))) == bits(3.25), "nextdown(nextup(x)) == x");
@@ -102,14 +103,14 @@ int main(void) {
     CHK(close_to(exp10(-3.0), 0.001, 1e-15), "exp10(-3) ~ 0.001");
     CHK(exp10(1e9) == HUGE_VAL, "exp10 overflow saturates to +inf");
     CHK(exp10(-1e9) == 0.0, "exp10 underflow saturates to +0");
-    if (have_nan) CHK(isnan(exp10(NAN)), "exp10(NaN) is NaN");
+    CHK(isnan(exp10(NAN)), "exp10(NaN) is NaN");
 
     /* ---- fmaximum_num / fminimum_num: a NaN argument poisons ---- */
     double qnan = NAN;  /* not "nan": isnan() is a macro */
     CHK(fmaximum_num(1.0, 2.0) == 2.0, "fmaximum_num(1,2) == 2");
     CHK(fmaximum_num(2.0, 1.0) == 2.0, "fmaximum_num(2,1) == 2");
     CHK(fminimum_num(1.0, 2.0) == 1.0, "fminimum_num(1,2) == 1");
-    if (have_nan) {
+    {
         CHK(isnan(fmaximum_num(qnan, 1.0)), "fmaximum_num(NaN,1) is NaN");
         CHK(isnan(fmaximum_num(1.0, qnan)), "fmaximum_num(1,NaN) is NaN");
         CHK(isnan(fminimum_num(qnan, 1.0)), "fminimum_num(NaN,1) is NaN");
@@ -130,7 +131,7 @@ int main(void) {
     CHK(fmaxmag(-1.0, 1.0) == 1.0, "fmaxmag(-1,1) is 1");
     CHK(fminmag(1.0, -1.0) == 1.0, "fminmag(1,-1) is 1");
     /* A NaN argument is still skipped, as in fmax. */
-    if (have_nan) {
+    {
         CHK(fmaxmag(qnan, -5.0) == -5.0, "fmaxmag(NaN,-5) is -5");
         CHK(fminmag(3.0, qnan) == 3.0, "fminmag(3,NaN) is 3");
     }
@@ -152,7 +153,7 @@ int main(void) {
         CHK(totalorder(&one, &ninf) > 0, "totalorder(1,-inf) > 0");
         CHK(totalorder(&pinf, &one) > 0, "totalorder(+inf,1) > 0");
         /* A NaN outranks every number, and never compares equal to one. */
-        if (have_nan) {
+        {
             CHK(totalorder(&pnan, &pinf) > 0, "totalorder(NaN,+inf) > 0");
             CHK(totalorder(&pinf, &pnan) < 0, "totalorder(+inf,NaN) < 0");
             CHK(totalorder(&pnan, &one) != totalorder(&one, &pnan),
@@ -185,11 +186,16 @@ int main(void) {
     /* Zero has no sign of its own, so this is +1 even though signbit is 0. */
     CHK(getsign(0.0) == 1.0, "getsign(+0) == 1.0");
     CHK(getsign(copysign(0.0, -1.0)) == -1.0, "getsign(-0) == -1.0");
-    /* NAN expands to (0.0/0.0), and goc builds that with the sign bit SET
-     * (the pattern is 0xfff8...), so NAN is a negative NaN there and getsign
-     * reports -1. copysign is how a positive NaN is spelled. */
-    if (have_nan) {
-        CHK(getsign(NAN) == -1.0, "getsign(NAN) is -1 (goc's NaN has the sign bit)");
+    /* A NaN's sign is whatever the toolchain's NAN happens to carry, and the
+     * two back ends disagree: goc builds 0.0/0.0 with the sign bit set (the
+     * pattern is 0xfff8...), gocl names the IEEE quiet NaN directly (0x7ff8...).
+     * C leaves both legal, so the assertion is written against signbit(NAN)
+     * rather than against a hard-coded +/-1 -- what is being checked is that
+     * getsign reports the sign that is actually there. copysign then pins both
+     * directions without depending on which NAN the toolchain has. */
+    CHK(getsign(NAN) == (signbit(NAN) ? -1.0 : 1.0),
+        "getsign(NAN) reports NAN's own sign bit");
+    {
         CHK(getsign(copysign(NAN, 1.0)) == 1.0, "getsign(+NaN) == 1.0");
         /* getpayload clears the sign and keeps NaN-ness. */
         CHK(isnan(getpayload(NAN)), "getpayload(NaN) is NaN");
@@ -212,7 +218,7 @@ int main(void) {
     CHK(ufromfp(-1.0) == 0 && errno == EDOM, "ufromfp(-1) is EDOM");
     errno = 0;
     CHK(ufromfp(1e300) == 0 && errno == EDOM, "ufromfp(1e300) is EDOM");
-    if (have_nan) {
+    {
         errno = 0;
         CHK(fromfp(NAN) == 0 && errno == EDOM, "fromfp(NaN) is EDOM");
     }

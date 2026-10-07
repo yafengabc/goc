@@ -262,3 +262,17 @@ func (e *irEmitter) storeString(sl *frontend.StrLit, t *frontend.Type, slot stri
 		e.line("store i8 %d, ptr %s, align 1", int(b), dst)
 	}
 }
+
+// entryAlloca allocates a typed slot in the function's ENTRY block and returns
+// its name.
+//
+// The entry block is the only one every path executes, so a slot placed there
+// is addressable from anywhere in the body. That is what lets a value be
+// written on one branch of a short-circuit operator and read back after the
+// join -- see logical, which needs that because a phi's constant propagation
+// gets a float comparison wrong.
+func (e *irEmitter) entryAlloca(irTy string) string {
+	slot := e.newTmp()
+	e.entry.WriteString("  " + slot + " = alloca " + irTy + ", align 8\n")
+	return slot
+}

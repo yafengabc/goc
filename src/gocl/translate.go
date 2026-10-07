@@ -646,7 +646,9 @@ func (m *irMod) constInitAt(e frontend.Expr, t *frontend.Type, top bool) (string
 		case "global":
 			return "@G_" + name, true
 		case "func":
-			return "@" + name, true
+			// irFuncSym for the same reason a call site uses it: the address
+			// has to name the symbol the function was *defined* under.
+			return "@" + irFuncSym(name), true
 		}
 	}
 	// A bare identifier naming an array decays to the address of its first

@@ -457,6 +457,59 @@ func sanitize(s string) string {
 	return b.String()
 }
 
+// llvmMisrecognizedMaxMin lists the C library names LLVM's TargetLibraryInfo
+// claims for its own libcall expansion, and which therefore must not appear
+// verbatim as an LLVM symbol.
+//
+// The mechanism is name-based and it overrides the body: InstCombine sees
+// `call double @fmaximum_num(...)`, decides from the name alone that this is a
+// libfunc, and replaces the call with the libcall's semantics -- which for
+// fmaximum_num is fmax's, not its own. C23 splits the maxima family in two:
+// fmax SKIPS a NaN and returns the other operand, fmaximum_num PROPAGATES it and
+// raises a domain error. Collapsing the two turns fmaximum_num(NaN, 1) into 1.0,
+// and the miscompile is silent -- no diagnostic, no trap, just a wrong number in
+// the program's output.
+//
+// The substitution is worse than it looks, because it does not need the body to
+// be the libfunc's. A definition of `@fmaximum_num` whose body is a bare
+// `ret double %p0` -- which returns its first argument and so must answer NaN --
+// still gets replaced, and answers 1.0. Nothing about the IR says "max"; only
+// the spelling of the symbol does.
+//
+// Measured on LLVM 22.1.8 (the libLLVM gocl links is 23.x, which behaves the
+// same way), and reproducible outside gocl: clang -O2 on
+// `fmaximum_num(0.0/0.0, 1.0)` prints 1.000000, because clang lowers the call to
+// @llvm.maximumnum.f64 and folds that with the same wrong rule. gcc -O2 gets it
+// right. The upstream fix is in flight in the min/max SimplifyDemandedFPClass
+// work; until it lands, the portable answer is to keep the name LLVM keys on out
+// of the IR entirely.
+//
+// Only the `_num` pair is renamed. fmax and fmin are *supposed* to skip a NaN, so
+// the expansion LLVM performs for them is the semantics the standard asks for,
+// and a program that calls them through a function pointer still wants a real
+// symbol of that name. The two families also behave identically for every input
+// that is not a NaN, so nothing else in the library can tell them apart.
+var llvmMisrecognizedMaxMin = map[string]string{
+	"fmaximum_num": "goclib_fmaximum_num",
+	"fminimum_num": "goclib_fminimum_num",
+}
+
+// irFuncSym returns the LLVM symbol a C function name is emitted as. It is the
+// C name unchanged for almost everything, and a private spelling for the two
+// libfuncs LLVM would otherwise rewrite -- see the table above.
+//
+// Renaming is safe here because gocl compiles a whole program into one LLVM
+// module: goclib's definitions and the user's calls are in the same module, so
+// both sides go through this function and agree. Nothing links against these
+// symbols from another object, and the image gocld builds keeps whatever spelling
+// the IR used.
+func irFuncSym(cName string) string {
+	if alt, ok := llvmMisrecognizedMaxMin[cName]; ok {
+		return alt
+	}
+	return cName
+}
+
 // lenOfTy returns the element count of an array type, or 1.
 func lenOfTy(t *frontend.Type) int {
 	if t.Len <= 0 {
@@ -495,8 +548,12 @@ func (m *irMod) noteExtern(name string, ret *frontend.Type, params []*frontend.T
 	if ret != nil {
 		r = m.llirType(ret)
 	}
+	// irFuncSym: a declaration has to spell the symbol the call site names. For
+	// the renamed libfuncs that is not the C name, and a `declare` under the C
+	// name would leave the module with a declaration nobody defines and a call
+	// to a symbol nobody declared.
 	m.prototypeLines = append(m.prototypeLines,
-		"declare "+m.dso()+r+" @"+name+"("+strings.Join(ps, ", ")+")")
+		"declare "+m.dso()+r+" @"+irFuncSym(name)+"("+strings.Join(ps, ", ")+")")
 }
 
 // noteExternGlobal declares a global this module reads or writes but does not
@@ -620,6 +677,45 @@ func (e *irEmitter) convertTo(op string, from *frontend.Type, toIR string) strin
 			return v
 		}
 	}
+	// Integer <-> floating point is a value conversion, not a reinterpretation,
+	// so it has to happen before the integer-width branch below -- an i1 and a
+	// double are both "different shapes", and left to the store-and-load
+	// fallback the 1-byte i1 was stored into an 8-byte slot and read back as a
+	// double, yielding whatever the adjacent bytes happened to hold. That is
+	// how "return (x != x);" in a function returning double came to answer
+	// 5368713217 instead of 0.0 or 1.0.
+	//
+	// An i1 source is signed: an LLVM i1 carries the values 0 and -1, so sitofp
+	// turns true into 1.0 and uitofp would turn it into 1.0 as well by luck of
+	// the zero-extension, but false into 0.0 either way. sitofp states the
+	// intent.
+	// An i1 source is neither signed nor unsigned: LLVM's i1 holds 0 and -1,
+	// so sitofp yields -1.0 for true and uitofp is not available on i1 at all.
+	// Both are wrong here, because C means 1.0. The three-step widen is what
+	// clang does and what keeps the value honest: zext to i64 turns the -1 bit
+	// pattern into 1, and uitofp then gives 1.0. (sitofp straight off the i1
+	// is not merely imprecise, it is actively wrong -- LLVM legalises it into
+	// "cmpunordsd + andpd <sign mask>", which hands back -1.0.)
+	if isIntIr(f) && isFloatIr(toIR) {
+		src := op
+		if f == "i1" {
+			w := e.newTmp()
+			e.line("%s = zext i1 %s to i64", w, op)
+			src, f = w, "i64"
+		}
+		v := e.newTmp()
+		opc := "uitofp"
+		if from != nil && from.Signed {
+			opc = "sitofp"
+		}
+		e.line("%s = %s %s %s to %s", v, opc, f, src, toIR)
+		return v
+	}
+	if isFloatIr(f) && isIntIr(toIR) {
+		v := e.newTmp()
+		e.line("%s = %s %s %s to %s", v, fptoiOp(toIR), f, op, toIR)
+		return v
+	}
 	// Integers: same width and different signedness needs no instruction, since
 	// both live in the same register and C only reinterprets the bits.
 	if len(f) > 1 && f[0] == 'i' && len(toIR) > 1 && toIR[0] == 'i' {
@@ -678,6 +774,29 @@ func (e *irEmitter) convertTo(op string, from *frontend.Type, toIR string) strin
 	v := e.newTmp()
 	e.line("%s = load %s, ptr %s, align %d", v, toIR, slot, alignOfIr(toIR))
 	return v
+}
+
+// isIntIr reports whether an IR type name is an integer ("i1", "i32", "i64").
+func isIntIr(s string) bool {
+	return len(s) > 1 && s[0] == 'i' && s[1] >= '0' && s[1] <= '9'
+}
+
+// isFloatIr reports whether an IR type name is a floating-point type.
+func isFloatIr(s string) bool {
+	return s == "float" || s == "double"
+}
+
+// fptoiOp picks the signed or unsigned float-to-integer opcode. An i1 target
+// has no width to speak of and only ever holds 0 or -1, so signed is the only
+// spelling that can work.
+func fptoiOp(toIR string) string {
+	if toIR == "i1" {
+		return "fptosi"
+	}
+	if toIR == "i32" {
+		return "fptosi"
+	}
+	return "fptoui"
 }
 
 // irIntWidth returns the bit width of an "iN" type, 64 when it cannot be read.

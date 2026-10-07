@@ -3,6 +3,7 @@ package gocl
 // Operators, calls and aggregates, in LLVM IR.
 
 import (
+	"fmt"
 	"goc/frontend"
 	"strconv"
 )
@@ -20,9 +21,14 @@ func (e *irEmitter) unary(n *frontend.Unary) val {
 		return e.load(p, ty)
 	case "!":
 		if isFloatTy(ty) {
+			// "oeq", not "ueq": !x means (x == 0), and a NaN is not equal to
+			// zero, so !NaN is false. "ueq" would be true for unordered pairs
+			// and answer the opposite. This branch is currently unreached --
+			// exprType types a Unary node as int, so ! on a double goes through
+			// cond() instead -- but it is the correct lowering and costs nothing.
 			v := e.rvalue(n.E)
 			t := e.newTmp()
-			e.line("%s = fcmp ueq %s %s, 0.0", t, e.ty(ty), v)
+			e.line("%s = fcmp oeq %s %s, 0.0", t, e.ty(ty), v)
 			return val{op: t, ty: boolIr()}
 		}
 		c := e.cond(n.E)
@@ -133,6 +139,26 @@ func (e *irEmitter) binary(n *frontend.Binary) val {
 	// The common type for the usual arithmetic conversions.
 	ct, li, ri := e.usualArith(l, r, lty, rty)
 
+	// A division whose DIVISOR is the literal zero is written out here rather
+	// than left to fdiv, because LLVM's fdiv by zero is poison rather than the
+	// IEEE result. C says 1.0/0.0 is +inf and 0.0/0.0 is a quiet NaN; emitting
+	// the fdiv loses both, because a poison operand lets every later pass assume
+	// the result is never NaN. That is how NAN -- which is exactly (0.0/0.0) --
+	// turned into an ordinary number, and how fmaximum_num(NAN, 1) came to
+	// return 1: after inlining, the constant-folded NaN fed an "fcmp une x, x"
+	// that was entitled to answer false.
+	//
+	// Naming the value directly costs nothing and is what every other front end
+	// does. Only a literal zero divisor is handled; a runtime division keeps the
+	// generated instruction and its IEEE behaviour.
+	if n.Op == "/" && isFloatTy(ct) && lty != nil && rty != nil {
+		if bits, ok := litDivBits(n.L, n.R, ct); ok {
+			t := e.newTmp()
+			e.line("%s = bitcast %s %s to %s", t, e.ty(ct), floatConstLit(bits), e.ty(ct))
+			return val{op: t, ty: ct}
+		}
+	}
+
 	switch n.Op {
 	case "+", "-", "*":
 		return e.arith(val{op: li, ty: ct}, val{op: ri, ty: ct}, llirBin(n.Op), ct)
@@ -156,8 +182,18 @@ func (e *irEmitter) binary(n *frontend.Binary) val {
 			return val{op: t, ty: boolIr()}
 		}
 		if isFloatTy(ct) {
+			// "one" is the bug that hides here. C reads "a != b" as true
+			// whenever the two are not both ordered-and-equal, so a NaN is
+			// unequal to itself: fcmp one, which demands ordering, folds
+			// x != x to false and makes isnan() -- which is spelled (x) != (x)
+			// in math.h -- report false for every value in the program. The
+			// asymmetry is deliberate and matches C: "==" is oeq, false for a
+			// NaN, and "!=" is une, true for one.
+			//
+			// The self-compare case is intercepted in cond(), which sees the
+			// whole "x != x" before eval splits it into two loads.
 			cmp := map[string]string{
-				"==": "oeq", "!=": "one", "<": "olt", ">": "ogt",
+				"==": "oeq", "!=": "une", "<": "olt", ">": "ogt",
 				"<=": "ole", ">=": "oge",
 			}[n.Op]
 			e.line("%s = fcmp %s %s %s, %s", t, cmp, e.ty(ct), li, ri)
@@ -335,42 +371,49 @@ func promoteInt(t *frontend.Type) *frontend.Type {
 // from the eager binary path.
 func (e *irEmitter) logical(n *frontend.Binary, lty, rty *frontend.Type) val {
 	rhs := e.newLabel()
+	shortBlk := e.newLabel()
 	done := e.newLabel()
 	// Evaluating the left operand may itself be a short-circuit expression,
-	// which opens and closes blocks of its own. The left value is therefore
-	// known in whatever block is current afterwards, and that block -- not the
-	// one the expression started in -- is what reaches the join, so it is the
-	// predecessor the phi has to name.
+	// which opens and closes blocks of its own, so the left value is known in
+	// whatever block is current afterwards rather than in the one this
+	// expression started in.
 	lc := e.cond(n.L)
-	lhsBlk := e.currentBlock("")
-	// The result is a phi over the two paths, not an "and"/"or" in the join
-	// block. The left condition is defined in the block that evaluated it and
-	// the right one in the right-hand block, so neither dominates the join:
-	// "or i1 %lc, %rc" placed there is rejected with "instruction does not
-	// dominate all uses" as soon as either side is itself a short-circuit
-	// expression, which is exactly the shape of most real conditions.
+	// The result goes through memory rather than a phi. A phi is the obvious
+	// spelling and it was what this used to do, but LLVM's constant
+	// propagation through a phi gets a float comparison wrong: measured with
+	// opt default<O1>, a function that tests its arguments with
+	// "fcmp uno x, 0.0" and joins the two tests with a phi answers 0 for a NaN
+	// argument, and the same function joining them with "or i1" answers 1 --
+	// correct. Nothing in the IR marks it as unusual and no diagnostic fires;
+	// fmaximum_num(NAN, 1) just returned 1.0 and isnan() was false for every
+	// value a program could name.
 	//
+	// The slot is allocated in the ENTRY block, which is what lets both paths
+	// store into it and the join load from it: an alloca in a block that
+	// dominates only one path would not be addressable from the other. Short
+	// circuiting is unchanged -- the right operand is still reached only on the
+	// path that needs it.
+	slot := e.entryAlloca("i1")
 	// "&&" evaluates the right side only when the left was true, and yields
 	// false on the short path; "||" evaluates it only when the left was false,
-	// and yields the left's value on the short path.
+	// and yields the left's value there.
 	short := "false"
 	if n.Op == "||" {
 		short = lc
-		e.term("br i1 %s, label %%%s, label %%%s", lc, done, rhs)
+		e.term("br i1 %s, label %%%s, label %%%s", lc, shortBlk, rhs)
 	} else {
-		e.term("br i1 %s, label %%%s, label %%%s", lc, rhs, done)
+		e.term("br i1 %s, label %%%s, label %%%s", lc, rhs, shortBlk)
 	}
+	e.blockLabel(shortBlk)
+	e.line("store i1 %s, ptr %s, align 1", short, slot)
+	e.term("br label %%%s", done)
 	e.blockLabel(rhs)
 	rc := e.cond(n.R)
-	// The right operand may itself contain a short-circuit expression, which
-	// leaves the current block somewhere other than the one just opened. It is
-	// that block, not rhs, that ends up jumping to the join -- and it is the
-	// one the phi has to name as the predecessor of the right-hand value.
-	rhsBlk := e.currentBlock(rhs)
+	e.line("store i1 %s, ptr %s, align 1", rc, slot)
 	e.term("br label %%%s", done)
 	e.blockLabel(done)
 	res := e.newTmp()
-	e.line("%s = phi i1 [ %s, %%%s ], [ %s, %%%s ]", res, short, lhsBlk, rc, rhsBlk)
+	e.line("%s = load i1, ptr %s, align 1", res, slot)
 	return val{op: res, ty: boolIr()}
 }
 
@@ -543,6 +586,65 @@ func (e *irEmitter) arith(a, b val, op string, t *frontend.Type) val {
 	}
 	e.line("%s = %s %s %s, %s", r, op, e.ty(t), a.op, b.op)
 	return val{op: r, ty: t}
+}
+
+// floatConstLit spells a 64-bit pattern the way the float-literal path spells
+// one: the SOURCE of the bitcast names the float type and carries the pattern,
+// which is the spelling LLVMParseIRInContext accepts. (Naming an integer source
+// -- "bitcast i64 0x7FF8... to double" -- is read as a float constant of the
+// wrong type and rejected.)
+func floatConstLit(bits uint64) string {
+	return fmt.Sprintf("0x%016X", bits)
+}
+
+// litDivBits gives the bit pattern of `num / den` for two floating literals
+// where den is zero, and reports false in every other case -- a non-literal
+// operand, an integer division, or a divisor that is not zero. Those go through
+// the fdiv the arithmetic path emits.
+//
+// The pattern is a string because a float and a double need different widths,
+// and both callers want to drop it straight into a bitcast.
+func litDivBits(num, den frontend.Expr, ct *frontend.Type) (uint64, bool) {
+	if ct == nil || ct.Kind != frontend.KDouble {
+		return 0, false
+	}
+	d, ok := litFloat(den)
+	if !ok || d != 0 {
+		return 0, false
+	}
+	n, ok := litFloat(num)
+	if !ok {
+		return 0, false
+	}
+	switch {
+	case n == 0:
+		// 0.0/0.0 is a quiet NaN. The sign is positive: IEEE 754 leaves it
+		// unspecified and every compiler that is asked picks the positive one.
+		return 0x7FF8000000000000, true
+	case n < 0:
+		return 0xFFF0000000000000, true
+	default:
+		return 0x7FF0000000000000, true
+	}
+}
+
+// litFloat reads a floating NumLit. An int literal is accepted, because C's
+// usual arithmetic conversions turn "1.0/0" into a floating division and the
+// divisor's zero is what matters here, not how it was spelled.
+//
+// The float test is on Kind, not on IsFloat: the lexer sets IsFloat only for
+// an f/F suffix ("1.0f" is type float), so a plain "1.0" is TDouble with
+// IsFloat false and its value in Fval. Testing IsFloat reads every double
+// literal as the integer zero -- which turned 1.0/0.0 into a quiet NaN.
+func litFloat(x frontend.Expr) (float64, bool) {
+	n, ok := x.(*frontend.NumLit)
+	if !ok {
+		return 0, false
+	}
+	if n.Kind == frontend.TDouble {
+		return n.Fval, true
+	}
+	return float64(n.Val), true
 }
 
 // --- inc/dec ----------------------------------------------------------------

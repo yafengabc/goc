@@ -245,12 +245,15 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 	}
 	rty := e.c.externRet(n.Name)
 	rs := e.ty(rty)
+	// irFuncSym keeps the call spelling in step with the definition's; see
+	// llvmMisrecognizedMaxMin for why the two cannot both use the C name.
+	sym := irFuncSym(n.Name)
 	call := e.newTmp()
 	if rs == "void" {
-		e.line("call void @%s(%s)", n.Name, argText)
+		e.line("call void @%s(%s)", sym, argText)
 		return val{op: "", ty: frontend.VoidType()}
 	}
-	e.line("%s = call %s @%s(%s)", call, rs, n.Name, argText)
+	e.line("%s = call %s @%s(%s)", call, rs, sym, argText)
 	return val{op: call, ty: rty}
 }
 
