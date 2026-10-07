@@ -1,6 +1,8 @@
 package gocld
 
 import (
+	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -203,5 +205,86 @@ func TestSanitizeObjName(t *testing.T) {
 		if got := sanitizeObjName(in); got != want {
 			t.Errorf("sanitizeObjName(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// objWithLocalIntArray builds a one-section relocatable object holding an
+// internal int array, the shape each unit of a multi-unit program gets for a
+// `static int base[3]` of its own.
+func objWithLocalIntArray(t *testing.T, unit string, vals []int32) []byte {
+	t.Helper()
+	img := NewImage(TargetELF)
+	data := newSection(img, ".data", true, false)
+	buf := make([]byte, 4*len(vals))
+	for i, v := range vals {
+		binary.LittleEndian.PutUint32(buf[4*i:], uint32(v))
+	}
+	data.Data = buf
+	img.Syms["base"] = SymLoc{Sect: sectionIndexOf(img, data), Off: 0, Static: true}
+	img.FileName = unit + ".o"
+	return WriteELFObject(img)
+}
+
+// TestIngestELFKeepsEachObjectsLocalsApart pins the address a local symbol gets
+// when a SECOND object brings one at the same (section, value) pair.
+//
+// ELF lets several locals share a name, and a linker that keys them by name
+// reports a duplicate definition of something that is not duplicated -- which
+// is why these are keyed by something else. But "something else" must still
+// tell two objects apart: a local's value is an offset into ITS OWN copy of the
+// section, and merging the copies rebases all but the first. Two units that
+// each declare `static int base[3]` both carry a local at (.data, value 0), and
+// keying on the section and value alone collapsed them into one -- so every
+// relocation in the second unit resolved to the first unit's array.
+//
+// Nothing complains when this happens. The program links, runs, and prints the
+// other file's numbers: a multi-unit build came out with unit B reading unit
+// A's array and printing 30 where 3 was meant. So the assertion is on the two
+// addresses being different, which is the only thing that distinguishes a
+// correct merge from that one.
+func TestIngestELFKeepsEachObjectsLocalsApart(t *testing.T) {
+	img := NewImage(TargetELF)
+	img.DeferUndefined(true)
+	for _, obj := range [][]byte{
+		objWithLocalIntArray(t, "a", []int32{10, 20, 30}),
+		objWithLocalIntArray(t, "b", []int32{1, 2, 3}),
+	} {
+		if err := img.IngestELFBytes(obj); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+	}
+	// Group the local symbols by section and collect the offsets each got.
+	//
+	// The bug's signature is a MISSING entry, not a wrong one: the second
+	// object's local finds the key already present and is skipped, so its
+	// relocations point at whatever the first object put there. Counting the
+	// entries is therefore the assertion -- two objects contribute two locals,
+	// and a merge that collapses them leaves one.
+	offs := map[int][]int{}
+	for name, loc := range img.Syms {
+		if strings.HasPrefix(name, "__loc_") {
+			offs[loc.Sect] = append(offs[loc.Sect], loc.Off)
+		}
+	}
+	if len(offs) == 0 {
+		t.Fatal("no local symbols were ingested; the test proves nothing")
+	}
+	paired := false
+	for sect, list := range offs {
+		if len(list) < 2 {
+			t.Errorf("section %d has %d local symbol(s), want 2: the two objects' locals\n"+
+				"collapsed into one, so the second object's references read the first\n"+
+				"object's data", sect, len(list))
+			continue
+		}
+		paired = true
+		if list[0] == list[1] {
+			t.Errorf("section %d: both objects' locals resolved to offset %d -- the second\n"+
+				"object's copy was not rebased onto its own place in the merged section",
+				sect, list[0])
+		}
+	}
+	if !paired {
+		t.Error("no section received locals from both objects")
 	}
 }

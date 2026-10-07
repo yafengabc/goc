@@ -212,6 +212,16 @@ type Image struct {
 	// question rather than a per-object one.
 	deferred bool
 
+	// elfObjSeq counts the ELF objects ingested so far. It is what keeps a
+	// local symbol's synthetic key unique across objects: STB_LOCAL names are
+	// private to the object that carries them, so two objects may hold
+	// identically named locals -- and even locals at the same (section, value)
+	// pair, which is the ordinary case for a static variable each unit defines
+	// at the start of its own .data. Numbering the object is what separates
+	// them; keying on the section and value alone made every relocation in the
+	// second object resolve to the first object's copy.
+	elfObjSeq int
+
 	// pending is the undefined-name set deferred mode has accumulated.
 	pending map[string]bool
 

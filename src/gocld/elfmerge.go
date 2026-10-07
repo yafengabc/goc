@@ -420,6 +420,13 @@ func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
 	// The section is non-allocated, so the loop below skips it anyway; it is
 	// read here rather than treated as an ordinary section precisely because it
 	// is metadata, not content.
+	// This object's number, taken once so that every local symbol keyed below
+	// carries the same one. See elfObjSeq on Image for why a local's key needs
+	// it, and the multi-unit case in the ingest loop for what goes wrong
+	// without it.
+	objSeq := img.elfObjSeq
+	img.elfObjSeq++
+
 	objName := ""
 	objLib := map[string]bool{}
 	for _, es := range o.secs {
@@ -599,12 +606,23 @@ func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
 			// *index*, not a name -- reach the one it means. Two locals that
 			// land on the same address are the same address, so merging those
 			// is correct rather than merely convenient.
+			//
+			// ...inside one object. Across objects it is not: a local's value
+			// is an offset into ITS OWN section copy, and merging the copies
+			// rebases all but the first. Two units that each declare
+			// `static int base[3]` both have a local at (section .data,
+			// value 0), which is exactly the pair the key above would collapse
+			// -- and then every relocation in the second unit reads the first
+			// unit's array. The program links, runs, and prints the other
+			// file's numbers, which is the worst shape such a bug can take.
+			// So the key carries the object's sequence number too, and the
+			// address it maps to is the rebased one (baseOf + value).
 			gi := sectOf[s.shndx]
 			if gi < 0 {
 				o.symKey[i] = ""
 				continue
 			}
-			key := fmt.Sprintf("__loc_%d_%d", s.shndx, s.value)
+			key := fmt.Sprintf("__loc_%d_%d_%d", objSeq, s.shndx, s.value)
 			o.symKey[i] = key
 			if _, ok := img.Syms[key]; !ok {
 				img.Syms[key] = SymLoc{Sect: gi, Off: baseOf[s.shndx] + int(s.value)}
