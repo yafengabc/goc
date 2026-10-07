@@ -92,7 +92,28 @@ static int soft_cmp64(unsigned long long a, unsigned long long b) {
 }
 
 static int soft_is_nan(unsigned long long u) {
-    return soft_exp(u) == 0x7FF && nonzero64(u & DBL_SIG_MASK);
+    /* Not the textbook `(u & EXP_MASK) == EXP_MASK && (u & SIG_MASK) != 0`,
+     * and not because it is wrong -- because LLVM recognises exactly that
+     * shape as `isnan`, and then folds
+     *
+     *     isnan(a) || isnan(b)      into      fcmp uno a, b
+     *
+     * On a target with no FPU an `fcmp uno` IS a call to __unorddf2, so the
+     * predicate every soft-float helper here opens with turned into a call to
+     * the function being written: __unorddf2 called __unorddf2, forever, until
+     * the stack ran out. The link was clean and the fault was a store below
+     * the stack from a helper nothing in the source named.
+     *
+     * The exponents are compared through an XOR and the mantissa is assembled
+     * from the two 32-bit halves, so neither test is a 64-bit compare (which
+     * would become a library call) and neither recombines into the isnan
+     * idiom. `e ^ 0x7FF00000 < 0x100000` is true only for e == 0x7FF00000:
+     * every other value of a masked exponent differs from it above bit 20. */
+    unsigned int hi = (unsigned int)(u >> 32);
+    unsigned int lo = (unsigned int)u;
+    unsigned int e = hi & 0x7FF00000u;
+    unsigned int m = (hi & 0x000FFFFFu) | lo;
+    return (e ^ 0x7FF00000u) < 0x100000u && m != 0u;
 }
 
 static int soft_is_inf(unsigned long long u) {
@@ -500,45 +521,93 @@ double __divdf3(double a, double b) {
  * false against everything including itself, and +0 == -0 even though their
  * bit patterns differ. */
 
-int __eqdf2(double a, double b) {
-    soft_double x, y;
-    x.d = a; y.d = b;
-    if (soft_is_nan(x.u) || soft_is_nan(y.u)) return 0;
-    if (soft_cmp64(x.u, y.u) == 0) return 1;
-    /* The only two distinct patterns that are numerically equal are +0 and -0. */
-    if (soft_is_zero(x.u) && soft_is_zero(y.u)) return 1;
-    return 0;
-}
-
-int __nedf2(double a, double b) { return !__eqdf2(a, b); }
-
-int __ltdf2(double a, double b) {
+/* The comparison family is NOT a set of boolean predicates, and writing it as
+ * one is the single most expensive mistake available here.
+ *
+ * libgcc -- and therefore every back end that names these when it lowers an
+ * `fcmp` -- defines them by the SIGN or the ZERO-NESS of what they return:
+ *
+ *   __eqdf2(a,b)  0 if a == b,          nonzero otherwise
+ *   __nedf2(a,b)  nonzero if a != b,    0 otherwise
+ *   __ltdf2(a,b)  <  0 if a < b,        >= 0 otherwise
+ *   __ledf2(a,b)  <= 0 if a <= b,       >  0 otherwise
+ *   __gtdf2(a,b)  >  0 if a > b,        <= 0 otherwise
+ *   __gedf2(a,b)  >= 0 if a >= b,       <  0 otherwise
+ *
+ * The generated code tests exactly that, so it is visible in the assembly: a
+ * `>=` comes out as `call __gedf2; bgez`. A predicate that returns 1 when the
+ * relation holds and 0 when it does not satisfies only the tests written as
+ * `bnez`. Under `bgez` its 0 becomes "true", and `v >= 1e9` was true for
+ * v = 1.5 -- which sent printf's integer formatter into `v / 1e9` forever and
+ * took the whole stack out.
+ *
+ * Unordered (either operand NaN): every ordered comparison is false, so each
+ * function returns the value that makes ITS test fail -- 0 for lt/gt (so
+ * `< 0` and `> 0` are both false), +1 for le (so `<= 0` is false) and -1 for
+ * ge (so `>= 0` is false). That is why le and ge cannot both be derived from
+ * the three-way result alone; they have to name the unordered case themselves.
+ *
+ * __nedf2 is the one exception, and it is worth naming because it is the
+ * opposite of what libgcc documents. libgcc says it returns 0 when the values
+ * DIFFER; the generated code tests it with `bnez` / `snez`, which only reads
+ * correctly if it returns nonzero when they differ -- a boolean predicate, not
+ * a signed one. Following the published convention there inverted `!=` for
+ * every soft-float program while leaving `==`, `<`, `<=`, `>` and `>=` all
+ * correct, which is a confusing combination to debug from the outside.
+ */
+static int soft_cmp3(double a, double b) {
     soft_double x, y;
     int sa, sb;
     unsigned int ea, eb, ma, mb;
     x.d = a; y.d = b;
-    if (soft_is_nan(x.u) || soft_is_nan(y.u)) return 0;
+    if (soft_is_nan(x.u) || soft_is_nan(y.u)) return 0;  /* unordered */
     sa = (int)(x.u >> 63);
     sb = (int)(y.u >> 63);
-    if (sa != sb) return sa;  /* negative beats non-negative */
+    if (sa != sb) return sa ? -1 : 1;   /* negative beats non-negative */
     /* Same sign: compare the magnitudes, which for equal signs orders the same
      * way as the values -- but reversed, because both are negative. Split into
      * 32-bit halves so no 64-bit compare (and so no call back into here). */
     ea = (unsigned int)((x.u & DBL_EXP_MASK) >> 52);
     eb = (unsigned int)((y.u & DBL_EXP_MASK) >> 52);
-    if (ea != eb) return sa ? (ea > eb) : (ea < eb);
+    if (ea != eb) return ((ea > eb) == (sa == 0)) ? 1 : -1;
     ma = (unsigned int)((x.u & DBL_SIG_MASK) >> 32);
     mb = (unsigned int)((y.u & DBL_SIG_MASK) >> 32);
-    if (ma != mb) return sa ? (ma > mb) : (ma < mb);
+    if (ma != mb) return ((ma > mb) == (sa == 0)) ? 1 : -1;
     ma = (unsigned int)(x.u & 0xFFFFFFFFull);
     mb = (unsigned int)(y.u & 0xFFFFFFFFull);
-    if (ma != mb) return sa ? (ma > mb) : (ma < mb);
-    return 0;  /* equal */
+    if (ma != mb) return ((ma > mb) == (sa == 0)) ? 1 : -1;
+    return 0;  /* equal, and +0 == -0 falls out of the magnitudes being 0 */
 }
 
-int __ledf2(double a, double b) { return __ltdf2(a, b) || __eqdf2(a, b); }
-int __gedf2(double a, double b) { return !(__ltdf2(a, b) || __eqdf2(a, b)); }
-int __gtdf2(double a, double b) { return !(__ltdf2(a, b) || __eqdf2(a, b)); }
+static int soft_either_nan(double a, double b) {
+    soft_double x, y;
+    x.d = a; y.d = b;
+    return soft_is_nan(x.u) || soft_is_nan(y.u);
+}
+
+int __eqdf2(double a, double b) {
+    if (soft_either_nan(a, b)) return 1;          /* not equal */
+    return soft_cmp3(a, b) == 0 ? 0 : 1;
+}
+
+int __nedf2(double a, double b) {
+    if (soft_either_nan(a, b)) return 0;          /* ordered != is false */
+    return soft_cmp3(a, b) == 0 ? 0 : 1;
+}
+
+int __ltdf2(double a, double b) { return soft_cmp3(a, b); }
+
+int __ledf2(double a, double b) {
+    if (soft_either_nan(a, b)) return 1;          /* > 0: a <= b does not hold */
+    return soft_cmp3(a, b) <= 0 ? -1 : 1;
+}
+
+int __gedf2(double a, double b) {
+    if (soft_either_nan(a, b)) return -1;         /* < 0: a >= b does not hold */
+    return soft_cmp3(a, b) >= 0 ? 1 : -1;
+}
+
+int __gtdf2(double a, double b) { return soft_cmp3(a, b); }
 
 int __unordereddf2(double a, double b) {
     soft_double x, y;

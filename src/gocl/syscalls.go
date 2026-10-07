@@ -60,7 +60,7 @@ func archSyscallTable(arch string) map[string]int64 {
 	switch arch {
 	case "aarch64", "riscv64", "riscv32":
 		return genericSyscalls
-	case "arm":
+	case "arm", "armel":
 		return arm32Syscalls
 	}
 	return nil

@@ -200,7 +200,16 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 		// the list. On Windows x64 the value already is the cursor pointer, so
 		// the ordinary read is exactly right and the slot's own address is not
 		// wanted.
-		if e.c.linux {
+		//
+		// The same is true of every flat-cursor Linux target -- ARM, AArch64
+		// and RISC-V -- whose va_list is a bare `char *` walking a save area.
+		// Passing the slot's address there hands the callee a pointer to the
+		// cursor rather than the cursor, which is one level of indirection too
+		// many: the callee's va_arg then loads the cursor's *value* and treats
+		// it as the argument. printf with any conversion in it read a garbage
+		// pointer, which is why the test programs printed "(null)" and a
+		// nonsense integer on every one of those targets.
+		if e.c.linux && !e.vaListIsFlatCursor() {
 			if id, ok := a.(*frontend.Ident); ok && e.vaNames[id.Name] {
 				args = append(args, "ptr "+e.vaListSlot(a))
 				continue
@@ -342,7 +351,34 @@ func (e *irEmitter) defaultPromote(v val) val {
 // _Bool, whose values are 0 and 1 and must not become 0xFFFFFFFF and 0) keeps
 // the value non-negative. Getting this backwards is the bug being fixed, only
 // with the sign bit set in the other half.
+//
+// The eight-byte slot is the x86-64 / Win64 shape, where the register save area
+// and the overflow area are both arrays of eight-byte slots. 32-bit ARM's AAPCS
+// does not work that way: a variadic argument is promoted to int or double and
+// then pushed as a *word*, and the callee's va_arg steps the cursor by 4 for an
+// int. Widening to i64 here therefore does not merely waste space -- it moves
+// every following argument by an extra 4 bytes, so `addall(4, 10, 20, 30, 40)`
+// read 10, 20, 30 and then whatever sits past the end (the sum came out 70,
+// having read 10, 20, 30, 10). So the widening is skipped there and the
+// promoted 32-bit value is passed as-is.
+//
+// AArch64's AAPCS64 rounds the slot *up* to eight bytes, so it keeps the
+// widened form even though its va_list is the same flat cursor as 32-bit ARM's.
+// The two differ in slot width, not in cursor shape, so the test is on the
+// architecture rather than on the cursor kind.
 func (e *irEmitter) widenVarargSlot(v val) val {
+	switch e.c.arch {
+	case "arm", "armel", "riscv32":
+		// AAPCS and the RISC-V 32-bit ABI: the slot is a word, and vaArgFlat
+		// steps by 4 for an int. Widening to i64 here pushes each following
+		// argument 4 bytes further along, so addall(4, 10, 20, 30, 40) reads
+		// 10, 20, 30 and then whatever follows -- 70 instead of 100.
+		//
+		// (Measured: making these targets eight-byte slots too, caller and
+		// callee together, answers 40. The four-byte step is not a
+		// simplification here, it is what the caller's layout actually is.)
+		return v
+	}
 	if v.ty == nil || v.ty.Kind != frontend.KInt {
 		// A pointer, a double, or a type the emitter did not classify: already
 		// a full slot.
@@ -368,6 +404,25 @@ func (e *irEmitter) widenVarargSlot(v val) val {
 }
 
 // indirectCall lowers a call through a computed callee.
+//
+// The callee's signature is NOT necessarily unknown: a call through a
+// function-pointer variable, a function-pointer parameter or any expression
+// whose static type is `pointer to function` all carry one, and the front end
+// has already resolved it. Using it is not an optimisation -- it is what makes
+// the call correct.
+//
+// Without it every argument keeps its own type, and a literal `0` passed where
+// the prototype says `char *` or `long` is emitted as `i32 0`. LLVM accepts
+// that (an indirect call is not type-checked against anything at IR level),
+// and on x86-64 it even works by accident: every argument goes in a 64-bit
+// register and a 32-bit zero leaves the upper half zero. On 32-bit targets it
+// does not. RISC-V passes an i64 in an even-aligned register pair, so a callee
+// reading `long limit` from a slot the caller filled with a single i32 picks up
+// the *next* argument as its high half: printf_lite_with's measuring pass
+// `fmtfn(0, 0, fmt, ap)` handed vfmt_i a limit of 0x9e3000000000, the guard
+// `n < limit` became vacuously true, and the "measure only" pass stored into
+// the null buffer -- a fault at the first byte on every 32-bit target, and
+// scrambled output on the 64-bit ones.
 func (e *irEmitter) indirectCall(n *frontend.IndirectCall) val {
 	if n.UFCS != nil {
 		// A method call resolved by the checker: the receiver is prepended and
@@ -375,35 +430,96 @@ func (e *irEmitter) indirectCall(n *frontend.IndirectCall) val {
 		return e.callExpr(n.UFCS)
 	}
 	fn := e.rvalue(n.Fn)
+	paramTys, ret := e.indirectCalleeSig(n.Fn)
 	var args []string
-	for _, a := range n.Args {
+	for i, a := range n.Args {
 		// A va_list argument goes over as the address of the caller's tag on
 		// SysV, for the same reason as in callExpr: the callee's parameter is a
 		// decayed array, and the ordinary `char *` read would hand it the tag's
 		// first eight bytes -- two packed cursors -- instead of an address.
-		if e.c.linux {
+		// Flat-cursor targets pass the cursor by value instead; see callExpr.
+		if e.c.linux && !e.vaListIsFlatCursor() {
 			if id, ok := a.(*frontend.Ident); ok && e.vaNames[id.Name] {
 				args = append(args, "ptr "+e.vaListSlot(a))
 				continue
 			}
 		}
 		v := e.eval(a)
-		v = e.defaultPromote(v)
-		// Same eight-byte slot rule as a direct variadic call (see callExpr):
-		// a narrow integer would otherwise leave the upper half of the slot
-		// undefined for the callee to read. Every argument of an indirect call
-		// is variadic in the sense that matters here -- the callee's signature
-		// is not known at this call site, so nothing else will widen them.
-		v = e.widenVarargSlot(v)
+		if i < len(paramTys) && paramTys[i] != nil && !isAggregateTy(paramTys[i]) {
+			// A declared parameter type is authoritative: the argument is
+			// converted to it, exactly as in a direct call.
+			v = e.coerce(v, paramTys[i])
+		} else {
+			v = e.defaultPromote(v)
+			// Same eight-byte slot rule as a direct variadic call (see
+			// callExpr): a narrow integer would otherwise leave the upper half
+			// of the slot undefined for the callee to read. Every argument of
+			// an indirect call is variadic in the sense that matters here --
+			// beyond the declared parameters the callee's signature says
+			// nothing, so nothing else will widen them.
+			v = e.widenVarargSlot(v)
+		}
 		args = append(args, e.ty(v.ty)+" "+v.op)
+	}
+	// A call through a pointer with a known arity that passes fewer arguments
+	// than the prototype declares gets the same zero fill as a direct call:
+	// LLVM rejects the arity mismatch outright otherwise.
+	for i := len(n.Args); i < len(paramTys); i++ {
+		pt := paramTys[i]
+		if pt == nil || isAggregateTy(pt) {
+			break
+		}
+		args = append(args, e.ty(pt)+" "+e.c.zeroOf(pt))
 	}
 	argText := ""
 	if len(args) > 0 {
 		argText = strings.Join(args, ", ")
 	}
+	rs := "i32"
+	if ret != nil {
+		if t := e.ty(ret); t != "" {
+			rs = t
+		}
+	}
 	t := e.newTmp()
-	e.line("%s = call i32 %s(%s)", t, fn, argText)
+	if rs == "void" {
+		e.line("call void %s(%s)", fn, argText)
+		return val{op: "", ty: frontend.VoidType()}
+	}
+	e.line("%s = call %s %s(%s)", t, rs, fn, argText)
+	if ret != nil {
+		return val{op: t, ty: ret}
+	}
 	return val{op: t, ty: frontend.IntType()}
+}
+
+// indirectCalleeSig recovers the declared signature behind a computed callee,
+// or two nils when the front end cannot see one.
+//
+// A call through a bare identifier is the common case (`fmtfn(...)` where
+// fmtfn is a parameter or a local of function-pointer type); anything else --
+// `(*fp)(x)`, `tbl[i](y)` -- is resolved from the expression's static type.
+func (e *irEmitter) indirectCalleeSig(fn frontend.Expr) ([]*frontend.Type, *frontend.Type) {
+	var ft *frontend.Type
+	if id, ok := fn.(*frontend.Ident); ok {
+		_, ft, _ = e.tr.fnPtrVar(id.Name)
+	}
+	if ft == nil {
+		if t := e.tr.exprType(fn); t != nil {
+			ft = frontend.FuncTypeOf(t)
+		}
+	}
+	if ft == nil {
+		return nil, nil
+	}
+	return ft.Params, ft.Ret
+}
+
+// isAggregateTy reports whether a parameter type has no single-operand
+// lowering, so its argument must be passed exactly as the front end produced
+// it rather than converted.
+func isAggregateTy(t *frontend.Type) bool {
+	return t != nil && (t.Kind == frontend.KStruct || t.Kind == frontend.KUnion || t.Kind == frontend.KArr)
 }
 
 // --- members ----------------------------------------------------------------

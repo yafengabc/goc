@@ -124,36 +124,111 @@ func (e *irEmitter) vaArg(n *frontend.VaArgExpr) val {
 	}
 	lty := e.ty(ty)
 
-	if e.c.linux {
-		return e.vaArgSysV(ap, lty, ty)
+	if e.vaListIsFlatCursor() {
+		return e.vaArgFlat(ap, lty, ty)
+	}
+	if e.c.arch == "aarch64" {
+		return e.vaArgAAPCS64(ap, lty, ty)
+	}
+	return e.vaArgSysV(ap, lty, ty)
+}
+
+// vaArgAAPCS64 reads one argument out of an AArch64 va_list.
+//
+// AAPCS64 is the one target here whose va_list is NOT a cursor. It is a
+// five-field record
+//
+//	struct { void *__stack; void *__gr_top; void *__vr_top;
+//	         int __gr_offs; int __vr_offs; }
+//
+// and the two halves of the argument list live in two different places: the
+// prologue spills the eight general-purpose argument registers into a GP save
+// area and the eight FP registers into a separate one, and an argument is in
+// whichever save area still has room for it. Once a half is exhausted the
+// argument comes off the stack instead.
+//
+// The offsets count UP from a negative start towards zero -- __gr_offs begins
+// at -(number of vararg GP slots) * 8, so the test is `offs < 0`, and the
+// address is __gr_top + offs, __gr_top pointing at the END of the save area.
+// That is the opposite direction from x86-64 SysV's gp_offset, which counts up
+// from zero to a positive limit; reading one as the other is why AArch64 used
+// to print the same wrong number for every value.
+//
+// Treating this record as the flat cursor it is not -- loading the first eight
+// bytes as a pointer -- yields __stack, the overflow area. That is where
+// arguments past the eight registers live, so a program that passed everything
+// on the stack would work; `printf("%d", 42)` does not, because 42 arrives in
+// x1 and is spilled into the GP save area, which __stack never points at.
+func (e *irEmitter) vaArgAAPCS64(ap, lty string, ty *frontend.Type) val {
+	const (
+		stackOff  = 0  // void *__stack
+		grTopOff  = 8  // void *__gr_top
+		vrTopOff  = 16 // void *__vr_top
+		grOffsOff = 24 // int __gr_offs
+		vrOffsOff = 28 // int __vr_offs
+	)
+	// A float or a double is in the FP save area, whose slots are 16 bytes
+	// wide -- one whole q register each. Everything else is in the GP save
+	// area, eight bytes a slot.
+	isFP := lty == "float" || lty == "double"
+	topOff, offsOff, step := grTopOff, grOffsOff, 8
+	if isFP {
+		topOff, offsOff, step = vrTopOff, vrOffsOff, 16
 	}
 
-	// Windows x64: a single cursor pointer into the register save area.
-	cur := e.newTmp()
-	e.line("%s = load ptr, ptr %s, align 8", cur, ap)
+	top := e.newTmp()
+	e.line("%s = load ptr, ptr %s, align 8", top, e.gepStruct(ap, topOff))
+	offs := e.newTmp()
+	e.line("%s = load i32, ptr %s, align 4", offs, e.gepStruct(ap, offsOff))
+	stack := e.newTmp()
+	e.line("%s = load ptr, ptr %s, align 8", stack, e.gepStruct(ap, stackOff))
 
-	// The slot is eight bytes wide, so a narrow type is read at its own width
-	// from the same address.
+	useReg := e.newTmp()
+	e.line("%s = icmp slt i32 %s, 0", useReg, offs)
+	// The offset is signed and negative, so it has to be sign-extended before
+	// it can index a GEP; zero-extending it would turn -56 into 4294967240.
+	offs64 := e.newTmp()
+	e.line("%s = sext i32 %s to i64", offs64, offs)
+	regAddr := e.newTmp()
+	e.line("%s = getelementptr inbounds i8, ptr %s, i64 %s", regAddr, top, offs64)
+	addr := e.newTmp()
+	e.line("%s = select i1 %s, ptr %s, ptr %s", addr, useReg, regAddr, stack)
+
+	// Advance only the cursor that was used, and write the other back exactly
+	// as it was read. Both stores go through the FIELD address: the record is
+	// five independent fields packed into 32 bytes, so storing the advanced
+	// __stack at ap+0 would land on top of __stack itself only by luck, and
+	// elsewhere by design.
+	advOffs := e.newTmp()
+	e.line("%s = add i32 %s, %d", advOffs, offs, step)
+	// Off the stack an argument occupies eight bytes whatever its type: the
+	// stack half is packed, unlike the 16-byte FP register slots.
+	advStack := e.newTmp()
+	e.line("%s = getelementptr inbounds i8, ptr %s, i64 8", advStack, stack)
+	offsKept := e.newTmp()
+	e.line("%s = select i1 %s, i32 %s, i32 %s", offsKept, useReg, advOffs, offs)
+	e.line("store i32 %s, ptr %s, align 4", offsKept, e.gepStruct(ap, offsOff))
+	stackKept := e.newTmp()
+	e.line("%s = select i1 %s, ptr %s, ptr %s", stackKept, useReg, stack, advStack)
+	e.line("store ptr %s, ptr %s, align 8", stackKept, e.gepStruct(ap, stackOff))
+
 	slot := e.newTmp()
 	switch lty {
 	case "i1":
 		raw := e.newTmp()
-		e.line("%s = load i8, ptr %s, align 1", raw, cur)
+		e.line("%s = load i8, ptr %s, align 1", raw, addr)
 		e.line("%s = trunc i8 %s to i1", slot, raw)
 	case "float":
 		bits := e.newTmp()
-		e.line("%s = load i32, ptr %s, align 4", bits, cur)
+		e.line("%s = load i32, ptr %s, align 4", bits, addr)
 		e.line("%s = bitcast i32 %s to float", slot, bits)
 	case "double":
 		bits := e.newTmp()
-		e.line("%s = load i64, ptr %s, align 8", bits, cur)
+		e.line("%s = load i64, ptr %s, align 8", bits, addr)
 		e.line("%s = bitcast i64 %s to double", slot, bits)
 	default:
-		e.line("%s = load %s, ptr %s, align %d", slot, lty, cur, alignOfIr(lty))
+		e.line("%s = load %s, ptr %s, align %d", slot, lty, addr, alignOfIr(lty))
 	}
-	next := e.newTmp()
-	e.line("%s = getelementptr inbounds i8, ptr %s, i64 8", next, cur)
-	e.line("store ptr %s, ptr %s, align 8", next, ap)
 	return val{op: slot, ty: ty}
 }
 
@@ -167,6 +242,125 @@ func (e *irEmitter) vaArg(n *frontend.VaArgExpr) val {
 // type comes from the GP half while gp_offset <= 48, otherwise from the overflow
 // area. Either way the chosen cursor advances, so the next va_arg reads the next
 // argument.
+// vaListIsFlatCursor reports whether this target's va_list is a single cursor
+// pointer -- the shape Windows x64 and the ARM AAPCS both use -- rather than
+// the 24-byte __va_list_tag x86-64 SysV uses.
+//
+// The two are not interchangeable. Reading a flat cursor as if it were the tag
+// makes the program take its offsets out of a stack address: a SysV read
+// treats the first eight bytes as gp_offset, so an ARM variadic call compares a
+// pointer against 48, decides the argument is "past the register save area",
+// and loads it from wherever the pointer's low bits point. Nothing traps at
+// link time; the program faults on the first variadic argument instead, which
+// is why the two shapes have to be told apart explicitly rather than by
+// "is this Linux".
+//
+// ARM's AAPCS has no register save area for variadic arguments at all: every
+// variadic argument past the fixed ones is pushed onto the stack, and va_list is
+// a bare `char *` cursor into that stack region (this is what
+// `add r1, sp, #36; str r1, [sp]` lowers to). RISC-V's psABI says the same of
+// va_list, so both are handled by vaArgFlat.
+//
+// AArch64 is deliberately NOT in that set, and it was once: AAPCS64's va_list
+// is the five-field record in vaArgAAPCS64, and reading it as a cursor hands
+// every integer argument the address of the stack overflow area instead of the
+// GP save area it was spilled into.
+func (e *irEmitter) vaListIsFlatCursor() bool {
+	switch e.c.arch {
+	case "arm", "armel", "riscv64", "riscv32":
+		// The AAPCS and RISC-V shapes both hand va_start a single pointer and
+		// let the callee walk it, so they share the flat-cursor reader.
+		//
+		// RISC-V earns its place here for a reason worth recording, because it
+		// is not obvious from the psABI text: llvm.va_start is target-defined,
+		// and what it writes on RISC-V is one pointer to a register save area
+		// the prologue spilled the variadic registers into -- not the
+		// {gp_offset, fp_offset, overflow, reg_save} four-part tag x86-64
+		// uses. Reading that tag out of a RISC-V va_list therefore compares a
+		// pointer's low half against 48, concludes the arguments are past the
+		// register save area, and loads from whatever the following fields
+		// happen to hold. The link succeeds; the first va_arg reads address 0.
+		return true
+	}
+	return !e.c.linux // Windows x64
+}
+
+// vaArgFlat reads one argument from a single-cursor va_list: load the type at
+// the cursor, then advance the cursor by that type's size. This is the ARM
+// AAPCS and the RISC-V (ILP32 / LP64) shape -- the cursor is a pointer into a
+// save area the callee's prologue spilled the variadic registers into, and the
+// caller's own stack args follow it contiguously, so every argument sits at the
+// position the cursor reaches by simply walking the slot sizes. No alignment
+// round-up is needed: the 8-byte alignment a double wants is already honoured
+// in *absolute* terms by the stack layout, but the save area itself begins at a
+// 4-byte-aligned offset within the frame, so rounding the cursor up to eight
+// relative to the save-area start would skip the low half of the double and
+// read the following register instead -- printf printed 0.00 on every 32-bit
+// target until this was removed. The caller and callee both walk the same
+// contiguous bytes, so the step (see vaArgStep) is the only thing that has to
+// agree, and it does: an int and a pointer are a word, a double and an i64 are
+// eight bytes, with nothing padded in between.
+func (e *irEmitter) vaArgFlat(ap, lty string, ty *frontend.Type) val {
+	cur := e.newTmp()
+	e.line("%s = load ptr, ptr %s, align 8", cur, ap)
+
+	slot := e.newTmp()
+	switch lty {
+	case "i1":
+		raw := e.newTmp()
+		e.line("%s = load i8, ptr %s, align 1", raw, cur)
+		e.line("%s = trunc i8 %s to i1", slot, raw)
+	case "float":
+		bits := e.newTmp()
+		e.line("%s = load i32, ptr %s, align 4", bits, cur)
+		e.line("%s = bitcast i32 %s to float", slot, bits)
+	default:
+		e.line("%s = load %s, ptr %s, align %d", slot, lty, cur, alignOfIr(lty))
+	}
+	next := e.newTmp()
+	e.line("%s = getelementptr inbounds i8, ptr %s, i64 %d", next, cur, e.vaArgStep(lty))
+	e.line("store ptr %s, ptr %s, align 8", next, ap)
+	return val{op: slot, ty: ty}
+}
+
+// vaArgStep is how far a va_arg cursor advances after reading an argument of
+// the given IR type. The width is the *slot* width, not the C type's width,
+// and the slot width follows the pointer size of the target, because that is
+// also what widenVarargSlot makes the caller store: on a 64-bit target an int
+// reaches the callee widened to i64 and occupies eight bytes in the save area,
+// so a cursor that steps four reads the low half of one argument and then the
+// zero above it -- printf("%d %d %d", 144, 7, 21) answers "144 0 7" on
+// Windows x64, where va_list is this very flat cursor.
+//
+// The 32-bit targets -- AAPCS (arm/armel) and the RV32 psABI -- pack a
+// variadic int into a word, so the step there is four. Widening it to eight on
+// those targets is wrong in the direction that looks like a code-generation
+// bug: the caller really did leave four bytes per argument and the cursor
+// walked past every other one. (And widening the caller's operand there is
+// independently wrong -- it changes how many registers the argument consumes --
+// which is why widenVarargSlot skips 32-bit targets too.)
+//
+// A double and an i64 always occupy a full eight bytes; a pointer is one word,
+// so it tracks the slot width with the ints.
+func (e *irEmitter) vaArgStep(lty string) int64 {
+	word := int64(8)
+	switch e.c.arch {
+	case "arm", "armel", "riscv32":
+		// 32-bit targets: a word is four bytes and the save area is an array
+		// of them.
+		word = 4
+	}
+	switch lty {
+	case "i1", "i8", "i16", "i32", "float", "ptr":
+		return word
+	case "i64", "double":
+		return 8
+	}
+	// Anything wider (a vector, or an aggregate lowered to its own storage)
+	// advances by its own natural size.
+	return int64(alignOfIr(lty))
+}
+
 func (e *irEmitter) vaArgSysV(ap, lty string, ty *frontend.Type) val {
 	// Field offsets within __va_list_tag: gp_offset and fp_offset are the two
 	// leading unsigned ints (ap+0 and ap+4), the two pointers follow.

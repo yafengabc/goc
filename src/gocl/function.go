@@ -306,15 +306,27 @@ func (e *irEmitter) slotFor(uid int, ty string) string {
 // vaListTy is the storage a va_list needs on this target.
 //
 // goc declares va_list as `char *` (parser.go: typedefs["va_list"] = frontend.PtrType(frontend.CharType())),
-// which is eight bytes, and the intrinsic llvm.va_start stores exactly one
-// eight-byte pointer into it: the cursor into the caller's register save area.
-// The slot is still widened to 24 bytes so the intrinsic can never overwrite
-// the three locals that would otherwise follow an eight-byte object, whatever
-// a future target's va_start writes. The pointer typedef stays as it is -- it
-// is what the rest of the front end reasons about, and passing a va_list
-// between functions passes this pointer. Only the storage is widened, which is
-// exactly what a real stdarg.h does when __builtin_va_list is an array type.
-const vaListTy = "[3 x i64]"
+// which is eight bytes, and on Windows x64 the intrinsic llvm.va_start stores
+// exactly one eight-byte pointer into it: the cursor into the caller's register
+// save area. The slot is still widened so the intrinsic can never overwrite the
+// locals that would otherwise follow an eight-byte object, whatever a future
+// target's va_start writes. The pointer typedef stays as it is -- it is what
+// the rest of the front end reasons about, and passing a va_list between
+// functions passes this pointer. Only the storage is widened, which is exactly
+// what a real stdarg.h does when __builtin_va_list is an array type.
+//
+// 24 bytes covers x86-64 SysV's __va_list_tag. AArch64 needs 32: AAPCS64's
+// __va_list is five fields -- two pointers plus two offsets, then the stack
+// cursor -- and an allocation one i64 short of that leaves __vr_offs in the
+// next local. llvm.va_start writes all five, so the shortfall is silent: the
+// last field lands on whatever follows and every floating-point va_arg reads
+// it back as garbage.
+func (e *irEmitter) vaListTy() string {
+	if e.c.arch == "aarch64" {
+		return "[4 x i64]"
+	}
+	return "[3 x i64]"
+}
 
 // vaListSlot returns the address of the object backing a va_list named by x.
 // Every mention of the same variable -- va_start, each va_arg, va_end, va_copy
@@ -354,7 +366,10 @@ func (e *irEmitter) vaListSlot(x frontend.Expr) string {
 	if e.paramNames[id.Name] {
 		if uid, ok := e.tr.lookupUID(id.Name); ok {
 			slot := e.slotFor(uid, "ptr")
-			if !e.c.linux {
+			if e.vaListIsFlatCursor() {
+				// Windows x64 and the ARM AAPCS: va_list is `char *`, so the
+				// parameter holds the cursor itself and the slot bindParams made
+				// is already the answer.
 				return slot
 			}
 			// SysV: `slot` holds a pointer to the caller's 24-byte tag. Load
@@ -398,7 +413,7 @@ func (e *irEmitter) vaListSlot(x frontend.Expr) string {
 		}
 	}
 	slot := e.newTmp()
-	e.entry.WriteString("  " + slot + " = alloca " + vaListTy + ", align 8\n")
+	e.entry.WriteString("  " + slot + " = alloca " + e.vaListTy() + ", align 8\n")
 	e.vaSlots[id.Name] = slot
 	return slot
 }

@@ -40,7 +40,8 @@ type Config struct {
 	WinGUI bool // -mwindows: PE subsystem 2 (GUI), no console window
 	Opt    int  // optimisation level, 0 = none
 	// Arch is the instruction set to compile for: "x86_64" (default), "aarch64",
-	// "arm" (armv7), "riscv64", "riscv32". It names the LLVM target triple and
+	// "arm" (armv7 hard-float), "armel" (armv7 soft-float), "riscv64",
+	// "riscv32". It names the LLVM target triple and
 	// data layout the IR is lowered to, and on a Linux target decides whether
 	// the program links through gocld alone or through goa's assembler.
 	Arch string
@@ -566,10 +567,10 @@ func parseArgs(args []string) (*Config, error) {
 			}
 			i++
 			switch args[i] {
-			case "x86_64", "aarch64", "arm", "riscv64", "riscv32":
+			case "x86_64", "aarch64", "arm", "armel", "riscv64", "riscv32":
 				cfg.Arch = args[i]
 			default:
-				return nil, fmt.Errorf("unknown arch %q (want x86_64, aarch64, arm, riscv64, riscv32)", args[i])
+				return nil, fmt.Errorf("unknown arch %q (want x86_64, aarch64, arm, armel, riscv64, riscv32)", args[i])
 			}
 		case strings.HasPrefix(a, "-m") && strings.Contains(a, "windows"):
 			cfg.WinGUI = true

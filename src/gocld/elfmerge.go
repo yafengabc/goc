@@ -45,6 +45,7 @@ const (
 	sttFunc    = 2
 	sttSection = 3
 	sttFile    = 4 // STT_FILE: the object's own name, not a thing inside it
+	stbLocal   = 0 // STB_LOCAL: st_info's bind field, the top four bits
 
 	shnUndef = 0
 	shnAbs   = 0xfff1
@@ -112,6 +113,31 @@ const (
 	rARMMovtAbs       = 44 // movt: high 16 bits of (S + A)
 )
 
+// RISC-V relocation types (psABI). RISC-V always uses RELA, so -- unlike
+// ARM32 -- the addend travels in the relocation entry and is not read back
+// out of the instruction.
+//
+// The pair HI20/LO12_I is the whole reason this block needs care: a RISC-V
+// address is built as `lui` (20 bits) followed by an I-type `addi`/`ld` whose
+// 12-bit immediate is SIGN-extended. The low part can therefore be negative,
+// down to -2048, and the high part has to be rounded up to compensate -- which
+// is what the +0x800 in R_RISCV_HI20 is for. Dropping it puts every symbol
+// whose page offset is 2048 or more one page low, and the program then reads
+// the wrong data with no complaint from the linker.
+const (
+	rRISCVNone    = 0
+	rRISCV32      = 1  // S + A (absolute 32-bit)
+	rRISCV64      = 2  // S + A (absolute 64-bit)
+	rRISCVCall    = 18 // auipc+jalr pair: expanded as PCREL_HI20 + LO12_I
+	rRISCVCallPLT = 19 // the same thing, routed through the PLT
+	rRISCVBranch  = 16 // SB-type branch: (S + A - P) >> 1
+	rRISCVJAL     = 17 // UJ-type jal: (S + A - P) >> 1
+	rRISCVHI20    = 26 // lui: ((S + A + 0x800) >> 12)
+	rRISCVLO12I   = 27 // I-type: (S + A) & 0xfff
+	rRISCVLO12S   = 28 // S-type store: (S + A) & 0xfff, split encoding
+	rRISCVRelax   = 51 // linker-relaxation hint; safe to ignore
+)
+
 // rd64 reads a little-endian u64 from b at off, or 0 past the end.
 func rd64(b []byte, off int) uint64 {
 	if off < 0 || off+8 > len(b) {
@@ -122,12 +148,13 @@ func rd64(b []byte, off int) uint64 {
 
 // elfsym is one parsed ELF symbol-table entry (the parts the merge needs).
 type elfsym struct {
-	name   string
-	value  uint64
-	shndx  uint16 // 0 = undefined, 0xfff1 = absolute, else 1-based section
-	isFunc bool
-	isSect bool // STT_SECTION: names "address of section N"
-	isFile bool // STT_FILE: names the object, not anything in it
+	name    string
+	value   uint64
+	shndx   uint16 // 0 = undefined, 0xfff1 = absolute, else 1-based section
+	isFunc  bool
+	isSect  bool // STT_SECTION: names "address of section N"
+	isFile  bool // STT_FILE: names the object, not anything in it
+	isLocal bool // STB_LOCAL: binds only inside this object
 }
 
 // elfsec is one parsed section header plus its contents.
@@ -155,16 +182,26 @@ type elfObj struct {
 	class   uint8    // elfClass64 or elfClass32
 }
 
-// isARMMetaSection reports whether name is one of the ARM-specific ELF sections
-// this linker drops (see the section-merge loop for why). None of them hold a C
-// symbol or executable byte; they are unwind/attribute metadata the kernel does
-// not consult at load time.
-func isARMMetaSection(name string) bool {
+// isELFMetaSection reports whether name is one of the metadata sections this
+// linker drops (see the section-merge loop for why). None of them hold a C
+// symbol or an executable byte; they are unwind and attribute metadata the
+// kernel does not consult at load time.
+//
+// .eh_frame is the DWARF unwind table, and dropping it costs the ability to
+// backtrace after a crash -- the same bargain the native backend already made,
+// because it never emits unwind data at all. It is listed here rather than
+// under an ARM heading because every LLVM target emits it, not just ARM.
+func isELFMetaSection(name string) bool {
 	switch name {
-	case ".ARM.exidx", ".ARM.extab", ".ARM.attributes", ".note.GNU-stack":
+	case ".ARM.exidx", ".ARM.extab", ".ARM.attributes", ".note.GNU-stack",
+		".eh_frame", ".eh_frame_hdr":
 		return true
 	}
 	return false
+}
+
+func isARMMetaSection(name string) bool {
+	return isELFMetaSection(name)
 }
 
 // IngestELF merges the object at path into the assembler.
@@ -361,12 +398,13 @@ func parseELF(src []byte) (*elfObj, error) {
 			}
 		}
 		o.syms = append(o.syms, elfsym{
-			name:   name,
-			value:  val,
-			shndx:  uint16(shndx),
-			isFunc: info&0xf == sttFunc,
-			isSect: info&0xf == sttSection,
-			isFile: info&0xf == sttFile,
+			name:    name,
+			value:   val,
+			shndx:   uint16(shndx),
+			isFunc:  info&0xf == sttFunc,
+			isSect:  info&0xf == sttSection,
+			isFile:  info&0xf == sttFile,
+			isLocal: info>>4 == stbLocal,
 		})
 	}
 	o.symKey = make([]string, len(o.syms))
@@ -546,6 +584,30 @@ func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
 						img.Syms[key] = SymLoc{Sect: secIdx, Off: baseOf[s.shndx]}
 					}
 				}
+			}
+		case s.isLocal && s.shndx >= 1 && int(s.shndx) <= len(o.secs):
+			// A local symbol is private to its object, so the ELF rules let
+			// several of them share a name -- and LLVM's RISC-V backend takes
+			// that option freely: one object emitted for a printf came out
+			// with five separate `.L0` labels, all STB_LOCAL in the same
+			// section. Treating those as globals made the link report a
+			// duplicate definition of a symbol that is not duplicated at all.
+			//
+			// The key is qualified by the section AND the value rather than by
+			// the name, which does two jobs at once: it keeps distinct locals
+			// distinct, and it lets a relocation -- which arrives as a symbol
+			// *index*, not a name -- reach the one it means. Two locals that
+			// land on the same address are the same address, so merging those
+			// is correct rather than merely convenient.
+			gi := sectOf[s.shndx]
+			if gi < 0 {
+				o.symKey[i] = ""
+				continue
+			}
+			key := fmt.Sprintf("__loc_%d_%d", s.shndx, s.value)
+			o.symKey[i] = key
+			if _, ok := img.Syms[key]; !ok {
+				img.Syms[key] = SymLoc{Sect: gi, Off: baseOf[s.shndx] + int(s.value)}
 			}
 		case s.shndx == shnUndef && s.name == "":
 			o.symKey[i] = ""
@@ -757,6 +819,22 @@ func (img *Image) ingestParsedELF(o *elfObj, src []byte) error {
 					})
 				default:
 					return fmt.Errorf("elf: unsupported ARM32 relocation type %d for %s (%s)", typ, es.name, key)
+				}
+			case emRISCV:
+				switch typ {
+				case rRISCVNone, rRISCVRelax:
+					// padding / relaxation hint -- nothing to patch
+				case rRISCV64, rRISCV32, rRISCVHI20, rRISCVLO12I, rRISCVLO12S,
+					rRISCVBranch, rRISCVJAL, rRISCVCall, rRISCVCallPLT:
+					// RISC-V patch sites are bit fields inside instruction words
+					// (or plain absolute data), and the HI20/LO12 pair cannot be
+					// expressed in the x86 Fixup model at all. Defer to
+					// applyReloc, which knows each type's encoding.
+					img.Relocs = append(img.Relocs, Reloc{
+						Machine: emRISCV, Type: typ, Sect: tsGi, Off: at, Sym: key, Addend: addend,
+					})
+				default:
+					return fmt.Errorf("elf: unsupported RISC-V relocation type %d for %s (%s)", typ, es.name, key)
 				}
 			default:
 				return fmt.Errorf("elf: unsupported machine 0x%x for relocation in %s", o.machine, es.name)

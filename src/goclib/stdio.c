@@ -121,19 +121,24 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             field[fl++] = (char)c;
         } else if (spec == 'd' || spec == 'i' || spec == 'u' ||
                    spec == 'o' || spec == 'x' || spec == 'X') {
-            /* integers (long on the varargs side) */
+            /* integers: read as int, which is what the default argument
+             * promotions make a %d/%i/%u/%o/%x/%X argument. Reading a `long`
+             * instead -- which looks harmless on x86-64, where every vararg
+             * fills an eight-byte slot -- reads EIGHT bytes out of a FOUR-byte
+             * slot on a 32-bit target, so the upper half is whatever the stack
+             * happened to hold: printf("%d", 0) printed 4294967296 there. */
             unsigned long v;
             if (spec == 'd' || spec == 'i') {
-                long sv = va_arg(ap, long);
+                int sv = va_arg(ap, int);
                 if (sv < 0 && spec != 'u') {
                     field[fl++] = '-';
-                    v = (unsigned long)(-sv);
+                    v = (unsigned long)(-(long)sv);
                 } else {
-                    v = (unsigned long)sv;
+                    v = (unsigned long)(unsigned int)sv;
                 }
-                if (spec == 'u') v = (unsigned long)sv; /* unsigned %u */
+                if (spec == 'u') v = (unsigned long)(unsigned int)sv;
             } else {
-                v = va_arg(ap, unsigned long);
+                v = va_arg(ap, unsigned int);
             }
         /* convert in the chosen base */
         int base = 10;
@@ -365,16 +370,16 @@ static int vfmt_i(char *out, long limit, const char *fmt, va_list ap) {
                    spec == 'o' || spec == 'x' || spec == 'X') {
             unsigned long v;
             if (spec == 'd' || spec == 'i') {
-                long sv = va_arg(ap, long);
+                int sv = va_arg(ap, int);
                 if (sv < 0 && spec != 'u') {
                     field[fl++] = '-';
-                    v = (unsigned long)(-sv);
+                    v = (unsigned long)(-(long)sv);
                 } else {
-                    v = (unsigned long)sv;
+                    v = (unsigned long)(unsigned int)sv;
                 }
-                if (spec == 'u') v = (unsigned long)sv;
+                if (spec == 'u') v = (unsigned long)(unsigned int)sv;
             } else {
-                v = va_arg(ap, unsigned long);
+                v = va_arg(ap, unsigned int);
             }
             int base = 10;
             if (spec == 'o') base = 8;
@@ -441,16 +446,16 @@ static int vfmt_f(char *out, long limit, const char *fmt, va_list ap) {
                    spec == 'o' || spec == 'x' || spec == 'X') {
             unsigned long v;
             if (spec == 'd' || spec == 'i') {
-                long sv = va_arg(ap, long);
+                int sv = va_arg(ap, int);
                 if (sv < 0 && spec != 'u') {
                     field[fl++] = '-';
-                    v = (unsigned long)(-sv);
+                    v = (unsigned long)(-(long)sv);
                 } else {
-                    v = (unsigned long)sv;
+                    v = (unsigned long)(unsigned int)sv;
                 }
-                if (spec == 'u') v = (unsigned long)sv;
+                if (spec == 'u') v = (unsigned long)(unsigned int)sv;
             } else {
-                v = va_arg(ap, unsigned long);
+                v = va_arg(ap, unsigned int);
             }
             int base = 10;
             if (spec == 'o') base = 8;

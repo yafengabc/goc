@@ -36,6 +36,50 @@ import (
 // tests, which exercise fragments without the runtime present). Its function table
 // is consulted for prototypes and for the reachability walk that decides which
 // runtime code has to be emitted.
+// softFloatBuiltins are the compiler-rt helpers a target without floating-point
+// registers needs. LLVM names them when it lowers `double` arithmetic, a
+// double-to-integer conversion, or a 64-bit division -- none of which appear as
+// a call in the source, so they have to be requested by name rather than
+// reached. The list is the set libgcc's soft-float library provides for the
+// operations goc's own runtime performs; a name that is missing shows up as an
+// undefined symbol naming it, which is a link error rather than a wrong answer.
+//
+// The `__*df2` family is the comparison set (each returns 0 or 1, matching what
+// an `fcmp`/`cset` pair expects); the `__*df3` family is arithmetic; the
+// conversions bridge both directions between `double` and the 64-bit integers.
+var softFloatBuiltins = []string{
+	"__adddf3", "__subdf3", "__muldf3", "__divdf3",
+	"__eqdf2", "__nedf2", "__ltdf2", "__ledf2", "__gedf2", "__gtdf2",
+	"__unorddf2",
+	"__fixdfdi", "__fixdfsi", "__fixunsdfdi",
+	"__floatsidf", "__floatdidf", "__floatunsidf",
+	"__udivdi3",
+}
+
+// doubleConvBuiltins are the conversions between a double and a 64-bit
+// integer. A hard-float target needs these even though it has no use for the
+// arithmetic above: VFP converts to and from a 32-bit int (vcvt.s32.f64), not
+// a 64-bit one, so a `long` cast or a `long long` argument to printf names
+// __fixdfdi, __fixunsdfdi and __floatdidf on armhf just as it does on a target
+// with no FPU at all. Asking for the whole soft-float set there would link
+// seventeen functions a VFP instruction already implements.
+var doubleConvBuiltins = []string{"__fixdfdi", "__fixunsdfdi", "__floatdidf"}
+
+// intBuiltins are the 64-bit integer multiply and divide helpers, for a target
+// with no divide instruction. They are separate from softFloatBuiltins because
+// they have nothing to do with floating point: a target can need these and have
+// hardware doubles (RISC-V with the F extension), or need the float ones and
+// divide in hardware.
+var intBuiltins = []string{
+	"__muldi3", "__divdi3", "__moddi3", "__udivdi3", "__umoddi3",
+}
+
+// int32Builtins are the 32-bit divide and remainder helpers. RV32 needs them
+// and RV64 does not: the 64-bit ISA has `divw`/`divuw`/`remw`/`remuw`, so a
+// 32-bit quotient there is an instruction, while the 32-bit baseline has no
+// divide at any width and lowers every one of these to a call.
+var int32Builtins = []string{"__divsi3", "__modsi3", "__udivsi3", "__umodsi3"}
+
 func translateProgram(prog *frontend.Program, lib *common.Program, linux bool, opt int, arch string) (string, map[string]bool, []string, error) {
 	m := newIRMod(linux, arch)
 	// Whether this build links through gocld alone decides if the module owns
@@ -216,7 +260,7 @@ func translateProgram(prog *frontend.Program, lib *common.Program, linux bool, o
 	// llvmRoots returns that reachable set, seeded from the program's own calls
 	// and the few helpers the entry stub names directly.
 	if lib != nil {
-		need, needGlobals := llvmRoots(prog, lib, linux, tr)
+		need, needGlobals := llvmRoots(prog, lib, linux, arch, tr)
 		m.emitLibGlobals(lib, needGlobals)
 		// lib.Order can name a function more than once -- the runtime's
 		// sources are concatenated, so a name that two of them define reaches
@@ -299,7 +343,7 @@ func irNameTaken(prog *frontend.Program, lib *common.Program, name string) bool 
 // Emitting the whole runtime (every one of its ~380 functions) is what made
 // the -fllvm binary 100k+ next to the native build's ~13; pruning to what the
 // program reaches brings it back in line.
-func llvmRoots(prog *frontend.Program, lib *common.Program, linux bool, tr *typeResolver) (map[string]bool, map[string]bool) {
+func llvmRoots(prog *frontend.Program, lib *common.Program, linux bool, arch string, tr *typeResolver) (map[string]bool, map[string]bool) {
 	need := map[string]bool{}
 	isLib := func(name string) bool {
 		f, ok := lib.Funcs[name]
@@ -377,6 +421,64 @@ func llvmRoots(prog *frontend.Program, lib *common.Program, linux bool, tr *type
 	//    termination; those names must exist in the LLVM object so the stub
 	//    resolves against it rather than going undefined.
 	need["__goclib_exit"] = true // stub terminator whenever the runtime is present
+	// The soft-float helpers are referenced by the *compiler*, not by the
+	// source: LLVM lowers a double operation on a target with no floating-point
+	// registers into a call to __adddf3 & co, and a 64-bit division into a call
+	// to __udivdi3. Nothing in the program mentions those names, so the
+	// reachability sweep above cannot see them and the link would fail on
+	// undefined symbols the moment a float or a long long appeared.
+	//
+	// They are marked unconditionally for that target rather than on demand,
+	// because the reference does not exist yet at this point -- it is created
+	// later, by the code generator.
+	//
+	// Which targets need them:
+	//
+	//   x86-64 / AArch64 -- SSE2 and the FP register file implement the whole
+	//     set, including the conversions.
+	//
+	//   armel, riscv64, riscv32 -- no FPU. The RISC-V triples name no F or D
+	//     extension, so a double there is soft: it arrives in an integer
+	//     register and every operation is a call. That is slower than the
+	//     hardware a real RV64 has, and it is also what keeps the flat va_list
+	//     cursor correct, because a soft double takes one integer slot in the
+	//     save area exactly like a long.
+	//
+	//   armhf (plain "arm") -- VFP does the arithmetic, but not the 64-bit
+	//     conversions, so it asks for those three alone.
+	switch arch {
+	case "armel", "riscv64", "riscv32":
+		for _, n := range softFloatBuiltins {
+			need[n] = true
+		}
+	case "arm":
+		for _, n := range doubleConvBuiltins {
+			need[n] = true
+		}
+	}
+	// RISC-V has no divide instruction in the baseline ISA, so a `long long`
+	// quotient or product becomes a call to one of these. Unlike the soft-float
+	// list this is not about floating point at all -- the linker asks for
+	// __muldi3 and __udivdi3 on riscv64 as readily as on riscv32, because the
+	// 64-bit divide needs a 128-bit intermediate either way.
+	//
+	// These are integer-only and cheap to get right, so they live in their own
+	// file rather than alongside the float helpers.
+	// armel needs the float ones too; it is listed above.
+	//
+	// armhf (plain "arm") is here as well: VFP gives it hardware doubles, but
+	// nothing gives it a 64-bit integer divide, so a `long long` quotient or
+	// remainder in the C library names __udivdi3 just as it does on RISC-V.
+	if arch == "riscv64" || arch == "riscv32" || arch == "arm" || arch == "armel" {
+		for _, n := range intBuiltins {
+			need[n] = true
+		}
+	}
+	if arch == "riscv32" {
+		for _, n := range int32Builtins {
+			need[n] = true
+		}
+	}
 	if !linux {
 		mainTakesArgs, gui, wide := false, false, false
 		for _, f := range prog.Funcs {

@@ -57,6 +57,157 @@ func irFromSource(t *testing.T, src string) (string, map[string]bool) {
 	return ir, claimed
 }
 
+// irFromSourceTarget is irFromSource for a named target, for the assertions
+// that are about one architecture's ABI rather than about the emitter in
+// general. A variadic call is the clearest case: what the caller pushes and
+// what the callee's va_arg reads have to agree, and the answer differs between
+// x86-64 SysV, AAPCS and AAPCS64.
+func irFromSourceTarget(t *testing.T, src, arch string, linux bool) string {
+	t.Helper()
+	toks, err := common.PreprocessTarget(src, "test.c", linux)
+	if err != nil {
+		t.Fatalf("preprocess: %v", err)
+	}
+	prog, err := frontend.Parse(toks)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if errs := frontend.Check(prog); len(errs) > 0 {
+		var b strings.Builder
+		for _, e := range errs {
+			if strings.Contains(e.Error(), "program has no main()") {
+				continue
+			}
+			b.WriteString("\n  " + e.Error())
+		}
+		if b.Len() > 0 {
+			t.Fatalf("type errors:%s", b.String())
+		}
+	}
+	ir, _, _, err := translateProgram(prog, nil, linux, 1, arch)
+	if err != nil {
+		t.Fatalf("generate IR for %s: %v", arch, err)
+	}
+	return ir
+}
+
+// TestIRVaArgMatchesTargetABI pins the va_list shape to the target's own ABI.
+//
+// The three shapes are genuinely different, and reading one as another is
+// silent: the program links, then loads its first variadic argument from
+// whatever the cursor's bits happen to address. So each target is checked for
+// the construct that distinguishes it rather than for "it produced something".
+func TestIRVaArgMatchesTargetABI(t *testing.T) {
+	const src = `
+int f(int n, ...){
+  va_list ap; va_start(ap, n);
+  int a = va_arg(ap, int);
+  va_end(ap);
+  return a;
+}
+`
+	// AAPCS (32-bit ARM) and AAPCS64 (AArch64) both pass every variadic
+	// argument on the stack and use a bare `char *` cursor -- so their va_arg is
+	// a load at the cursor with no tag to walk. x86-64 SysV is the outlier: its
+	// va_list is a 24-byte __va_list_tag whose gp_offset decides whether the
+	// argument comes from the register save area or the overflow area.
+	sysv := irFromSourceTarget(t, src, "x86_64", true)
+	if !strings.Contains(sysv, "load i32, ptr") && !strings.Contains(sysv, "load i32, i32") {
+		t.Errorf("x86-64 SysV va_arg did not load the argument value:\n%s", sysv)
+	}
+
+	for _, tc := range []struct{ arch, name string }{
+		{"arm", "AAPCS"},
+		{"aarch64", "AAPCS64"},
+		// RISC-V joins them for the same reason ARM did, and the failure it
+		// guards against is worth naming: llvm.va_start is target-defined, so
+		// on RISC-V the object it fills is NOT the x86-64
+		// {gp_offset, fp_offset, overflow, reg_save} tag. Reading that tag out
+		// of it compared a pointer's low half against 48, decided every
+		// argument was past the register save area, and loaded from address 0.
+		{"riscv64", "RISC-V LP64"},
+		{"riscv32", "RISC-V ILP32"},
+	} {
+		ir := irFromSourceTarget(t, src, tc.arch, true)
+		// A flat cursor: read the pointer, load through it, then bump it.
+		if !strings.Contains(ir, "getelementptr inbounds i8") {
+			t.Errorf("%s va_arg does not advance its cursor:\n%s", tc.name, ir)
+		}
+		// The SysV tag has two cursors and a register save area; none of that
+		// should appear on a target whose va_list is a bare pointer.
+		for _, bad := range []string{"48", "reg_save_area"} {
+			if strings.Contains(ir, bad) && tc.arch == "arm" {
+				t.Errorf("%s va_arg leaked the x86-64 SysV shape (%q):\n%s", tc.name, bad, ir)
+			}
+		}
+	}
+}
+
+// TestIRVarargStepMatchesSaveAreaWidth pins the *reader* side of the same
+// contract. The cursor advances by the slot the caller actually stored the
+// argument in, which is not the C type's width: on RISC-V 64 the prologue
+// spills the variadic registers with `sd`, eight bytes apart, so a cursor that
+// steps four reads the low half of one argument and then the zero above it --
+// addall(4,10,20,30,40) answering 30 instead of 100.
+func TestIRVarargStepMatchesSaveAreaWidth(t *testing.T) {
+	const src = `
+int f(int n, ...){
+  va_list ap; va_start(ap, n);
+  int a = va_arg(ap, int);
+  (void)a;
+  va_end(ap);
+  return 0;
+}
+`
+	cases := []struct {
+		arch string
+		step string
+	}{
+		// 64-bit flat-cursor targets (Windows x64, RISC-V LP64): the caller
+		// widens every variadic int to i64, so the slot -- and the step -- is
+		// eight bytes.
+		{"riscv64", "i64 8"},
+		// 32-bit targets (AAPCS, RV32 psABI): a word is four bytes and the
+		// save area is an array of words.
+		{"riscv32", "i64 4"},
+		{"arm", "i64 4"},
+	}
+	for _, tc := range cases {
+		ir := irFromSourceTarget(t, src, tc.arch, true)
+		if !strings.Contains(ir, "getelementptr inbounds i8, ptr %") {
+			t.Fatalf("%s: va_arg produced no cursor advance", tc.arch)
+		}
+		if !strings.Contains(ir, tc.step) {
+			t.Errorf("%s: va_arg cursor did not advance by %s (expected a "+
+				"getelementptr inbounds i8 ... %s):\n%s", tc.arch, tc.step, tc.step, ir)
+		}
+	}
+}
+
+// TestIRVarargSlotWidthIsTargetSpecific checks the caller side of the same
+// contract. A variadic argument is widened to fill its slot only where the slot
+// is eight bytes; 32-bit ARM's slot is a word, so widening there would push
+// every following argument four bytes further out than the callee's va_arg
+// expects -- each read landing on the previous argument's tail.
+func TestIRVarargSlotWidthIsTargetSpecific(t *testing.T) {
+	const src = `
+int g(int n, ...){ return n; }
+void h(void){ g(2, 10, 20); }
+`
+	// AAPCS64 and the x86-64/Win64 shapes keep the widened i64 operand.
+	for _, arch := range []string{"aarch64", "x86_64"} {
+		ir := irFromSourceTarget(t, src, arch, true)
+		if !strings.Contains(ir, "sext i32 10 to i64") {
+			t.Errorf("%s: variadic int was not widened to its slot width:\n%s", arch, ir)
+		}
+	}
+	// AAPCS passes the promoted int as a word, so the widening must not appear.
+	arm := irFromSourceTarget(t, src, "arm", true)
+	if strings.Contains(arm, "sext i32 10 to i64") {
+		t.Errorf("arm: a variadic int was widened to i64, but the AAPCS slot is a word:\n%s", arm)
+	}
+}
+
 // TestIRGeneration covers the shapes the generator has to get right, each
 // checked by inspecting the emitted text. LLVM's own parser is the final
 // authority and runs in the goa package, which is where the shared library is

@@ -197,11 +197,27 @@ func archLayoutTriple(arch string, linux bool) (string, string) {
 			return "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128", "aarch64" + vendorOS
 		}
 		return "e-m:w-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128", "aarch64" + vendorOS
-	case "arm":
+	case "arm", "armel":
 		// ARMv7: a 32-bit pointer machine. The layout differs from AArch64 in
 		// the explicit p:32:32 and the S64 stack alignment.
+		//
+		// The two float ABIs are separate targets, not a detail of one. "arm"
+		// is armhf -- the hard-float ABI every current ARM Linux distribution
+		// uses -- where the triple ends in `hf` and a `double` operation is a
+		// VFP instruction. "armel" is the older soft-float ABI, where the
+		// target has no FPU and every double operation becomes a *call* to
+		// __adddf3 and its relatives in the C runtime (see softfloat.c).
+		//
+		// The distinction is not cosmetic and not detectable after the fact:
+		// the two ABIs disagree about which registers hold a float argument,
+		// so a binary built for one is not merely slower under the other, it
+		// passes the wrong values. Naming them separately is the only way a
+		// program can ask for the one it needs.
 		if linux {
-			return "e-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64", "arm" + vendorOS
+			if arch == "armel" {
+				return "e-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64", "arm" + vendorOS
+			}
+			return "e-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64", "armv7" + vendorOS + "hf"
 		}
 		return "e-m:w-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64", "arm" + vendorOS
 	case "riscv64":
@@ -1046,7 +1062,7 @@ func (m *irMod) emitSyscallStub(name string) string {
 	retTy := m.llirType(ret)
 	// 32-bit targets: i64 parameters cannot bind to a single asm register
 	// (see the comment above), so they are truncated to i32 before the call.
-	is32 := m.arch == "arm" || m.arch == "riscv32"
+	is32 := m.arch == "arm" || m.arch == "armel" || m.arch == "riscv32"
 
 	var ps, ins []string
 	var pre []string
@@ -1197,10 +1213,13 @@ func syscallAsm(arch string, num int64, nargs int) (tmpl, cons, numOperand strin
 		scratch = []string{"a7", "t0", "t1", "t2", "t3", "t4", "t5", "t6"}
 		tmpl = "li a7, " + n + asmNL + "ecall"
 		arg0AliasOut = true
-	case "arm":
+	case "arm", "armel":
 		// ARM's EABI passes at most four arguments in registers and the rest
 		// on the stack, so this is right for the syscalls the C library
 		// actually calls with four or fewer operands (all but mmap/select).
+		// The register convention is the same in both float ABIs -- only the
+		// floating-point *argument* passing differs, and no raw syscall here
+		// takes a float.
 		argRegs = []string{"r0", "r1", "r2", "r3", "r4", "r5"}
 		outReg = "r0"
 		scratch = []string{"r7", "r12"}
