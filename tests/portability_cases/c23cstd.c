@@ -19,13 +19,21 @@ int main(void) {
     /* ---- stdc_rotate_left / stdc_rotate_right (typed + generic) ---- */
     CHK(stdc_rotate_left_ui(0x12345678u, 8) == 0x34567812u, "rotl32 by 8");
     CHK(stdc_rotate_right_ui(0x12345678u, 8) == 0x78123456u, "rotr32 by 8");
-    /* The 8-bit rotations are taken through their typed entry points rather than
-     * the type-generic macro: gocl's linker drops stdc_*_uc symbols selected via
-     * _Generic on unsigned char (a pre-existing gocld quirk that also affects the
-     * existing stdc_leading_zeros((unsigned char)x) -- see the regression note).
-     * A generic dispatch on a wider type below still exercises the macro itself. */
-    CHK(stdc_rotate_left_uc(0x81, 1) == 0x03, "rotl8  by 1");
-    CHK(stdc_rotate_right_uc(0x81, 1) == 0xC0, "rotr8  by 1");
+    /* Both the typed entry points and the type-generic macro. The 8-bit cases
+     * go through the macro deliberately: every stdc_*_N function is reached
+     * only through _Generic in real code, and gocl's reachability walk used to
+     * skip the selected branch -- so the definitions were pruned and the link
+     * failed with "undefined symbol: stdc_leading_zeros_uc". */
+    CHK(stdc_rotate_left_uc(0x81, 1) == 0x03, "rotl8  by 1 (typed)");
+    CHK(stdc_rotate_right_uc(0x81, 1) == 0xC0, "rotr8  by 1 (typed)");
+    CHK(stdc_rotate_left((unsigned char)0x81, 1) == 0x03,
+        "rotl8  by 1 (generic macro)");
+    CHK(stdc_rotate_right((unsigned char)0x81, 1) == 0xC0,
+        "rotr8  by 1 (generic macro)");
+    CHK(stdc_leading_zeros((unsigned char)0x01) == 7,
+        "leading_zeros (generic macro, unsigned char)");
+    CHK(stdc_trailing_zeros((unsigned char)0x81) == 0,
+        "trailing_zeros (generic macro, unsigned char)");
     CHK(stdc_rotate_left((unsigned int)0x12345678u, 8) == 0x34567812u,
         "rotl32 by 8 (generic macro)");
     CHK(stdc_rotate_left_ull(0x0000000000000001ull, 63) == 0x8000000000000000ull,

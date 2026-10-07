@@ -112,9 +112,9 @@ done
 
 # The C23 standard-library additions: stdbit rotate (left/right, all widths),
 # reallocarray / free_sized / free_aligned_sized, and memalignment. Self-
-# reporting (exit 0 + final "OK"). The 8-bit rotations use their typed entry
-# points on purpose -- gocl's linker drops stdc_*_uc symbols selected via
-# _Generic on unsigned char (a pre-existing gocld quirk; see c23cstd.c).
+# reporting (exit 0 + final "OK"). The 8-bit rotations go through the
+# type-generic macro, because that is how <stdbit.h> reaches every stdc_*_N
+# entry point -- the case gocl's reachability walk used to miss.
 build_run_win_ok "c23cstd [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "c23cstd" goc
 build_run_win_ok "c23cstd [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "c23cstd" gocl
 

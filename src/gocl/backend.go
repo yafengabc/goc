@@ -226,5 +226,25 @@ func walkExpr(e frontend.Expr, fn func(frontend.Expr)) {
 		walkExpr(n.Base, fn)
 	case *frontend.VaArgExpr:
 		walkExpr(n.Ap, fn)
+	case *frontend.GenericExpr:
+		// _Generic resolves at check time, so only the chosen association is
+		// ever emitted. Walking it matters all the same: the reachability pass
+		// in translate.go discovers the runtime functions a program needs by
+		// walking its expressions, and <stdbit.h> reaches every one of its
+		// stdc_*_N entry points through _Generic. Skipping the branch made
+		// markReachable miss them, so their definitions were pruned from the
+		// object and the link failed with "undefined symbol" for a function
+		// that is right there in stdbit.c. Only Chosen is walked -- the
+		// unselected associations never reach codegen, and marking them
+		// would keep five dead functions alive per _Generic.
+		walkExpr(n.Chosen, fn)
+	case *frontend.CompoundLit:
+		if n.Init != nil {
+			for _, el := range n.Init.Elems {
+				walkExpr(el.E, fn)
+			}
+		}
+	case *frontend.SizeofExpr:
+		walkExpr(n.E, fn)
 	}
 }
