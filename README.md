@@ -191,18 +191,30 @@ Windows 上没法 exec ELF，所以本机这一腿交给 **QEMU 的 CPU 核心**
 
 ## 多架构（gocl）
 
-`gocl`（LLVM 后端）有 `-arch`，可选五种指令集：
+`gocl`（LLVM 后端）有 `-arch`，可选六种目标：
 
 ```
 gocl -arch aarch64 -target linux hi.c -o hi.elf
 ```
 
-| `-arch` | 当前状态（2026-10-07 实测） |
-| --- | --- |
-| `x86_64` | ✅ 默认，完整可用（PE 与 ELF64） |
-| `aarch64` | ✅ 出合法 ARM64 ELF64（`e_machine=0xb7`） |
-| `arm` | ✅ 出 ELF32（`e_machine=0x28`）；见下方 `__udivdi3` 说明 |
-| `riscv64` / `riscv32` | 🚧 进行中 |
+| `-arch` | 产物 | `e_machine` | 2026-10-08 实测 |
+| --- | --- | --- | --- |
+| `x86_64` | PE32+ 与 ELF64 | 0x3e | ✅ 默认，完整可用 |
+| `aarch64` | ELF64 | 0xb7 | ✅ |
+| `arm` | ELF32，hard-float（armhf） | 0x28 | ✅ |
+| `armel` | ELF32，soft-float | 0x28 | ✅ |
+| `riscv64` | ELF64 | 0xf3 | ✅ |
+| `riscv32` | ELF32 | 0xf3 | ✅ |
+
+上表的"✅"是**产物**层面的：每个目标都编译链接出结构合法的 ELF（用 ELF 头的
+`e_type`/`e_machine`/`e_ident` 核对过）。**只有 x86_64 在真机上执行过**
+（WSL 的 alpine，直接 `exec`）；其余五种本机没有 qemu 用户态模拟，所以"跑起来
+对不对"这一层是 CI 的事，不是这张表能证明的。
+
+`arm` 与 `armel` 是两个目标而不是一个目标的两种选项：armhf 的 `double` 运算是
+VFP 指令，armel 没有 FPU，每一次 `double` 加/减/乘/除/比较都变成对
+`softfloat.c` 里 `__adddf3` 一类函数的**调用**。两者对同一个浮点参数用不同的
+寄存器传，编给其中一个的二进制在另一个上不是"慢一点"，而是取到错的值。
 
 多架构要求 `libLLVM.dll` 里含对应后端。判断方法很直接——`objdump -p` 看它导出
 哪些 `LLVMInitialize*TargetInfo`：
@@ -217,11 +229,26 @@ objdump -p bin/libLLVM.dll | grep -o "LLVMInitialize[A-Za-z0-9]*TargetInfo" | so
 
 两点现状值得记：
 
-- **arm 的 `__udivdi3`**：不涉及 64 位除法的程序正常出 ELF32；一旦走到（比如
-  `printf` 内部的 64 位除法），链接会报 `undefined symbol(s): __udivdi3`。这是
-  LLVM 为 ARM 生成的编译器内建调用，goclib 目前没提供这个运行时函数。
+- **没有除法指令的目标是软实现**：LLVM 会把 64 位除法降到 `__udivdi3` /
+  `__divdi3` 一类 libcall（RISC-V 基线 ISA 根本没有除法，ARM 的 64 位商需要
+  128 位中间值）。这些由 `goclib/intops.c` 提供，用的是移位-减法，所以它不调用
+  任何除法——一个用 `/` 实现 `/` 的版本会绕回自己直到栈耗尽。带上 64 位除法的
+  程序在 arm / riscv 上因此能直接编过；`double` 的运算在 armel 上走
+  `softfloat.c`，是同一套思路的另一半。
 - **`elfcheck --structure-only` 只认 x86-64**（硬编码 `want 0x3e`），拿它校验
   aarch64 产物会误报。产物本身是合法的 ARM64 ELF。
+
+还有一个坑值得单独写，因为它只在浮点上现身、而在整数上完全隐形：**x86-64 Linux
+的入口必须先把栈对齐到 16 字节**。内核进入 `_start` 时 `rsp` 已经是 16 对齐的，
+而 LLVM 写的 prologue 是给"被 `call` 进来的函数"用的——`call` 会压入返回地址，
+于是它假设进来时 `rsp` 是 8 模 16，并再用一条 `pushq` 把它凑回 16。这一次
+`pushq` 就把真实栈推到 8 模 16 上，`_start` 之后每一次调用都把偏移八字节的栈
+交给被调者。整数路径没有指令在乎，直到某个被调者的 prologue 用 `movaps` 把 SSE
+寄存器倒进 save area——`movaps` 对未对齐地址直接 #GP，于是
+`printf("%f\n", 1.5)` 在打印任何东西之前就 SIGSEGV。修法是给 ELF 入口换一段
+`andq $-16, %rsp` 的汇编 stub（`__goc_entry`），让 `_start` 看到 LLVM 为它编译
+时所假设的栈形。这个坑只在 x86-64 上成立：`call` 压返回地址是它独有的，
+AArch64 / ARM / RISC-V 进函数时栈指针就是调用者留下的那个。
 
 `goc`（自研后端）只有 x86-64，不接受 `-arch`。
 
