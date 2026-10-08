@@ -290,19 +290,55 @@ func (e *irEmitter) vaListIsFlatCursor() bool {
 // AAPCS and the RISC-V (ILP32 / LP64) shape -- the cursor is a pointer into a
 // save area the callee's prologue spilled the variadic registers into, and the
 // caller's own stack args follow it contiguously, so every argument sits at the
-// position the cursor reaches by simply walking the slot sizes. No alignment
-// round-up is needed: the 8-byte alignment a double wants is already honoured
-// in *absolute* terms by the stack layout, but the save area itself begins at a
-// 4-byte-aligned offset within the frame, so rounding the cursor up to eight
-// relative to the save-area start would skip the low half of the double and
-// read the following register instead -- printf printed 0.00 on every 32-bit
-// target until this was removed. The caller and callee both walk the same
-// contiguous bytes, so the step (see vaArgStep) is the only thing that has to
-// agree, and it does: an int and a pointer are a word, a double and an i64 are
-// eight bytes, with nothing padded in between.
+// position the cursor reaches by walking the slot sizes. The caller and callee
+// both walk the same contiguous bytes, so the step (see vaArgStep) is the one
+// thing that has to agree, and it does: an int and a pointer are a word, a
+// double and an i64 are eight bytes, with nothing padded in between.
+//
+// The one wrinkle is the 8-byte case on a 32-bit target, handled inside: there
+// the caller aligns a 64-bit argument to an even register pair, so the cursor
+// has to be rounded up to eight before such a read. Rounding it up *relative to
+// the save-area start for every argument* -- which is what an earlier version
+// did -- walks past the low half of a double and made printf print 0.00 on
+// every 32-bit target; the round-up belongs on the address of an 8-byte read
+// only, and only where a word is four bytes.
 func (e *irEmitter) vaArgFlat(ap, lty string, ty *frontend.Type) val {
 	cur := e.newTmp()
 	e.line("%s = load ptr, ptr %s, align 8", cur, ap)
+
+	// A 64-bit argument starts at an EVEN register pair.
+	//
+	// Both the AAPCS (arm/armel) and the RV32 psABI place a 64-bit variadic
+	// argument in an even-aligned register pair: the caller skips the odd
+	// register and the value begins at the next 8-byte-aligned address, so a
+	// `printf("%lld", 7LL)` passes its 7 in r2:r3 (a2:a3), never in r1:r2. The
+	// cursor va_start hands over points at the next *free word*, which is that
+	// skipped odd register whenever a 64-bit argument comes first. Loading
+	// eight bytes there takes the skipped register as the low half and the
+	// real low half as the high half: the value reads shifted left by 32
+	// (`7` printed as 30064771072).
+	//
+	// So the cursor is rounded UP to eight before an 8-byte read -- on the
+	// ADDRESS, not on the step: the step stays 8 and the next argument still
+	// begins immediately after the value. Rounding the step instead (or
+	// rounding unconditionally, on 64-bit targets where every slot is already
+	// eight bytes) is what used to make every 32-bit target print 0.00.
+	//
+	// When the 64-bit argument is NOT the first one there is nothing to skip:
+	// an earlier int has already consumed the odd register and the cursor is
+	// aligned, which is why `printf("%d %lld", 42, 7LL)` was already correct
+	// while `printf("%lld", 7LL)` was not.
+	if (lty == "i64" || lty == "double") && e.vaArgStep("i32") == 4 {
+		asInt := e.newTmp()
+		e.line("%s = ptrtoint ptr %s to i64", asInt, cur)
+		up := e.newTmp()
+		e.line("%s = add i64 %s, 7", up, asInt)
+		round := e.newTmp()
+		e.line("%s = and i64 %s, -8", round, up)
+		aligned := e.newTmp()
+		e.line("%s = inttoptr i64 %s to ptr", aligned, round)
+		cur = aligned
+	}
 
 	slot := e.newTmp()
 	switch lty {

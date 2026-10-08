@@ -48,11 +48,19 @@ import (
 // an `fcmp`/`cset` pair expects); the `__*df3` family is arithmetic; the
 // conversions bridge both directions between `double` and the 64-bit integers.
 var softFloatBuiltins = []string{
+	// double
 	"__adddf3", "__subdf3", "__muldf3", "__divdf3",
 	"__eqdf2", "__nedf2", "__ltdf2", "__ledf2", "__gedf2", "__gtdf2",
 	"__unorddf2",
 	"__fixdfdi", "__fixdfsi", "__fixunsdfdi",
-	"__floatsidf", "__floatdidf", "__floatunsidf",
+	"__floatsidf", "__floatdidf", "__floatunsidf", "__floatundidf",
+	// float (a target with no FPU at all lowers `float` ops to these too)
+	"__addsf3", "__subsf3", "__mulsf3", "__divsf3",
+	"__eqsf2", "__nesf2", "__ltsf2", "__lesf2", "__gtsf2", "__gesf2",
+	"__unordsf2",
+	"__extendsfdf2", "__truncdfsf2",
+	"__fixsfsi", "__fixsfdi", "__fixunssfsi", "__fixunssfdi",
+	"__floatsisf", "__floatdisf", "__floatunsisf", "__floatundisf",
 	"__udivdi3",
 }
 
@@ -63,7 +71,7 @@ var softFloatBuiltins = []string{
 // __fixdfdi, __fixunsdfdi and __floatdidf on armhf just as it does on a target
 // with no FPU at all. Asking for the whole soft-float set there would link
 // seventeen functions a VFP instruction already implements.
-var doubleConvBuiltins = []string{"__fixdfdi", "__fixunsdfdi", "__floatdidf"}
+var doubleConvBuiltins = []string{"__fixdfdi", "__fixunsdfdi", "__floatdidf", "__floatundidf"}
 
 // intBuiltins are the 64-bit integer multiply and divide helpers, for a target
 // with no divide instruction. They are separate from softFloatBuiltins because

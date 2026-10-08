@@ -765,3 +765,129 @@ double __floatunsdfdi(unsigned long long a) { return soft_from_uint(a, 0); }
 
 /* The 64-bit integer divide/multiply helpers (__udivdi3, __divdi3, __moddi3,
  * __umoddi3, __muldi3) live in intops.c, not here. */
+
+/* ===========================================================================
+ * Single-precision soft float.
+ *
+ * A target with no FPU at all (armel, riscv32, riscv64) lowers `float`
+ * arithmetic to the `__*sf*` helpers exactly as `double` lowers to the
+ * `__*df*` helpers above. Rather than port the whole double machinery to a
+ * 24-bit significand, every single-precision operation is expressed through the
+ * double one: extend the operands to double, do the work in double (all bit
+ * operations, no float recursion), and truncate the result back to float.
+ * __extendsfdf2 and __truncdfsf2 below are the only two that touch the bit
+ * patterns directly; everything else is a one-line delegate. Extending a float
+ * to a double is exact, so the delegated comparisons return the same
+ * sign/zero answer libgcc defines for the single-precision names.
+ */
+
+typedef union { float f; unsigned int u; } soft_flt;
+
+double __extendsfdf2(float a) {
+    soft_flt x;
+    soft_double r;
+    unsigned int u, sign, frac;
+    int exp;
+    x.f = a;
+    u = x.u;
+    sign = u >> 31;
+    exp = (u >> 23) & 0xFF;
+    frac = u & 0x7FFFFF;
+    if (exp == 0xFF) {                       /* inf or nan */
+        r.u = DBL_INF_BITS | (frac ? DBL_NAN_BITS : 0ull);
+        if (sign) r.u |= DBL_SIGN_BIT;
+        return r.d;
+    }
+    if (exp == 0) {                          /* zero or subnormal */
+        if (frac == 0) { r.u = (unsigned long long)sign << 63; return r.d; }
+        r.u = ((unsigned long long)sign << 63) | ((unsigned long long)frac << 29);
+        return r.d;
+    }
+    r.u = ((unsigned long long)sign << 63)
+        | ((unsigned long long)(exp - 127 + 1023) << 52)
+        | ((unsigned long long)frac << 29);
+    return r.d;
+}
+
+float __truncdfsf2(double a) {
+    soft_double x;
+    soft_flt r;
+    unsigned int sign;
+    int exp, e, rsh;
+    unsigned long long frac, sig, top, lost, guard, sticky;
+    x.d = a;
+    sign = (unsigned int)(x.u >> 63);
+    exp = (int)((x.u >> 52) & 0x7FF);
+    frac = x.u & 0x000FFFFFFFFFFFFFull;
+    if (exp == 0x7FF) {                      /* inf or nan */
+        r.u = 0x7F800000u | (frac ? 0x00400000u : 0u);
+        if (sign) r.u |= 0x80000000u;
+        return r.f;
+    }
+    if (exp == 0) {                          /* double subnormal/zero -> float zero */
+        r.u = sign ? 0x80000000u : 0u;
+        return r.f;
+    }
+    e = exp - 1023;
+    sig = frac | 0x0010000000000000ull;      /* 53-bit significand */
+    if (e > 127) {                           /* overflow -> inf */
+        r.u = 0x7F800000u;
+        if (sign) r.u |= 0x80000000u;
+        return r.f;
+    }
+    if (e < -126) {                          /* subnormal or zero float */
+        rsh = -(e + 97);                     /* positive; sig * 2^(e+97) is the fraction */
+        if (rsh >= 64) { r.u = sign ? 0x80000000u : 0u; return r.f; }
+        lost = sig & ((1ull << rsh) - 1ull);
+        guard = (lost >> (rsh - 1)) & 1ull;
+        sticky = lost & ((1ull << (rsh - 1)) - 1ull);
+        top = sig >> rsh;
+        if (guard && (sticky || (top & 1ull))) top++;
+        if (top & 0x00800000ull) {           /* rounded up into the smallest normal */
+            r.u = (sign << 31) | (0x00000001u << 23) | (unsigned int)(top & 0x7FFFFFull);
+        } else {
+            r.u = (sign << 31) | (unsigned int)(top & 0x7FFFFFull);
+        }
+        return r.f;
+    }
+    /* Normal float: keep the top 24 bits of sig (implicit one at bit 23),
+     * round to nearest even on bits 28..0. */
+    top = sig >> 29;
+    guard = (sig >> 28) & 1ull;
+    sticky = sig & ((1ull << 28) - 1ull);
+    if (guard && (sticky || (top & 1ull))) top++;
+    if (top & 0x01000000ull) { top >>= 1; e++; }   /* carry out of the fraction */
+    if (e > 127) { r.u = 0x7F800000u; if (sign) r.u |= 0x80000000u; return r.f; }
+    r.u = (sign << 31) | ((unsigned int)(e + 127) << 23) | (unsigned int)(top & 0x007FFFFFull);
+    return r.f;
+}
+
+/* --- arithmetic: extend, do in double, truncate --- */
+float __addsf3(float a, float b) { return (float)__adddf3((double)a, (double)b); }
+float __subsf3(float a, float b) { return (float)__subdf3((double)a, (double)b); }
+float __mulsf3(float a, float b) { return (float)__muldf3((double)a, (double)b); }
+float __divsf3(float a, float b) { return (float)__divdf3((double)a, (double)b); }
+
+/* --- comparisons: exact in double, same sign/zero convention --- */
+int __eqsf2(float a, float b) { return __eqdf2((double)a, (double)b); }
+int __nesf2(float a, float b) { return __nedf2((double)a, (double)b); }
+int __ltsf2(float a, float b) { return __ltdf2((double)a, (double)b); }
+int __lesf2(float a, float b) { return __ledf2((double)a, (double)b); }
+int __gtsf2(float a, float b) { return __gtdf2((double)a, (double)b); }
+int __gesf2(float a, float b) { return __gedf2((double)a, (double)b); }
+int __unordsf2(float a, float b) { return __unorddf2((double)a, (double)b); }
+
+/* --- float <-> integer conversions --- */
+int __fixsfsi(float a) { return (int)(double)a; }
+long long __fixsfdi(float a) { return (long long)(double)a; }
+unsigned int __fixunssfsi(float a) { return (unsigned int)__fixunsdfdi((double)a); }
+unsigned long long __fixunssfdi(float a) { return __fixunsdfdi((double)a); }
+
+float __floatsisf(int a) { return (float)__floatdidf((long long)a); }
+float __floatdisf(long long a) { return (float)__floatdidf(a); }
+float __floatunsisf(unsigned int a) { return (float)__floatunsidf(a); }
+float __floatundisf(unsigned long long a) { return (float)__floatunsdfdi(a); }
+
+/* __floatundidf: unsigned 64-bit -> double. The existing __floatunsdfdi does
+ * exactly this; the standard spelling LLVM emits is __floatundidf. */
+double __floatundidf(unsigned long long a) { return __floatunsdfdi(a); }

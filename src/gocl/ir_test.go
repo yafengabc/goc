@@ -208,6 +208,49 @@ void h(void){ g(2, 10, 20); }
 	}
 }
 
+// TestIRVaArgAlignsEightByteRead checks the one place where walking the cursor
+// by slot sizes is not enough: the first 64-bit variadic argument.
+//
+// AAPCS and the RV32 psABI put a 64-bit variadic argument in an EVEN register
+// pair, so the caller skips the odd register -- `printf("%lld", 7LL)` passes
+// its 7 in r2:r3 (a2:a3), never r1:r2. The cursor va_start hands back points at
+// the next free word, which is that skipped register, so a plain 8-byte load
+// reads the skipped word as the low half and the real low half as the high
+// half: 7 came out as 30064771072 (7 << 32) on armel and riscv32.
+//
+// It is easy to miss because it only shows up when the 64-bit argument is the
+// FIRST variadic one -- with an int ahead of it the cursor is already aligned,
+// which is exactly the shape the older tests used.
+func TestIRVaArgAlignsEightByteRead(t *testing.T) {
+	const src = `
+int f(int n, ...){
+  va_list ap; va_start(ap, n);
+  long long a = va_arg(ap, long long);
+  va_end(ap);
+  return (int)a;
+}
+`
+	// The three 32-bit targets: the cursor must be rounded up to eight before
+	// an 8-byte read. The read itself still advances by exactly 8.
+	for _, arch := range []string{"arm", "armel", "riscv32"} {
+		ir := irFromSourceTarget(t, src, arch, true)
+		if !strings.Contains(ir, "and i64") || !strings.Contains(ir, "-8") {
+			t.Errorf("%s: 64-bit va_arg did not round its cursor up to 8:\n%s", arch, ir)
+		}
+		if !strings.Contains(ir, "load i64, ptr") {
+			t.Errorf("%s: 64-bit va_arg did not load eight bytes:\n%s", arch, ir)
+		}
+	}
+	// Every slot is already eight bytes wide on these, so rounding must not
+	// appear: adding it there is what made printf print 0.00 on all of them.
+	for _, arch := range []string{"x86_64", "aarch64", "riscv64"} {
+		ir := irFromSourceTarget(t, src, arch, true)
+		if strings.Contains(ir, "and i64") && strings.Contains(ir, "-8") {
+			t.Errorf("%s: 64-bit va_arg rounded a cursor that was already aligned:\n%s", arch, ir)
+		}
+	}
+}
+
 // TestIRGeneration covers the shapes the generator has to get right, each
 // checked by inspecting the emitted text. LLVM's own parser is the final
 // authority and runs in the goa package, which is where the shared library is
