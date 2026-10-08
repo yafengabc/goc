@@ -7,13 +7,18 @@
               └─[goc -target linux]─[goa -f elf]─> foo    Linux ELF64，只用 syscall
 ```
 
-`goc -c` 停在中间，产出真正可重定位的目标文件；`gocld`（已编进 `goc.exe`）
-是独立的链接阶段：
+`goc -c` 可以生成中间文件（.OBJ .O）；`gocld`（已编进 `goc.exe`）
+是独立的链接程序：
 
 ```
   foo.c ──[goc -c]──> foo.o ──[gocld]──> foo.exe
                         (COFF / ELF64)     └─ .o 也可以来自别处，按需混入 .c
 ```
+
+而gocl则是goc+llvm后端，能利用强大的llvm生成更紧凑，性能更强的程序，并且能生成多个平台的程序（linux）
+goc+goa则只能生成x86-64的程序。
+
+另外我自己裁剪了一个14M的libllvm.dll,跟gocl.exe放到同意目录即可使用。
 
 ```bash
 bash build.sh       # 一条命令：goc + goa + 两个测试工具（见下面目录结构）
