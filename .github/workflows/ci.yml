@@ -76,7 +76,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install unicorn
+        # bash, not the default PowerShell: the windows runner's default shell
+        # is pwsh, which parses this block and dies with "Missing opening '('
+        # after keyword 'for'" -- PowerShell has its own `for` grammar and no
+        # subshell/cd chaining like this.
         continue-on-error: true
+        shell: bash
       # Unit tests for every module. The end-to-end suites (run_tests.sh,
       # which compiles and runs all the examples, and run_tests_linux.sh) are
       # deliberately NOT run here -- they execute freshly built binaries, so
@@ -100,3 +105,4 @@ jobs:
             (cd "$m" && go test ./...) || fail=1
           done
           exit $fail
+        shell: bash
