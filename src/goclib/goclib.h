@@ -47,6 +47,46 @@
 #include <windows.h>
 #endif
 
+/* ---- binary128: goc's long double, in software (fp128.c) ------------------ *
+ *
+ * `long double` is IEEE binary128 on every target, so its arithmetic cannot be
+ * an instruction anywhere and lives in fp128.c as integer code over the bit
+ * pattern. A value crosses this interface as two words rather than as a C type
+ * because the front end does not have the type yet (#45 lands the type system,
+ * #47/#48 the codegen): lo is bits 63..0 and hi bits 127..64, which is both a
+ * little-endian 128-bit store and LLVM's <2 x i64> lane order.
+ *
+ * These are deliberately not named __addtf3 and friends. That name is the
+ * compiler's own calling convention -- LLVM lowers `fadd fp128` to a call with
+ * an fp128 in XMM0 -- and this ABI is not that one. The one-line wrappers get
+ * added when the back ends can emit the type and the ABI can be checked. */
+typedef struct {
+    unsigned long long lo;
+    unsigned long long hi;
+} goc_tf128;
+
+goc_tf128          goc_tf_add(goc_tf128 a, goc_tf128 b);
+goc_tf128          goc_tf_sub(goc_tf128 a, goc_tf128 b);
+goc_tf128          goc_tf_mul(goc_tf128 a, goc_tf128 b);
+goc_tf128          goc_tf_div(goc_tf128 a, goc_tf128 b);
+goc_tf128          goc_tf_neg(goc_tf128 a);
+/* -1, 0 or 1 by magnitude (so +0 == -0); 2 when either operand is a NaN. */
+int                goc_tf_cmp(goc_tf128 a, goc_tf128 b);
+/* Widen and narrow. The double/float forms take the raw 64/32-bit pattern,
+ * not a `double`, so nothing here ever performs a floating-point operation. */
+goc_tf128          goc_tf_from_double(unsigned long long bits);
+goc_tf128          goc_tf_from_float(unsigned int bits);
+unsigned long long goc_tf_to_double(goc_tf128 a);
+unsigned int       goc_tf_to_float(goc_tf128 a);
+/* Integer conversions: out-of-range and NaN saturate rather than raise, since
+ * C leaves both undefined and a program cannot portably depend on either. */
+goc_tf128          goc_tf_from_ll(long long v);
+goc_tf128          goc_tf_from_ull(unsigned long long v);
+long long          goc_tf_to_ll(goc_tf128 a);
+unsigned long long goc_tf_to_ull(goc_tf128 a);
+int                goc_tf_to_int(goc_tf128 a);
+unsigned int       goc_tf_to_uint(goc_tf128 a);
+
 /* ---- platform primitives (implemented in goclib.c, OS glue) ---------------- */
 /* Write `len` bytes from `buf` to standard output. Returns bytes written. */
 long __goclib_write(const char *buf, long len);

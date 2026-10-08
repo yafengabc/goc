@@ -125,6 +125,15 @@ build_run_win_ok "c23cstd [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "c2
 build_run_win_ok "printfmt [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "printfmt" goc
 build_run_win_ok "printfmt [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "printfmt" gocl
 
+# binary128 (long double) runtime: add/sub/mul/div with correct rounding,
+# subnormals, overflow and underflow, the NaN/inf rules, the widen and narrow
+# conversions and the integer conversions. The interesting part here is not
+# the arithmetic -- tests/fp128/oracle.c checks that bit for bit against
+# libgcc -- but that the same integer code compiled by each back end agrees:
+# the battery folds ~29 thousand operations into one hash.
+build_run_win_ok "fp128 [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "fp128" goc
+build_run_win_ok "fp128 [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "fp128" gocl
+
 echo ""
 echo "== Windows: pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]
