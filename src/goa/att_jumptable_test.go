@@ -123,6 +123,14 @@ func runPEUnderUnicorn(t *testing.T, pePath string) int {
 	if py == "" {
 		t.Skip("no python3 on PATH -- cannot run peun.py")
 	}
+	// Unicorn is an optional dependency: peun.py emulates the PE, and a
+	// checkout without the module cannot run this leg at all. Probe the import
+	// explicitly instead of letting the script die on it -- a missing module
+	// surfaces as a Python traceback, which looksLikeExitCode would classify as
+	// a hard failure and turn an absent dependency into a red test run.
+	if !hasUnicorn(py) {
+		t.Skipf("python at %s has no unicorn module -- cannot run peun.py", py)
+	}
 	// The script path is absolute *and* the working directory is the repo
 	// root. Passing a relative path alongside cmd.Dir works or not depending
 	// on how the child resolves it, which is not worth depending on.
@@ -147,6 +155,14 @@ func runPEUnderUnicorn(t *testing.T, pePath string) int {
 // a traceback rather than as a bare numeric status.
 func looksLikeExitCode(s string) bool {
 	return !strings.Contains(s, "Traceback") && !strings.Contains(s, "peun: ")
+}
+
+// hasUnicorn reports whether py can import the unicorn emulation module that
+// tools/peun.py is built on.
+func hasUnicorn(py string) bool {
+	// -c rather than a script file: no temp file to clean up, and the import
+	// either resolves or the child exits non-zero, which is all we need to know.
+	return exec.Command(py, "-c", "import unicorn").Run() == nil
 }
 
 func findPython() string {

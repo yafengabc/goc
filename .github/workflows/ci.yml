@@ -64,6 +64,17 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27'
+      - name: "install unicorn (optional: goa's PE emulation test)"
+        # tools/peun.py emulates a built PE to prove a switch's jump-table
+        # relocations land in the right basic blocks. It needs the unicorn CPU
+        # emulator, which no runner ships. Without it the test skips instead of
+        # failing, so this is best effort: install the wheel when pip can get
+        # it and carry on when it cannot -- a flaky package index must not turn
+        # an optional dependency into a red build.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install unicorn
+        continue-on-error: true
       # Windows targets here; Linux targets are the Ubuntu job's, which execs
       # the ELFs on a real kernel instead of relying on this runner having a
       # Python with unicorn. It does not, so run_tests.sh skips that leg with
