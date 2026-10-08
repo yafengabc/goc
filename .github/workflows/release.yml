@@ -31,7 +31,11 @@ jobs:
       - name: cross-compile Linux toolchain
         run: |
           V="$(git describe --tags --always)"
-          (cd src/goc && GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=$V" -o ../../bin/goc-linux .)
+          # goc's main lives in src/ (package main, selected by -tags goc), the
+          # old command built the library package src/goc which produces no
+          # binary. goc derives its version from git at run time, so no -X is
+          # needed here (only gocl stamps via -X gocl.version).
+          (cd src && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../bin/goc-linux -tags goc .)
           (cd src/goa && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../../bin/goa-linux ./cmd/goa)
           ls -l bin/
 

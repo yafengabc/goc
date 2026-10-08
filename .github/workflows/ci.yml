@@ -37,8 +37,12 @@ jobs:
       - name: go build
         run: |
           mkdir -p bin
-          (cd src/goc && go build -o ../../bin/goc ./cmd/goc)
-          (cd src && go build -o ../bin/goc-standalone .)
+          # goc and gocl are both built from the single src/ main package,
+          # selected by build tag (-tags goc / -tags gocl). The old commands
+          # pointed at src/goc/cmd/goc (removed in the frontend refactor) and
+          # built src/ without a tag (no main declared -> build error).
+          (cd src && go build -o ../bin/goc -tags goc .)
+          (cd src && go build -o ../bin/gocl -tags gocl .)
           (cd src/goa && go build -o ../../bin/goa ./cmd/goa)
           (cd tools && go build -o ../bin/elfcheck ./elfcheck)
           # msgboxcheck drives a real Windows dialog box, so it only exists as
