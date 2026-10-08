@@ -1007,10 +1007,34 @@ func (c *CG) loadGlobal(lab string, gt *frontend.Type) (frontend.CType, error) {
 		c.resW = 8
 		return frontend.TDouble, nil
 	}
-	c.emit("mov rax, [rip+%s]", lab)
+	// Narrow globals live in 8-byte slots (every global gets a resq), but
+	// their address is always available to the whole program, so a store
+	// through a char*/short*/int* (goclib's %n, %hhn, %h stores are exactly
+	// this) leaves the C-width value with stale high bytes -- the same
+	// staleness loadVar re-extends for address-taken locals. Load exactly the
+	// semantic width and extend, mirroring the local-variable load path.
+	w := c.semWOf(gt)
+	signed := gt != nil && gt.Kind == frontend.KInt && gt.Signed
+	switch w {
+	case 1:
+		c.emit("xor rax, rax")
+		c.emit("mov al, [rip+%s]", lab)
+		c.extendInt(1, signed)
+	case 2:
+		c.emit("mov eax, [rip+%s]", lab) // low 16 bits hold the value
+		c.extendInt(2, signed)
+	case 4:
+		if signed {
+			c.emit("movsxd rax, dword [rip+%s]", lab)
+		} else {
+			c.emit("mov eax, [rip+%s]", lab) // zero-extends to 64
+		}
+	default:
+		c.emit("mov rax, [rip+%s]", lab)
+	}
 	c.resTyp = frontend.TInt
-	c.resSigned = gt != nil && gt.Kind == frontend.KInt && gt.Signed
-	c.resW = c.semWOf(gt)
+	c.resSigned = signed
+	c.resW = w
 	return frontend.TInt, nil
 }
 
