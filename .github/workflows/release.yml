@@ -57,8 +57,14 @@ jobs:
         # works. Python zipfile is used on purpose: Git Bash `tar -a` and
         # plain `cp` of extension-less files into a dir that already holds
         # e.g. goc.exe have known path-mangling bugs (MSYS EXEPATH).
+        #
+        # The zip/release filename uses the triggering tag ($GITHUB_REF_NAME),
+        # NOT `git describe`: both v0.2.0 and v0.2.1 may point at the same
+        # commit, and git describe would then stamp every zip with the same
+        # (alphabetically-first) tag, so the v0.2.1 release would ship files
+        # named v0.2.0.
         run: |
-          V="$(git describe --tags --always)"
+          V="$GITHUB_REF_NAME"
           mkdir -p build/win build/linux release
           # Windows toolchain: the compilers/assembler/linker build.sh produces
           # (goc/gocl/gocld/cc/goa). elfcheck/msgboxcheck are test/diagnostic
