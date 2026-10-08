@@ -35,8 +35,17 @@ jobs:
           # old command built the library package src/goc which produces no
           # binary. goc derives its version from git at run time, so no -X is
           # needed here (only gocl stamps via -X gocl.version).
+          #
+          # gocld/elfcheck/cc are cross-compiled too so the Linux zip carries the
+          # full toolchain (cc is just goc under a gcc-compatible name). gocl is
+          # intentionally NOT cross-compiled here: it needs libLLVM.so at run
+          # time, which is not shipped in the Linux zip (only the Windows zip
+          # gets libLLVM.dll, uploaded separately from a local copy).
           (cd src && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../bin/goc-linux -tags goc .)
+          (cd src && cp bin/goc-linux bin/cc-linux)
+          (cd src/gocld && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../../bin/gocld-linux ./cmd/gocld)
           (cd src/goa && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../../bin/goa-linux ./cmd/goa)
+          (cd tools && GOOS=linux go build -trimpath -ldflags="-s -w" -o ../bin/elfcheck-linux ./elfcheck)
           ls -l bin/
 
       - name: package + checksums
@@ -50,11 +59,25 @@ jobs:
         run: |
           V="$(git describe --tags --always)"
           mkdir -p build/win build/linux release
-          cp bin/goc.exe   build/win/goc.exe
-          cp bin/cc.exe    build/win/cc.exe
-          cp bin/goa.exe   build/win/goa.exe
-          cp bin/goc-linux build/linux/goc
-          cp bin/goa-linux build/linux/goa
+          # Windows toolchain: the full set build.sh produces
+          # (goc/gocl/gocld/cc/goa/elfcheck/msgboxcheck). libLLVM.dll is NOT
+          # copied here -- it is a prebuilt dependency, not compiled by CI, and
+          # is uploaded separately from a local copy after the release is made.
+          cp bin/goc.exe         build/win/goc.exe
+          cp bin/gocl.exe        build/win/gocl.exe
+          cp bin/gocld.exe       build/win/gocld.exe
+          cp bin/cc.exe          build/win/cc.exe
+          cp bin/goa.exe         build/win/goa.exe
+          cp bin/elfcheck.exe    build/win/elfcheck.exe
+          cp bin/msgboxcheck.exe build/win/msgboxcheck.exe
+          # Linux toolchain (native x86-64 back end): goc/gocld/cc/goa/elfcheck.
+          # gocl is omitted on Linux -- it needs libLLVM.so at run time, which
+          # this zip does not ship.
+          cp bin/goc-linux      build/linux/goc
+          cp bin/cc-linux       build/linux/cc
+          cp bin/gocld-linux    build/linux/gocld
+          cp bin/goa-linux      build/linux/goa
+          cp bin/elfcheck-linux build/linux/elfcheck
           cp README.md build/win/README.md
           cp README.md build/linux/README.md
           cp LICENSE build/win/LICENSE
