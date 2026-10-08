@@ -118,6 +118,13 @@ done
 build_run_win_ok "c23cstd [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "c23cstd" goc
 build_run_win_ok "c23cstd [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "c23cstd" gocl
 
+# printf/scanf conformance: integer precision, width accounting with sign and
+# prefix, '*' widths, %g carry re-decision, %n in all widths, scansets, %hhd,
+# %p, EOF vs matching failure, hex floats and the float token rule, plus
+# pushback that survives into the next fscanf call. Self-reporting.
+build_run_win_ok "printfmt [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "printfmt" goc
+build_run_win_ok "printfmt [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "printfmt" gocl
+
 echo ""
 echo "== Windows: pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]
