@@ -579,8 +579,16 @@ func (e *irEmitter) strLit(n *frontend.StrLit) val {
 	// an unterminated [N x i8] and the runtime reads straight past its end
 	// into the next global (e.g. vfmt formatting "x" then walking into the
 	// "assertion \"%s\"..." template and hitting the %s branch).
+	//
+	// The terminator is one ELEMENT wide: an L"..." literal's Bytes hold
+	// UTF-16LE code units, so its NUL is two zero bytes. One byte there left
+	// the last wchar_t half-initialised and %ls walked into the next
+	// constant ("wide" printed "wide", a NUL, then whatever followed).
 	b := bytesToBytes(n.Bytes)
 	b = append(b, 0)
+	if n.Wide {
+		b = append(b, 0)
+	}
 	name := e.c.addString(b)
 	t := e.newTmp()
 	e.line("%s = getelementptr inbounds i8, ptr @%s, i64 0", t, name)

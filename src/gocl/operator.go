@@ -74,15 +74,21 @@ func (e *irEmitter) binary(n *frontend.Binary) val {
 	r := e.eval(n.R)
 
 	// Pointer arithmetic: p + i scales the integer by the pointee's size.
+	// An array local decays to a pointer when it is an operand ("tb + ti"),
+	// so KArr counts as a pointer here exactly as it does for ptr - ptr.
 	if n.Op == "+" || n.Op == "-" {
-		if lty != nil && lty.Kind == frontend.KPtr && rty != nil && rty.Kind == frontend.KInt {
+		if lty != nil && (lty.Kind == frontend.KPtr || lty.Kind == frontend.KArr) && rty != nil && rty.Kind == frontend.KInt {
 			return e.ptrAdd(l, r, lty, n.Op == "-")
 		}
-		if rty != nil && rty.Kind == frontend.KPtr && lty != nil && lty.Kind == frontend.KInt && n.Op == "+" {
+		if rty != nil && (rty.Kind == frontend.KPtr || rty.Kind == frontend.KArr) && lty != nil && lty.Kind == frontend.KInt && n.Op == "+" {
 			return e.ptrAdd(r, l, rty, false)
 		}
-		// ptr - ptr yields a count of elements, not of bytes.
-		if n.Op == "-" && lty != nil && rty != nil && lty.Kind == frontend.KPtr && rty.Kind == frontend.KPtr {
+		// ptr - ptr yields a count of elements, not of bytes. An array local
+		// decays to a pointer in this context -- `char tb[320]; ... endp -
+		// tb` -- so KArr counts as a pointer on either side, with the
+		// element size taken from the side that is a declared pointer.
+		if n.Op == "-" && lty != nil && rty != nil && lty.Kind == frontend.KPtr &&
+			(rty.Kind == frontend.KPtr || rty.Kind == frontend.KArr) {
 			esz := frontend.Sizeof(lty.Elem)
 			if esz == 0 {
 				esz = 1

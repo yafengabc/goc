@@ -840,12 +840,22 @@ func (m *irMod) constScalar(n *frontend.NumLit, t *frontend.Type) (string, bool)
 }
 
 func (m *irMod) constString(b []byte, t *frontend.Type) (string, bool) {
-	// A char array is initialised by copying the bytes; a char pointer takes the
-	// address of a private copy of them.
+	// A char array is initialised by copying the bytes; a char pointer takes
+	// the address of a private copy of them.
+	//
+	// The terminator is ONE element wide, not one byte: an L"..." literal's
+	// Bytes hold UTF-16LE code units, so `wchar_t *p = L"ab"` needs two zero
+	// bytes after them. A single byte there left the last wchar_t
+	// half-initialised and %ls read straight past the terminator into
+	// whatever constant followed it.
+	w := 1
+	if t != nil && t.Elem != nil && t.Elem.Width > 1 {
+		w = t.Elem.Width
+	}
 	if t == nil || t.Kind == frontend.KArr {
 		n := t.Len
 		if n <= 0 {
-			n = len(b) + 1
+			n = len(b) + w
 		}
 		body := cStringN(b, n)
 		name := m.internConst(body, "["+strconv.Itoa(n)+" x i8]")
@@ -856,8 +866,9 @@ func (m *irMod) constString(b []byte, t *frontend.Type) (string, bool) {
 			" x i8], ptr @" + name + ", i64 0, i64 0)", true
 	}
 	if t.Kind == frontend.KPtr {
-		name := m.internConst(cStringN(b, len(b)+1), "["+strconv.Itoa(len(b)+1)+" x i8]")
-		return "getelementptr inbounds ([" + strconv.Itoa(len(b)+1) +
+		n := len(b) + w
+		name := m.internConst(cStringN(b, n), "["+strconv.Itoa(n)+" x i8]")
+		return "getelementptr inbounds ([" + strconv.Itoa(n) +
 			" x i8], ptr @" + name + ", i64 0, i64 0)", true
 	}
 	return "", false
