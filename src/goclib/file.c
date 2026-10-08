@@ -29,7 +29,11 @@ typedef struct __goclib_FILE {
     long  _len;       /* read: valid bytes held in the buffer */
     long  _off;       /* read: file offset of buffer[0]; write: next write target;
                          -1 = sequential stream (std*): never seek, OS-positioned */
-    int   _unget;     /* one pushed-back char, or -1 */
+    int   _upb[4];    /* pushed-back chars (LIFO); ungetc is allowed more
+                         than one slot because fscanf's scanners push back a
+                         two-character look-ahead ("0" + "x") and the state
+                         must survive into the next fscanf call */
+    int   _upbn;
     int   _own;       /* 1 if _base and the FILE itself were heap-allocated */
     char *_tmpname;   /* set only by tmpfile(); fclose() unlinks it, as
                        * C99 7.19.5.4 requires ("automatically deleted when the
@@ -236,7 +240,7 @@ static FILE *finish_open(long fd, int readable, int writable, int append) {
     if (f == 0) { __goclib_os_close(fd); return 0; }
     f->_fd = fd;
     f->_readable = readable; f->_writable = writable; f->_append = append;
-    f->_eof = 0; f->_err = 0; f->_unget = -1;
+    f->_eof = 0; f->_err = 0; f->_upbn = 0;
     f->_pos = 0; f->_len = 0; f->_off = 0;
     /* heap_alloc does not zero, and fclose() reads _tmpname on every stream */
     f->_tmpname = 0;
@@ -431,7 +435,7 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
     f->_pos = 0;
     f->_len = 0;
     f->_off = nf->_off;
-    f->_unget = -1;
+    f->_upbn = 0;
     /* a freopen()ed stream is no longer a tmpfile() one */
     f->_tmpname = 0;
     /* nf's buffer now belongs to f; only the FILE shell itself is dropped */
@@ -498,7 +502,7 @@ size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
 int fgetc(FILE *stream) {
     __goclib_FILE *f = (__goclib_FILE *)stream;
     if (f == 0 || !f->_readable) { if (f) f->_err = 1; return -1; }
-    if (f->_unget >= 0) { int c = f->_unget; f->_unget = -1; return (unsigned char)c; }
+    if (f->_upbn > 0) { f->_upbn--; return (unsigned char)f->_upb[f->_upbn]; }
     if (f->_pos >= f->_len) {
         long got = __goclib_file_read(f, f->_base, f->_size);
         if (got < 0) { f->_err = 1; return -1; }
@@ -570,7 +574,7 @@ int fseek(FILE *stream, long offset, int whence) {
     if (f == 0) return -1;
     if (f->_off < 0) { f->_err = 1; return -1; }  /* cannot seek a std stream */
     if (f->_writable) __goclib_file_flush(f);
-    f->_pos = 0; f->_len = 0; f->_unget = -1;   /* discard buffered bytes */
+    f->_pos = 0; f->_len = 0; f->_upbn = 0;   /* discard buffered bytes */
     if (whence == 0) newoff = offset;
     else if (whence == 1) newoff = f->_off + f->_pos + offset;
     else newoff = __goclib_os_size(f->_fd) + offset;
@@ -601,8 +605,8 @@ void clearerr(FILE *stream) {
 
 int ungetc(int c, FILE *stream) {
     __goclib_FILE *f = (__goclib_FILE *)stream;
-    if (f == 0 || f->_unget >= 0) return -1;
-    f->_unget = (unsigned char)c;
+    if (f == 0 || c == -1 || f->_upbn >= (int)(sizeof f->_upb / sizeof f->_upb[0])) return -1;
+    f->_upb[f->_upbn++] = (unsigned char)c;
     f->_eof = 0;
     return (unsigned char)c;
 }
@@ -714,7 +718,7 @@ static void __goclib_init_streams(void) {
     __goclib_stdin_file._pos = 0;  __goclib_stdin_file._len = 0;  __goclib_stdin_file._off = -1;
     __goclib_stdout_file._pos = 0; __goclib_stdout_file._len = 0; __goclib_stdout_file._off = -1;
     __goclib_stderr_file._pos = 0; __goclib_stderr_file._len = 0; __goclib_stderr_file._off = -1;
-    __goclib_stdin_file._unget = -1;  __goclib_stdout_file._unget = -1; __goclib_stderr_file._unget = -1;
+    __goclib_stdin_file._upbn = 0; __goclib_stdout_file._upbn = 0;__goclib_stderr_file._upbn = 0;
     __goclib_stdin_file._eof = 0; __goclib_stdout_file._eof = 0; __goclib_stderr_file._eof = 0;
     __goclib_stdin_file._err = 0; __goclib_stdout_file._err = 0; __goclib_stderr_file._err = 0;
 }

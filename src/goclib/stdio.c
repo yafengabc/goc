@@ -56,6 +56,9 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
         int width = 0;
         if (*p == '*') { width = va_arg(ap, int); p++; }
         else { while (*p >= '0' && *p <= '9') { width = width * 10 + (*p - '0'); p++; } }
+        /* A negative width read through '*' means left-justify with the
+         * absolute value (C99 7.19.6.1p5). */
+        if (width < 0) { left = 1; width = -width; }
         /* optional precision: ".NN" digits, a bare "." for zero, or ".*" to
          * read it from the args. Only %f consumes it (fractional digit count);
          * default 6. %a uses the distinction between "no precision" (exact
@@ -70,6 +73,9 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             if (*p == '*') { prec = va_arg(ap, int); p++; }
             else { while (*p >= '0' && *p <= '9') { prec = prec * 10 + (*p - '0'); p++; } }
         }
+        /* A negative precision read through '*' means "as if omitted"
+         * (C99 7.19.6.1p5). */
+        if (prec < 0) { hasPrec = 0; prec = 6; }
         /* Length modifiers. `wide` (a single `l`) only reinterprets %s/%c as
          * %ls/%lc; the integer conversions need the whole run, because the run
          * is what says how wide the argument is: `l` selects long, `ll`
@@ -77,10 +83,11 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
          * ptrdiff_t. h/hh select short/char, but the default argument
          * promotions have already widened those to int by the time the
          * argument is stored, so they are read back as int. */
-        int wide = 0, longs = 0, sizeT = 0, imax = 0;
+        int wide = 0, longs = 0, sizeT = 0, imax = 0, shorts = 0;
         while (*p == 'l' || *p == 'h' || *p == 'L' ||
                *p == 'z' || *p == 'j' || *p == 't') {
             if (*p == 'l') { longs++; wide = 1; }
+            else if (*p == 'h') shorts++;
             else if (*p == 'z' || *p == 't') sizeT = 1;
             else if (*p == 'j') imax = 1;
             p++;
@@ -93,6 +100,7 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
         char field[512];
         int fl = 0;
         const char *s = 0;
+        unsigned long long intVal = 0;   /* last integer value; '#' checks it */
         if (spec == 's' && wide) {
             /* %ls: a wchar_t array (UTF-16LE on Windows, UTF-32 elsewhere).
              * Only the low byte of each unit is emitted, which is exact for
@@ -162,6 +170,8 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                 else if (longs == 1 || sizeT) v = va_arg(ap, unsigned long);
                 else                          v = va_arg(ap, unsigned int);
             }
+        unsigned long long origV = v;
+        intVal = origV;
         /* convert in the chosen base */
         int base = 10;
         if (spec == 'o') base = 8;
@@ -174,6 +184,29 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             v /= base;
             if (d < 10) tmp[t++] = (char)('0' + d);
             else tmp[t++] = (char)((spec == 'X' ? 'A' : 'a') + (d - 10));
+        }
+        /* Precision on an integer conversion is a minimum digit count,
+         * zero-filled between the sign/prefix and the digits (C99
+         * 7.19.6.1p6); a zero value with an explicit precision of 0 prints
+         * nothing. The '0' flag is ignored once a precision is given.
+         * '#' on %o raises the precision until the first digit is a zero --
+         * and a zero value with an explicit precision of 0 prints a lone
+         * "0" (C99 7.19.6.1p6, last sentence). Without a precision, '#'
+         * puts the single leading zero in front of the digits itself. */
+        if (hasPrec) {
+            zero = 0;
+            if (spec == 'o' && alt && origV != 0 && prec <= t) prec = t + 1;
+            else if (spec == 'o' && alt && origV == 0 && prec == 0) prec = 1;
+            if (prec == 0 && origV == 0) {
+                /* a zero value with precision 0 prints NO digits at all;
+                 * the sign (if any) still comes from the flags below */
+                t = 0;
+            } else {
+                int dig = t;
+                while (dig < prec) { field[fl++] = '0'; dig++; }
+            }
+        } else if (spec == 'o' && alt && origV != 0) {
+            field[fl++] = '0';
         }
         while (t-- > 0) field[fl++] = tmp[t];
     } else if (spec == 'a' || spec == 'A') {
@@ -195,17 +228,56 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             int upper = (spec == 'E' || spec == 'G' || spec == 'F');
             if (spec == 'f' || spec == 'F') {
                 fl = __goclib_double_to_buf(field, x, prec);
+                /* '#' forces the decimal point even when the precision is 0
+                 * (C99 7.19.6.1p6); inf/nan end in a letter and are left
+                 * alone. */
+                if (alt && prec == 0 && fl > 0 &&
+                    field[fl-1] >= '0' && field[fl-1] <= '9') {
+                    field[fl++] = '.';
+                }
             } else if (spec == 'e' || spec == 'E') {
                 fl = __goclib_double_to_exp(field, x, prec, upper, 0);
+                /* '#' with precision 0 puts the point before the exponent */
+                if (alt && prec == 0) {
+                    int ei = 0;
+                    while (ei < fl && field[ei] != 'e' && field[ei] != 'E') ei++;
+                    if (ei < fl) {
+                        int j = fl;
+                        while (j > ei) { field[j] = field[j-1]; j--; }
+                        field[ei] = '.';
+                        fl++;
+                    }
+                }
             } else {
                 int sig = prec;
                 int e10 = fmt_g_exp(x);
                 if (sig == 0) sig = 1;          /* "%.0g" means one digit */
                 if (e10 < -4 || e10 >= sig) {
-                    fl = __goclib_double_to_exp(field, x, sig - 1, upper, 1);
+                    /* '#' keeps every precision digit, so no stripping */
+                    fl = __goclib_double_to_exp(field, x, sig - 1, upper, !alt);
                 } else {
                     fl = __goclib_double_to_buf(field, x, sig - 1 - e10);
-                    fl = __goclib_double_strip_g(field, fl);
+                    /* Rounding can carry the value into the next decade
+                     * ("9.999999e5" with 6 significant digits becomes
+                     * 1000000): the exponent then no longer satisfies the
+                     * %g style rule, and the %e shape wins (C99 7.19.6.1p8).
+                     * Count the digits the rounded text actually has. */
+                    {
+                        int ip = 0;
+                        while (ip < fl && field[ip] >= '0' && field[ip] <= '9') ip++;
+                        if (ip > sig) {
+                            fl = __goclib_double_to_exp(field, x, sig - 1, upper, !alt);
+                        } else if (alt) {
+                            int hasdot = 0, q;
+                            for (q = 0; q < fl; q++) if (field[q] == '.') hasdot = 1;
+                            if (!hasdot && fl > 0 &&
+                                field[fl-1] >= '0' && field[fl-1] <= '9') {
+                                field[fl++] = '.';
+                            }
+                        } else {
+                            fl = __goclib_double_strip_g(field, fl);
+                        }
+                    }
                 }
             }
         } else if (spec == 'p') {
@@ -219,6 +291,17 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                 int d = (int)((v >> shift) & 0xf);
                 field[fl++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
             }
+        } else if (spec == 'n') {
+            /* %n: nothing is emitted; the count of characters written so far
+             * goes to the pointer, at the width the length modifier asks for
+             * (C99 7.19.6.1p7). No padding either. */
+            void *np = va_arg(ap, void *);
+            if (shorts >= 2)              *(char *)np = (char)n;
+            else if (shorts == 1)         *(short *)np = (short)n;
+            else if (longs >= 2 || imax)  *(long long *)np = (long long)n;
+            else if (longs == 1 || sizeT) *(long *)np = (long)n;
+            else                          *(int *)np = (int)n;
+            continue;
         } else {
             /* unknown specifier: emit it verbatim */
             field[fl++] = spec;
@@ -238,23 +321,32 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                            spec == 'f' || spec == 'F' || spec == 'e' ||
                            spec == 'E' || spec == 'g' || spec == 'G' ||
                            spec == 'a' || spec == 'A');
-            int signedish = (spec == 'd' || spec == 'i');
+            /* signed conversions take the '+' and ' ' flags: the integer
+             * conversions and every floating one (C99 7.19.6.1p6). "+inf"
+             * is what the reference libcs print. */
+            int signedish = (spec == 'd' || spec == 'i' ||
+                             spec == 'f' || spec == 'F' || spec == 'e' ||
+                             spec == 'E' || spec == 'g' || spec == 'G' ||
+                             spec == 'a' || spec == 'A');
             /* the sign character, if any, and where it is in `field` */
             char sign = 0;
             int signlen = 0;
-            if (signedish && (plus || blank) && fl > 0 && field[0] != '-') {
+            if (signedish && (plus || blank) && !(fl > 0 && field[0] == '-')) {
                 /* "+"/" " only applies to non-negative values; a literal '-'
-                 * from the conversion wins over both. */
+                 * from the conversion wins over both. An empty field (a zero
+                 * printed with precision 0) still takes its sign. */
                 sign = plus ? '+' : ' ';
                 signlen = 1;
             }
-            /* the '#' base marker, if any */
+            /* the '#' base marker, if any. For %x/%X only a NONZERO result
+             * takes the 0x/0X prefix (C99 7.19.6.1p6); %#o's forced zero is
+             * emitted with the digits, not here. */
             char pfx[2];
             int pfxlen = 0;
-            if (alt) {
-                if (spec == 'x') { pfx[0] = '0'; pfx[1] = 'x'; pfxlen = 2; }
-                else if (spec == 'X') { pfx[0] = '0'; pfx[1] = 'X'; pfxlen = 2; }
-                else if (spec == 'o') { pfx[0] = '0'; pfxlen = 1; }
+            if (alt && (spec == 'x' || spec == 'X') && intVal != 0) {
+                pfx[0] = '0';
+                pfx[1] = spec;
+                pfxlen = 2;
             }
             /* digits start after any existing '-', so zero padding never
              * lands between the minus and the digits */
@@ -274,7 +366,12 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                 if (emit_text) { while (*s) { ADV(*s); s++; } }
                 else { for (k = 0; k < fl; k++) ADV(field[k]); }
             } else {
-                int pad = width - clen;
+                /* every path emits exactly: field content (or s) + sign +
+                 * prefix + pad, so the pad is what is left after all of
+                 * them. (Counting only the field content here padded
+                 * width+pfxlen characters and, worse, the right-justify
+                 * path below never emitted the leading '-' at all.) */
+                int pad = width - clen - signlen - pfxlen;
                 if (left) {
                     if (signlen) ADV(sign);
                     if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
@@ -292,6 +389,7 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                     else { for (k = 0; k < body; k++) ADV(field[digoff + k]); }
                 } else {
                     for (k = 0; k < pad; k++) ADV(' ');
+                    if (digoff) ADV(field[0]);
                     if (signlen) ADV(sign);
                     if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
                     if (emit_text) { while (*s) { ADV(*s); s++; } }
@@ -637,10 +735,16 @@ int __goclib_double_to_buf(char *buf, double x, int prec) {
     char dig[20];                      /* prec+1 digits to round on */
     int k;
     /* Infinity and NaN have no digits to convert; spell them out instead of
-     * letting floor() propagate them into nonsense. */
+     * letting floor() propagate them into nonsense. The spelling matches
+     * __goclib_double_to_hex (and the ucrt reference): "inf", and
+     * "nan(ind)". The sign bit of a NaN is deliberately NOT printed -- the
+     * hardware indefinite is negative while an optimiser's folded 0.0/0.0
+     * is positive, and a format library must not make that unobservable
+     * difference visible (C leaves the NaN sign unspecified). */
     if (x != x) {
-        buf[0] = 'n'; buf[1] = 'a'; buf[2] = 'n';
-        return 3;
+        buf[n]='n'; buf[n+1]='a'; buf[n+2]='n'; buf[n+3]='(';
+        buf[n+4]='i'; buf[n+5]='n'; buf[n+6]='d'; buf[n+7]=')';
+        return n + 8;
     }
     if (x > 1.7976931348623157e308 || x < -1.7976931348623157e308) {
         if (x < 0) { buf[0] = '-'; n = 1; }
@@ -790,8 +894,11 @@ int __goclib_double_to_exp(char *buf, double x, int prec, int upper, int strip) 
     double m;
     char mant[64];
     if (x != x) {
-        buf[0] = 'n'; buf[1] = 'a'; buf[2] = 'n';
-        return 3;
+        /* same ucrt spelling as __goclib_double_to_buf; the NaN sign bit is
+         * not printed (see there) */
+        buf[n]='n'; buf[n+1]='a'; buf[n+2]='n'; buf[n+3]='(';
+        buf[n+4]='i'; buf[n+5]='n'; buf[n+6]='d'; buf[n+7]=')';
+        return n + 8;
     }
     if (x > 1.7976931348623157e308 || x < -1.7976931348623157e308) {
         if (x < 0) { buf[0] = '-'; n = 1; }
@@ -1240,10 +1347,12 @@ int getchar(void) {
 
 /* ------------------------------- sscanf ---------------------------------- */
 /*
- * The scanf conversions goc supports: d i u o x X (with h/l/ll lengths),
- * f e g a and friends, c, s, and "%%". Widths and "*" suppression are
- * honoured; scansets (%[...]), %p and %n are not. Floating point is parsed
- * by strtod, so the two agree by construction.
+ * The scanf conversions goc supports: d i u o x X p n (with h/hh/l/ll/z/j/t
+ * lengths), f e g a and friends, c, s, and the scanset %[...]. Widths and "*"
+ * suppression are honoured; %a has its C99 float meaning (not glibc's
+ * allocate extension); %lc/%ls/%l[ store wchar_t units with the same
+ * low-byte convention printf's %ls documents. Floating point is parsed by
+ * strtod, so the two agree by construction.
  *
  * Returns the number of items ASSIGNED (suppressed conversions do not
  * count), or -1 if the input ends before the first conversion completes.
@@ -1260,7 +1369,20 @@ static const char *scan_ws(const char *p) {
  * hex, a leading 0 means octal, otherwise decimal). Stops at the first
  * character that is not a digit in that base. *ok reports whether at least
  * one digit was consumed.
+ *
+ * The width caps CHARACTERS consumed, prefix included (the field scanf
+ * matches is a run of input characters). The 0x/0X prefix is only consumed
+ * when a hex digit follows it AND the width leaves room for that digit --
+ * scanf matches the longest VALID field, so "0x" with no hex digit after
+ * is just "0", and "%2x" on "0xff" reads "0", not "0x".
  */
+static int scan_hexch(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 static unsigned long scan_uint(const char **pp, int base, int width, int *ok) {
     const char *p = *pp;
     unsigned long v = 0;
@@ -1269,8 +1391,19 @@ static unsigned long scan_uint(const char **pp, int base, int width, int *ok) {
     *ok = 0;
     if (base == 0) {
         if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-            base = 16;
-            p = p + 2;
+            if (scan_hexch(p[2]) >= 0 && (width <= 0 || width >= 3)) {
+                base = 16;
+                p = p + 2;
+                n = 2;
+            } else if (width == 2) {
+                /* the width cuts between "0x" and the digits: glibc treats
+                 * the field as "0x", which converts to nothing -- a matching
+                 * failure, with the field consumed */
+                *pp = p + 2;
+                return 0;
+            } else {
+                base = 8;    /* the bare "0" (width 1) */
+            }
         } else if (p[0] == '0') {
             base = 8;
         } else {
@@ -1279,7 +1412,13 @@ static unsigned long scan_uint(const char **pp, int base, int width, int *ok) {
     } else if (base == 16 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
         /* An explicit "%x" still accepts the 0x prefix -- scanf's %x and %i
          * agree here, and "0x1f" must not be read as the integer 0. */
-        p = p + 2;
+        if (scan_hexch(p[2]) >= 0 && (width <= 0 || width >= 3)) {
+            p = p + 2;
+            n = 2;
+        } else if (width == 2) {
+            *pp = p + 2;
+            return 0;
+        }
     }
     while (*p != '\0' && (width <= 0 || n < width)) {
         if (*p >= '0' && *p <= '9') {
@@ -1345,44 +1484,170 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
             width = width * 10 + (*fp - '0');
             fp++;
         }
-        /* goc's long is already 64 bits, so "l", "ll" and "L" all name the
-         * same 8-byte target for an integer conversion. */
+        /* Length modifiers. goc's long is already 64 bits, so l, ll, L and
+         * the size_t/ptrdiff_t spellings z/j/t all name the same 8-byte
+         * target for an integer conversion; they are folded to 'l'. h names
+         * short, hh names char ('H' here -- hh must write ONE byte, and the
+         * old code wrote two by falling into the short case). */
         lmod = 0;
-        if (*fp == 'h' || *fp == 'l' || *fp == 'L') {
+        if (*fp == 'h' || *fp == 'l' || *fp == 'L' ||
+            *fp == 'z' || *fp == 'j' || *fp == 't') {
             lmod = *fp;
             fp++;
-            if ((lmod == 'l' && *fp == 'l') || (lmod == 'h' && *fp == 'h')) fp++;
+            if ((lmod == 'l' && *fp == 'l') || (lmod == 'h' && *fp == 'h')) {
+                fp++;
+                if (lmod == 'h') lmod = 'H';   /* hh: ONE byte, not short */
+            }
+            if (lmod == 'L' || lmod == 'z' || lmod == 'j' || lmod == 't') lmod = 'l';
         }
 
         if (*fp == 'c') {
             int n = width > 0 ? width : 1;
-            int i;
+            int i = 0;
             if (suppress) {
-                sp = sp + n;
+                while (i < n && *sp != '\0') { sp++; i++; }
+                if (i == 0) break;    /* input ends before the field starts */
+                fp++;
+                continue;
+            }
+            if (lmod == 'l') {
+                /* %lc: one input byte widened into one wchar_t unit, the
+                 * exact inverse of printf's lossy %ls */
+                wchar_t *wd = (wchar_t *)va_arg(ap, wchar_t *);
+                for (; i < n && *sp != '\0'; i++) {
+                    wd[i] = (wchar_t)(unsigned char)*sp;
+                    sp++;
+                }
             } else {
                 dst = (char *)va_arg(ap, char *);
-                for (i = 0; i < n && *sp != '\0'; i++) {
+                for (; i < n && *sp != '\0'; i++) {
                     dst[i] = *sp;
                     sp++;
                 }
-                assigned++;
+            }
+            if (i == 0) break;        /* matching failure, not an assignment */
+            assigned++;
+            fp++;
+            continue;
+        }
+        if (*fp == 'n') {
+            /* %n consumes no input and never fails; it stores the number of
+             * characters consumed so far (C99 7.19.6.2p12(5)). */
+            if (!suppress) {
+                void *out = va_arg(ap, void *);
+                long cnt = (long)(sp - s);
+                if (lmod == 'H')      *(char *)out = (char)cnt;
+                else if (lmod == 'h') *(short *)out = (short)cnt;
+                else if (lmod == 'l') *(long *)out = cnt;
+                else                  *(int *)out = (int)cnt;
             }
             fp++;
             continue;
         }
         if (*fp == 's') {
             int n = 0;
-            if (!suppress) dst = (char *)va_arg(ap, char *);
-            sp = scan_ws(sp);
-            while (*sp != '\0' && *sp != ' ' && *sp != '\t' && *sp != '\n' && *sp != '\r' &&
-                   (width <= 0 || n < width)) {
-                if (!suppress) dst[n] = *sp;
-                sp++;
-                n++;
+            if (lmod == 'l') {
+                /* %ls: narrow bytes widened to wchar_t units, the inverse of
+                 * printf's lossy %ls; NUL-terminated like %s */
+                wchar_t *wd = 0;
+                if (!suppress) wd = (wchar_t *)va_arg(ap, wchar_t *);
+                sp = scan_ws(sp);
+                while (*sp != '\0' && *sp != ' ' && *sp != '\t' && *sp != '\n' && *sp != '\r' &&
+                       (width <= 0 || n < width)) {
+                    if (!suppress) wd[n] = (wchar_t)(unsigned char)*sp;
+                    sp++;
+                    n++;
+                }
+                if (n == 0) break;
+                if (!suppress) { wd[n] = 0; assigned++; }
+            } else {
+                if (!suppress) dst = (char *)va_arg(ap, char *);
+                sp = scan_ws(sp);
+                while (*sp != '\0' && *sp != ' ' && *sp != '\t' && *sp != '\n' && *sp != '\r' &&
+                       (width <= 0 || n < width)) {
+                    if (!suppress) dst[n] = *sp;
+                    sp++;
+                    n++;
+                }
+                if (n == 0) break;
+                if (!suppress) { dst[n] = '\0'; assigned++; }
             }
-            if (n == 0) break;
+            fp++;
+            continue;
+        }
+        if (*fp == '[') {
+            unsigned char set[256];
+            int negate, i2, got = 0;
+            fp++;
+            for (i2 = 0; i2 < 256; i2++) set[i2] = 0;
+            negate = (*fp == '^');
+            if (negate) fp++;
+            /* a ']' right after '[' or '[^' is a literal member */
+            if (*fp == ']') { set[(unsigned char)']'] = 1; fp++; }
+            while (*fp != '\0' && *fp != ']') {
+                unsigned char c1 = (unsigned char)*fp;
+                if (fp[1] == '-' && fp[2] != '\0' && fp[2] != ']') {
+                    unsigned char c2 = (unsigned char)fp[2];
+                    if (c2 < c1) c2 = c1;      /* reversed range: just c1 */
+                    for (;;) {
+                        set[c1] = 1;
+                        if (c1 == c2) break;
+                        c1++;
+                    }
+                    fp += 3;
+                } else {
+                    set[c1] = 1;
+                    fp++;
+                }
+            }
+            if (*fp == ']') fp++;
+            else break;                       /* unterminated scanset */
+            /* Collect: characters in (or, with ^, not in) the set, up to the
+             * width. A scanset stores NO terminating NUL; zero matched
+             * characters is a matching failure. */
+            if (lmod == 'l') {
+                wchar_t *wd = 0;
+                if (!suppress) wd = (wchar_t *)va_arg(ap, wchar_t *);
+                while (*sp != '\0' && set[(unsigned char)*sp] != negate &&
+                       (width <= 0 || got < width)) {
+                    if (!suppress) wd[got] = (wchar_t)(unsigned char)*sp;
+                    sp++;
+                    got++;
+                }
+            } else {
+                if (!suppress) dst = (char *)va_arg(ap, char *);
+                while (*sp != '\0' && set[(unsigned char)*sp] != negate &&
+                       (width <= 0 || got < width)) {
+                    if (!suppress) dst[got] = *sp;
+                    sp++;
+                    got++;
+                }
+            }
+            if (got == 0) break;
             if (!suppress) {
-                dst[n] = '\0';
+                if (lmod == 'l') {
+                    /* %[ with l: wchar_t units plus the terminating NUL --
+                     * scansets add one exactly like %s does (C99 7.19.6.2p9);
+                     * only %c goes without */
+                    wchar_t *wd = (wchar_t *)va_arg(ap, wchar_t *);
+                    wd[got] = 0;
+                } else {
+                    dst[got] = '\0';
+                }
+                assigned++;
+            }
+            continue;
+        }
+        if (*fp == 'p') {
+            /* %p: read back what printf's %p writes -- an optional 0x then
+             * hex digits (C99 leaves the set to the implementation; this is
+             * ours, and the two agree). */
+            sp = scan_ws(sp);
+            uv = scan_uint(&sp, 16, width, &ok);
+            if (!ok) break;
+            if (!suppress) {
+                void **out = va_arg(ap, void **);
+                *out = (void *)(unsigned long)uv;
                 assigned++;
             }
             fp++;
@@ -1390,19 +1655,64 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
         }
         if (*fp == 'f' || *fp == 'F' || *fp == 'e' || *fp == 'E' ||
             *fp == 'g' || *fp == 'G' || *fp == 'a' || *fp == 'A') {
-            char *endp;
+            /* scanf's float field is a token, not "whatever strtod takes":
+             * the longest input sequence shaped like a float (C99
+             * 7.19.6.2p9), which strtod must then consume WHOLE. A partial
+             * consumption ("1e+x" -> strtod takes "1") is a matching
+             * failure, and the field stays consumed -- glibc hands "x" to
+             * the next conversion, not "e+x". "0x1p3" matches as "0"
+             * because goclib's strtod is decimal-only, which is exactly
+             * what this libc's printf emits. */
+            char tb[320];
+            int ti = 0, ndig = 0;
             double dv;
+            char *endp;
             sp = scan_ws(sp);
-            dv = strtod(sp, &endp);
-            if (endp == sp) break;
-            sp = endp;
+            {
+                const char *q = sp;
+                if (*q == '+' || *q == '-') tb[ti++] = *q++;
+                if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X') &&
+                    (scan_hexch(q[2]) >= 0 || (q[2] == '.' && scan_hexch(q[3]) >= 0))) {
+                    /* hexadecimal float: 0x hexdigits [. hexdigits]
+                     * [p [+-] digits] -- strtod takes it, so the token must
+                     * reach past the 'x' (C99 7.19.6.2p9: the input item is
+                     * "longest matching input sequence", and hex floats are
+                     * what %a prints). */
+                    tb[ti++] = *q++;
+                    tb[ti++] = *q++;
+                    while (scan_hexch(*q) >= 0) { if (ti < (int)sizeof tb - 1) tb[ti++] = *q; q++; }
+                    if (*q == '.') {
+                        tb[ti++] = *q++;
+                        while (scan_hexch(*q) >= 0) { if (ti < (int)sizeof tb - 1) tb[ti++] = *q; q++; }
+                    }
+                    if (*q == 'p' || *q == 'P') {
+                        tb[ti++] = *q++;
+                        if (*q == '+' || *q == '-') tb[ti++] = *q++;
+                        while (*q >= '0' && *q <= '9') { if (ti < (int)sizeof tb - 1) tb[ti++] = *q; q++; }
+                    }
+                    sp = q;
+                } else {
+                while (*q >= '0' && *q <= '9') { tb[ti++] = *q++; ndig++; }
+                if (*q == '.' && (ndig > 0 || q[1] >= '0' && q[1] <= '9')) {
+                    tb[ti++] = *q++;
+                    while (*q >= '0' && *q <= '9') { tb[ti++] = *q++; ndig++; }
+                }
+                if (ndig > 0 && (*q == 'e' || *q == 'E')) {
+                    tb[ti++] = *q++;
+                    if (*q == '+' || *q == '-') tb[ti++] = *q++;
+                    while (*q >= '0' && *q <= '9') { tb[ti++] = *q++; }
+                }
+                sp = q;    /* the field is consumed whether or not it matches */
+                }
+            }
+            if (ti == 0) break;          /* nothing shaped like a float */
+            tb[ti] = 0;
+            dv = strtod(tb, &endp);
+            if (endp != tb + ti) break;  /* partial conversion: no assignment */
             if (!suppress) {
                 void *out = va_arg(ap, void *);
-                if (lmod == 0) {
-                    *(float *)out = (float)dv;
-                } else {
-                    *(double *)out = dv;
-                }
+                if (lmod == 0) *(float *)out = (float)dv;
+                else *(double *)out = dv;
                 assigned++;
             }
             fp++;
@@ -1420,9 +1730,11 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
         neg = 0;
         if (*sp == '+') {
             sp++;
+            if (width > 0) width--;   /* the sign is part of the field */
         } else if (*sp == '-') {
             neg = 1;
             sp++;
+            if (width > 0) width--;
         }
         uv = scan_uint(&sp, base, width, &ok);
         if (!ok) break;
@@ -1431,7 +1743,10 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
          * masked the shadowing bug is gone -- see task #38). */
         if (!suppress) {
             void *out = va_arg(ap, void *);
-            if (lmod == 'h') {
+            if (lmod == 'H') {
+                /* hh: ONE byte; the target may be an unsigned char */
+                *(char *)out = (char)(neg ? -(long)uv : (long)uv);
+            } else if (lmod == 'h') {
                 *(short *)out = (short)(neg ? -(long)uv : (long)uv);
             } else if (lmod == 0) {
                 *(int *)out = (int)(neg ? -(long)uv : (long)uv);
@@ -1444,12 +1759,13 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
         continue;
     }
     /* EOF means "an input failure occurred before the first conversion could
-     * complete", i.e. the input was already exhausted. A *matching* failure
-     * (a digit expected, a letter found) is not an input failure: scanf returns
+     * complete", i.e. the input was already exhausted -- possibly only after
+     * whitespace or literal characters were matched. A *matching* failure (a
+     * digit expected, a letter found) is not an input failure: scanf returns
      * the number of items assigned, which is then 0. Telling the two apart is
      * the whole point of the return value -- callers test "!= 1" after asking
      * for one item, and would misread a matching failure as end-of-input. */
-    if (assigned == 0 && sp == s && *s == '\0') return -1;
+    if (assigned == 0 && *sp == '\0') return -1;
     return assigned;
 }
 
@@ -1467,20 +1783,30 @@ int sscanf(const char *s, const char *fmt, ...) {
  * fscanf -- formatted input from a FILE* (standard streams, disk files, ...).
  *
  * Mirrors sscanf's conversion logic but sources characters from `stream` via
- * fgetc/ungetc instead of a string pointer. ungetc provides exactly one
- * character of pushback, which is sufficient: every branch reads at most one
- * look-ahead character and pushes it back when it does not match.
+ * fgetc/ungetc. Pushback goes straight into the stream's ungetc slots (the
+ * FILE keeps a small ring), so look-ahead given back by one conversion is
+ * also still there for the NEXT fscanf call -- the stream position must not
+ * drift just because a conversion failed mid-token. `consumed` counts
+ * characters read minus characters pushed back, which is what %n stores;
+ * `hit_eof` distinguishes "input ran out" (EOF return) from "next character
+ * did not match" (0 return) exactly like vsscanf's *sp == '\0'.
  * ========================================================================== */
-typedef struct { FILE *f; int pushed; int got_any; } __fscan;
+typedef struct { FILE *f; int got_any; int hit_eof; long consumed; } __fscan;
 
 static int __fs_get(__fscan *s) {
-    int c;
-    if (s->pushed >= 0) { c = s->pushed; s->pushed = -1; return c; }
-    c = fgetc(s->f);
-    if (c != -1) s->got_any = 1;
+    int c = fgetc(s->f);
+    if (c == -1) {
+        s->hit_eof = 1;
+    } else {
+        s->got_any = 1;
+        s->consumed++;
+    }
     return c;
 }
-static void __fs_unget(__fscan *s, int c) { s->pushed = c; }
+static void __fs_unget(__fscan *s, int c) {
+    if (c == -1) return;
+    if (ungetc(c, s->f) != -1) s->consumed--;
+}
 
 static int __fs_ws(__fscan *s) {
     int c;
@@ -1513,7 +1839,7 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
     long width;
 
     if (stream == 0) return -1;
-    sc.f = stream; sc.pushed = -1; sc.got_any = 0;
+    sc.f = stream; sc.got_any = 0; sc.hit_eof = 0; sc.consumed = 0;
     while (*fp != '\0') {
         if (*fp == ' ' || *fp == '\t' || *fp == '\n') {
             __fs_ws(&sc);
@@ -1540,68 +1866,340 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
         width = 0;
         while (*fp >= '0' && *fp <= '9') { width = width * 10 + (*fp - '0'); fp++; }
         lmod = 0;
-        if (*fp == 'h' || *fp == 'l' || *fp == 'L') {
+        if (*fp == 'h' || *fp == 'l' || *fp == 'L' ||
+            *fp == 'z' || *fp == 'j' || *fp == 't') {
             lmod = *fp; fp++;
-            if ((lmod == 'l' && *fp == 'l') || (lmod == 'h' && *fp == 'h')) fp++;
+            if ((lmod == 'l' && *fp == 'l') || (lmod == 'h' && *fp == 'h')) {
+                fp++;
+                if (lmod == 'h') lmod = 'H';   /* hh: ONE byte, not short */
+            }
+            if (lmod == 'L' || lmod == 'z' || lmod == 'j' || lmod == 't') lmod = 'l';
         }
 
         if (*fp == 'c') {
             long n = (width > 0) ? width : 1;
-            long i;
+            long i = 0;
             if (suppress) {
-                for (i = 0; i < n; i++) { c = __fs_get(&sc); if (c == -1) break; }
+                while (i < n) {
+                    c = __fs_get(&sc);
+                    if (c == -1) break;
+                    i++;
+                }
+                if (i == 0) break;
+                fp++;
+                continue;
+            }
+            if (lmod == 'l') {
+                /* %lc: input bytes widened to wchar_t units */
+                wchar_t *wd = (wchar_t *)va_arg(ap, wchar_t *);
+                for (; i < n; i++) {
+                    c = __fs_get(&sc);
+                    if (c == -1) break;
+                    wd[i] = (wchar_t)(unsigned char)c;
+                }
             } else {
                 dst = (char *)va_arg(ap, char *);
-                for (i = 0; i < n; i++) {
+                for (; i < n; i++) {
                     c = __fs_get(&sc);
                     if (c == -1) break;
                     dst[i] = (char)c;
                 }
-                assigned++;
+            }
+            if (i == 0) break;    /* input ended before the field started */
+            assigned++;
+            fp++;
+            continue;
+        }
+        if (*fp == 'n') {
+            /* %n: store characters consumed so far; no input, never fails */
+            if (!suppress) {
+                void *out = va_arg(ap, void *);
+                if (lmod == 'H')      *(char *)out = (char)sc.consumed;
+                else if (lmod == 'h') *(short *)out = (short)sc.consumed;
+                else if (lmod == 'l') *(long *)out = sc.consumed;
+                else                  *(int *)out = (int)sc.consumed;
             }
             fp++;
             continue;
         }
         if (*fp == 's') {
             long n = 0;
-            if (!suppress) dst = (char *)va_arg(ap, char *);
-            __fs_ws(&sc);
-            for (;;) {
-                c = __fs_get(&sc);
-                if (c == -1 || c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-                    if (c != -1) __fs_unget(&sc, c);
-                    break;
+            if (lmod == 'l') {
+                wchar_t *wd = 0;
+                if (!suppress) wd = (wchar_t *)va_arg(ap, wchar_t *);
+                __fs_ws(&sc);
+                for (;;) {
+                    c = __fs_get(&sc);
+                    if (c == -1 || c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                        if (c != -1) __fs_unget(&sc, c);
+                        break;
+                    }
+                    if (!suppress) wd[n] = (wchar_t)(unsigned char)c;
+                    n++;
+                    if (width > 0 && n >= width) break;
                 }
-                if (!suppress) dst[n] = (char)c;
-                n++;
-                if (width > 0 && n >= width) break;
+                if (n == 0) break;
+                if (!suppress) { wd[n] = 0; assigned++; }
+            } else {
+                if (!suppress) dst = (char *)va_arg(ap, char *);
+                __fs_ws(&sc);
+                for (;;) {
+                    c = __fs_get(&sc);
+                    if (c == -1 || c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                        if (c != -1) __fs_unget(&sc, c);
+                        break;
+                    }
+                    if (!suppress) dst[n] = (char)c;
+                    n++;
+                    if (width > 0 && n >= width) break;
+                }
+                if (n == 0) break;
+                if (!suppress) { dst[n] = 0; assigned++; }
             }
-            if (!suppress) { dst[n] = 0; assigned++; }
+            fp++;
+            continue;
+        }
+        if (*fp == '[') {
+            unsigned char set[256];
+            int negate, i2;
+            long got = 0;
+            fp++;
+            for (i2 = 0; i2 < 256; i2++) set[i2] = 0;
+            negate = (*fp == '^');
+            if (negate) fp++;
+            if (*fp == ']') { set[(unsigned char)']'] = 1; fp++; }
+            while (*fp != '\0' && *fp != ']') {
+                unsigned char c1 = (unsigned char)*fp;
+                if (fp[1] == '-' && fp[2] != '\0' && fp[2] != ']') {
+                    unsigned char c2 = (unsigned char)fp[2];
+                    if (c2 < c1) c2 = c1;      /* reversed range: just c1 */
+                    for (;;) {
+                        set[c1] = 1;
+                        if (c1 == c2) break;
+                        c1++;
+                    }
+                    fp += 3;
+                } else {
+                    set[c1] = 1;
+                    fp++;
+                }
+            }
+            if (*fp == ']') fp++;
+            else break;                       /* unterminated scanset */
+            /* No terminating NUL is stored; zero matched characters is a
+             * matching failure. */
+            if (lmod == 'l') {
+                wchar_t *wd = 0;
+                if (!suppress) wd = (wchar_t *)va_arg(ap, wchar_t *);
+                for (;;) {
+                    c = __fs_get(&sc);
+                    if (c == -1 || set[(unsigned char)c] == negate) {
+                        if (c != -1) __fs_unget(&sc, c);
+                        break;
+                    }
+                    if (!suppress) wd[got] = (wchar_t)(unsigned char)c;
+                    got++;
+                    if (width > 0 && got >= width) break;
+                }
+            } else {
+                if (!suppress) dst = (char *)va_arg(ap, char *);
+                for (;;) {
+                    c = __fs_get(&sc);
+                    if (c == -1 || set[(unsigned char)c] == negate) {
+                        if (c != -1) __fs_unget(&sc, c);
+                        break;
+                    }
+                    if (!suppress) dst[got] = (char)c;
+                    got++;
+                    if (width > 0 && got >= width) break;
+                }
+            }
+            if (got == 0) break;
+            if (!suppress) {
+                if (lmod == 'l') {
+                    /* %[ with l: wchar_t units plus the terminating NUL --
+                     * scansets add one exactly like %s does (C99 7.19.6.2p9);
+                     * only %c goes without */
+                    wchar_t *wd = (wchar_t *)va_arg(ap, wchar_t *);
+                    wd[got] = 0;
+                } else {
+                    dst[got] = (char)0;
+                }
+                assigned++;
+            }
+            continue;
+        }
+        if (*fp == 'p') {
+            /* %p: read back what printf's %p writes -- hex digits, with the
+             * 0x handled by the same longest-valid-field rule as %x. */
+            __fs_ws(&sc);
+            c = __fs_get(&sc);
+            if (c == -1) break;
+            neg = 0;
+            if (c == '+') c = __fs_get(&sc);
+            else if (c == '-') { neg = 1; c = __fs_get(&sc); }
+            if (c == -1) break;
+            uv = 0; ok = 0; cnt = 0;
+            if (c == '0') {
+                int d2 = __fs_get(&sc);
+                if (d2 == 'x' || d2 == 'X') {
+                    int d3 = __fs_get(&sc);
+                    if (d3 != -1 && scan_hexch((char)d3) >= 0) {
+                        uv = (unsigned long)scan_hexch((char)d3);
+                        ok = 1; cnt = 3;
+                    } else {
+                        if (d3 != -1) __fs_unget(&sc, d3);
+                        __fs_unget(&sc, d2);
+                        uv = 0; ok = 1; cnt = 1;
+                    }
+                } else {
+                    if (d2 != -1) __fs_unget(&sc, d2);
+                    uv = 0; ok = 1; cnt = 1;
+                }
+            } else {
+                int d = __fs_digit(c, 16);
+                if (d >= 0) { uv = (unsigned long)d; ok = 1; cnt = 1; }
+                else __fs_unget(&sc, c);
+            }
+            while (ok) {
+                int d3b = __fs_get(&sc);
+                if (d3b == -1) break;
+                {
+                    int d = __fs_digit(d3b, 16);
+                    if (d < 0) { __fs_unget(&sc, d3b); break; }
+                    if (width > 0 && cnt >= width) { __fs_unget(&sc, d3b); break; }
+                    uv = uv * 16ul + (unsigned long)d;
+                    cnt++;
+                }
+            }
+            if (!ok) break;
+            if (!suppress) {
+                void **out = va_arg(ap, void **);
+                *out = (void *)(unsigned long)(neg ? -(long)uv : (long)uv);
+                assigned++;
+            }
             fp++;
             continue;
         }
         if (*fp == 'f' || *fp == 'F' || *fp == 'e' || *fp == 'E' ||
             *fp == 'g' || *fp == 'G' || *fp == 'a' || *fp == 'A') {
+            /* The float field is a token: the longest input sequence shaped
+             * like a float, which strtod must consume WHOLE ("1e+x" fails
+             * and its field stays consumed -- "x", not "e+x", goes to the
+             * next conversion, matching glibc). The pushback buffer only
+             * ever holds the one look-ahead character that ended the token;
+             * the token itself is consumed either way. */
+            char tb[320];
+            int ti = 0, ndig = 0;
             double dv;
-            char tb[256];
-            long ti = 0;
             char *endp;
+            int peek;
             __fs_ws(&sc);
             c = __fs_get(&sc);
             if (c == -1) break;
-            tb[ti++] = (char)c;
-            for (;;) {
-                c = __fs_get(&sc);
-                if (c == -1) break;
-                if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' ||
-                    c == '+' || c == '-') {
-                    if (ti < 255) tb[ti++] = (char)c;
-                } else { __fs_unget(&sc, c); break; }
+            if (c == '+' || c == '-') { tb[ti++] = (char)c; c = __fs_get(&sc); }
+            if (c == '0') {
+                /* hexadecimal float: 0x hexdigits [. hexdigits] [p exp] --
+                 * the token must reach past the 'x' or strtod's "0" would be
+                 * a partial consumption (C99 7.19.6.2p9) */
+                int d2 = __fs_get(&sc);
+                int d3 = -2;
+                if (d2 == 'x' || d2 == 'X') d3 = __fs_get(&sc);
+                if ((d2 == 'x' || d2 == 'X') &&
+                    (scan_hexch((char)d3) >= 0 ||
+                     (d3 == '.' && d3 != -2))) {
+                    int hxok = 0;
+                    if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;   /* '0' */
+                    if (ti < (int)sizeof tb - 1) tb[ti++] = (char)d2;  /* 'x' */
+                    c = __fs_get(&sc);
+                    while (c != -1 && scan_hexch((char)c) >= 0) {
+                        if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                        hxok = 1;
+                        c = __fs_get(&sc);
+                    }
+                    if (c == '.') {
+                        int d4 = __fs_get(&sc);
+                        int dotok = (d4 != -1 && scan_hexch((char)d4) >= 0);
+                        if (d4 != -1) __fs_unget(&sc, d4);
+                        if (dotok) {
+                            if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                            c = __fs_get(&sc);
+                            while (c != -1 && scan_hexch((char)c) >= 0) {
+                                if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                                c = __fs_get(&sc);
+                            }
+                        }
+                    }
+                    if (hxok && (c == 'p' || c == 'P')) {
+                        if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                        c = __fs_get(&sc);
+                        if (c == '+' || c == '-') {
+                            if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                            c = __fs_get(&sc);
+                        }
+                        while (c >= '0' && c <= '9') {
+                            if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                            c = __fs_get(&sc);
+                        }
+                    }
+                    __fs_unget(&sc, c);
+                    tb[ti] = 0;
+                    {
+                        double hv;
+                        char *hend;
+                        hv = strtod(tb, &hend);
+                        if (hend != tb + ti) break;   /* partial: failure */
+                        if (!suppress) {
+                            void *out = va_arg(ap, void *);
+                            if (lmod == 0) *(float *)out = (float)hv;
+                            else *(double *)out = hv;
+                            assigned++;
+                        }
+                    }
+                    fp++;
+                    continue;
+                }
+                /* not a hex float: give the look-ahead back and fall through
+                 * to the decimal scanner, which reads the '0' */
+                if (d3 != -2 && d3 != -1) __fs_unget(&sc, d3);
+                if (d2 != -1) __fs_unget(&sc, d2);
+                c = '0';
             }
+            while (c >= '0' && c <= '9') {
+                if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                ndig++;
+                c = __fs_get(&sc);
+            }
+            if (c == '.') {
+                peek = __fs_get(&sc);
+                if (peek != -1) __fs_unget(&sc, peek);
+                if (ndig > 0 || (peek >= '0' && peek <= '9')) {
+                    if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                    c = __fs_get(&sc);
+                    while (c >= '0' && c <= '9') {
+                        if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                        ndig++;
+                        c = __fs_get(&sc);
+                    }
+                }
+            }
+            if (ndig > 0 && (c == 'e' || c == 'E')) {
+                if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                c = __fs_get(&sc);
+                if (c == '+' || c == '-') {
+                    if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                    c = __fs_get(&sc);
+                }
+                while (c >= '0' && c <= '9') {
+                    if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
+                    c = __fs_get(&sc);
+                }
+            }
+            __fs_unget(&sc, c);            /* the token's terminator stays */
+            if (ndig == 0) break;          /* nothing shaped like a float */
             tb[ti] = 0;
-            if (ti == 0) break;
             dv = strtod(tb, &endp);
-            if (endp == tb) break;   /* nothing parseable */
+            if (endp != tb + ti) break;    /* partial conversion: failure */
             if (!suppress) {
                 void *out = va_arg(ap, void *);
                 if (lmod == 0) *(float *)out = (float)dv;
@@ -1623,42 +2221,53 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
         c = __fs_get(&sc);
         if (c == -1) break;
         neg = 0;
-        if (c == '+') { c = __fs_get(&sc); }
-        else if (c == '-') { neg = 1; c = __fs_get(&sc); }
+        if (c == '+') { c = __fs_get(&sc); if (width > 0) width--; }
+        else if (c == '-') { neg = 1; c = __fs_get(&sc); if (width > 0) width--; }
         if (c == -1) break;
 
         uv = 0; ok = 0; cnt = 0;
         {
+            /* "0x" starts a hex field only when a hex digit follows AND the
+             * width leaves room for all three characters -- scanf matches
+             * the longest valid field, and every consumed character costs
+             * width. */
             int hexpre = 0;
+            int d3v = -2;    /* the hex digit after "0x", when one was read */
             if (c == '0') {
                 int d2 = __fs_get(&sc);
-                if (d2 == 'x' || d2 == 'X') {
-                    if (base == 0 || base == 16) { hexpre = 1; base = 16; }
-                    else if (d2 != -1) __fs_unget(&sc, d2);
+                int d3 = (d2 == 'x' || d2 == 'X') ? __fs_get(&sc) : -2;
+                if ((d2 == 'x' || d2 == 'X') && (base == 0 || base == 16) &&
+                    d3 >= 0 && scan_hexch((char)d3) >= 0 &&
+                    (width <= 0 || width >= 3)) {
+                    hexpre = 1;
+                    base = 16;
+                    cnt = 2;
+                    d3v = d3;
+                    if (width > 0) width -= 2;
                 } else {
+                    /* not a hex field: give back what was looked at */
+                    if (d3 != -2 && d3 != -1) __fs_unget(&sc, d3);
                     if (d2 != -1) __fs_unget(&sc, d2);
                     if (base == 0) base = 8;
                 }
             }
             if (hexpre) {
-                int d2 = __fs_get(&sc);
-                if (d2 != -1) {
-                    int d = __fs_digit(d2, 16);
-                    if (d >= 0) { uv = (unsigned long)d; ok = 1; cnt = 1; }
-                    else __fs_unget(&sc, d2);
-                }
+                /* the first value digit is the one after "0x", not the '0' */
+                uv = (unsigned long)scan_hexch((char)d3v);
+                ok = 1;
+                cnt = 3;
             } else {
                 int d = __fs_digit(c, base);
                 if (d >= 0) { uv = (unsigned long)d; ok = 1; cnt = 1; }
                 else __fs_unget(&sc, c);
             }
             while (ok) {
-                int d3 = __fs_get(&sc);
-                if (d3 == -1) break;
+                int d3b = __fs_get(&sc);
+                if (d3b == -1) break;
                 {
-                    int d = __fs_digit(d3, base);
-                    if (d < 0) { __fs_unget(&sc, d3); break; }
-                    if (width > 0 && cnt >= width) { __fs_unget(&sc, d3); break; }
+                    int d = __fs_digit(d3b, base);
+                    if (d < 0) { __fs_unget(&sc, d3b); break; }
+                    if (width > 0 && cnt >= width) { __fs_unget(&sc, d3b); break; }
                     uv = uv * (unsigned long)base + (unsigned long)d;
                     cnt++;
                 }
@@ -1667,15 +2276,16 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
         if (!ok) break;
         if (!suppress) {
             void *out = va_arg(ap, void *);
-            if (lmod == 'h') *(short *)out = (short)(neg ? -(long)uv : (long)uv);
-            else if (lmod == 0) *(int *)out = (int)(neg ? -(long)uv : (long)uv);
-            else *(long *)out = neg ? -(long)uv : (long)uv;
+            if (lmod == 'H')      *(char *)out = (char)(neg ? -(long)uv : (long)uv);
+            else if (lmod == 'h') *(short *)out = (short)(neg ? -(long)uv : (long)uv);
+            else if (lmod == 0)   *(int *)out = (int)(neg ? -(long)uv : (long)uv);
+            else                  *(long *)out = neg ? -(long)uv : (long)uv;
             assigned++;
         }
         fp++;
         continue;
     }
-    if (assigned == 0 && !sc.got_any) return -1;
+    if (assigned == 0 && sc.hit_eof) return -1;
     return assigned;
 }
 

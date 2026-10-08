@@ -10,5 +10,5 @@ int 1<2=1 -1<1=1
 1e19=1e+19
 1e20=1e+20
 1e19 f=10000000000000000000.0
-inf=inf nan=nan
+inf=inf nan=nan(ind)
 -1e19=-1e+19
