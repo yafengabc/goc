@@ -68,6 +68,12 @@ type coffSec struct {
 	vsize    int
 	relOff   int // file offset of the first relocation, 0 if none
 	relCount int
+	// align is the alignment the section header declares, in bytes, or 0 for
+	// "not stated". LLVM sets it per fragment: a .rdata fragment holding an
+	// xmm constant declares 16, and honouring it is what keeps a movapd from
+	// faulting on an operand the object placed 16-aligned within its own
+	// fragment but that the merge sat at 8 mod 16.
+	align int
 }
 
 // coffSym is one parsed symbol-table entry.
@@ -183,6 +189,14 @@ func parseCOFF(src []byte) (*coffObj, error) {
 			relCount: nrel,
 			vsize:    rawSize,
 			bss:      chars&0x80 != 0 || rawPtr == 0,
+		}
+		// Characteristics bits 20..23 hold the section alignment as an
+		// exponent minus one: 5 means 1<<4 = 16 bytes (IMAGE_SCN_ALIGN_16BYTES
+		// is 0x00500000). Zero means "not stated" -- sections of fewer than
+		// 16 bytes commonly carry no field -- and 1 is meaningless here, so
+		// both fall back to the merge's per-name default.
+		if a := (chars >> 20) & 0xF; a > 1 {
+			sec.align = 1 << (a - 1)
 		}
 		if !sec.bss {
 			if rawPtr < 0 || rawPtr+rawSize > len(src) {

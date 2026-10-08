@@ -222,6 +222,13 @@ type Image struct {
 	// second object resolve to the first object's copy.
 	elfObjSeq int
 
+	// coffObjSeq counts the COFF objects ingested so far. It is what keeps a
+	// jump-table base symbol (__jtbase_*) unique across objects: every object
+	// numbers its own sections from one, so the same section index appears in
+	// both; keying the synthetic base name on the object sequence is what stops
+	// the second object's table bases from overwriting the first's.
+	coffObjSeq int
+
 	// pending is the undefined-name set deferred mode has accumulated.
 	pending map[string]bool
 

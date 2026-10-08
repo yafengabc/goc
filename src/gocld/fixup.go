@@ -53,8 +53,10 @@ func applyFixup(s *Section, f Fixup, target, sym2, base int) error {
 		// "sym relative to wherever the field sits". The two live in different
 		// sections, so the usual displacement arithmetic is meaningless here --
 		// the value is an offset into the table, which happens to be what
-		// `base + i*4` lands on because the table's own base is sym2.
-		diff := int32(target - sym2)
+		// `base + i*4` lands on because the table's own base is sym2. The addend
+		// is the target label's offset within sym, folded in here because a COFF
+		// REL32 carries it in the field rather than in the relocation record.
+		diff := int32(target + f.Addend - sym2)
 		for i := 0; i < size; i++ {
 			s.Data[f.Off+i] = byte(diff >> (8 * i))
 		}
@@ -348,13 +350,13 @@ const armImm16Mask = 0x000f0fff
 
 // armImm16 reads the split imm16 field of a MOVW/MOVT instruction.
 func armImm16(w uint32) uint32 {
-	return ((w >> 16) & 0xf) << 12 | (w & 0xfff)
+	return ((w>>16)&0xf)<<12 | (w & 0xfff)
 }
 
 // armEncodeImm16 places a 16-bit immediate into the split MOVW/MOVT field,
 // leaving the destination register (bits 15:12) untouched.
 func armEncodeImm16(v uint32) uint32 {
-	return ((v >> 12) & 0xf) << 16 | (v & 0xfff)
+	return ((v>>12)&0xf)<<16 | (v & 0xfff)
 }
 
 // armRotImm decodes an ARM "modified immediate" held in the low 12 bits of an

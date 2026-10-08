@@ -136,9 +136,50 @@ type refptrLoc struct {
 	off  int
 }
 
+// isSectionSymbol reports whether s is a COFF section symbol -- the entry a
+// compiler writes per section, named after the section itself and filed in it.
+// A section symbol is how an object references a section's base address: a
+// `lea` that loads a jump table's base relocates against it.
+//
+// The test is name equality with the symbol's own section, because that is the
+// only thing distinguishing a section symbol from an ordinary static (both are
+// IMAGE_SYM_CLASS_STATIC and both carry a section number). A section's
+// definition symbol and its header always carry the same name -- both decode
+// through the same string-table form -- so the comparison holds for the long
+// "/N" names too.
+func (o *coffObj) isSectionSymbol(s coffSym) bool {
+	if s.secNum <= 0 || int(s.secNum) > len(o.secs) {
+		return false
+	}
+	return s.name == o.secs[s.secNum-1].name
+}
+
+// secBaseKey is the image symbol key under which a section symbol is
+// registered: unique per object and per section. The plain section name cannot
+// serve as the key because an object may hold many sections of one name --
+// dozens of `.rdata` fragments in a module of any size -- and registering each
+// under ".rdata" has the last one overwrite the rest. Every reference then
+// resolves to whichever fragment was merged last, which is how a jump-table
+// `lea` came to load the address of an unrelated constant section and the
+// program jumped through a table that was not a table. Keying on the object
+// sequence and section number gives every section its own entry, and the
+// relocation pass names the same key for a section-symbol reference, so each
+// resolves to the base of the section it actually named.
+func secBaseKey(seq, si int) string {
+	return fmt.Sprintf("__secbase_%d_%d", seq, si)
+}
+
 // ingestParsedCOFF does the merge for an already-parsed object; src is the raw
 // file, needed because relocations are read from it.
 func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
+	// seq numbers this object within the link. Every synthetic symbol the
+	// merge registers (jump-table bases, section bases) is keyed with it:
+	// each object numbers its own sections from one, so a key of the section
+	// number alone would have the second object's registration overwrite the
+	// first's while the first object's fixups still point at the old name.
+	seq := img.coffObjSeq
+	img.coffObjSeq++
+
 	// LLVM emits a call to the C runtime's __main module initialiser at the top
 	// of every function whose module has global constructors. goc does its own
 	// start-up and never calls it, but the reference still has to resolve -- and
@@ -322,6 +363,15 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 		if want == 0 {
 			want = 8
 		}
+		// The object may declare a stricter alignment than the per-name
+		// default -- a .rdata fragment holding an xmm constant declares 16.
+		// Ignoring it parks the constant at 8 mod 16 once earlier fragments
+		// of odd size precede it, and the movapd that loads it then faults on
+		// the alignment check at run time: a valid instruction, a page of
+		// correctly linked data, and a crash that points at neither.
+		if cs.align > want {
+			want = cs.align
+		}
 		if pad := align(gs.VSize, want) - gs.VSize; pad > 0 {
 			padSection(gs, pad)
 		}
@@ -485,6 +535,18 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 			continue
 		}
 		si := int(s.secNum)
+		// A section symbol is registered under its unique section key rather
+		// than its name, which every same-named section of the object shares.
+		// The relocation pass names the same key for a section-symbol
+		// reference, so a `lea` against section 55's `.rdata` resolves to
+		// section 55 and not to whichever `.rdata` was merged last. A section
+		// that received no image bytes (.rsrc) has no address to register.
+		if o.isSectionSymbol(s) {
+			if sectOf[si] >= 0 {
+				img.Syms[secBaseKey(seq, si)] = SymLoc{Sect: sectOf[si], Off: baseOf[si] + int(s.value)}
+			}
+			continue
+		}
 		// A symbol filed in .rsrc has no address in the finished image: the
 		// resource tree is rebuilt from the parsed leaves, so the offsets the
 		// object recorded for its own internal labels are gone. windres does not
@@ -565,6 +627,113 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 		}
 	}
 
+	// --- jump-table base symbols ---
+	// A COFF jump table is a run of REL32 entries, each pointing into .text,
+	// laid out contiguously inside a read-only section. At run time the code
+	// loads the table's base with a `lea`, reads entry[i], adds it to the base,
+	// and jumps there -- so each entry must store (target_label - table_base), a
+	// label difference, and not the usual "distance from the byte after the
+	// field". COFF has no relocation that expresses the subtraction, so we name
+	// the specific table's base as the entry's Sym2 and applyFixup performs the
+	// subtraction.
+	//
+	// LLVM may merge several tables into one .rdata section, so the whole
+	// section's start is the base of the first table only. We recover each
+	// table's true base from the `lea` that loads it: a REL32 in .text to this
+	// section whose stored addend is the table's offset within the section. We
+	// keep only those addends that are also the offset of an actual table entry
+	// (filtering out string-constant loads, whose offset is never an entry
+	// start), then for every entry pick the greatest base that does not lie past
+	// it.
+	jtEntries := map[int]map[int]bool{} // section si -> set of entry offsets
+	jtLeas := map[int]map[int]bool{}    // section si -> set of candidate base addends
+	for i, cs := range o.secs {
+		si := i + 1
+		if cs.relCount == 0 {
+			continue
+		}
+		for r := 0; r < cs.relCount; r++ {
+			rec := cs.relOff + 10*r
+			if rec+10 > len(src) {
+				continue
+			}
+			off := rd32(src, rec)
+			symIdx := rd32(src, rec+4)
+			typ := rd16(src, rec+8)
+			if typ != relAMD64Rel32 {
+				continue
+			}
+			sym, err := o.symbolAt(int(symIdx))
+			if err != nil {
+				continue
+			}
+			if sym.name == ".text" {
+				// A jump-table entry: a REL32 inside a (read-only) section that
+				// points at the .text section symbol. Its offset within the
+				// section is a candidate entry start.
+				if cs.name != ".text" {
+					if jtEntries[si] == nil {
+						jtEntries[si] = map[int]bool{}
+					}
+					jtEntries[si][off] = true
+				}
+			} else if cs.name == ".text" && sym.secNum > 0 && int(sym.secNum) != si {
+				// A `lea` in .text that loads a base from another section: the
+				// addend is that base's offset within the target section.
+				tgt := int(sym.secNum)
+				if jtLeas[tgt] == nil {
+					jtLeas[tgt] = map[int]bool{}
+				}
+				addend := 0
+				if off+4 <= len(cs.data) {
+					addend = rd32(cs.data, off)
+				}
+				jtLeas[tgt][addend] = true
+			}
+		}
+	}
+	// For every read-only section that holds table entries, register one base
+	// symbol per table and remember the ordered base offsets.
+	jtBases := map[int][]int{} // section si -> sorted base offsets
+	for si, entries := range jtEntries {
+		bases := map[int]bool{}
+		// A lea base is real if its addend is also an entry start; that filters
+		// out string-constant loads.
+		if leas, ok := jtLeas[si]; ok {
+			for b := range leas {
+				if entries[b] {
+					bases[b] = true
+				}
+			}
+		}
+		// Defensive fallback: if no lea matched (should not happen), derive
+		// bases from contiguous entry runs (a gap > 4 bytes starts a new table).
+		if len(bases) == 0 {
+			offs := make([]int, 0, len(entries))
+			for o := range entries {
+				offs = append(offs, o)
+			}
+			sort.Ints(offs)
+			prev := -1
+			for _, o := range offs {
+				if prev < 0 || o-prev > 4 {
+					bases[o] = true
+				}
+				prev = o
+			}
+		}
+		bs := make([]int, 0, len(bases))
+		for b := range bases {
+			bs = append(bs, b)
+		}
+		sort.Ints(bs)
+		for k, b := range bs {
+			name := fmt.Sprintf("__jtbase_%d_%d_%d", seq, si, k)
+			img.Syms[name] = SymLoc{Sect: sectOf[si], Off: baseOf[si] + b}
+		}
+		jtBases[si] = bs
+	}
+
 	// --- relocations ---
 	for i, cs := range o.secs {
 		if cs.relCount == 0 {
@@ -611,6 +780,12 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 			// only references them. Checking the symbol table first is what
 			// keeps a global from turning into a load from an import slot.
 			key := sym.name
+			// A reference to a section symbol resolves through the same unique
+			// key the symbol pass registered it under -- never through the
+			// bare section name, which dozens of same-named sections share.
+			if o.isSectionSymbol(sym) {
+				key = secBaseKey(seq, int(sym.secNum))
+			}
 			if sym.secNum == 0 {
 				switch {
 				case sym.name == "__main":
@@ -682,9 +857,51 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 					}
 				}
 				addend := rd32(cs.data, off)
-				img.Fixups = append(img.Fixups, Fixup{
+				fixup := Fixup{
 					Sect: sectOf[si], Off: at, Sym: key, Addend: addend,
-				})
+				}
+				// A REL32 from a read-only/data section to the .text section symbol
+				// is a jump-table entry. The hardware reads entry[i] and adds it to
+				// the table's own base to reach the target label, so the stored
+				// value must be (target_label - table_base) -- a label difference --
+				// not the usual "distance from the byte after the field". COFF has
+				// no relocation for the subtraction, so we name the specific table's
+				// base (an __jtbase_<seq>_<si>_<k> symbol computed above) as Sym2
+				// and applyFixup does the subtraction. A call or jmp inside .text
+				// references .text the same way but lives in .text, where the plain
+				// rel32 form is the correct one.
+				//
+				// The addend LLVM stores in the entry is not the bare label offset.
+				// It is pre-adjusted by the entry's own position -- A = Lo + E + 4
+				// - base, where Lo is the label offset within .text, E this entry's
+				// offset within the section, and base the table's offset -- so that
+				// a plain REL32 application (field = S + A - P, P the address after
+				// the field) yields exactly the runtime value target - table_base
+				// wherever the two sections land. Verified on a real object: for
+				// all 107 entries, A - E - 4 + base lands on an instruction
+				// boundary, while A alone does not (it points mid-instruction and
+				// the program faults on the dispatch itself). Since the Sym2 form
+				// subtracts the table base itself, the position adjustment has to
+				// come back out of the addend or every entry drifts by its own
+				// distance from the table start -- 4 bytes per entry index, small
+				// negative values that look plausible in a dump and crash on jump.
+				if sym.name == ".text" && cs.name != ".text" {
+					if bases := jtBases[si]; len(bases) > 0 {
+						// Choose the greatest table base that does not lie past
+						// this entry's offset within the section.
+						k := 0
+						for j, b := range bases {
+							if b <= off {
+								k = j
+							} else {
+								break
+							}
+						}
+						fixup.Sym2 = fmt.Sprintf("__jtbase_%d_%d_%d", seq, si, k)
+						fixup.Addend = addend - (off + 4 - bases[k])
+					}
+				}
+				img.Fixups = append(img.Fixups, fixup)
 			case relAMD64Addr32NB:
 				// A relocation against a *section* symbol is how the Win64 unwind
 				// tables address code: the symbol names the section and the
