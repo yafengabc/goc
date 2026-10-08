@@ -737,6 +737,10 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			w := (n.BigBits + 63) / 64
 			return &Type{Kind: KBitInt, Bits: n.BigBits, Size: w * 8, Signed: n.BigSigned}
 		}
+		// An l/L-suffixed constant is still typed double until the back ends
+		// can emit fp128 (#47/#48) -- see the matching note in the parser.
+		// When that lands this branch goes back in, before the TDouble test:
+		//   if n.IsLongDouble { return LongDoubleType() }
 		if n.Kind == TDouble {
 			if n.IsFloat {
 				return FloatType()
@@ -1034,6 +1038,14 @@ func (c *checker) binaryResultType(op string, lt, rt *Type) *Type {
 			}
 			if op == "%" {
 				c.errf(0, "operator '%%' requires integer operands, got %s and %s", lt, rt)
+			}
+			// The usual arithmetic conversions rank the floating types:
+			// long double > double > float. (Only the storage footprint and
+			// the soft-float helpers differ -- every one of them is a real
+			// floating type, so the ordering is the only thing to get right
+			// here.)
+			if lt.Kind == KLongDouble || rt.Kind == KLongDouble {
+				return LongDoubleType()
 			}
 			if lt.Kind == KDouble || rt.Kind == KDouble {
 				return DoubleType()

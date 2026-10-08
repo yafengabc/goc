@@ -679,6 +679,15 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		case "long":
 			width = 8
 		case "double":
+			// NOTE: "long double" deliberately still lands on plain double:
+			// the parser lets "double" win over the "long" that preceded it.
+			// The long double type (KLongDouble, binary128) exists in the
+			// type system and frontend/fp128.go encodes its constants
+			// exactly, but neither back end can emit fp128 yet, and test_c89
+			// -- which uses long double -- is compiled as double today.
+			// Activating it is #47 (gocl) and #48 (goc): track a longSeen
+			// flag on the "long" case above and return LongDoubleType() here
+			// when it is set.
 			fp = DoubleType()
 		case "float":
 			fp = FloatType()
@@ -2786,7 +2795,12 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	case t.Kind == TNum:
 		p.next()
 		if t.IsDbl {
-			return &NumLit{Kind: TDouble, Fval: t.Fval, IsFloat: t.IsFloat}, nil
+			// An l/L-suffixed constant keeps the TDouble slot for now (see
+			// the "long double" note above): the token carries the exact
+			// binary128 encoding in t.F128, ready for when the back ends can
+			// emit it, but codegen still sees a double.
+			return &NumLit{Kind: TDouble, Fval: t.Fval, IsFloat: t.IsFloat,
+				IsLongDouble: t.IsLongDouble, F128: t.F128}, nil
 		}
 		if t.BigWords != nil {
 			var lo int64

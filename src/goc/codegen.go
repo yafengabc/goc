@@ -3328,6 +3328,10 @@ func newCGFor(prog *frontend.Program, linux bool, opt int) *CG {
 // What comes out is still a complete program: the entry stub, the globals, and
 // every library function the IR side did not claim.
 func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs map[string]bool) (string, error) {
+	// long double still arrives here as plain double (see the note in the
+	// parser's "double" specifier case). Once #48 gives this back end fp128
+	// codegen, a long double that reaches here un-lowered is a bug, not
+	// something to fall back on.
 	return genOpts(prog, genConfig{linux: linux, opt: opt, winGUI: winGUI, skipFuncs: skipFuncs})
 }
 

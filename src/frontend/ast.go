@@ -12,6 +12,11 @@ type CType int
 const (
 	TInt CType = iota
 	TDouble
+	// TF128 is long double: IEEE binary128, 16 bytes. It is neither of the
+	// two 8-byte slots above -- codegen carries it as a 16-byte aggregate
+	// (goc) or as LLVM's fp128 (gocl), and every arithmetic operation on it
+	// lowers to a soft-float helper. See frontend/fp128.go.
+	TF128
 )
 
 type Program struct {
@@ -214,6 +219,11 @@ type NumLit struct {
 	Kind    CType
 	Fval    float64
 	IsFloat bool // a "1.5f" literal: type float rather than double
+	// A "1.5L" literal: type long double (binary128). F128 holds the exact
+	// 128-bit encoding; Fval is left at the float64 rounding for diagnostics
+	// and is never what codegen materialises.
+	IsLongDouble bool
+	F128         Float128
 	Unsig   bool // u/U suffix: the constant's type is unsigned
 	Long    bool // l/L suffix: the constant is at least 64 bits wide
 	Wide    bool // L'x' wide character literal: type is wchar_t, not int
