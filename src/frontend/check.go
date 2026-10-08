@@ -833,8 +833,16 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			// pointer is initialised ("fp = &add"). The designator is not an
 			// lvalue, so it must be resolved before the lvalue check.
 			if id, ok := n.E.(*Ident); ok {
-				if ft := c.funcTypeByName(id.Name); ft != nil {
-					return PtrType(ft)
+				// A local variable hides a same-named function: C block
+				// scoping hides file-scope names, and function names are
+				// file-scope. Without this guard `&exp` on a local `int exp`
+				// resolved to math.h's exp() and came out as double(double)*
+				// -- the variable was readable and writable, and only taking
+				// its address went to the function.
+				if c.lookup(id.Name) == nil {
+					if ft := c.funcTypeByName(id.Name); ft != nil {
+						return PtrType(ft)
+					}
 				}
 				if t := c.lookup(id.Name); t != nil && t.IsArray() {
 					// &array yields a pointer to the whole array
