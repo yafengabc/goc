@@ -408,6 +408,9 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	signed := true
 	width := 0
 	var fp *Type // set when a floating-point specifier (float/double) is seen
+	// "long double" is one type, so the "long" has to be remembered until the
+	// "double" arrives.
+	longSeen := false
 	isVoid := false
 	isBool := false
 	isConst := false // a "const" qualifier appeared anywhere in the list
@@ -678,17 +681,17 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 			}
 		case "long":
 			width = 8
+			longSeen = true
 		case "double":
-			// NOTE: "long double" deliberately still lands on plain double:
-			// the parser lets "double" win over the "long" that preceded it.
-			// The long double type (KLongDouble, binary128) exists in the
-			// type system and frontend/fp128.go encodes its constants
-			// exactly, but neither back end can emit fp128 yet, and test_c89
-			// -- which uses long double -- is compiled as double today.
-			// Activating it is #47 (gocl) and #48 (goc): track a longSeen
-			// flag on the "long" case above and return LongDoubleType() here
-			// when it is set.
-			fp = DoubleType()
+			// "long double" is one type, not a long followed by a double, so
+			// the "long" has to be remembered until the "double" arrives.
+			// (With EnableLongDouble off -- see it in fp128.go -- the double
+			// still wins, which is the fold to double that predates fp128.)
+			if longSeen && EnableLongDouble {
+				fp = LongDoubleType()
+			} else {
+				fp = DoubleType()
+			}
 		case "float":
 			fp = FloatType()
 		case "unsigned":
@@ -2795,10 +2798,13 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	case t.Kind == TNum:
 		p.next()
 		if t.IsDbl {
-			// An l/L-suffixed constant keeps the TDouble slot for now (see
-			// the "long double" note above): the token carries the exact
-			// binary128 encoding in t.F128, ready for when the back ends can
-			// emit it, but codegen still sees a double.
+			if t.IsLongDouble && EnableLongDouble {
+				// A long double constant carries its binary128 encoding, not
+				// the float64 rounding: 113 bits of mantissa survive here and
+				// would be lost by going through Fval.
+				return &NumLit{Kind: TF128, Fval: t.Fval, IsLongDouble: true,
+					F128: t.F128}, nil
+			}
 			return &NumLit{Kind: TDouble, Fval: t.Fval, IsFloat: t.IsFloat,
 				IsLongDouble: t.IsLongDouble, F128: t.F128}, nil
 		}

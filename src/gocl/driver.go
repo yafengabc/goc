@@ -112,6 +112,10 @@ func Compile(cfg *Config) (string, error) {
 	if cfg.PreprocessOnly {
 		return "", preprocessOnly(cfg)
 	}
+	// This back end is the one that can emit fp128, so it is the one that
+	// asks the front end for the real long double. The switch is scaffolding
+	// for #48 -- see frontend.EnableLongDouble.
+	frontend.EnableLongDouble = true
 	prog, err := common.Translate(cfg.Inputs, cfg.Defines, cfg.Linux, cfg.IncDirs...)
 	if err != nil {
 		return "", err

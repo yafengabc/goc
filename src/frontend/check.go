@@ -737,10 +737,14 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			w := (n.BigBits + 63) / 64
 			return &Type{Kind: KBitInt, Bits: n.BigBits, Size: w * 8, Signed: n.BigSigned}
 		}
-		// An l/L-suffixed constant is still typed double until the back ends
-		// can emit fp128 (#47/#48) -- see the matching note in the parser.
-		// When that lands this branch goes back in, before the TDouble test:
-		//   if n.IsLongDouble { return LongDoubleType() }
+		// A long double constant is its own class (16-byte binary128), not
+		// the TDouble slot, so it has to be recognised before the double test
+		// -- otherwise typeof(1.0L) and _Generic(1.0L, long double: ...) both
+		// fall through to the integer/default branch. (EnableLongDouble is the
+		// #47/#48 scaffolding described in fp128.go.)
+		if n.IsLongDouble && EnableLongDouble {
+			return LongDoubleType()
+		}
 		if n.Kind == TDouble {
 			if n.IsFloat {
 				return FloatType()

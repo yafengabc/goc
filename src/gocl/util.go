@@ -63,6 +63,26 @@ func (e *irEmitter) convert(op string, from, to *frontend.Type) string {
 	if to != nil && to.Kind == frontend.KArr {
 		to = frontend.PtrType(to.Elem)
 	}
+	// long double is a runtime conversion in both directions, and it has to be
+	// recognised before the float/integer test below: isFloatTy is false for
+	// it (only float and double are), so "long double -> double" would read as
+	// "integer -> float" and reach convertTo, where the i128 source counts as
+	// an integer and gets truncated instead of converted.
+	if isLongDouble(from) || isLongDouble(to) {
+		if isLongDouble(from) && isLongDouble(to) {
+			return op
+		}
+		if isLongDouble(from) {
+			// The target's C signedness decides which runtime entry point
+			// handles the conversion: goc_tf_to_ull saturates an out-of-range
+			// value at ULLONG_MAX, while goc_tf_to_ll stops at LLONG_MAX. A
+			// long double -> unsigned long long that forgets the unsigned flag
+			// takes the signed path and hands back 0x7fff... instead of
+			// 0xffff..., so the signedness must ride along from here.
+			return e.tfFromLDTo(op, e.ty(to), to != nil && !to.Signed)
+		}
+		return e.tfToLD(op, from)
+	}
 	// Integer <-> floating point is a value conversion, not a reinterpretation,
 	// and it has to be done here rather than in convertTo because the signedness
 	// of the target is a C fact that the target's IR spelling ("i32") does not

@@ -57,6 +57,10 @@
  * a positive quiet NaN and an infinity, matching what the hardware produces. */
 #define TF_NAN_HI 0x7FFF800000000000ull
 #define TF_NAN_LO 0x0000000000000000ull
+/* Arithmetic that yields a NaN (0/0, inf/inf, inf - inf, 0 * inf) takes a
+ * negative-sign quiet NaN, the way libgcc's __*tf3 do; an explicit NaN literal
+ * keeps its own sign. TF_NAN_HI_NEG is that negative-sign spelling. */
+#define TF_NAN_HI_NEG 0xFFFF800000000000ull
 #define TF_INF_HI 0x7FFF000000000000ull
 
 /* Not an enum: goc has no enum constants (an `enum { A = 1 }` leaves A
@@ -302,7 +306,7 @@ static goc_tf128 tf_addsub(goc_tf128 a, goc_tf128 b, int subtract) {
     if (vb.cls == TF_NAN) { r.hi = b.hi | TF_QUIET; r.lo = b.lo; return r; }
     if (va.cls == TF_INF) {
         if (vb.cls == TF_INF && va.sign != vb.sign) { /* inf + -inf */
-            r.hi = TF_NAN_HI; r.lo = TF_NAN_LO; return r;
+            r.hi = TF_NAN_HI_NEG; r.lo = TF_NAN_LO; return r;
         }
         r.hi = (va.sign ? TF_SIGN : 0ull) | TF_INF_HI; r.lo = 0ull; return r;
     }
@@ -375,7 +379,7 @@ goc_tf128 goc_tf_mul(goc_tf128 a, goc_tf128 b) {
     if (vb.cls == TF_NAN) { r.hi = b.hi | TF_QUIET; r.lo = b.lo; return r; }
     if ((va.cls == TF_INF && vb.cls == TF_ZERO) ||
         (va.cls == TF_ZERO && vb.cls == TF_INF)) {
-        r.hi = TF_NAN_HI; r.lo = TF_NAN_LO; return r;
+        r.hi = TF_NAN_HI_NEG; r.lo = TF_NAN_LO; return r;
     }
     if (va.cls == TF_INF || vb.cls == TF_INF) {
         r.hi = ((va.sign ^ vb.sign) ? TF_SIGN : 0ull) | TF_INF_HI; r.lo = 0ull; return r;
@@ -441,7 +445,7 @@ goc_tf128 goc_tf_div(goc_tf128 a, goc_tf128 b) {
     tf_unpack(b.hi, b.lo, &vb);
     if (va.cls == TF_NAN) { r.hi = a.hi | TF_QUIET; r.lo = a.lo; return r; }
     if (vb.cls == TF_NAN) { r.hi = b.hi | TF_QUIET; r.lo = b.lo; return r; }
-    if (va.cls == TF_INF && vb.cls == TF_INF) { r.hi = TF_NAN_HI; r.lo = TF_NAN_LO; return r; }
+    if (va.cls == TF_INF && vb.cls == TF_INF) { r.hi = TF_NAN_HI_NEG; r.lo = TF_NAN_LO; return r; }
     if (va.cls == TF_INF) {
         r.hi = ((va.sign ^ vb.sign) ? TF_SIGN : 0ull) | TF_INF_HI; r.lo = 0ull; return r;
     }
@@ -449,7 +453,7 @@ goc_tf128 goc_tf_div(goc_tf128 a, goc_tf128 b) {
         r.hi = ((va.sign ^ vb.sign) ? TF_SIGN : 0ull); r.lo = 0ull; return r;
     }
     if (vb.cls == TF_ZERO) {
-        if (va.cls == TF_ZERO) { r.hi = TF_NAN_HI; r.lo = TF_NAN_LO; return r; }
+        if (va.cls == TF_ZERO) { r.hi = TF_NAN_HI_NEG; r.lo = TF_NAN_LO; return r; }
         r.hi = ((va.sign ^ vb.sign) ? TF_SIGN : 0ull) | TF_INF_HI; r.lo = 0ull; return r;
     }
     if (va.cls == TF_ZERO) {
@@ -552,7 +556,14 @@ goc_tf128 goc_tf_from_double(unsigned long long bits) {
         if (tf_is_zero64(frac)) {
             r.hi = (sign ? TF_SIGN : 0ull) | TF_INF_HI;
         } else {
-            r.hi = TF_NAN_HI; /* the payload does not survive the widening */
+            /* gcc widens a double NaN like libgcc's __extenddftf2: the 52-bit
+             * fraction is copied to the top of the 112-bit significand and the
+             * quiet bit is forced. f<<60 lands bits 111..60; hi48 is f>>4. */
+            unsigned long long f = frac;
+            unsigned long long fhi = (f >> 4) | 0x800000000000ull;
+            r.hi = ((unsigned long long)sign << 63) | (0x7FFFULL << 48) | fhi;
+            r.lo = (f << 60) & 0xFFFFFFFFFFFFFFFFull;
+            return r;
         }
         r.lo = 0ull;
         return r;
@@ -584,7 +595,14 @@ goc_tf128 goc_tf_from_float(unsigned int bits) {
         if (tf_is_zero64(frac)) {
             r.hi = (sign ? TF_SIGN : 0ull) | TF_INF_HI;
         } else {
-            r.hi = TF_NAN_HI;
+            /* gcc widens a float NaN like libgcc's __extendsftf2: the 23-bit
+             * fraction is copied to the top of the 112-bit significand and the
+             * quiet bit is forced. f<<89 sits entirely above bit 64. */
+            unsigned long long f = frac;
+            unsigned long long fhi = (f << 25) | 0x800000000000ull;
+            r.hi = ((unsigned long long)sign << 63) | (0x7FFFULL << 48) | fhi;
+            r.lo = 0ull;
+            return r;
         }
         r.lo = 0ull;
         return r;
@@ -612,7 +630,14 @@ unsigned long long goc_tf_to_double(goc_tf128 a) {
 
     tf_unpack(a.hi, a.lo, &v);
     sign = v.sign;
-    if (v.cls == TF_NAN) return 0x7FF8000000000000ull; /* the payload is lost */
+    if (v.cls == TF_NAN) {
+        /* gcc narrows a binary128 NaN like libgcc's __trunctfdf2: the top 52
+         * fraction bits are copied and the quiet bit is forced (so a signalling
+         * source becomes a quiet result). */
+        unsigned long long fr = ((a.hi & 0xFFFFFFFFFFFFull) << 4) | (a.lo >> 60);
+        fr |= 0x8000000000000ull;
+        return ((unsigned long long)sign << 63) | (0x7FFull << 52) | fr;
+    }
     if (v.cls == TF_INF) return ((unsigned long long)sign << 63) | 0x7FF0000000000000ull;
     if (v.cls == TF_ZERO) return (unsigned long long)sign << 63;
     exp = v.exp;
@@ -647,7 +672,13 @@ unsigned int goc_tf_to_float(goc_tf128 a) {
 
     tf_unpack(a.hi, a.lo, &v);
     sign = v.sign;
-    if (v.cls == TF_NAN) return 0x7FC00000u;
+    if (v.cls == TF_NAN) {
+        /* gcc narrows a binary128 NaN like libgcc's __trunctfsf2: the top 23
+         * fraction bits are copied and the quiet bit is forced. */
+        unsigned int fr = (unsigned int)((a.hi & 0xFFFFFFFFFFFFull) >> 25);
+        fr |= 0x400000u;
+        return ((unsigned int)sign << 31) | (0xFFu << 23) | fr;
+    }
     if (v.cls == TF_INF) return ((unsigned int)sign << 31) | 0x7F800000u;
     if (v.cls == TF_ZERO) return (unsigned int)sign << 31;
     exp = v.exp;
@@ -692,7 +723,11 @@ long long goc_tf_to_ll(goc_tf128 a) {
     tf_val v;
     unsigned long long mag;
     tf_unpack(a.hi, a.lo, &v);
-    if (v.cls == TF_NAN) return 0;
+    if (v.cls == TF_NAN)
+        /* gcc saturates a NaN to the range bound with the sign kept, exactly
+         * like it does for an infinity. */
+        return v.sign ? (long long)0x8000000000000000ull
+                      : (long long)0x7FFFFFFFFFFFFFFFull;
     /* Out-of-range and NaN are undefined in C; saturating is the choice here
      * and it is the same choice in both directions, which is what matters --
      * a program that relies on it is relying on nothing the standard promises. */
@@ -716,7 +751,7 @@ unsigned long long goc_tf_to_ull(goc_tf128 a) {
     tf_val v;
     unsigned long long mag;
     tf_unpack(a.hi, a.lo, &v);
-    if (v.cls == TF_NAN) return 0ull;
+    if (v.cls == TF_NAN) return v.sign ? 0ull : 0xFFFFFFFFFFFFFFFFull; /* saturate, as gcc */
     if (v.cls == TF_ZERO) return 0ull;
     if (v.sign) return 0ull; /* negative to unsigned: saturate at 0 */
     if (v.cls == TF_INF) return 0xFFFFFFFFFFFFFFFFull;

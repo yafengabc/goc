@@ -378,6 +378,12 @@ func (m *irMod) llirType(t *frontend.Type) string {
 		return "float"
 	case frontend.KDouble:
 		return "double"
+	case frontend.KLongDouble:
+		// A long double is carried as 128 raw bits: see tfIRType in fp128.go.
+		// It is not LLVM's fp128, which would have LLVM legalise every
+		// operation into a libgcc-named helper this runtime does not provide.
+		m.tfPairDecl()
+		return tfIRType
 	case frontend.KPtr, frontend.KFunc:
 		return "ptr"
 	case frontend.KArr:
@@ -810,6 +816,19 @@ func (e *irEmitter) convertTo(op string, from *frontend.Type, toIR string) strin
 	// against a pointer, which LLVM rejects.
 	if from != nil && from.Kind == frontend.KArr {
 		from = frontend.PtrType(from.Elem)
+	}
+	// Same interception as convert's: a long double's i128 reads as an integer
+	// to every branch below, so it has to be taken out before the integer
+	// width logic gets it and truncates the pattern instead of converting the
+	// value.
+	if isLongDouble(from) || toIR == tfIRType {
+		if isLongDouble(from) && toIR == tfIRType {
+			return op
+		}
+		if isLongDouble(from) {
+			return e.tfFromLD(op, toIR)
+		}
+		return e.tfToLD(op, from)
 	}
 	f := e.ty(from)
 	if f == toIR {

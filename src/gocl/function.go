@@ -27,6 +27,7 @@ type irEmitter struct {
 
 	fname string
 	retTy string // LLVM type of the return value
+	retType *frontend.Type // the C return type, for signedness-sensitive conversions (e.g. long double -> unsigned long long)
 	// paramNames is the parameter list of the function being written. A va_list
 	// is a char*, so `va_arg(ap, T)` needs the va_list itself when `ap` arrived
 	// as a parameter -- it is already the pointer -- and the address of the
@@ -139,6 +140,7 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 		tr:         tr,
 		fname:      f.Name,
 		retTy:      m.llirType(f.Ret),
+		retType:    f.Ret,
 		slots:      map[int]string{},
 		userLabels: map[string]string{},
 	}

@@ -173,6 +173,12 @@ func (tr *typeResolver) exprType(e frontend.Expr) *frontend.Type {
 		if n.BigWords != nil {
 			return &frontend.Type{Kind: frontend.KBitInt, Bits: n.BigBits, Signed: n.BigSigned}
 		}
+		if n.Kind == frontend.TF128 {
+			// A long double literal is binary128; an exprType of int would
+			// send "1.0L / 3.0L" down the integer sdiv path, where the
+			// operands are the literal's raw bit patterns read as decimals.
+			return frontend.LongDoubleType()
+		}
 		if n.Kind == frontend.TDouble {
 			if n.IsFloat {
 				return frontend.FloatType()

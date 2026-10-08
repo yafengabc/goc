@@ -558,6 +558,12 @@ func (e *irEmitter) cond(x frontend.Expr) string {
 		e.line("%s = fcmp une %s %s, 0.0", t, ty, v.op)
 		return t
 	}
+	// A long double condition is a runtime comparison against zero. Truncating
+	// it to an integer first would make 1e-4000 -- whose integer conversion is
+	// 0 -- a false condition, and C says only a zero is false.
+	if v.ty != nil && v.ty.Kind == frontend.KLongDouble {
+		return e.tfTruth(v.op)
+	}
 	t := e.newTmp()
 	if ty == "ptr" {
 		// A pointer condition is "non-null"; compare against the null pointer
@@ -600,6 +606,13 @@ func (e *irEmitter) numLit(n *frontend.NumLit) val {
 	// INFINITY macros -- look like an integer, so a division of them was
 	// emitted as "sdiv i32 0, 0" and the surrounding double arithmetic lost its
 	// type.
+	if n.Kind == frontend.TF128 {
+		// A long double literal is written as its full 128-bit pattern. There
+		// is no fp128 constant spelling to reach for and no float64 in the
+		// path: n.F128 is the encoding the lexer produced from the exact
+		// decimal, and losing it to a double would lose 60 bits of mantissa.
+		return val{op: tfConst(n.F128.Hi, n.F128.Lo), ty: frontend.LongDoubleType()}
+	}
 	if n.Kind == frontend.TDouble {
 		// A float literal lives in an i32 on this path (the same choice the
 		// native generator makes), so it is written as a bit pattern.

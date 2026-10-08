@@ -140,7 +140,16 @@ func (e *irEmitter) doReturn(n *frontend.ReturnStmt) {
 	// "static type == return type" can hold while the value is still i1 and
 	// `ret i32 %v` is rejected.
 	if e.ty(v.ty) != e.retTy {
-		v.op = e.convertTo(v.op, v.ty, e.retTy)
+		// A long double return value reaching an integer return type must take
+		// the runtime entry point that matches the return type's signedness:
+		// "return (unsigned long long)ld;" saturates at ULLONG_MAX, not
+		// LLONG_MAX. convertTo cannot see that signedness (it only has the IR
+		// spelling), so route the long double -> int case here with retType.
+		if isLongDouble(v.ty) && e.retType != nil {
+			v.op = e.tfFromLDTo(v.op, e.retTy, e.retType != nil && !e.retType.Signed)
+		} else {
+			v.op = e.convertTo(v.op, v.ty, e.retTy)
+		}
 	}
 	e.term("ret %s %s", e.retTy, v.op)
 }

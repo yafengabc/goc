@@ -424,6 +424,15 @@ func llvmRoots(prog *frontend.Program, lib *common.Program, linux bool, arch str
 			}
 		})
 	}
+	// 1b. The binary128 runtime, which long double is lowered to calls into.
+	//     Those calls are created by the code generator, so no source-level
+	//     reference exists for the sweep above to find -- the same blind spot
+	//     the soft-float helpers have, and handled the same way.
+	if usesLongDouble(prog) {
+		for _, n := range tfRuntime {
+			need[n] = true
+		}
+	}
 	// 2. Entry-stub helpers. goa's own assembler still builds the entry stub,
 	//    and it calls into the runtime for argument parsing and process
 	//    termination; those names must exist in the LLVM object so the stub

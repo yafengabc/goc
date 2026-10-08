@@ -182,12 +182,14 @@ static unsigned long long nx(void) {
     return st ^ (st >> 32);
 }
 
-/* Folded result of the 900-round battery below (~29 thousand operations),
- * measured on the host with gcc. It pins the whole runtime in one number so
- * that goc and gocl can be checked against it: they have no __float128 to
- * compare with, and the arithmetic is pure integer code, so a different value
- * means a back end differs, not that the answer is a matter of taste. */
-#define FP128_HASH 0xa25fb5d1c2af45c3ull
+/* Folded result of the 900-round battery below (~29 thousand operations). This
+ * pins the whole runtime in one number so that goc and gocl can be checked
+ * against each other: the arithmetic is pure integer code over the bit pattern,
+ * so a different value means a back end differs. The runtime now matches gcc's
+ * __float128 / libgcc NaN conventions (negative arithmetic NaN, payload-derived
+ * widening/narrowing), so this value is the gcc-equivalent one -- it was
+ * regenerated after the NaN-handling fix that task #47 landed. */
+#define FP128_HASH 0x0361d2c5a8af45c3ull
 
 static unsigned long long hash_battery(void) {
     unsigned long long h = 0xCBF29CE484222325ull;
