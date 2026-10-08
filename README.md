@@ -298,20 +298,23 @@ goc 在启动时把整个库当普通 C 程序编译**两次**（每个目标一
 `putchar` 的程序不会背上 `printf` 的 512 字节输出缓冲。库全局变量（如 `rand_state`）
 同样按引用打标后发射。
 
-printf 的已知边界：
+printf/scanf 与默认 C 库的一致性（2026-10-08 起，以 ucrt gcc -std=c11 为对照基准，
+`tests/portability_cases/printfmt.c` 逐字节钉住）：
 
-- 支持 `%d %i %u %o %x %X %s %c %f %g %p %%`；长度修饰符 `l h L z j t` 被解析（所有变参
-  槽位都是 8 字节，所以解析掉即等价）。
-- **宽度一概忽略**：`%5d` 打 `42`、`%02x` 打 `7`，不会补空格或前导零 —— 这是与标准 C
-  明确的差异（代码里有意为之，见 `stdio.c` 里 vfmt 的注释）。
-- 精度只有 `%f` 与 `%g` 认：`%.6f` 默认 6 位，`%.0f` 到 `%.17f` 都行；`%g` 用同一套
-  定点转换后去掉小数部分的尾零（`2.500000`→`2.5`、`1.000000`→`1`）。注意这是
-  **简化版 `%g`**：C 的 `%g` 按有效数字计数并会切换科学计数法，这里按小数位计数
-  且没有指数形式。
-- 单次调用超过 512 字节会截断；`sprintf` 跟真货一样不做边界检查（缓冲区归调用方管）。
-- 没有 `%e %a %n`。
-- `scanf` / `sscanf` / `fscanf` / `vscanf` 家族已实现，支持 `%d %i %u %o %x %s %c %f %lf %g %%`
-  与 `l h z j t` 长度修饰符。浮点转换支持科学计数法（`sscanf("1e3", "%lf", &d)` 得 1000）。
+- **printf** 支持 `%d %i %u %o %x %X %c %s %f %e %g %a %p %n %%`（含大小写浮点
+  拼写与 `%ls`/`%lc`），旗标 `- + 0 # 空格`，宽度/精度含 `*`（负宽=左对齐、负精度=
+  省略）。整数精度（`%.5d`、`%.0d`+0 打空）、`%#x` 仅非零值加前缀、`%#o` 提升精度
+  强制前导 0、符号与前缀计入宽度（`%#08x` 恰 8 字符）、`%g` 舍入进位后重判风格
+  （`9.999999e5`→`1e+06`）等语义与 C99 一致。
+- **scanf**（`scanf`/`sscanf`/`fscanf`/`vscanf` 全家）支持 `%d %i %u %o %x %X %c %s
+  %[ %f %e %g %a %p %n %%`，长度修饰符 `hh h l z j t`（`hh` 真写 1 字节）。scanset
+  支持 `^` 取反、`a-z` 区间、`]` 字面成员，并按 C99 自动补终止 NUL。EOF 语义
+  （未赋值且输入耗尽返回 -1，匹配失败返回 0）、浮点 field 按 token 收集
+  （`"1e+x"` 整体失败且 field 已消费、`"1.5-3"` 是两项）、十六进制浮点均已对齐。
+- 与 ucrt 的两处**刻意差异**：NaN 不打符号位（ucrt 打 `-nan(ind)`，而符号位在
+  硬件 indefinite 与优化器折叠之间不可稳定观测）；`%n` 按标准写入（ucrt 安全
+  加固拒绝）。LP64（Linux）平台上 `long` 为 64 位属平台语义，非库差异。
+- 单次调用超过 512 字节会截断；`sprintf` 不做边界检查（缓冲区归调用方管）。
 - 文件 I/O 已实现：`FILE *`、`fopen`/`fopen_s`/`_wfopen`/`freopen`/`tmpfile`、
   `fread`/`fwrite`/`fgets`/`fputs`/`fgetc`/`fputc`/`ungetc`、
   `fseek`/`ftell`/`rewind`/`fflush`/`fclose`、`feof`/`ferror`/`clearerr`、
@@ -384,7 +387,8 @@ printf 的已知边界：
   `ar` 出来的报 `machine 0x3c21 is not AMD64`）
 - 资源只做到 PE 的 `.rsrc`：能从 `windres` 之类的 `.o` 读入、合并、写进 exe。
   不解析 `.rc` 源文件，不生成资源，也不做 ELF 侧（ELF 根本没有资源节）
-- `printf` 的 `%e` `%a` `%n` 没有；`%g` 是简化版（按小数位计数，不切科学计数法）
+- `%.20f` 起（超过 double 的 17 位有效数字）的十进制展开是近似值；精确展开要等
+  `long double`（fp128）的十进制转换机器
 - `math.h` 缺 `long double` 取整族（`lround`/`llround`）；`round`/`trunc` 有
 - `winsock2.h` 是 `socket.c` 的内部实现，用户应 include `<socket.h>`（POSIX 拼写）
 
