@@ -68,6 +68,28 @@ func (e *irEmitter) stmt(s frontend.Stmt) {
 	}
 }
 
+// vlaDecl lowers a C99 variable-length array declaration "T a[n];".
+//
+// The array's extent is a run-time value, so the object cannot be an alloca of
+// a fixed array type -- which is what a declaration whose size is known gets.
+// LLVM's alloca takes its element count as a VALUE ("alloca i32, i64 %n"),
+// which is exactly C's semantics, and it yields a plain element pointer. Every
+// other site -- decay, subscripting, pointer arithmetic -- already works in
+// terms of opaque pointers and a separately computed element size, so handing
+// them that pointer needs no change at all.
+//
+// The alloca is emitted where the declaration is, not in the entry block: the
+// length expression can only be evaluated here. A VLA inside a loop body
+// therefore allocates once per iteration, which is the same growth C accepts.
+func (e *irEmitter) vlaDecl(d *frontend.DeclStmt, ty *frontend.Type, uid int) {
+	e.tr.declUID[d] = uid
+	count := e.indexValue(ty.VLALen)
+	ety := e.ty(ty.Elem)
+	slot := e.newTmp()
+	e.line("%s = alloca %s, i64 %s, align %d", slot, ety, count, alignOfIr(ety))
+	e.slots[uid] = slot
+}
+
 // localDecl gives a local its stack slot and runs the initialiser.
 func (e *irEmitter) localDecl(d *frontend.DeclStmt) {
 	if d.Name == "" {
@@ -77,8 +99,15 @@ func (e *irEmitter) localDecl(d *frontend.DeclStmt) {
 	if ty == nil {
 		return
 	}
-	lty := e.ty(ty)
 	uid := e.tr.declareVar(d.Name, varInfo{ty: ty})
+	// A C99 variable-length array: its extent is not known until this
+	// declaration actually runs, so it cannot be the entry-block alloca of a
+	// fixed array type that an ordinary local gets.
+	if ty.HasVLA() {
+		e.vlaDecl(d, ty, uid)
+		return
+	}
+	lty := e.ty(ty)
 	slot := e.slotFor(uid, lty)
 	e.tr.declUID[d] = uid
 	if d.Init != nil {

@@ -36,6 +36,16 @@ type varInfo struct {
 	// consumption sites then skip the movsxd (T1.6 C4): the high 32 bits are
 	// meaningful pointer bits, not a materialized int's zero padding.
 	ptr bool
+	// vlaSize is the frame offset of the hidden slot holding a C99
+	// variable-length array's byte size, and 0 for every other variable.
+	//
+	// A VLA has no size until the declaration that created it has run, and the
+	// object itself is stored as a POINTER to a run-time stack allocation --
+	// so varInfo.typ is the decayed pointer type and every subscript, decay and
+	// pointer-arithmetic site works on it unchanged. What cannot work that way
+	// is sizeof: it is a run-time value here, and this slot is where the
+	// declaration parks it for sizeof to read back.
+	vlaSize int
 }
 
 type CG struct {
@@ -2131,6 +2141,37 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 		c.genLoadElem("r10", width, frontend.TInt, signed)
 		return c.resTyp, nil
 	case *frontend.SizeofExpr:
+		// sizeof on a variable-length array is NOT a constant: the size exists
+		// only once the declaration has run. Read it back from the hidden slot
+		// the allocation parked it in -- and, for a VLA *type* operand
+		// (sizeof(int[n])), evaluate the length now, which is the one case
+		// where C does evaluate sizeof's operand.
+		if off, ok := c.vlaSizeSlot(n.E); ok {
+			c.emit("mov rax, [rbp%+d]", off)
+			c.resTyp = frontend.TInt
+			c.resSigned = true
+			c.resW = 8
+			return frontend.TInt, nil
+		}
+		if n.Typ != nil && n.Typ.IsVLA() {
+			if _, err := c.genExprT(n.Typ.VLALen); err != nil {
+				return frontend.TInt, err
+			}
+			if err := c.ensureType(frontend.TInt); err != nil {
+				return frontend.TInt, err
+			}
+			if c.resW == 4 && c.resSigned {
+				c.emit("movsxd rax, eax")
+			}
+			if w := c.typeWidth(n.Typ.Elem); w != 1 {
+				c.emit("mov r10, %d", w)
+				c.emit("imul rax, r10")
+			}
+			c.resTyp = frontend.TInt
+			c.resSigned = true
+			c.resW = 8
+			return frontend.TInt, nil
+		}
 		var sz int
 		if n.Typ != nil {
 			sz = frontend.Sizeof(n.Typ)
@@ -5605,10 +5646,14 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 	}
 
 	// localDecl is one (name, type, uid) triple for a function-local variable.
+	// line is the declaration's source line, kept so the checks that can only
+	// run once the frame is laid out (a variable-length array's shape, say) can
+	// still report where the offending declaration is.
 	type localDecl struct {
 		name string
 		typ  *frontend.Type
 		uid  int
+		line int
 	}
 
 	// Gather every local declaration (including those inside nested blocks)
@@ -5675,7 +5720,7 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 				uid := c.varUID
 				c.varUID++
 				c.declUID[n] = uid
-				decls = append(decls, localDecl{n.Name, n.Typ, uid})
+				decls = append(decls, localDecl{name: n.Name, typ: n.Typ, uid: uid, line: n.Line})
 			}
 		case *frontend.IfStmt:
 			gather(n.Then, swDepth)
@@ -5919,6 +5964,32 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 		// requested alignment (no-op when none was specified, Align==0).
 		if a := d.typ.Align; a > 1 {
 			localBytes = (localBytes + a - 1) / a * a
+		}
+		if d.typ != nil && d.typ.HasVLA() {
+			// A C99 variable-length array. Its extent does not exist yet, so
+			// the elements cannot be laid out inside the frame: what lives
+			// here is a POINTER to a run-time allocation, plus a hidden slot
+			// holding the total byte size (sizeof reads it back, and the
+			// enclosing block's exit uses it to give the space back).
+			//
+			// Handing the rest of the compiler the decayed pointer type is what
+			// keeps this cheap: subscripting, decay in a value context and
+			// pointer arithmetic all stride by the element width, which is
+			// still a constant, so every one of those sites works unchanged.
+			if !d.typ.IsVLA() || d.typ.Elem.HasVLA() {
+				// "int a[3][n]" / "int a[n][m]": the element type is itself
+				// variable-length, so the stride of a[i] is a run-time value.
+				// Refuse instead of emitting a constant stride -- a wrong one
+				// is indistinguishable from memory corruption.
+				return fmt.Errorf("line %d: only a single variable-length dimension is supported (%s)", d.line, d.typ)
+			}
+			localBytes += 8 // the pointer to the run-time allocation
+			ptrOff := -(regArea + localBytes)
+			localBytes += 8 // hidden slot: total byte size, for sizeof and the block exit
+			sizeOff := -(regArea + localBytes)
+			c.varEnts[d.uid] = varInfo{off: ptrOff, typ: frontend.PtrType(d.typ.Elem),
+				addr: c.addrTaken[d.name], ptr: true, vlaSize: sizeOff}
+			continue
 		}
 		if d.typ != nil && d.typ.IsArray() {
 			ln := d.typ.Len
@@ -6232,6 +6303,128 @@ func (c *CG) emitFrameAlloc(n int) {
 	c.curFrame = n
 }
 
+// vlaSizeSlot returns the hidden frame slot holding the byte size of a
+// variable-length array, when e names one. Anything else -- including an
+// ordinary array, whose size is a constant -- reports false.
+func (c *CG) vlaSizeSlot(e frontend.Expr) (int, bool) {
+	id, ok := e.(*frontend.Ident)
+	if !ok {
+		return 0, false
+	}
+	vi, ok := c.lookupVar(id.Name)
+	if !ok || vi.vlaSize == 0 {
+		return 0, false
+	}
+	return vi.vlaSize, true
+}
+
+// genVLAAlloc emits the run-time allocation behind a C99 variable-length array
+// declaration "T a[n];". The length is part of the type, but it can only be
+// evaluated here, where the declaration actually executes: the frame was laid
+// out long before anything knew the value of n.
+//
+// The frame holds a pointer to the elements (see the HasVLA branch of the
+// layout pass). This takes the bytes off the stack, points that pointer at
+// them, and parks the byte count in the hidden size slot so that sizeof(a) --
+// a run-time value for a VLA -- can read it back.
+//
+// The space is not given back here. The epilogue restores rsp from rbp, which
+// covers every return path; the enclosing block's exit additionally releases it
+// (see releaseVLAs) so a loop body that declares a VLA does not grow the frame
+// once per iteration.
+func (c *CG) genVLAAlloc(n *frontend.DeclStmt, vi varInfo) error {
+	// C forbids an initialiser on a variable-length array (6.7.9p3): there is
+	// no way to know how many elements the braces would have to fill. Reject
+	// it rather than silently dropping the initialiser -- an uninitialised VLA
+	// that was supposed to be zeroed is a bug nobody can see.
+	if n.Init != nil {
+		return fmt.Errorf("line %d: a variable-length array cannot have an initialiser", n.Line)
+	}
+	if _, err := c.genExprT(n.Typ.VLALen); err != nil {
+		return err
+	}
+	if err := c.ensureType(frontend.TInt); err != nil {
+		return err
+	}
+	// The length is an int expression, but the byte count has to be 64-bit
+	// before it is multiplied or a long array would wrap in 32 bits.
+	if c.resW == 4 && c.resSigned {
+		c.emit("movsxd rax, eax")
+	}
+	w := c.typeWidth(n.Typ.Elem)
+	if w != 1 {
+		c.emit("mov r10, %d", w)
+		c.emit("imul rax, r10")
+	}
+	c.emit("mov [rbp%+d], rax", vi.vlaSize)
+	// Round up to 16 so the stack stays aligned for later calls: rsp is
+	// 16-aligned on entry and every allocation here keeps it that way.
+	// shr/shl rather than `and rax, -16` -- a negative immediate is not
+	// something the assembler is asked for anywhere else in this pipeline.
+	c.emit("add rax, 15")
+	c.emit("shr rax, 4")
+	c.emit("shl rax, 4")
+	if c.linux {
+		c.emit("sub rsp, rax")
+	} else {
+		// Windows commits stack one guard page at a time, so a large VLA has
+		// to be walked down a page at a time rather than skipped over -- the
+		// run-time twin of the probing loop in emitFrameAlloc.
+		c.emit("mov r11, rax")
+		lab := fmt.Sprintf(".Lvlachk%d", c.chkSeq)
+		c.chkSeq++
+		c.line(lab + ":")
+		c.emit("sub rsp, 4096")
+		c.emit("sub r11, 4096")
+		c.emit("mov rcx, [rsp]") // touch the page; mov leaves the flags alone
+		c.emit("jg %s", lab)
+		c.emit("sub rsp, r11") // r11 <= 0: hand the overshoot back
+	}
+	c.emit("mov [rbp%+d], rsp", vi.off)
+	return nil
+}
+
+// blockVLASizes collects the hidden size slots of every variable-length array
+// declared directly in b, in declaration order.
+func (c *CG) blockVLASizes(b *frontend.Block) []int {
+	var out []int
+	collect := func(d *frontend.DeclStmt) {
+		if d == nil || d.Typ == nil || !d.Typ.HasVLA() {
+			return
+		}
+		if uid, ok := c.declUID[d]; ok {
+			if vi, ok2 := c.varEnts[uid]; ok2 && vi.vlaSize != 0 {
+				out = append(out, vi.vlaSize)
+			}
+		}
+	}
+	for _, st := range b.Stmts {
+		switch n := st.(type) {
+		case *frontend.DeclStmt:
+			collect(n)
+		case *frontend.DeclList:
+			for _, d := range n.Decls {
+				collect(d)
+			}
+		}
+	}
+	return out
+}
+
+// releaseVLAs gives the stack space of the block's variable-length arrays back
+// at the end of the block that declared them. Without this a VLA declared in a
+// loop body would consume a fresh slice of stack on every iteration and the
+// frame would grow without bound.
+func (c *CG) releaseVLAs(sizes []int) {
+	for _, off := range sizes {
+		c.emit("mov rax, [rbp%+d]", off)
+		c.emit("add rax, 15")
+		c.emit("shr rax, 4")
+		c.emit("shl rax, 4")
+		c.emit("add rsp, rax")
+	}
+}
+
 func (c *CG) growFrameForTemps() {
 	if c.maxTmp <= scratchSlots || c.frameIdx < 0 || c.frameIdx+1 > len(c.insts) {
 		return
@@ -6297,12 +6490,17 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 		// A compound statement opens a new lexical scope. Its declarations
 		// register themselves into this scope when their frontend.DeclStmt is emitted.
 		c.pushScope()
+		// Variable-length arrays declared directly in this block own stack
+		// space that has to go back when the block ends -- otherwise a VLA in
+		// a loop body eats a fresh slice of stack on every iteration.
+		vlaSizes := c.blockVLASizes(n)
 		for _, st := range n.Stmts {
 			if err := c.genStmt(st); err != nil {
 				c.popScope()
 				return err
 			}
 		}
+		c.releaseVLAs(vlaSizes)
 		c.popScope()
 	case *frontend.DeclList:
 		// A multi-declarator declaration ("int a = 1, b = 2;") is one
@@ -6339,6 +6537,11 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 			c.scopes[len(c.scopes)-1][n.Name] = uid
 		}
 		vi, _ := c.lookupVar(n.Name)
+		if vi.vlaSize != 0 {
+			// A variable-length array: its elements can only be allocated
+			// here, where the declaration executes and its length is known.
+			return c.genVLAAlloc(n, vi)
+		}
 		if bi, ok := n.Init.(*frontend.BraceInit); ok {
 			// A braced initialiser stores each leaf directly into its frame
 			// slot and zero-fills what it leaves uncovered. A scalar target

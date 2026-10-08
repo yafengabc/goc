@@ -68,6 +68,27 @@ func (e *irEmitter) eval(x frontend.Expr) val {
 		if t == nil && n.E != nil {
 			t = e.tr.exprType(n.E)
 		}
+		// sizeof on a variable-length array is a run-time value -- and it is
+		// the one sizeof whose operand is evaluated, because the extent lives
+		// in the type rather than in any stored object. Multiply the dimension
+		// by the element width; the element width is still a constant (a
+		// second variable-length dimension is rejected by the checker).
+		if t != nil && t.IsVLA() && t.Elem != nil && !t.Elem.HasVLA() {
+			cnt := e.indexValue(t.VLALen)
+			w := frontend.Sizeof(t.Elem)
+			// The result is a 64-bit value, and it must be ANNOUNCED as one:
+			// a conversion site (a cast, a return, an argument) turns it into
+			// the type this val claims, and claiming the 4-byte unsigned that
+			// a constant sizeof uses makes it emit `sext i32` on an i64 --
+			// which LLVM rejects outright.
+			sz64 := &frontend.Type{Kind: frontend.KInt, Width: 8, Signed: false}
+			if w <= 1 {
+				return val{op: cnt, ty: sz64}
+			}
+			tmp := e.newTmp()
+			e.line("%s = mul i64 %s, %d", tmp, cnt, w)
+			return val{op: tmp, ty: sz64}
+		}
 		return val{op: itoa(frontend.Sizeof(t)), ty: frontend.UnsignedType()}
 	case *frontend.CompoundLit:
 		return e.compoundLit(n)

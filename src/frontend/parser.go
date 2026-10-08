@@ -1110,10 +1110,15 @@ func (p *Parser) parseTypeSuffixes(base *Type, allowFunc bool) (declResult, erro
 			// elements of int[2] -- wrapping each dimension as it is read
 			// produces the latter, which silently miscomputes every m[i][j]
 			// address (m[0][1] landing on m[1][0]'s bytes).
+			// One entry per dimension, in source order. dims[i] is the
+			// compile-time length and vlas[i] the length expression; exactly
+			// one of the two is set, so the wrap below can rebuild the
+			// right-to-left nesting without losing which dimensions are VLAs.
 			var dims []int
+			var vlas []Expr
 			for p.atPunct("[") {
 				p.next()
-				n, err := p.parseArrayLength()
+				n, vla, err := p.parseArrayLength()
 				if err != nil {
 					return d, err
 				}
@@ -1121,8 +1126,13 @@ func (p *Parser) parseTypeSuffixes(base *Type, allowFunc bool) (declResult, erro
 					return d, err
 				}
 				dims = append(dims, n)
+				vlas = append(vlas, vla)
 			}
 			for i := len(dims) - 1; i >= 0; i-- {
+				if vlas[i] != nil {
+					d.typ = VLAArrType(d.typ, vlas[i])
+					continue
+				}
 				d.typ = ArrType(d.typ, dims[i])
 			}
 		} else if p.atPunct("(") {
@@ -1155,18 +1165,32 @@ func declType(t *Type) *Type {
 	return t
 }
 
-// parseArrayLength parses a small integer constant expression for [N]. An
-// empty pair of brackets (incomplete array type, e.g. "int a[]" in a
-// parameter list) yields 0; the caller decays such a parameter to a pointer.
-func (p *Parser) parseArrayLength() (int, error) {
+// parseArrayLength parses the length of an array declarator. It returns either
+// a compile-time length (n) or, when the bracket holds something that is not a
+// constant, the length expression (vla) of a C99 variable-length array -- never
+// both. An empty pair of brackets (incomplete array type, e.g. "int a[]" in a
+// parameter list) yields 0 and no expression; the caller decays such a
+// parameter to a pointer.
+func (p *Parser) parseArrayLength() (n int, vla Expr, err error) {
 	if p.atPunct("]") {
-		return 0, nil
+		return 0, nil, nil
 	}
-	v, err := p.constExpr()
-	if err != nil {
-		return 0, err
+	// Constant lengths come first: nearly every array in real code is [N] or
+	// [SOME_ENUM], and everything downstream -- frame layout, sizeof, the
+	// element stride of a subscript -- is built around knowing the extent now.
+	save := p.pos
+	if v, cerr := p.constExpr(); cerr == nil {
+		return v, nil, nil
 	}
-	return v, nil
+	// Not a constant. Rewind and take it as an ordinary expression instead:
+	// C99 lets an array bound be any expression, evaluated when control
+	// reaches the declaration, so "int a[n]" is well-formed for a local n.
+	p.pos = save
+	e, aerr := p.parseAssign()
+	if aerr != nil {
+		return 0, nil, aerr
+	}
+	return 0, e, nil
 }
 
 // Constant expressions above '+': case labels, enum values and array lengths

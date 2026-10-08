@@ -46,9 +46,16 @@ type Member struct {
 }
 
 type Type struct {
-	Kind       TypeKind
-	Elem       *Type     // KPtr / KArr: element type
-	Len        int       // KArr: number of elements (0 = incomplete)
+	Kind TypeKind
+	Elem *Type // KPtr / KArr: element type
+	Len  int   // KArr: number of elements (0 = incomplete)
+	// VLALen is the length expression of a C99 variable-length array. It is
+	// non-nil exactly for a VLA dimension, whose extent is only known when the
+	// declaration is executed; Len stays 0 there and sizeOf() cannot be used
+	// on the type (it would report 0). A VLA therefore has no compile-time
+	// size at all -- sizeof on it is a run-time operation, and the storage for
+	// a VLA object is a pointer to a run-time stack allocation.
+	VLALen     Expr
 	Params     []*Type   // KFunc: parameter types
 	Ret        *Type     // KFunc: return type
 	Variadic   bool      // KFunc: declared with a trailing "..."
@@ -79,6 +86,12 @@ func PtrType(elem *Type) *Type        { return &Type{Kind: KPtr, Elem: elem} }
 func ArrType(elem *Type, n int) *Type { return &Type{Kind: KArr, Elem: elem, Len: n} }
 func FuncType(ret *Type, params []*Type) *Type {
 	return &Type{Kind: KFunc, Ret: ret, Params: params}
+}
+
+// VLAArrType builds a C99 variable-length array type: n elements of elem,
+// where n is an expression evaluated when the declaration is reached.
+func VLAArrType(elem *Type, n Expr) *Type {
+	return &Type{Kind: KArr, Elem: elem, Len: 0, VLALen: n}
 }
 
 // StructType builds an (initially incomplete) struct/union type carrying the
@@ -377,6 +390,37 @@ func (t *Type) IsArray() bool    { return t.Kind == KArr }
 func (t *Type) IsFunc() bool     { return t.Kind == KFunc }
 func (t *Type) IsStruct() bool   { return t.Kind == KStruct }
 func (t *Type) IsUnion() bool    { return t.Kind == KUnion }
+
+// IsVLA reports whether t is a C99 variable-length array: an array whose
+// extent is an expression rather than a constant, so it has no size until the
+// declaration that created it has run.
+func (t *Type) IsVLA() bool { return t != nil && t.Kind == KArr && t.VLALen != nil }
+
+// HasVLA reports whether any dimension in t's array chain is variable-length
+// ("int a[3][n]"). It deliberately does not descend through a pointer:
+// "int (*p)[n]" is a pointer, and sizeof(p) is 8 whatever the pointee is.
+func (t *Type) HasVLA() bool {
+	for t != nil && t.Kind == KArr {
+		if t.VLALen != nil {
+			return true
+		}
+		t = t.Elem
+	}
+	return false
+}
+
+// StorageSize is the bytes a variable of type t occupies in the frame. It is
+// sizeOf for everything except a type with a variable-length dimension, whose
+// object is a *pointer* to a run-time stack allocation rather than the
+// elements themselves -- so its storage is the 8-byte pointer, while its
+// sizeof is a run-time value. HasVLA rather than IsVLA: "int a[3][n]" is not
+// itself a VLA object but is stored exactly like one.
+func StorageSize(t *Type) int {
+	if t.HasVLA() {
+		return 8
+	}
+	return sizeOf(t)
+}
 
 // IsChar reports whether t is a char type. In this dialect char is a 1-byte
 // int (signed or unsigned); it is the element type a string literal can
