@@ -250,13 +250,21 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 			// gone by then.
 			v = e.widenVarargSlot(v)
 		}
-		// A long double variadic argument is passed by address: the value is
+		// A long double VARIADIC argument is passed by address: the value is
 		// stored into its own stack slot and ONE pointer rides the argument
 		// list, exactly how goc marshals it (genCall's aggregate branch) and
 		// how va_arg reads it back (expression.go's vaArg intercept). Passing
 		// the i128 value instead would let LLVM split it across two argument
 		// slots and desynchronise the cursor the callee walks.
-		if v.ty != nil && v.ty.Kind == frontend.KLongDouble {
+		//
+		// The check MUST be "beyond the prototype": a prototyped `long
+		// double` parameter is still read by the callee as the i128 value
+		// (function.go's parameter lowering, unchanged), so passing that
+		// position by address hands the callee a pointer where it expects
+		// the value itself -- every goc_tf_* call in every program crashed
+		// this way before the position guard went in (found by win_regress:
+		// longdouble [gocl] segfaulted with no output).
+		if i >= len(paramTys) && v.ty != nil && v.ty.Kind == frontend.KLongDouble {
 			slot := e.ldVarargSlot()
 			e.line("store i128 %s, ptr %s, align 16", v.op, slot)
 			args = append(args, "ptr "+slot)
@@ -477,10 +485,11 @@ func (e *irEmitter) indirectCall(n *frontend.IndirectCall) val {
 			// nothing, so nothing else will widen them.
 			v = e.widenVarargSlot(v)
 		}
-		// A long double variadic argument rides one pointer slot, exactly as
+		// A long double VARIADIC argument rides one pointer slot, exactly as
 		// in callExpr above (the two paths must agree, or an indirect printf
 		// and a direct one would disagree about where argument two lives).
-		if v.ty != nil && v.ty.Kind == frontend.KLongDouble {
+		// Beyond-prototype only, for the same callee-shape reason as there.
+		if i >= len(paramTys) && v.ty != nil && v.ty.Kind == frontend.KLongDouble {
 			slot := e.ldVarargSlot()
 			e.line("store i128 %s, ptr %s, align 16", v.op, slot)
 			args = append(args, "ptr "+slot)
