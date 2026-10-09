@@ -143,6 +143,13 @@ build_run_win_ok "fp128 [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "fp12
 build_run_win_ok "longdouble [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble" goc
 build_run_win_ok "longdouble [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble" gocl
 
+# long double stdio (#49c): printf %Lf/%Le/%Lg including flag/width/precision
+# combinations and the heap path for outputs that dwarf the fixed field buffer,
+# plus scanf %Lf round-trips (decimal exact parse, hex via widen, suppressed
+# assignment). Self-reporting (exit 0 + final "OK").
+build_run_win_ok "longdouble_io [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble_io" goc
+build_run_win_ok "longdouble_io [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble_io" gocl
+
 # Struct-returning calls consumed in expression position ("f(a).hi"): the bug
 # corrupted the statements AFTER the trigger (negative temporary slot indices
 # aliased live locals), so the detection is the byte-exact stdout of the

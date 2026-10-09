@@ -22,7 +22,7 @@
 - **进度**：
   - #49a 变参 fp128 ABI（08d1fee + cdbf48f 位置修复）✅；
   - #49b `src/goclib/fp128dec.c` fmt+parse（0f88e5a）✅ —— libquadmath 差分 408664 case 全绿（`src/goclib/tests/test_fp128dec.c`）；
-  - #49c 待做：stdio.c 挂接 %Lf/%Le/%Lg（vfmt 记 'L' 修饰符、>512 字节走 malloc 重试路径）；scanf 修 'L' 被折叠成 'l' 的 bug；portability case（goc/gocl 双后端 vs gcc）挂 win_regress；全量回归；提交。
+  - #49c stdio.c 挂接 ✅：printf `%Lf/%Le/%Lg/%La(不接)/%n` 全套 flag/width/prec，>512 字节走 malloc 重试（tf128_fmt 返回负 need，NUL 由调用方补）；scanf `%Lf` 十进制走 tf128_parse、hex 回落 strtod+widen；'L' 修饰符折叠 bug 修复（isL 在折叠前记录）。附带修掉 5 个 goc 前端/codegen bug：负 LD 字面量、聚合 LD 初始化、sprintf 返回值被 resBig 残留毁掉、字面量 LD 变参实参段错误、gocl EnableLongDouble 时序（库构建早于赋值 → 无条件化）。`longdouble_io.c` 挂 win_regress（24/0）+ gocregress 496/0。
 
 ### 3. #50 float.h LDBL 常量 + math.h l 后缀函数
 
