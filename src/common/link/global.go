@@ -34,6 +34,11 @@ func typeWidth(t *frontend.Type) int {
 		return 4
 	case frontend.KDouble:
 		return 8
+	case frontend.KLongDouble:
+		// goc's long double is IEEE binary128: 16 bytes, whichever back end
+		// lays the value out (the native side addresses it by copy, gocl
+		// carries it as an i128).
+		return 16
 	case frontend.KBitInt:
 		return frontend.Sizeof(t)
 	case frontend.KArr:
@@ -61,11 +66,14 @@ func typeWidth(t *frontend.Type) int {
 // both back ends lay out the same values and must not disagree about it.
 func TypeWidth(t *frontend.Type) int { return typeWidth(t) }
 
-// IsAgg reports whether t is a struct/union aggregate (or a C23 _BitInt,
-// which rides the same by-address value model), i.e. a value that is never
-// loaded into a register but always handled by address + copyBytes.
+// IsAgg reports whether t is a struct/union aggregate (or a C23 _BitInt /
+// long double, which ride the same by-address value model), i.e. a value that
+// is never loaded into a register but always handled by address + copyBytes.
+// long double is 16 bytes -- wider than any register class the native back end
+// moves scalars in -- so it travels by address like an aggregate.
 func IsAgg(t *frontend.Type) bool {
-	return t != nil && (t.IsStruct() || t.IsUnion() || t.Kind == frontend.KBitInt)
+	return t != nil && (t.IsStruct() || t.IsUnion() || t.Kind == frontend.KBitInt ||
+		t.Kind == frontend.KLongDouble)
 }
 
 // tlsAlignedSize returns the exact number of bytes emitGlobalVar will write for
@@ -435,6 +443,39 @@ func foldFloatInit(e frontend.Expr) (float64, bool) {
 // reason as FoldConstInit.
 func FoldFloatInit(e frontend.Expr) (float64, bool) { return foldFloatInit(e) }
 
+// foldTFInit folds the constant initialiser of a global long double to its
+// binary128 bit pattern (low word first, matching the little-endian layout).
+// The checker has already parsed the literal into the exact 128-bit encoding,
+// so this is a copy, not a rounding; a negation flips the sign bit in place
+// and a cast passes through to its operand. Anything else is not foldable and
+// the global falls back to +0.0, exactly as the float/double folder does.
+func foldTFInit(e frontend.Expr) (uint64, uint64, bool) {
+	switch n := e.(type) {
+	case nil:
+		return 0, 0, true
+	case *frontend.NumLit:
+		if n.IsLongDouble {
+			return n.F128.Lo, n.F128.Hi, true
+		}
+		return 0, 0, false
+	case *frontend.Unary:
+		lo, hi, ok := foldTFInit(n.E)
+		if !ok {
+			return 0, 0, false
+		}
+		switch n.Op {
+		case "-":
+			return lo, hi ^ 1<<63, true
+		case "+":
+			return lo, hi, true
+		}
+		return 0, 0, false
+	case *frontend.CastExpr:
+		return foldTFInit(n.E)
+	}
+	return 0, 0, false
+}
+
 // encodeStr renders decoded string bytes as a double-quoted literal with
 // escapes, for goa's db directive.
 func encodeStr(b []byte) string {
@@ -691,6 +732,16 @@ func emitGlobalVar(out *strings.Builder, g *frontend.DeclStmt, lab string) error
 			return nil
 		}
 	}
+	if g.Typ != nil && g.Typ.Kind == frontend.KLongDouble {
+		// binary128 initialiser: two quads, low word at offset 0. The signed
+		// decimal form keeps the bit pattern within goa's dq range.
+		lo, hi, ok := foldTFInit(g.Init)
+		if !ok {
+			lo, hi = 0, 0
+		}
+		out.WriteString(fmt.Sprintf("%s dq %d, %d\n", lab, int64(lo), int64(hi)))
+		return nil
+	}
 	if g.Typ != nil && (g.Typ.IsArray() || IsAgg(g.Typ)) {
 		// typeWidth already returns the full byte size (elem width * len for
 		// arrays, the computed Size for structs/unions), so that IS the size
@@ -776,6 +827,16 @@ func isZeroInit(g *frontend.DeclStmt) bool {
 			((!sl.Wide && g.Typ.Elem.IsChar()) || (sl.Wide && g.Typ.Elem.Width == 2)) {
 			return false
 		}
+	}
+	if g.Typ != nil && g.Typ.Kind == frontend.KLongDouble {
+		// Exact bit test: a value like 1e-4000L rounds to zero through the
+		// float64 folder but is not zero in binary128, and .bss placement
+		// would silently drop it.
+		lo, hi, ok := foldTFInit(g.Init)
+		if !ok {
+			return false
+		}
+		return lo == 0 && hi == 0
 	}
 	if g.Typ != nil && g.Typ.IsFloating() {
 		f := 0.0
@@ -973,6 +1034,14 @@ func fillBraceElem(t *frontend.Type, e frontend.Expr, img []byte, off int) error
 		bits := math.Float64bits(f)
 		for i := 0; i < 8; i++ {
 			img[off+i] = byte(bits >> (8 * i))
+		}
+		return nil
+	case frontend.KLongDouble:
+		// binary128 in a brace: the exact 128-bit encoding, low word first.
+		lo, hi, _ := foldTFInit(e)
+		for i := 0; i < 8; i++ {
+			img[off+i] = byte(lo >> (8 * i))
+			img[off+8+i] = byte(hi >> (8 * i))
 		}
 		return nil
 	}

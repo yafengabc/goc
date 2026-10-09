@@ -87,7 +87,7 @@ func UnsignedType() *Type             { return &Type{Kind: KInt, Width: 4, Signe
 func UnsignedCharType() *Type         { return &Type{Kind: KInt, Width: 1, Signed: false} }
 func DoubleType() *Type               { return &Type{Kind: KDouble} }
 func FloatType() *Type                { return &Type{Kind: KFloat} }
-func LongDoubleType() *Type           { return &Type{Kind: KLongDouble} }
+func LongDoubleType() *Type           { return &Type{Kind: KLongDouble, Size: 16, Align: 16} }
 func VoidType() *Type                 { return &Type{Kind: KVoid} }
 func PtrType(elem *Type) *Type        { return &Type{Kind: KPtr, Elem: elem} }
 func ArrType(elem *Type, n int) *Type { return &Type{Kind: KArr, Elem: elem, Len: n} }

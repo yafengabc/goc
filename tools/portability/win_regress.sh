@@ -134,11 +134,13 @@ build_run_win_ok "printfmt [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "p
 build_run_win_ok "fp128 [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "fp128" goc
 build_run_win_ok "fp128 [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "fp128" gocl
 
-# long double end-to-end for the gocl back end (task #47): literals, arithmetic,
-# comparisons, conversions in and out, compound assignment, and a 200k-pair
-# randomised battery folded into one FNV hash that must match gcc's __float128
-# golden value. Self-reporting (exit 0 + final "OK"). goc's native long-double
-# codegen is a separate task (#48), so this exercises the gocl path only.
+# long double end-to-end: literals, arithmetic, comparisons, conversions in
+# and out, compound assignment, and a 200k-pair randomised battery folded into
+# one FNV hash that must match gcc's __float128 golden value. Self-reporting
+# (exit 0 + final "OK"). Both back ends lower long double to the same binary128
+# runtime (goc via direct helper calls since #48, gocl via LLVM IR since #47),
+# so the same battery pins both.
+build_run_win_ok "longdouble [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble" goc
 build_run_win_ok "longdouble [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble" gocl
 
 echo ""
