@@ -19,6 +19,10 @@
 - 核心是 binary128 → 十进制字符串：最长 **4932 位有效数字**（次正规 `LDBL_TRUE_MIN` 场景），不能走 double 路径。
 - 参考：goclib `fp128.c`（binary128 软浮点，95563b9）；gcc `__float128` 对照 harness `/tmp/fullcmp.c` 模式（#46 日志）。
 - **验收**：随机值 + 边界（最大/最小/次正规/NaN/Inf）与 gcc `printf("%Qa/%.4932f")` 逐位对照；portability case 挂 win_regress。
+- **进度**：
+  - #49a 变参 fp128 ABI（08d1fee + cdbf48f 位置修复）✅；
+  - #49b `src/goclib/fp128dec.c` fmt+parse（0f88e5a）✅ —— libquadmath 差分 408664 case 全绿（`src/goclib/tests/test_fp128dec.c`）；
+  - #49c 待做：stdio.c 挂接 %Lf/%Le/%Lg（vfmt 记 'L' 修饰符、>512 字节走 malloc 重试路径）；scanf 修 'L' 被折叠成 'l' 的 bug；portability case（goc/gocl 双后端 vs gcc）挂 win_regress；全量回归；提交。
 
 ### 3. #50 float.h LDBL 常量 + math.h l 后缀函数
 
