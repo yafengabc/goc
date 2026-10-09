@@ -5,12 +5,11 @@
 
 ## P0 — 隐患修复
 
-### 1. goc 原生 `f(x).member` structret bug
+### 1. ~~goc 原生 `f(x).member` structret bug~~ ✅ 已修复（e3658d7，2026-10-09）
 
-- **现象**：结构体返回调用出现在表达式位置（如 `MIX(goc_tf_neg(a).hi)`）会把该调用的**结果地址**当值返回，且污染函数内**后续所有** struct 返回调用（读到 0x140014000 之类 PE 镜像地址，hi==lo）。
-- **复现**：`tests/fp128/goc_structret_bug.c`（gcc/gocl 正确，goc 原生错；先赋给变量则正确——`tests/portability_cases/fp128.c` 因此绕开）。
-- **影响**：任意用户代码，不只 fp128。
-- **验收**：bug 用例在 goc 原生下输出 `r = 3ece32d23193c687.1000000000000000`；变异：撤销修复必须 FAIL。
+- 根因：标量成员读取后结果缓冲声明未释放；复合赋值回滚 tmpDepth 后语句边界再释放一次 → 槽号变负 → 停车槽别名进活局部变量。
+- 修在缓冲真正死亡处（genExprT1 的标量成员加载，releaseCallResultBuffer）；聚合成员/数组衰减路径不提前释放。
+- 回归：`tests/portability_cases/structret_bug.c`（字节级 stdout 对比，布局敏感）+ `structret.c`（位置电池）；win_regress 22 项，gocregress 496/0。
 
 ## P1 — fp128/long double 可用性收尾
 
