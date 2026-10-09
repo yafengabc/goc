@@ -1,6 +1,7 @@
 #include "goclib.h"
 #include <stdarg.h>
 #include <errno.h>
+#include <string.h>  /* memcpy: long double <-> goc_tf128 bit transfer */
 #include <wchar.h>   /* %ls / %lc take wchar_t */
 
 /* ----------------------------- <stdio.h> --------------------------------- */
@@ -83,13 +84,14 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
          * ptrdiff_t. h/hh select short/char, but the default argument
          * promotions have already widened those to int by the time the
          * argument is stored, so they are read back as int. */
-        int wide = 0, longs = 0, sizeT = 0, imax = 0, shorts = 0;
+        int wide = 0, longs = 0, sizeT = 0, imax = 0, shorts = 0, Lmod = 0;
         while (*p == 'l' || *p == 'h' || *p == 'L' ||
                *p == 'z' || *p == 'j' || *p == 't') {
             if (*p == 'l') { longs++; wide = 1; }
             else if (*p == 'h') shorts++;
             else if (*p == 'z' || *p == 't') sizeT = 1;
             else if (*p == 'j') imax = 1;
+            else if (*p == 'L') Lmod = 1;   /* long double floating conversions */
             p++;
         }
         char spec = *p++;
@@ -99,6 +101,7 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
          * and `s` is cleared, so the padding code can just test `s != 0`. */
         char field[512];
         int fl = 0;
+        char *heap = 0;   /* %Lf's exact expansion can dwarf field; freed below */
         const char *s = 0;
         unsigned long long intVal = 0;   /* last integer value; '#' checks it */
         if (spec == 's' && wide) {
@@ -224,6 +227,38 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
              * %e outside it, with trailing zeros stripped either way.
              * All three share __goclib_double_to_buf with the array
              * printers, so the conversion lives in exactly one place. */
+            if (Lmod) {
+                /* %Lf/%LE/%LG: goc's long double is IEEE binary128, so the
+                 * digits come from fp128dec.c's exact integer converter --
+                 * 4932 integer digits for the largest finite value, far
+                 * beyond field[512]. The converter names the needed size
+                 * with a negative return; retry on the heap and let the
+                 * padding code emit from `s` (freed after padding). %La is
+                 * not wired: fp128dec.c is decimal-only by design. */
+                long double ld = va_arg(ap, long double);
+                goc_tf128 tv;
+                memcpy(&tv, &ld, 16);
+                fl = __goclib_tf128_fmt(field, sizeof field, &tv,
+                                        spec, prec, hasPrec, alt);
+                if (fl < 0) {
+                    int need = -fl;
+                    heap = (char *)malloc((size_t)need + 1);
+                    if (heap) {
+                        int r = __goclib_tf128_fmt(heap, (unsigned long)need,
+                                                   &tv, spec, prec, hasPrec, alt);
+                        if (r >= 0) {
+                            /* the converter returns a LENGTH, not a string:
+                             * NUL-terminate or the padding code's strlen runs
+                             * off the malloc block and writes garbage (and,
+                             * for printf, past the stdout buffer) */
+                            heap[r] = 0;
+                            fl = r; s = heap;
+                        } else { free(heap); heap = 0; fl = 0; }
+                    } else {
+                        fl = 0;     /* out of memory: an empty field */
+                    }
+                }
+            } else {
             double x = va_arg(ap, double);
             int upper = (spec == 'E' || spec == 'G' || spec == 'F');
             if (spec == 'f' || spec == 'F') {
@@ -280,6 +315,7 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                     }
                 }
             }
+            }
         } else if (spec == 'p') {
             /* %p: "0x" followed by 16 hex digits (full 64-bit address). */
             void *pv = va_arg(ap, void *);
@@ -328,10 +364,18 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                              spec == 'f' || spec == 'F' || spec == 'e' ||
                              spec == 'E' || spec == 'g' || spec == 'G' ||
                              spec == 'a' || spec == 'A');
+            /* The text to pad lives either in `field` or, for an uncapped
+             * %s and an oversized %Lf, at `s`. Both pad the same way, and
+             * a leading '-' always counts as the sign: zero padding must
+             * land between the minus and the digits for a heap-resident
+             * %Lf exactly as it does for the in-field conversions. */
+            const char *text = field;
+            int clen = fl;
+            if (s) { text = s; clen = (int)strlen(s); }
             /* the sign character, if any, and where it is in `field` */
             char sign = 0;
             int signlen = 0;
-            if (signedish && (plus || blank) && !(fl > 0 && field[0] == '-')) {
+            if (signedish && (plus || blank) && !(clen > 0 && text[0] == '-')) {
                 /* "+"/" " only applies to non-negative values; a literal '-'
                  * from the conversion wins over both. An empty field (a zero
                  * printed with precision 0) still takes its sign. */
@@ -350,11 +394,8 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             }
             /* digits start after any existing '-', so zero padding never
              * lands between the minus and the digits */
-            int digoff = (fl > 0 && field[0] == '-') ? 1 : 0;
-            int clen = s ? (int)strlen(s) : fl;
-            int emit_text = s ? 1 : 0;
-            int body = emit_text ? 0 : fl - digoff;   /* digits to write */
-            int prelen = (digoff ? 1 : 0) + signlen + pfxlen;
+            int digoff = (clen > 0 && text[0] == '-') ? 1 : 0;
+            int body = clen - digoff;   /* digits to write */
 
             /* advance() writes one byte honouring `limit` and always counts */
             int k;
@@ -363,41 +404,38 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
             if (clen >= width || width <= 0) {
                 if (signlen) ADV(sign);
                 if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
-                if (emit_text) { while (*s) { ADV(*s); s++; } }
-                else { for (k = 0; k < fl; k++) ADV(field[k]); }
+                for (k = 0; k < clen; k++) ADV(text[k]);
             } else {
-                /* every path emits exactly: field content (or s) + sign +
-                 * prefix + pad, so the pad is what is left after all of
-                 * them. (Counting only the field content here padded
-                 * width+pfxlen characters and, worse, the right-justify
-                 * path below never emitted the leading '-' at all.) */
+                /* every path emits exactly: text + sign + prefix + pad, so
+                 * the pad is what is left after all of them. (Counting only
+                 * the field content here padded width+pfxlen characters
+                 * and, worse, the right-justify path below never emitted
+                 * the leading '-' at all.) */
                 int pad = width - clen - signlen - pfxlen;
                 if (left) {
                     if (signlen) ADV(sign);
                     if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
-                    if (emit_text) { while (*s) { ADV(*s); s++; } }
-                    else { for (k = 0; k < fl; k++) ADV(field[k]); }
+                    for (k = 0; k < clen; k++) ADV(text[k]);
                     for (k = 0; k < pad; k++) ADV(' ');
                 } else if (zero && numeric) {
                     /* "0" flag: pad with zeros, but only after sign/prefix */
                     char pc = (zero && numeric) ? '0' : ' ';
-                    if (digoff) ADV(field[0]);
+                    if (digoff) ADV(text[0]);
                     if (signlen) ADV(sign);
                     if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
                     for (k = 0; k < pad; k++) ADV(pc);
-                    if (emit_text) { while (*s) { ADV(*s); s++; } }
-                    else { for (k = 0; k < body; k++) ADV(field[digoff + k]); }
+                    for (k = 0; k < body; k++) ADV(text[digoff + k]);
                 } else {
                     for (k = 0; k < pad; k++) ADV(' ');
-                    if (digoff) ADV(field[0]);
+                    if (digoff) ADV(text[0]);
                     if (signlen) ADV(sign);
                     if (pfxlen) { ADV(pfx[0]); if (pfxlen == 2) ADV(pfx[1]); }
-                    if (emit_text) { while (*s) { ADV(*s); s++; } }
-                    else { for (k = 0; k < body; k++) ADV(field[digoff + k]); }
+                    for (k = 0; k < body; k++) ADV(text[digoff + k]);
                 }
             }
 #undef ADV
         }
+        if (heap) { free(heap); heap = 0; }
     }
     return n;
 }
@@ -1440,6 +1478,28 @@ static unsigned long scan_uint(const char **pp, int base, int width, int *ok) {
     return v;
 }
 
+/* Store one scanned float token per the length modifier. `isL` (%Lf family)
+ * means goc's binary128 long double: decimal tokens parse exactly through
+ * fp128dec.c; hexadecimal ones -- which fp128dec.c is decimal-only by design
+ * and does not take -- arrive through strtod and widen. In both cases the
+ * bits land in the 16-byte object through memcpy, never through a floating
+ * operation (none exists for binary128 on an integer-only target). */
+static void scan_store_float(void *out, int lmod, int isL,
+                             const char *tok, double dv) {
+    if (isL) {
+        goc_tf128 tv;
+        if (tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
+            unsigned long long db;
+            memcpy(&db, &dv, 8);
+            tv = goc_tf_from_double(db);
+        } else {
+            __goclib_tf128_parse(tok, &tv);
+        }
+        memcpy(out, &tv, 16);
+    } else if (lmod == 0) *(float *)out = (float)dv;
+    else *(double *)out = dv;
+}
+
 int vsscanf(const char *s, const char *fmt, va_list ap) {
     const char *sp = s;
     const char *fp = fmt;
@@ -1447,6 +1507,7 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
     int suppress;
     int width;
     int lmod;
+    int isL;
     int base;
     int ok;
     int neg;
@@ -1490,6 +1551,7 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
          * short, hh names char ('H' here -- hh must write ONE byte, and the
          * old code wrote two by falling into the short case). */
         lmod = 0;
+        isL = 0;
         if (*fp == 'h' || *fp == 'l' || *fp == 'L' ||
             *fp == 'z' || *fp == 'j' || *fp == 't') {
             lmod = *fp;
@@ -1498,6 +1560,12 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
                 fp++;
                 if (lmod == 'h') lmod = 'H';   /* hh: ONE byte, not short */
             }
+            /* 'L' folds to 'l' for the integer conversions (its only use
+             * there, and both are 8 bytes) -- but NOT for the float
+             * conversions: goc's long double is 16-byte binary128, and
+             * %Lf must store 16 bytes where %lf stores 8. isL survives
+             * the fold for scan_store_float. */
+            isL = (lmod == 'L');
             if (lmod == 'L' || lmod == 'z' || lmod == 'j' || lmod == 't') lmod = 'l';
         }
 
@@ -1711,8 +1779,7 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
             if (endp != tb + ti) break;  /* partial conversion: no assignment */
             if (!suppress) {
                 void *out = va_arg(ap, void *);
-                if (lmod == 0) *(float *)out = (float)dv;
-                else *(double *)out = dv;
+                scan_store_float(out, lmod, isL, tb, dv);
                 assigned++;
             }
             fp++;
@@ -1833,7 +1900,7 @@ static int __fs_digit(int c, int base) {
 int vfscanf(FILE *stream, const char *fmt, va_list ap) {
     __fscan sc;
     const char *fp = fmt;
-    int assigned = 0, suppress, lmod, base, ok, neg, c, cnt;
+    int assigned = 0, suppress, lmod, isL, base, ok, neg, c, cnt;
     unsigned long uv;
     char *dst;
     long width;
@@ -1866,6 +1933,7 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
         width = 0;
         while (*fp >= '0' && *fp <= '9') { width = width * 10 + (*fp - '0'); fp++; }
         lmod = 0;
+        isL = 0;
         if (*fp == 'h' || *fp == 'l' || *fp == 'L' ||
             *fp == 'z' || *fp == 'j' || *fp == 't') {
             lmod = *fp; fp++;
@@ -1873,6 +1941,9 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
                 fp++;
                 if (lmod == 'h') lmod = 'H';   /* hh: ONE byte, not short */
             }
+            /* see vsscanf: 'L' folds for the integer conversions, but the
+             * float conversions must see it -- %Lf stores 16 bytes */
+            isL = (lmod == 'L');
             if (lmod == 'L' || lmod == 'z' || lmod == 'j' || lmod == 't') lmod = 'l';
         }
 
@@ -2151,8 +2222,7 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
                         if (hend != tb + ti) break;   /* partial: failure */
                         if (!suppress) {
                             void *out = va_arg(ap, void *);
-                            if (lmod == 0) *(float *)out = (float)hv;
-                            else *(double *)out = hv;
+                            scan_store_float(out, lmod, isL, tb, hv);
                             assigned++;
                         }
                     }
@@ -2202,8 +2272,7 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
             if (endp != tb + ti) break;    /* partial conversion: failure */
             if (!suppress) {
                 void *out = va_arg(ap, void *);
-                if (lmod == 0) *(float *)out = (float)dv;
-                else *(double *)out = dv;
+                scan_store_float(out, lmod, isL, tb, dv);
                 assigned++;
             }
             fp++;
