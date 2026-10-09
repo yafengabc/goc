@@ -21,19 +21,18 @@ import (
 // first would round twice and produce a different answer for constants that
 // fall near a binary128 rounding boundary.
 
-// EnableLongDouble turns `long double` into the real binary128 type instead of
-// the double it has always been folded into.
+// EnableLongDouble turns `long double` into the real binary128 type instead
+// of the double it has always been folded into.
 //
-// SCAFFOLDING: delete this once #48 (the native back end's fp128 codegen)
-// lands, and make the parser and the checker unconditional. It is a switch and
-// not a fact because only gocl can emit fp128 today: the front end is shared,
-// so gocl sets it before it parses and the native back end leaves it off, which
-// keeps `long double` a double there rather than a type its code generator
-// would silently emit 8-byte code for.
+// FORMER SCAFFOLDING, now unconditional: #48 landed the native back end's
+// fp128 codegen, so every back end emits the real type and the flag is true
+// forever. It stays a named variable only so the reader can grep the three
+// places (parser literal, parser type specifier, checker) that still consult
+// it; the drivers' assignments remain as belt-and-braces.
 //
 // The value it guards is not small -- with it off, `long double` is a 53-bit
 // double that happens to be spelled long double, and sizeof(long double) is 8.
-var EnableLongDouble bool
+var EnableLongDouble = true
 
 // Float128 is an IEEE-754 binary128 value in raw word form: Hi holds bits
 // 127..64 (sign, the 15-bit exponent and the top 48 mantissa bits) and Lo
