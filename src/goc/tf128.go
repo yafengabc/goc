@@ -281,6 +281,16 @@ func (c *CG) genTFValue(e frontend.Expr, t *frontend.Type) (frontend.CType, erro
 		}
 	case *frontend.IncDecExpr:
 		return c.genTFIncDec(n)
+	case *frontend.VaArgExpr:
+		// va_arg(ap, long double) already leaves the shared by-address
+		// carrier behind (genVaArg's ld branch: a pointer out of the
+		// cursor, the 16 bytes it names copied into a fresh temporary).
+		// genExprT cannot be used here -- its TF intercept would call
+		// genTFValue again and loop.
+		if _, err := c.genVaArg(n); err != nil {
+			return frontend.TInt, err
+		}
+		return frontend.TInt, nil
 	case *frontend.Call:
 		return c.genBigFromCall(func() (frontend.CType, error) { return c.genCall(n.Name, nil, nil, n.Args) }, t)
 	case *frontend.IndirectCall:

@@ -8370,6 +8370,13 @@ func (c *CG) exprType(e frontend.Expr) *frontend.Type {
 		// The unnamed object's own declared type (arrays included: callers
 		// decide between value-address and decay handling).
 		return n.Typ
+	case *frontend.VaArgExpr:
+		// va_arg(ap, T) has the type T the caller asked for. Without this a
+		// `long double v = va_arg(ap, long double)` read a nil type off the
+		// initialiser, failed the isLDExpr test, and went down the scalar
+		// path -- to_ll/from_ll round-tripping 16 bytes of binary128 through
+		// an int64 and destroying the value.
+		return n.Typ
 	case *frontend.GenericExpr:
 		// The selection's type is the type of the chosen branch (the
 		// controlling expression's own type is irrelevant after the pick).
@@ -9551,6 +9558,35 @@ func (c *CG) genVaArg(n *frontend.VaArgExpr) (frontend.CType, error) {
 		return frontend.TInt, err
 	}
 	c.emit("mov rcx, [r10]") // rcx = current cursor
+	// Long double rides the shared by-address carrier (r10 = value address).
+	// The caller passed it as ONE general-purpose slot holding a pointer to
+	// the 16 bytes (the aggregate hidden-pointer convention, see genCall's
+	// isAgg branch, which is what a long double argument reaches), so the
+	// read is: take the pointer out of the slot, copy the 16 bytes it names
+	// into a fresh temporary, and describe that temporary as the value.
+	// Copying (rather than handing the caller's buffer straight back) keeps
+	// the carrier contract simple: resBigK names a buffer this frame owns,
+	// released by the ordinary statement-boundary path like every other
+	// long double temporary.
+	if n.Typ.Kind == frontend.KLongDouble {
+		c.emit("mov rax, [rcx]")
+		c.emit("add rcx, 8")
+		c.emit("mov [r10], rcx")
+		k, _, off := c.tfTemp()
+		c.emit("mov r11, [rax]")
+		c.emit("mov r10, [rax+8]")
+		c.emit("mov [rbp%+d], r11", off)
+		c.emit("mov [rbp%+d], r10", off+8)
+		c.emit("lea r10, [rbp%+d]", off)
+		c.resBig = true
+		c.resBigT = n.Typ
+		c.resBigK = k
+		c.resBigSl = tfWords
+		c.resTyp = frontend.TInt
+		c.resW = 8
+		c.resSigned = false
+		return frontend.TInt, nil
+	}
 	if n.Typ.Class() == frontend.TDouble {
 		c.emit("mov rax, [rcx]")
 		c.emit("movq xmm0, rax")
@@ -10854,6 +10890,15 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 				c.tmpDepth += c.resStructSl
 				consumed += c.resStructSl
 				c.resStruct = false
+			}
+			if c.resBig && c.resBigSl > 0 {
+				// Same protection for a long double value: its bytes live in
+				// a claimed temporary and we are passing that temporary's
+				// ADDRESS, so later argument evaluation must not reuse it
+				// before the call consumes it.
+				c.tmpDepth += c.resBigSl
+				consumed += c.resBigSl
+				c.resBig = false
 			}
 			c.tmpDepth++
 			c.emit("mov [rbp%+d], r10", c.tmpSlot(c.tmpDepth))

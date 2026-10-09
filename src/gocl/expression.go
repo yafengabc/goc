@@ -143,6 +143,23 @@ func (e *irEmitter) vaArg(n *frontend.VaArgExpr) val {
 	if ty == nil {
 		ty = frontend.IntType()
 	}
+	// A long double variadic argument was passed as ONE pointer slot naming
+	// the 16 bytes (the aggregate hidden-pointer convention -- see call.go's
+	// variadic marshalling, and goc's genVaArg for the other back end).
+	// Reading it is therefore two steps: take a pointer out of the cursor
+	// with the machinery for a pointer argument (which picks the right half
+	// of a SysV register save area and steps by one slot on every target),
+	// then load the 16 bytes it names. Handing the i128 IR type straight to
+	// the readers would instead load 16 bytes OUT of the save area and step
+	// the cursor by 16 -- a value from nowhere and every later argument off
+	// by eight.
+	if ty.Kind == frontend.KLongDouble {
+		ptrTy := frontend.PtrType(frontend.CharType())
+		pv := e.vaArg(&frontend.VaArgExpr{Ap: n.Ap, Typ: ptrTy})
+		v := e.newTmp()
+		e.line("%s = load i128, ptr %s, align 16", v, pv.op)
+		return val{op: v, ty: ty}
+	}
 	lty := e.ty(ty)
 
 	if e.vaListIsFlatCursor() {

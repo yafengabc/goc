@@ -70,6 +70,15 @@ type irEmitter struct {
 	// value through memory, and scratchSize is how many bytes it holds.
 	scratch     string
 	scratchSize int
+	// ldVararg is the pool of entry allocas that long double variadic
+	// arguments are stored into before being passed by address (call.go's
+	// variadic marshalling). One slot per live argument of a single call is
+	// enough: calls are serialised, so all call sites share the pool and it
+	// only grows to the largest number of long double arguments any one call
+	// in this function takes. ldVarargUsed is reset to zero at the start of
+	// each call's marshalling.
+	ldVararg     []string
+	ldVarargUsed int
 	// forwards records branches to a C label that had not been seen yet.
 	forwards []forwardGoto
 }

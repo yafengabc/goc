@@ -172,6 +172,27 @@ func (e *irEmitter) scratchSlot(n int) string {
 	return slot
 }
 
+// ldVarargSlot hands out one of the shared entry allocas that a call stores a
+// long double variadic argument into before passing its ADDRESS (call.go's
+// variadic marshalling). The pool is per-function because the slots are entry
+// allocas: emitting them in the call's own basic block would grow the stack on
+// every loop iteration the call sits in. A call consumes the pool from index
+// zero -- callExpr and indirectCall reset ldVarargUsed before marshalling -- so
+// two arguments of one call get distinct slots while calls that run one after
+// another reuse them.
+func (e *irEmitter) ldVarargSlot() string {
+	if e.ldVarargUsed < len(e.ldVararg) {
+		s := e.ldVararg[e.ldVarargUsed]
+		e.ldVarargUsed++
+		return s
+	}
+	slot := e.newTmp()
+	e.entry.WriteString("  " + slot + " = alloca i128, align 16\n")
+	e.ldVararg = append(e.ldVararg, slot)
+	e.ldVarargUsed++
+	return slot
+}
+
 // storeBrace writes a braced initialiser into an object of type t at address p.
 func (e *irEmitter) storeBrace(b *frontend.BraceInit, t *frontend.Type, p string) {
 	e.storeInit(b, t, p, 0)
