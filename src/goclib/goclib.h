@@ -87,6 +87,21 @@ unsigned long long goc_tf_to_ull(goc_tf128 a);
 int                goc_tf_to_int(goc_tf128 a);
 unsigned int       goc_tf_to_uint(goc_tf128 a);
 
+/* ---- binary128 <-> decimal text (fp128dec.c) ------------------------------ */
+/* Format v per a printf floating conversion: spec is 'f','e','g' or an
+ * uppercase form, prec the precision, hasPrec whether '.' was written (a
+ * missing precision defaults to 6), alt the '#' flag. Returns the character
+ * count; if the text needs more than cap bytes, returns the NEGATED total
+ * so the caller can retry with a bigger buffer. Exponent letter and the
+ * inf/nan spellings follow the conversion's case. */
+int  __goclib_tf128_fmt(char *buf, unsigned long cap, const goc_tf128 *v,
+                        int spec, int prec, int hasPrec, int alt);
+/* Parse a decimal floating token: [-+]?digits[.digits][(e|E)[+-]digits].
+ * Returns 0 and fills *v (overflow -> signed inf, underflow -> signed zero);
+ * returns 1 when the token has no digit at all. Hexadecimal floats are the
+ * scanner's job and are not accepted here. */
+int  __goclib_tf128_parse(const char *s, goc_tf128 *v);
+
 /* ---- platform primitives (implemented in goclib.c, OS glue) ---------------- */
 /* Write `len` bytes from `buf` to standard output. Returns bytes written. */
 long __goclib_write(const char *buf, long len);
