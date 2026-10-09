@@ -24,11 +24,13 @@
   - #49b `src/goclib/fp128dec.c` fmt+parse（0f88e5a）✅ —— libquadmath 差分 408664 case 全绿（`src/goclib/tests/test_fp128dec.c`）；
   - #49c stdio.c 挂接 ✅：printf `%Lf/%Le/%Lg/%La(不接)/%n` 全套 flag/width/prec，>512 字节走 malloc 重试（tf128_fmt 返回负 need，NUL 由调用方补）；scanf `%Lf` 十进制走 tf128_parse、hex 回落 strtod+widen；'L' 修饰符折叠 bug 修复（isL 在折叠前记录）。附带修掉 5 个 goc 前端/codegen bug：负 LD 字面量、聚合 LD 初始化、sprintf 返回值被 resBig 残留毁掉、字面量 LD 变参实参段错误、gocl EnableLongDouble 时序（库构建早于赋值 → 无条件化）。`longdouble_io.c` 挂 win_regress（24/0）+ gocregress 496/0。
 
-### 3. #50 float.h LDBL 常量 + math.h l 后缀函数
+### 3. ~~#50 float.h LDBL 常量 + math.h l 后缀函数~~ ✅ 已完成
 
-- `LDBL_MANT_DIG/LDBL_DIG/LDBL_MIN_EXP/MAX_EXP/MIN_EXP/MAX_10_EXP/MIN_10_EXP/LDBL_MAX/MIN/EPSILON/TRUE_MIN/DECIMAL_DIG`。
-- `sqrtl/fablsl/fmodl/modfl/expl/logl/powl/sinl/cosl/tanl/atan2l/floorl/ceill/roundl/fmaxl/fminl/...` 挂 fp128 运行时。
-- **验收**：常量与 gcc `__float128` 的 float.h 逐值一致；函数对 gcc 对照 hash。
+- `LDBL_MANT_DIG/LDBL_DIG/LDBL_MIN_EXP/MAX_EXP/MIN_EXP/MAX_10_EXP/MIN_10_EXP/LDBL_MAX/MIN/EPSILON/TRUE_MIN/DECIMAL_DIG` ✅ —— binary128 值，用 **hex 浮点字面量**拼写（`LDBL_MAX` 的精确十进制有 4933 位，短写法是否舍回原位型无从保证）；按 `__goc__` 二分，宿主编译器仍拿 double 别名（x87/MSVC 下 binary128 值会溢出/下溢告警）。已与 WSL gcc `__float128` 位型逐项对齐。
+- l 后缀函数 ✅ —— `src/goclib/mathl.c`，45 个：**用普通 C 的 `long double` 算术写**，不调 `goc_tf_*`，因此三后端各自降级（goc→fp128 运行时、gocl→LLVM fp128、gcc→原生）。常量由 `tools/gen_ldconst.py` 用整数运算生成，exp/三角的归约用 65 位 HI + 精确 LO 拆分。
+- **验收** ✅：`longdouble_limits.c`（位型 + 语义 + DIG/DECIMAL_DIG 往返）+ `longdouble_math.c`（30 位 golden，来自 `tools/ldmath_golden.py` 的 60 位 decimal 参考，算法刻意与 mathl.c 不同）；win_regress 28/0，gocregress 496/0，gcc `-nostdinc` 26/26 编过且零实质警告。
+- **已知边界**：超越函数约 1 ulp（非正确舍入）；sinl/cosl 在 |x| > 2^60 后归约精度退化（与 math.c 的 double 版同款取舍）；erf/erfc/tgamma/lgamma/fma 的 l 版未做；bit-poking 五个（floorl/ceill/truncl/roundl/frexpl/logbl/nextafterl 等）假定 binary128 位布局，x86-64 gcc 的 x87 long double 下不成立。
+- **附带修掉的 goc bug**：三元运算符作用在 long double 上（`exprType` 无 CondExpr 分支 → 赋值走标量路径 to_ll/from_ll 往返，0.5 变 0.0；补类型后 `genTFValue` 默认分支又把三元当左值）。单测 `TestLongDoubleCondExpr`。
 
 ## P2 — 任务清单核实与关闭（先核实再关，防过时账）
 
