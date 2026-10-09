@@ -36,6 +36,13 @@ const (
 	etExec  = 2
 	emX8664 = 0x3E
 
+	// EMX8664 is the ELF e_machine for x86-64, exported for callers that build
+	// an Image from goa's own sections rather than from an ingested ELF object:
+	// goa's encoder speaks x86-64 and nothing else, and without an ingest
+	// nothing stamps the machine on the image, which the ELF writer then emits
+	// as 0 -- a header the Linux kernel rejects with ENOEXEC.
+	EMX8664 = emX8664
+
 	ptLoad = 1
 	pfX    = 0x1
 	pfW    = 0x2
