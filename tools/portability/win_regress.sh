@@ -150,6 +150,18 @@ build_run_win_ok "longdouble [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" 
 build_run_win_ok "longdouble_io [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble_io" goc
 build_run_win_ok "longdouble_io [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble_io" gocl
 
+# <float.h> for binary128 (#50a): the LDBL_* range and precision macros, pinned
+# by bit pattern as well as by their printed digits, plus the LDBL_DIG /
+# LDBL_DECIMAL_DIG round trips (which promise opposite directions).
+build_run_win_ok "longdouble_limits [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble_limits" goc
+build_run_win_ok "longdouble_limits [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble_limits" gocl
+
+# The long double math family (#50b): 30-significant-digit goldens for the
+# transcendentals (tools/ldmath_golden.py, a 60-digit decimal reference using
+# different algorithms) and exact checks for the algebraic members.
+build_run_win_ok "longdouble_math [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble_math" goc
+build_run_win_ok "longdouble_math [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble_math" gocl
+
 # Struct-returning calls consumed in expression position ("f(a).hi"): the bug
 # corrupted the statements AFTER the trigger (negative temporary slot indices
 # aliased live locals), so the detection is the byte-exact stdout of the

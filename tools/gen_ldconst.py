@@ -1,0 +1,165 @@
+"""Generate binary128 hex float literals for goclib's long double math (#50b).
+
+Everything here is exact rational arithmetic: no Python float is involved, so
+the digits are trustworthy to the last bit.
+"""
+from fractions import Fraction
+
+PREC = 220  # guard digits for the series below
+
+
+def atan_inv(n, terms=400):
+    """atan(1/n) for integer n >= 2, as an exact Fraction."""
+    n = Fraction(n)
+    total = Fraction(0)
+    for k in range(terms):
+        total += Fraction((-1) ** k, (2 * k + 1)) / n ** (2 * k + 1)
+    return total
+
+
+PI = 4 * (4 * atan_inv(5) - atan_inv(239))
+
+
+def atanh(x, terms=400):
+    """atanh(x) = sum x^(2k+1)/(2k+1), exact for rational x."""
+    total = Fraction(0)
+    for k in range(terms):
+        total += x ** (2 * k + 1) / (2 * k + 1)
+    return total
+
+
+# ln 2 = 2*atanh(1/3);  ln 10 = 4*ln2 - 2*atanh(3/13)   (since 2*atanh(3/13) = ln 1.6)
+LN2 = 2 * atanh(Fraction(1, 3))
+LN10 = 4 * LN2 - 2 * atanh(Fraction(3, 13))
+
+MANT = 113  # significand bits of binary128
+
+
+def to_binary128(v):
+    """Round a positive Fraction to binary128; return (sign, biased_exp, frac)."""
+    sign = 0
+    if v < 0:
+        sign, v = 1, -v
+    # exponent: largest e with 2^e <= v
+    e = 0
+    while Fraction(2) ** (e + 1) <= v:
+        e += 1
+    while Fraction(2) ** e > v:
+        e -= 1
+    m = v / Fraction(2) ** e            # in [1, 2)
+    scaled = m * 2 ** (MANT - 1)        # target integer in [2^112, 2^113)
+    M = scaled.numerator // scaled.denominator
+    rem = scaled - M
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and M % 2 == 1):
+        M += 1
+    if M == 2 ** MANT:
+        M //= 2
+        e += 1
+    return sign, e + 16383, M - 2 ** (MANT - 1)
+
+
+def hexlit(v, bits=MANT):
+    """hex floating literal string for v, rounded to `bits` of significand.
+
+    bits-1 must be a multiple of 4: a hex literal names 4 bits per fraction
+    digit, and 64-bit significand (63 fraction bits) is neither 15 nor 16
+    digits -- spelling it is where the first version of this file lost a
+    factor of two. HI/LO splits therefore use 65 bits.
+    """
+    assert (bits - 1) % 4 == 0, "not a whole number of hex fraction digits"
+    if v < 0:
+        return "-" + hexlit(-v, bits)
+    if bits != MANT:
+        # round to a shorter significand first (used for the hi/lo splits)
+        s, be, frac = to_binary128(v)
+        e = be - 16383
+        m = Fraction(2 ** (MANT - 1) + frac, 2 ** (MANT - 1))
+        scaled = m * 2 ** (bits - 1)
+        M = scaled.numerator // scaled.denominator
+        rem = scaled - M
+        if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and M % 2 == 1):
+            M += 1
+        if M == 2 ** bits:
+            M //= 2
+            e += 1
+        s, be, frac = (s, e + 16383, M - 2 ** (bits - 1))
+    else:
+        s, be, frac = to_binary128(v)
+    e = be - 16383
+    digits = (bits - 1) // 4
+    return "0x1.%0*xp%+dL" % (digits, frac, e)
+
+
+def split(v):
+    """(hi, lo): hi rounds v to 65 significand bits, lo = v - hi exactly.
+
+    65 bits is 1 + 64 fraction bits = 16 hex digits exactly. The point of the
+    split is that lo then fits: v needs 113 bits, hi 65, so v - hi is a
+    multiple of 2^-112 of magnitude below 2^-64 -- about 48 significant bits,
+    well inside one binary128. hi + lo is therefore EXACTLY v, which is what
+    makes x - k*hi - k*lo a faithful argument reduction instead of an
+    approximation with a hidden 2^-113 hole in it.
+    """
+    hi_bits = 65
+    # Split the VALUE THE LITERAL NAMES, not the exact real: LD_LN2 is the
+    # binary128 rounding of ln 2, and it is that rounded V the compiler sees.
+    # V - hi is then a difference of two 112-bit fractions that cancels in the
+    # high bits -- about 48 bits live -- so it is exactly representable, while
+    # (exact ln 2) - hi is not a binary128 at all and would round.
+    s, be, frac = to_binary128(v)
+    e = be - 16383
+    V = Fraction(2 ** (MANT - 1) + frac, 2 ** (MANT - 1)) * Fraction(2) ** e
+    hi_str = hexlit(V, hi_bits)
+    m = Fraction(2 ** (MANT - 1) + frac, 2 ** (MANT - 1))
+    scaled = m * 2 ** (hi_bits - 1)
+    M = scaled.numerator // scaled.denominator
+    rem = scaled - M
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and M % 2 == 1):
+        M += 1
+    e2 = e
+    if M == 2 ** hi_bits:
+        M //= 2
+        e2 += 1
+    hi = Fraction(M, 2 ** (hi_bits - 1)) * Fraction(2) ** e2
+    lo = V - hi
+    out = hexlit(lo)
+    assert parseable(out) + hi == V, "hi + lo must be exactly the literal's value"
+    return hi_str, out
+
+
+def parseable(lit):
+    """The exact value a hex literal spells -- the check split() asserts on."""
+    s = lit.rstrip("L")
+    neg = s.startswith("-")
+    if neg:
+        s = s[1:]
+    mant, exp = s.split("p")
+    ip, fp = mant.split(".")
+    val = Fraction(int(ip, 16))
+    for i, ch in enumerate(fp, 1):
+        val += Fraction(int(ch, 16), 16 ** i)
+    v = val * Fraction(2) ** int(exp)
+    return -v if neg else v
+
+
+print("/* generated by tools/gen_ldconst.py -- do not edit by hand */")
+print("#define LD_LN2      %s" % hexlit(LN2))
+hi, lo = split(LN2)
+print("#define LD_LN2_HI   %s" % hi)
+print("#define LD_LN2_LO   %s" % lo)
+print("#define LD_LOG2E    %s" % hexlit(1 / LN2))
+print("#define LD_LN10     %s" % hexlit(LN10))
+print("#define LD_LOG10E   %s" % hexlit(1 / LN10))
+print("#define LD_PI       %s" % hexlit(PI))
+print("#define LD_PI_2     %s" % hexlit(PI / 2))
+hi, lo = split(PI / 2)
+print("#define LD_PI_2_HI  %s" % hi)
+print("#define LD_PI_2_LO  %s" % lo)
+print("#define LD_PI_4     %s" % hexlit(PI / 4))
+print("#define LD_2_OVER_PI %s" % hexlit(2 / PI))
+print("")
+print("/* decimal cross-check (should match the known expansions):")
+for name, v in (("ln2", LN2), ("ln10", LN10), ("pi", PI)):
+    print(" * %-5s %s" % (name, ("%." + "40" + "f") % float(0)) if False else
+          " * %-5s %s" % (name, "%.40f" % (v.numerator / v.denominator)))
+print(" */")
