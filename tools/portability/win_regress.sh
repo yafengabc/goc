@@ -143,6 +143,18 @@ build_run_win_ok "fp128 [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "fp12
 build_run_win_ok "longdouble [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble" goc
 build_run_win_ok "longdouble [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble" gocl
 
+# Struct-returning calls consumed in expression position ("f(a).hi"): the bug
+# corrupted the statements AFTER the trigger (negative temporary slot indices
+# aliased live locals), so the detection is the byte-exact stdout of the
+# original repro -- layout-dependent, which is why it is compared verbatim
+# rather than self-reported. goc-native only: the bug lived in goc's slot
+# accounting, and gocl's LLVM struct returns never had it.
+build_run_win "structret_bug [goc/win]" "$ROOT/bin/goc.exe"  "-"               "structret_bug" "r = 3ece32d23193c687.1000000000000000   a.lo=2ce32d23193c6871" goc
+# The position battery: argument, condition, plain and compound assignment,
+# double/aggregate/array members -- guards that the fix releases the result
+# buffer exactly where it dies and nowhere earlier.
+build_run_win_ok "structret [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "structret" goc
+
 echo ""
 echo "== Windows: pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]

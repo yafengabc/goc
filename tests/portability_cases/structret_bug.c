@@ -1,29 +1,34 @@
 /* ---------------------------------------------------------------------------
- * Known goc native-back-end bug: taking a member of a struct-returning call
- * *in expression position* corrupts the next struct-returning call.
+ * Regression: taking a member of a struct-returning call *in expression
+ * position* used to corrupt the next struct-returning call (fixed; this file
+ * stays as the byte-exact harness that caught it).
  *
  *     MIX(goc_tf_neg(a).hi);        <-- the trigger
- *     r = goc_tf_from_double(a.lo); <-- now returns a pointer, not a value
+ *     r = goc_tf_from_double(a.lo); <-- used to return a pointer, not a value
  *
- * Expected (gcc, gocl, and goc with the member read through a variable):
+ * Correct output (gcc, gocl, and goc since the structret fix):
  *
  *     r = 3ece32d23193c687.1000000000000000   a.lo=2ce32d23193c6871
  *
- * goc native gives:
+ * Pre-fix, goc native gave:
  *
  *     r = 0000000140014000.0000000140014000   a.lo=2ce32d23193c6871
  *
- * 0x140014000 is an address inside the PE image (base 0x140000000) and both
- * halves of the 16-byte result carry it, so the call's result location is
- * being handed back instead of its contents. The damage also outlives the
- * statement: every later struct-returning call in the function is wrong.
+ * 0x140014000 is an address inside the PE image (base 0x140000000): the
+ * member load left the call's result-buffer claim set, the compound
+ * assignment rolled tmpDepth back over it, and the statement boundary's
+ * release subtracted the slots twice -- negative slot indices then aliased
+ * live locals, and printf's argument parks wrote a format-string pointer
+ * into r's own bytes. Fixed by releasing the buffer at the scalar member
+ * load itself (releaseCallResultBuffer, codegen.go); the shape that
+ * reproduces it is layout-dependent, which is why this exact statement
+ * sequence is pinned here byte for byte.
  *
- * Workaround until it is fixed: assign to a variable first
+ * Workaround (still valid): assign to a variable first
  * (`r = goc_tf_neg(a); ... r.hi`). tests/portability_cases/fp128.c does that
- * and says why in a comment.
+ * and says why in a comment. The wider position battery lives in
+ * structret.c next to this file.
  *
- * Build: goc goc_structret_bug.c -o bug.exe && ./bug.exe
- * (it links against goclib, which is what supplies the goc_tf_* functions)
  * ------------------------------------------------------------------------- */
 
 #include <stdio.h>

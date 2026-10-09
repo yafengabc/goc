@@ -2211,6 +2211,7 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 			// offset/width inside the storage unit at r10); extract with
 			// sign or zero extension per the member's signedness.
 			c.genLoadBitfield(c.lvBitUnit, c.lvBitOff, c.lvBitWidth, c.lvBitSigned)
+			c.releaseCallResultBuffer()
 			return c.resTyp, nil
 		}
 		// Members are laid out at their C type width (MSVC x64 packs an int
@@ -2220,10 +2221,12 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 		width := c.typeWidth(t)
 		if t.IsFloating() {
 			c.genLoadElem("r10", width, frontend.TDouble, false)
+			c.releaseCallResultBuffer()
 			return c.resTyp, nil
 		}
 		signed := t.Kind == frontend.KInt && t.Signed
 		c.genLoadElem("r10", width, frontend.TInt, signed)
+		c.releaseCallResultBuffer()
 		return c.resTyp, nil
 	case *frontend.SizeofExpr:
 		// sizeof on a variable-length array is NOT a constant: the size exists
@@ -9421,6 +9424,21 @@ func (c *CG) releaseResStruct() {
 		c.tmpDepth -= c.resStructSl
 		c.resStruct = false
 	}
+}
+
+// releaseCallResultBuffer frees a struct-return call's result buffer after a
+// SCALAR member of it has been loaded into a register ("f().x"): the value is
+// in rax/xmm0, so the buffer is dead -- but the claim must be unwound HERE,
+// while tmpDepth still includes it. Consumers roll tmpDepth back to their
+// entry depth without checking the flag (genCompoundAssign's restore did),
+// and the statement boundary then releases unconditionally -- so a claim left
+// set was subtracted twice and drove tmpDepth negative. Negative slot indices
+// handed out addresses inside live locals: "MIX(f(a).hi); r = g(b);" parked
+// format pointers into r's own bytes and every half of r printed an image
+// address. Aggregate members and array decays must NOT release here: their
+// consumers still need the buffer's bytes through the address in r10.
+func (c *CG) releaseCallResultBuffer() {
+	c.releaseResStruct()
 }
 
 // lvalueWidth returns the byte width of the value stored at the lvalue e. For
