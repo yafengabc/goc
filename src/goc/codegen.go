@@ -8412,6 +8412,13 @@ func (c *CG) exprType(e frontend.Expr) *frontend.Type {
 		if n.Op == "-" && isLD(c.exprType(n.E)) {
 			return c.exprType(n.E)
 		}
+		// ...and the same for a NEGATED long double literal ("-2.5L"): the
+		// literal is in no type table, so the branch above misses it and
+		// the expression's type came out nil -- the value then fell into
+		// genUnary's integer `neg` and "-2.5L" evaluated to +2.0.
+		if n.Op == "-" && c.isLDExpr(n.E) {
+			return frontend.LongDoubleType()
+		}
 		if n.Op == "*" {
 			if t := c.exprType(n.E); t != nil && t.IsPtr() {
 				return t.Elem
@@ -9357,6 +9364,17 @@ func (c *CG) braceElemLocal(t *frontend.Type, e frontend.Expr, off int) error {
 	}
 	if _, err := c.genExprT(e); err != nil {
 		return err
+	}
+	if isLD(t) {
+		// The tf intercept leaves the value's ADDRESS in r10 (a literal's
+		// .rdata slot or a claimed carrier); the scalar store below would
+		// push 8 bytes of xmm0 and leave 8 zero bytes -- observed as every
+		// element of "long double vals[] = {...}" being garbage. Copy the
+		// 16 bytes, then free the carrier exactly like tfOperand does.
+		c.emit("lea r11, [rbp%+d]", off)
+		c.copyBytes("r11", "r10", 16)
+		c.releaseResBig()
+		return nil
 	}
 	if err := c.ensureType(t.Class()); err != nil {
 		return err
@@ -10786,6 +10804,15 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 			pt = paramTypes[i]
 		}
 		at := c.exprType(args[i])
+		if at == nil && c.isLDExpr(args[i]) {
+			// A long double literal ("printf("%Lf", 1.5L)") is in no type
+			// table, so exprType is nil and the argument fell through the
+			// aggregate branch into the scalar path -- which passed the
+			// value's LOW 8 BYTES where the callee's va_arg expected a
+			// pointer to the 16-byte value. Give it its real type so the
+			// by-address marshalling below runs.
+			at = frontend.LongDoubleType()
+		}
 		// Long double parameter: the argument is materialised as binary128
 		// (converted from whatever type it has) and its address is passed,
 		// exactly like a struct argument's hidden pointer. The operand's
@@ -10898,8 +10925,15 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 				// before the call consumes it.
 				c.tmpDepth += c.resBigSl
 				consumed += c.resBigSl
-				c.resBig = false
 			}
+			// A long double LVALUE (or a literal: both carry resBigSl == 0)
+			// needs no slot protection -- its address points at a local or
+			// at .rdata -- but resBig itself MUST still be cleared. Left
+			// set, the call's int result was consumed by ensureType's LD
+			// branch: "int n = sprintf(buf, "%Lf", x)" ran goc_tf_to_ll on
+			// whatever r10 held after the call and got 0 (and, for a
+			// literal argument, a wild r10 segfaulted the process).
+			c.resBig = false
 			c.tmpDepth++
 			c.emit("mov [rbp%+d], r10", c.tmpSlot(c.tmpDepth))
 			slots[i] = argSlot{slot: c.tmpDepth, typ: frontend.TInt}

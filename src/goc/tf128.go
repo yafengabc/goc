@@ -50,6 +50,14 @@ func (c *CG) isLDExpr(e frontend.Expr) bool {
 	if nl, ok := e.(*frontend.NumLit); ok {
 		return nl.IsLongDouble
 	}
+	// A negated long double expression ("-2.5L", "-x" with x long double)
+	// is itself a long double value. Without this the genExprT intercept
+	// misses "-<literal>" (exprType is nil for a literal, and the Unary
+	// node is not a NumLit), the expression fell through to genUnary, and
+	// the integer `neg` ran on the carrier address.
+	if u, ok := e.(*frontend.Unary); ok && u.Op == "-" {
+		return c.isLDExpr(u.E)
+	}
 	return false
 }
 
