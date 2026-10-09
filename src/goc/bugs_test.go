@@ -131,3 +131,25 @@ func TestVarTypesResetAcrossTUs(t *testing.T) {
 		t.Errorf("v declared only in TU1 must not resolve in TU2; _Alignof(v) should fail to parse")
 	}
 }
+
+// TestLongDoubleCondExpr pins the conditional operator over long double,
+// which needed two separate fixes. exprType had no CondExpr case, so
+// "c = (a < 0 ? -a : a)" read a nil type off the right-hand side, failed
+// isLDExpr and took the SCALAR assignment path -- a to_ll/from_ll round trip
+// through an int64 that turned 0.5 into 0.0. Fixing only the type then
+// reached genTFValue, whose default branch treats its operand as an lvalue
+// and failed codegen outright on a conditional; it now copies each arm into
+// one buffer the merge can name.
+func TestLongDoubleCondExpr(t *testing.T) {
+	src := `long double f(long double a){ return a < 0.0L ? -a : a; }
+int main(){
+  long double v = f(0.5L);
+  return v > 0.4L && v < 0.6L ? 1 : 0;
+}`
+	asm := genAsm(t, src)
+	// The scalar path narrows the 16-byte value to an int64 and widens it
+	// back; neither call belongs anywhere near a long double conditional.
+	if strings.Contains(asm, "goc_tf_to_ll") || strings.Contains(asm, "goc_tf_from_ll") {
+		t.Errorf("a long double conditional must not round-trip through an int64:\n%s", asm)
+	}
+}

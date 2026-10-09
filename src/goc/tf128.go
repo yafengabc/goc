@@ -261,6 +261,42 @@ func (c *CG) genTFValue(e frontend.Expr, t *frontend.Type) (frontend.CType, erro
 		}
 	case *frontend.Binary:
 		return c.genTFBinary(n)
+	case *frontend.CondExpr:
+		// "cond ? a : b" with long double arms. Each arm's value lives at
+		// its own address (an lvalue's slot, or a temporary a computed one
+		// claimed), so the two paths cannot simply leave r10 pointing at
+		// their own buffer -- the merge would name one and the other path
+		// would never write it. Both arms therefore copy into ONE buffer
+		// claimed before the branch.
+		if err := c.genTruth(n.Cond); err != nil {
+			return frontend.TInt, err
+		}
+		rk, rsl, roff := c.tfTemp()
+		lElse := c.newLabel("ldelse")
+		lEnd := c.newLabel("ldendif")
+		c.emit("cmp rax, 0")
+		c.emit("je %s", lElse)
+		_, _, aoff, err := c.tfOperand(n.Then)
+		if err != nil {
+			return frontend.TInt, err
+		}
+		c.emit("lea r10, [rbp%+d]", roff)
+		c.emit("lea r11, [rbp%+d]", aoff)
+		c.copyBytes("r10", "r11", 16)
+		c.tmpDepth -= tfWords // the arm's temporary is dead; the else arm reuses it
+		c.emit("jmp %s", lEnd)
+		c.line(lElse + ":\n")
+		_, _, boff, err := c.tfOperand(n.Else)
+		if err != nil {
+			return frontend.TInt, err
+		}
+		c.emit("lea r10, [rbp%+d]", roff)
+		c.emit("lea r11, [rbp%+d]", boff)
+		c.copyBytes("r10", "r11", 16)
+		c.tmpDepth -= tfWords
+		c.line(lEnd + ":\n")
+		c.markLD(t, rk, rsl)
+		return frontend.TInt, nil
 	case *frontend.CastExpr:
 		return c.genTFCast(n)
 	case *frontend.Unary:

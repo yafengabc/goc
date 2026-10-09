@@ -8171,7 +8171,7 @@ func (c *CG) genLValue(e frontend.Expr) error {
 		c.emit("add r10, %d", off)
 		return nil
 	}
-	return fmt.Errorf("expression is not an lvalue")
+	return fmt.Errorf("expression is not an lvalue (%T)", e)
 }
 
 // ptrArithElem returns the element type of a pointer-arithmetic expression
@@ -8382,6 +8382,27 @@ func (c *CG) exprType(e frontend.Expr) *frontend.Type {
 		// controlling expression's own type is irrelevant after the pick).
 		if n.Chosen != nil {
 			return c.exprType(n.Chosen)
+		}
+		return nil
+	case *frontend.CondExpr:
+		// A conditional's type is the common type of its arms. This branch
+		// exists for the WIDE types only -- int/double arms still come back
+		// nil, which is what every existing caller was written against --
+		// because a nil here is not neutral for them: "c = (a < 0 ? -a : a)"
+		// with a long double `a` read a nil type off the right-hand side,
+		// failed isLDExpr, and took the SCALAR assignment path, which round-
+		// trips 16 bytes of binary128 through an int64 (to_ll/from_ll).
+		// 0.5 came out as 0.0. The arms' own codegen already leaves the
+		// value at r10 with resBig set; the type is all that was missing.
+		tt, et := c.exprType(n.Then), c.exprType(n.Else)
+		if isLD(tt) || isLD(et) || c.isLDExpr(n.Then) || c.isLDExpr(n.Else) {
+			return frontend.LongDoubleType()
+		}
+		if frontend.IsBig(tt) || frontend.IsBig(et) {
+			if frontend.IsBig(tt) {
+				return tt
+			}
+			return et
 		}
 		return nil
 	case *frontend.Ident:
