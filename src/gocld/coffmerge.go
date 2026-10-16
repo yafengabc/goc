@@ -219,8 +219,18 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 	// still holds the frame size for that sub. An earlier helper here either
 	// read rcx (which the caller never sets, so the probe walked the stack for
 	// a garbage size) or subtracted pages itself (double allocation); both
-	// ended in STATUS_STACK_OVERFLOW (0xC00000FD). r10/r11 are volatile per
-	// the Windows ABI, so they are free scratch.
+	// ended in STATUS_STACK_OVERFLOW (0xC00000FD).
+	//
+	// r10/r11 are scratch for the probe loop, but they are SAVED first. The
+	// old body treated them as free because the Windows ABI marks them
+	// volatile -- true for ordinary calls, wrong here: LLVM models the chkstk
+	// call as preserving everything but rax (a match for MSVC's __chkstk,
+	// which push/pops r10/r11), so its register allocator keeps loop state in
+	// those registers across a VLA's mid-function probe call. Clobbering them
+	// silently miscompiled such loops (a continue condition computed into
+	// r10 never fired; verified 2026-10-16 with a 300000-iteration VLA loop
+	// whose sum came out equal to the no-continue run). Pushing the pair and
+	// popping it on the way out matches what the caller's allocator was told.
 	//
 	// One body therefore serves either name, and it is registered under both.
 	// Registering only ___chkstk_ms leaves a current-LLVM object referencing
@@ -231,11 +241,17 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 			padSection(text, pad)
 		}
 		start := text.VSize
-		// mov r11, rax ; mov r10, rsp
+		// push r10 ; push r11 ; mov r10, rsp ; mov r11, rax
 		// (4C 8B D4 = mov r10,rsp; the 89 variant would be mov rsp,r10 and
-		// clobber the stack pointer with garbage r10 on entry.)
-		text.Data = append(text.Data, 0x49, 0x89, 0xC3, 0x4C, 0x8B, 0xD4)
-		text.VSize += 6
+		// clobber the stack pointer with garbage r10 on entry. rax itself is
+		// never copied out of: it must reach the caller's `sub rsp, rax`
+		// intact, so the probe counter gets its own copy in r11.)
+		text.Data = append(text.Data,
+			0x41, 0x52, // push r10
+			0x41, 0x53, // push r11
+			0x4C, 0x8B, 0xD4, // mov r10, rsp
+			0x49, 0x89, 0xC3) // mov r11, rax
+		text.VSize += 9
 		loop := text.VSize
 		// loop: sub rsp,4096 ; mov [rsp],r11 ; sub r11,4096
 		// The probe block is 18 bytes (7 + 4 + 7); the cursor must advance by
@@ -253,9 +269,13 @@ func (img *Image) ingestParsedCOFF(o *coffObj, src []byte) error {
 		rel8 := int8(loop - (text.VSize + 2))
 		text.Data = append(text.Data, 0x7F, byte(rel8))
 		text.VSize += 2
-		// mov rsp, r10 ; ret
-		text.Data = append(text.Data, 0x4C, 0x89, 0xD4, 0xC3)
-		text.VSize += 4
+		// mov rsp, r10 ; pop r11 ; pop r10 ; ret
+		text.Data = append(text.Data,
+			0x4C, 0x89, 0xD4, // mov rsp, r10
+			0x41, 0x5B, // pop r11
+			0x41, 0x5A, // pop r10
+			0xC3) // ret
+		text.VSize += 9
 		loc := SymLoc{Sect: sectionIndexOf(img, text), Off: start}
 		img.Syms["___chkstk_ms"] = loc
 		img.Syms["__chkstk"] = loc

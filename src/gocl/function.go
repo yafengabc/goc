@@ -58,6 +58,12 @@ type irEmitter struct {
 	// breakTo and continueTo hold the enclosing loop's labels, innermost last.
 	breakTo    []string
 	continueTo []string
+	// fnHasVLA says the function allocates variable-length arrays at run time.
+	// Only then do the loops need an llvm.stacksave/stackrestore bracket:
+	// every VLA alloca stays on the stack until its restore point, so a loop
+	// without one would grow the frame once per iteration until the stack
+	// overflowed (0xC00000FD after enough iterations of a large VLA).
+	fnHasVLA bool
 	// userLabels maps a C goto label to the LLVM block carrying it.
 	userLabels map[string]string
 	// pendingLabels are C labels waiting for the block that follows.
@@ -161,6 +167,15 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 	// so the whole body is swept first.
 	e.vaNames = map[string]bool{}
 	collectVaListNames(f.Body, e.vaNames)
+
+	// Does this function ever allocate a VLA? Loops bracket their iterations
+	// with llvm.stacksave/stackrestore only then, so a function with no
+	// run-time stack allocation emits byte-identical IR to before.
+	frontend.WalkStmts(f.Body, func(s frontend.Stmt) {
+		if d, ok := s.(*frontend.DeclStmt); ok && d.Typ != nil && d.Typ.HasVLA() {
+			e.fnHasVLA = true
+		}
+	})
 
 	params := e.bindParams(f)
 

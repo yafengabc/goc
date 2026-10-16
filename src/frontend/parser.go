@@ -899,7 +899,23 @@ func (p *Parser) parseStructMembers() ([]*Member, error) {
 					return nil, fmt.Errorf("line %d: bit-field width %d exceeds storage unit of %d bits", p.cur().Line, bitWidth, sizeOf(bt)*8)
 				}
 			}
-			members = append(members, &Member{Name: d.name, Type: declType(d.typ), BitWidth: bitWidth})
+			mt := declType(d.typ)
+			// C99 lets a block-scope struct carry a VLA member (the struct
+			// type itself becomes variably modified), but no back end can
+			// lay one out: goc sized the member 0 and let writes run past
+			// the object (stack corruption), gocl kept a compile-time size
+			// while sizeof reported the run-time element count. sizeof of
+			// the struct then disagreed with gcc on both (8 vs 20/36).
+			// Reject at the definition instead of miscompiling silently;
+			// flexible members ("int a[]") have no VLALen and stay legal.
+			if mt.HasVLA() {
+				name := d.name
+				if name == "" {
+					name = "?"
+				}
+				return nil, fmt.Errorf("line %d: struct/union member %q has variable-length type (not supported)", d.line, name)
+			}
+			members = append(members, &Member{Name: d.name, Type: mt, BitWidth: bitWidth})
 			if p.atPunct(",") {
 				p.next()
 				continue

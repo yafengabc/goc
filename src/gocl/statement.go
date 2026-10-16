@@ -172,15 +172,60 @@ func (e *irEmitter) doIf(n *frontend.IfStmt) {
 	e.flushPendingLabels()
 }
 
+// stackSave emits llvm.stacksave and returns its token. Together with
+// stackRestore it is the IR-level twin of goc's per-loop rsp checkpoint: the
+// token marks the stack pointer, and a restore rewinds to it, unwinding every
+// alloca made since -- including a VLA whose block-exit cleanup a break or
+// continue jumps over.
+func (e *irEmitter) stackSave() string {
+	e.c.noteIntrinsic("llvm.stacksave", "ptr", nil)
+	v := e.newTmp()
+	e.line("%s = call ptr @llvm.stacksave()", v)
+	return v
+}
+
+// stackRewind rewinds the stack to a token from stackSave. The spelling is
+// stackRestore (llvm's name), the verb here distinguishes it from the label
+// binding helpers.
+func (e *irEmitter) stackRewind(tok string) {
+	if tok == "" {
+		return
+	}
+	e.c.noteIntrinsic("llvm.stackrestore", "void", []string{"ptr"})
+	e.line("call void @llvm.stackrestore(ptr %s)", tok)
+}
+
+// stmtHasVLA reports whether executing s can allocate a VLA (a declaration
+// anywhere inside it). Used for the for-statement's initialiser, whose VLA
+// must outlive the loop and is therefore rewound only at the exit.
+func stmtHasVLA(s frontend.Stmt) bool {
+	found := false
+	frontend.WalkStmts(s, func(x frontend.Stmt) {
+		if d, ok := x.(*frontend.DeclStmt); ok && d.Typ != nil && d.Typ.HasVLA() {
+			found = true
+		}
+	})
+	return found
+}
+
 // doWhile lowers `while (c) B`, testing before each iteration.
 func (e *irEmitter) doWhile(n *frontend.WhileStmt) {
 	testL := e.newLabel()
 	bodyL := e.newLabel()
 	doneL := e.newLabel()
+	// The token is taken before the loop is entered and rewound at the top of
+	// every test and at the exit, so each iteration starts from the stack
+	// pointer the loop found -- and a break from deep inside the body cannot
+	// carry a stale, deeper rsp past the loop.
+	tok := ""
+	if e.fnHasVLA {
+		tok = e.stackSave()
+	}
 	e.term("br label %%%s", testL)
 
 	e.blockLabel(testL)
 	e.flushPendingLabels()
+	e.stackRewind(tok)
 	cond := e.cond(n.Cond)
 	e.term("br i1 %s, label %%%s, label %%%s", cond, bodyL, doneL)
 
@@ -194,6 +239,7 @@ func (e *irEmitter) doWhile(n *frontend.WhileStmt) {
 
 	e.blockLabel(doneL)
 	e.flushPendingLabels()
+	e.stackRewind(tok)
 }
 
 // doDoWhile lowers `do B while (c)`, running the body before the first test and
@@ -202,6 +248,10 @@ func (e *irEmitter) doDoWhile(n *frontend.DoWhileStmt) {
 	bodyL := e.newLabel()
 	testL := e.newLabel()
 	doneL := e.newLabel()
+	tok := ""
+	if e.fnHasVLA {
+		tok = e.stackSave()
+	}
 	e.term("br label %%%s", bodyL)
 
 	e.blockLabel(bodyL)
@@ -214,11 +264,16 @@ func (e *irEmitter) doDoWhile(n *frontend.DoWhileStmt) {
 
 	e.blockLabel(testL)
 	e.flushPendingLabels()
+	// Rewind before the condition: the body's declarations are out of scope
+	// there (their block has ended), and continue arrives at this test from
+	// mid-body with the stack pointer wherever the body left it.
+	e.stackRewind(tok)
 	cond := e.cond(n.Cond)
 	e.term("br i1 %s, label %%%s, label %%%s", cond, bodyL, doneL)
 
 	e.blockLabel(doneL)
 	e.flushPendingLabels()
+	e.stackRewind(tok)
 }
 
 // doFor lowers the three-clause `for`. The initialiser runs once, the condition
@@ -227,8 +282,22 @@ func (e *irEmitter) doDoWhile(n *frontend.DoWhileStmt) {
 func (e *irEmitter) doFor(n *frontend.ForStmt) {
 	e.tr.pushScope()
 	defer e.tr.popScope()
+	// The initialiser's own VLA must survive every iteration (the body may
+	// legitimately index it), so it gets a token of its own taken BEFORE it
+	// runs and rewound only at the exit -- after the loop token, which sits
+	// below it. The loop token itself goes after the initialiser for the same
+	// reason: rewinding above a live VLA would let the body's allocations
+	// overwrite it.
+	initTok := ""
+	if n.Init != nil && stmtHasVLA(n.Init) {
+		initTok = e.stackSave()
+	}
 	if n.Init != nil {
 		e.stmt(n.Init)
+	}
+	tok := ""
+	if e.fnHasVLA {
+		tok = e.stackSave()
 	}
 	testL := e.newLabel()
 	bodyL := e.newLabel()
@@ -238,6 +307,7 @@ func (e *irEmitter) doFor(n *frontend.ForStmt) {
 
 	e.blockLabel(testL)
 	e.flushPendingLabels()
+	e.stackRewind(tok)
 	if n.Cond != nil {
 		cond := e.cond(n.Cond)
 		e.term("br i1 %s, label %%%s, label %%%s", cond, bodyL, doneL)
@@ -262,6 +332,8 @@ func (e *irEmitter) doFor(n *frontend.ForStmt) {
 
 	e.blockLabel(doneL)
 	e.flushPendingLabels()
+	e.stackRewind(tok)
+	e.stackRewind(initTok)
 }
 
 // doSwitch lowers a switch. C allows fall-through, and keeping the case labels

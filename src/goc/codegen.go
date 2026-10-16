@@ -211,6 +211,9 @@ type CG struct {
 	breaks       []string          // active break targets: innermost loop or switch, last
 	swDepth      int               // how many switch statements enclose the code being emitted
 	swSlots      int               // switch value slots reserved in this frame (max nesting)
+	fnHasVLA     bool              // current function allocates VLAs at run time (loop checkpoints needed)
+	chkSlots     int               // loop checkpoint slots reserved in this frame
+	chkNext      int               // checkpoint slots handed out during emission
 	curFn        string            // name of the function being generated (label mangling)
 	labels       map[string]string // C label name -> assembly label, per function
 	saveBaseOff  int               // rbp offset of the variadic save area (0 if none)
@@ -729,6 +732,41 @@ func (c *CG) tmpSlotBlock(k, n int) int {
 // temporaries and above the variadic save area.
 func (c *CG) swSlot(k int) int {
 	return -(c.regArea + c.localBytes + 8*scratchSlots + 8*k)
+}
+
+// chkSlot returns the rbp offset of the k-th (0-indexed) loop checkpoint slot.
+// A checkpoint parks rsp at loop entry so every iteration start (lTop) and the
+// loop's exit (lEnd) can put the stack pointer back exactly where the loop
+// found it. That is what stops a variable-length array declared inside the
+// body -- whose block-exit release a break/continue jumps over -- from growing
+// the frame once per iteration. The slots sit below the switch value slots and
+// above the variadic save area.
+func (c *CG) chkSlot(k int) int {
+	return -(c.regArea + c.localBytes + 8*scratchSlots + 8*c.swSlots + 8*(k+1))
+}
+
+// chkSave emits the loop-entry rsp checkpoint and returns its chkSlot offset.
+// In a function without run-time stack allocation rsp never moves, so there is
+// nothing to restore and no instruction is emitted (0 marks "none").
+func (c *CG) chkSave() int {
+	if !c.fnHasVLA {
+		return 0
+	}
+	k := c.chkNext
+	c.chkNext++
+	off := c.chkSlot(k)
+	c.emit("mov [rbp%+d], rsp", off)
+	return off
+}
+
+// chkRestore puts rsp back at the checkpoint captured by chkSave. Emitted at
+// every point where control re-enters the loop from the top or leaves it: any
+// VLA the body allocated in between is unwound whether the exit ran the
+// block-end release or jumped straight out with break/continue.
+func (c *CG) chkRestore(off int) {
+	if off != 0 {
+		c.emit("mov rsp, [rbp%+d]", off)
+	}
 }
 
 // slotWidth returns the byte width used to load/store a variable/value of type t
@@ -5662,6 +5700,12 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 	var decls []localDecl
 	maxSwDepth := 0
 	hasAsm := false // an inline-assembly block in this function?
+	// Loop checkpoints cost one frame slot each, but only a function that
+	// allocates VLAs at run time can need them (rsp moves only there). Counting
+	// both here -- before the frame is frozen -- is what lets the checkpoint
+	// be a pure no-op for every other function: identical frame, identical asm.
+	hasVLA := false
+	loopCount := 0
 	var gather func(frontend.Stmt, int)
 	gather = func(s frontend.Stmt, swDepth int) {
 		if swDepth > maxSwDepth {
@@ -5717,6 +5761,9 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 				// Each declaration -- even two with the same name in sibling
 				// blocks -- gets its own uid so their frame homes never
 				// collide. Name->uid scoping is rebuilt at emission time.
+				if n.Typ != nil && n.Typ.HasVLA() {
+					hasVLA = true
+				}
 				uid := c.varUID
 				c.varUID++
 				c.declUID[n] = uid
@@ -5728,10 +5775,13 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 				gather(n.Else, swDepth)
 			}
 		case *frontend.WhileStmt:
+			loopCount++
 			gather(n.Body, swDepth)
 		case *frontend.DoWhileStmt:
+			loopCount++
 			gather(n.Body, swDepth)
 		case *frontend.ForStmt:
+			loopCount++
 			if n.Init != nil {
 				gather(n.Init, swDepth)
 			}
@@ -5750,6 +5800,12 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 		gather(st, 0)
 	}
 	c.swSlots = maxSwDepth
+	c.fnHasVLA = hasVLA
+	c.chkSlots = 0
+	if hasVLA {
+		c.chkSlots = loopCount
+	}
+	c.chkNext = 0
 
 	// A local whose address is taken (&x) cannot live in a register, doubles
 	// cannot live in a GPR, and arrays obviously need memory. Struct/union
@@ -6099,14 +6155,14 @@ func (c *CG) genFunc(f *frontend.FuncDecl) error {
 	// + switch depth + variadic save area. The +8 mirrors the +8 gap baked into
 	// regArea above: the locals now start 8 bytes lower (rbp-40 instead of
 	// rbp-32), so the frame must grow by 8 to keep them inside it.
-	frame := 8 + pad + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave + winShadow
+	frame := 8 + pad + localBytes + 8*scratchSlots + 8*maxSwDepth + 8*c.chkSlots + varargSave + winShadow
 	// Must fold in the push count, not just round to 16 -- see alignFrame.
 	frame = c.alignFrame(frame)
 	// saveBaseOff points at save-area slot 0, which sits just below the
 	// expression temporaries. The ABI pad added to frame above pushes it up
 	// so the callee's argument-spill slots ([rsp+0..8*len(argRegs)) of the
 	// caller) stay below it.
-	c.saveBaseOff = -(regArea + localBytes + 8*scratchSlots + 8*maxSwDepth + varargSave)
+	c.saveBaseOff = -(regArea + localBytes + 8*scratchSlots + 8*maxSwDepth + 8*c.chkSlots + varargSave)
 	if winShadow != 0 {
 		// The variadic save area sits just above the bottom shadow; shift it
 		// down by the shadow size so it still lands at the frame bottom.
@@ -6409,6 +6465,37 @@ func (c *CG) blockVLASizes(b *frontend.Block) []int {
 		}
 	}
 	return out
+}
+
+// blockVLASizesFrom is blockVLASizes for a single statement: the initialiser
+// of a for-statement, which is what can declare a VLA in the loop's own scope
+// rather than in a nested block. The loop's exit gives that space back; the
+// checkpoint deliberately sits below it (see the ForStmt case in genStmt).
+func (c *CG) blockVLASizesFrom(ini frontend.Stmt) []int {
+	one := func(d *frontend.DeclStmt) []int {
+		if d == nil || d.Typ == nil || !d.Typ.HasVLA() {
+			return nil
+		}
+		if uid, ok := c.declUID[d]; ok {
+			if vi, ok2 := c.varEnts[uid]; ok2 && vi.vlaSize != 0 {
+				return []int{vi.vlaSize}
+			}
+		}
+		return nil
+	}
+	switch n := ini.(type) {
+	case *frontend.Block:
+		return c.blockVLASizes(n)
+	case *frontend.DeclList:
+		var out []int
+		for _, d := range n.Decls {
+			out = append(out, one(d)...)
+		}
+		return out
+	case *frontend.DeclStmt:
+		return one(n)
+	}
+	return nil
 }
 
 // releaseVLAs gives the stack space of the block's variable-length arrays back
@@ -6862,7 +6949,14 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 	case *frontend.WhileStmt:
 		lTop := c.newLabel("while")
 		lEnd := c.newLabel("wend")
+		// rsp checkpoint: stored once before the loop is entered, restored at
+		// the top of every iteration and at the exit, so a VLA the body
+		// allocates is unwound even when break/continue jumps over the block-end
+		// release (which used to grow the frame without bound and overflow the
+		// stack after enough iterations).
+		chk := c.chkSave()
 		c.line(lTop + ":\n")
+		c.chkRestore(chk)
 		if err := c.genTruth(n.Cond); err != nil {
 			return err
 		}
@@ -6883,6 +6977,7 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 		}
 		c.emit("jmp %s", lTop)
 		c.line(lEnd + ":\n")
+		c.chkRestore(chk)
 	case *frontend.ForStmt:
 		lTop := c.newLabel("for")
 		lEnd := c.newLabel("forend")
@@ -6898,7 +6993,13 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 				return err
 			}
 		}
+		// The checkpoint goes AFTER the initialiser: a VLA declared there has
+		// to survive every iteration, and restoring to a point above it would
+		// let the body's own allocations overwrite it. Its space is given back
+		// at lEnd instead (initVLAs below).
+		chk := c.chkSave()
 		c.line(lTop + ":\n")
+		c.chkRestore(chk)
 		if n.Cond != nil {
 			if err := c.genTruth(n.Cond); err != nil {
 				c.popScope()
@@ -6927,6 +7028,11 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 		}
 		c.emit("jmp %s", lTop)
 		c.line(lEnd + ":\n")
+		// Unwind anything the body allocated, then hand back a VLA the
+		// initialiser declared: the checkpoint sat below it, so the restore
+		// above deliberately does not cover it.
+		c.chkRestore(chk)
+		c.releaseVLAs(c.blockVLASizesFrom(n.Init))
 		c.popScope()
 	case *frontend.DoWhileStmt:
 		// "do body while (cond);": the body runs first, so the condition is
@@ -6934,7 +7040,9 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 		lTop := c.newLabel("do")
 		lCont := c.newLabel("docont")
 		lEnd := c.newLabel("doend")
+		chk := c.chkSave()
 		c.line(lTop + ":\n")
+		c.chkRestore(chk)
 		c.loops = append(c.loops, loopLabels{breakLbl: lEnd, contLbl: lCont})
 		c.breaks = append(c.breaks, lEnd)
 		c.pushScope() // loop body scope
@@ -6952,6 +7060,7 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 		c.emit("cmp rax, 0")
 		c.emit("jne %s", lTop)
 		c.line(lEnd + ":\n")
+		c.chkRestore(chk)
 	case *frontend.SwitchStmt:
 		if err := c.genSwitch(n); err != nil {
 			return err

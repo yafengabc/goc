@@ -162,6 +162,35 @@ func (c *checker) checkStmt(st Stmt, fn *FuncDecl) {
 		if n.IsTLS && fn != nil && n.Storage != "static" && n.Storage != "extern" {
 			c.errf(n.Line, "_Thread_local variable %q at block scope must be static or extern", n.Name)
 		}
+		// C99 variable-length array constraints, checked once here so both
+		// back ends report them before any code is generated. Without these,
+		// gocl silently dropped the initialiser of "int a[n] = {...}", emitted
+		// a crashing binary for the second-dimension form "int a[3][n]"
+		// (a constant stride against a run-time element size), and accepted a
+		// file-scope "int a[n];" whose length expression has no run-time to
+		// evaluate. gcc rejects all three.
+		if n.Typ != nil && n.Typ.HasVLA() {
+			if fn == nil {
+				// File scope: there is no run-time point at which the length
+				// expression could be evaluated (gcc: "variably modified ...").
+				c.errf(n.Line, "variably modified %q at file scope", n.Name)
+				c.put(n.Name, n.Typ, n.Line)
+				return
+			}
+			if !n.Typ.IsVLA() || n.Typ.Elem.HasVLA() {
+				// "int a[3][n]" / "int a[n][m]": the element stride is a
+				// run-time value, which no back end supports.
+				c.errf(n.Line, "only a single variable-length dimension is supported (%s)", n.Typ)
+				c.put(n.Name, n.Typ, n.Line)
+				return
+			}
+			if n.Init != nil {
+				// C11 6.7.9p3: no initialiser for a variable-length array.
+				c.errf(n.Line, "a variable-length array cannot have an initialiser")
+				c.put(n.Name, n.Typ, n.Line)
+				return
+			}
+		}
 		// ("auto x = expr;"). The declared type is the type of the initialiser
 		// after lvalue/array-to-pointer/function-to-pointer decay -- exactly
 		// what checkExpr returns -- or the type of the single element of the
