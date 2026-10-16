@@ -261,9 +261,14 @@ static int vfmt(char *out, long limit, const char *fmt, va_list ap) {
                      * ("9.999999e5" with 6 significant digits becomes
                      * 1000000): the exponent then no longer satisfies the
                      * %g style rule, and the %e shape wins (C99 7.19.6.1p8).
-                     * Count the digits the rounded text actually has. */
+                     * Count the digits the rounded text actually has. The
+                     * sign is skipped first: it is not a digit, so a leading
+                     * '-' made ip stop at 0 and the re-judgement never fired
+                     * for negatives ("-9.999999e5" printed as -1000000
+                     * instead of -1e+06, while the positive twin worked). */
                     {
                         int ip = 0;
+                        if (ip < fl && (field[ip] == '-' || field[ip] == '+')) ip++;
                         while (ip < fl && field[ip] >= '0' && field[ip] <= '9') ip++;
                         if (ip > sig) {
                             fl = __goclib_double_to_exp(field, x, sig - 1, upper, !alt);
@@ -1653,6 +1658,11 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
             fp++;
             continue;
         }
+/* TPUT writes one token character into tb while room remains. The token
+ * itself (q, and so the field position sp) always advances past the whole
+ * input item -- only the buffer copy is capped, so a 5000-digit fraction
+ * cannot smash the stack yet the stream still ends up past the field. */
+#define TPUT(ch) do { if (ti < (int)sizeof tb - 1) tb[ti++] = (char)(ch); } while (0)
         if (*fp == 'f' || *fp == 'F' || *fp == 'e' || *fp == 'E' ||
             *fp == 'g' || *fp == 'G' || *fp == 'a' || *fp == 'A') {
             /* scanf's float field is a token, not "whatever strtod takes":
@@ -1660,9 +1670,9 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
              * 7.19.6.2p9), which strtod must then consume WHOLE. A partial
              * consumption ("1e+x" -> strtod takes "1") is a matching
              * failure, and the field stays consumed -- glibc hands "x" to
-             * the next conversion, not "e+x". "0x1p3" matches as "0"
-             * because goclib's strtod is decimal-only, which is exactly
-             * what this libc's printf emits. */
+             * the next conversion, not "e+x". The field is also capped at
+             * `width` characters (C99 7.19.6.2p5): "%3f" on "123456" reads
+             * "123" and leaves "456" for the next conversion. */
             char tb[320];
             int ti = 0, ndig = 0;
             double dv;
@@ -1670,37 +1680,44 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
             sp = scan_ws(sp);
             {
                 const char *q = sp;
-                if (*q == '+' || *q == '-') tb[ti++] = *q++;
-                if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X') &&
+                /* the field ends at the width or at the NUL, first of the two */
+                int flen = (int)strlen(sp);
+                const char *flim;
+                if (width > 0 && width < flen) flen = width;
+                flim = sp + flen;
+                if (q < flim && (*q == '+' || *q == '-')) { TPUT(*q); q++; }
+                if (q + 2 <= flim && q[0] == '0' && (q[1] == 'x' || q[1] == 'X') &&
                     (scan_hexch(q[2]) >= 0 || (q[2] == '.' && scan_hexch(q[3]) >= 0))) {
                     /* hexadecimal float: 0x hexdigits [. hexdigits]
                      * [p [+-] digits] -- strtod takes it, so the token must
                      * reach past the 'x' (C99 7.19.6.2p9: the input item is
                      * "longest matching input sequence", and hex floats are
-                     * what %a prints). */
-                    tb[ti++] = *q++;
-                    tb[ti++] = *q++;
-                    while (scan_hexch(*q) >= 0) { if (ti < (int)sizeof tb - 1) tb[ti++] = *q; q++; }
-                    if (*q == '.') {
-                        tb[ti++] = *q++;
-                        while (scan_hexch(*q) >= 0) { if (ti < (int)sizeof tb - 1) tb[ti++] = *q; q++; }
+                     * what %a prints). Entry needs both "0x" characters
+                     * inside the width: "%1f" on "0x1p3" may see only "0",
+                     * which stands alone as a value. */
+                    TPUT(*q); q++;
+                    TPUT(*q); q++;
+                    while (q < flim && scan_hexch(*q) >= 0) { TPUT(*q); q++; }
+                    if (q < flim && *q == '.') {
+                        TPUT(*q); q++;
+                        while (q < flim && scan_hexch(*q) >= 0) { TPUT(*q); q++; }
                     }
-                    if (*q == 'p' || *q == 'P') {
-                        tb[ti++] = *q++;
-                        if (*q == '+' || *q == '-') tb[ti++] = *q++;
-                        while (*q >= '0' && *q <= '9') { if (ti < (int)sizeof tb - 1) tb[ti++] = *q; q++; }
+                    if (q < flim && (*q == 'p' || *q == 'P')) {
+                        TPUT(*q); q++;
+                        if (q < flim && (*q == '+' || *q == '-')) { TPUT(*q); q++; }
+                        while (q < flim && *q >= '0' && *q <= '9') { TPUT(*q); q++; }
                     }
                     sp = q;
                 } else {
-                while (*q >= '0' && *q <= '9') { tb[ti++] = *q++; ndig++; }
-                if (*q == '.' && (ndig > 0 || q[1] >= '0' && q[1] <= '9')) {
-                    tb[ti++] = *q++;
-                    while (*q >= '0' && *q <= '9') { tb[ti++] = *q++; ndig++; }
+                while (q < flim && *q >= '0' && *q <= '9') { TPUT(*q); q++; ndig++; }
+                if (q < flim && *q == '.' && (ndig > 0 || q[1] >= '0' && q[1] <= '9')) {
+                    TPUT(*q); q++;
+                    while (q < flim && *q >= '0' && *q <= '9') { TPUT(*q); q++; ndig++; }
                 }
-                if (ndig > 0 && (*q == 'e' || *q == 'E')) {
-                    tb[ti++] = *q++;
-                    if (*q == '+' || *q == '-') tb[ti++] = *q++;
-                    while (*q >= '0' && *q <= '9') { tb[ti++] = *q++; }
+                if (ndig > 0 && q < flim && (*q == 'e' || *q == 'E')) {
+                    TPUT(*q); q++;
+                    if (q < flim && (*q == '+' || *q == '-')) { TPUT(*q); q++; }
+                    while (q < flim && *q >= '0' && *q <= '9') { TPUT(*q); q++; }
                 }
                 sp = q;    /* the field is consumed whether or not it matches */
                 }
@@ -1718,6 +1735,7 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
             fp++;
             continue;
         }
+#undef TPUT
 
         base = -1;
         if (*fp == 'd' || *fp == 'u') base = 10;
@@ -2044,7 +2062,16 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
                 int d2 = __fs_get(&sc);
                 if (d2 == 'x' || d2 == 'X') {
                     int d3 = __fs_get(&sc);
-                    if (d3 != -1 && scan_hexch((char)d3) >= 0) {
+                    if (width == 2) {
+                        /* the width cuts between "0x" and the digits: the
+                         * whole field is the prefix, which holds no value --
+                         * a matching failure with the field consumed, exactly
+                         * what scan_uint reports to vsscanf ("%2p" on
+                         * "0x123" assigns nothing on either path) */
+                        if (d3 != -1) __fs_unget(&sc, d3);
+                        ok = 0; cnt = 0;
+                    } else if (d3 != -1 && scan_hexch((char)d3) >= 0 &&
+                               (width <= 0 || width >= 3)) {
                         uv = (unsigned long)scan_hexch((char)d3);
                         ok = 1; cnt = 3;
                     } else {
@@ -2081,41 +2108,67 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
             fp++;
             continue;
         }
+/* FLTGET reads one more field character, or reports the end of the field:
+ * once `width` characters have been consumed this conversion may read no
+ * further input (C99 7.19.6.2p5), and the look-ahead that ended the token
+ * stays in the stream. -1 is what every terminator path below already
+ * understands (end of input), so a width-cut token falls out exactly the
+ * way an EOF-cut one does. `fw` counts what this conversion consumed. */
+#define FLTGET() ((width > 0 && fw >= width) ? -1 : (fw++, __fs_get(&sc)))
         if (*fp == 'f' || *fp == 'F' || *fp == 'e' || *fp == 'E' ||
             *fp == 'g' || *fp == 'G' || *fp == 'a' || *fp == 'A') {
             /* The float field is a token: the longest input sequence shaped
              * like a float, which strtod must consume WHOLE ("1e+x" fails
              * and its field stays consumed -- "x", not "e+x", goes to the
-             * next conversion, matching glibc). The pushback buffer only
-             * ever holds the one look-ahead character that ended the token;
-             * the token itself is consumed either way. */
+             * next conversion, matching glibc), and never longer than the
+             * field width ("%3f" on "123456" reads "123"). The pushback
+             * buffer only ever holds the one look-ahead character that ended
+             * the token; the token itself is consumed either way. */
             char tb[320];
             int ti = 0, ndig = 0;
             double dv;
             char *endp;
             int peek;
+            int fw = 0;     /* field characters consumed (the width caps it) */
             __fs_ws(&sc);
-            c = __fs_get(&sc);
+            c = FLTGET();
             if (c == -1) break;
-            if (c == '+' || c == '-') { tb[ti++] = (char)c; c = __fs_get(&sc); }
+            if (c == '+' || c == '-') { tb[ti++] = (char)c; c = FLTGET(); }
             if (c == '0') {
                 /* hexadecimal float: 0x hexdigits [. hexdigits] [p exp] --
                  * the token must reach past the 'x' or strtod's "0" would be
-                 * a partial consumption (C99 7.19.6.2p9) */
+                 * a partial consumption (C99 7.19.6.2p9). d2/d3 are unguarded
+                 * look-aheads (ungot unless kept), so the grammar decision
+                 * sees the digits past the width while the field itself never
+                 * consumes more than the width allows: entry needs room for
+                 * both "0x" characters, and the digit joins only while width
+                 * remains -- "%1f" on "0x1p3" may see just "0", and "%2f" on
+                 * it sees "0x", which strtod cannot take whole. */
                 int d2 = __fs_get(&sc);
                 int d3 = -2;
                 if (d2 == 'x' || d2 == 'X') d3 = __fs_get(&sc);
                 if ((d2 == 'x' || d2 == 'X') &&
                     (scan_hexch((char)d3) >= 0 ||
-                     (d3 == '.' && d3 != -2))) {
+                     (d3 == '.' && d3 != -2)) &&
+                    (width <= 0 || fw + 1 <= width)) {
                     int hxok = 0;
                     if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;   /* '0' */
+                    fw++;
                     if (ti < (int)sizeof tb - 1) tb[ti++] = (char)d2;  /* 'x' */
-                    c = __fs_get(&sc);
+                    fw++;
+                    /* d3 was already read as the look-ahead: it joins the
+                     * token only when the width still has room for it */
+                    if (width > 0 && fw >= width) {
+                        __fs_unget(&sc, d3);
+                        c = -1;
+                    } else {
+                        c = d3;
+                        fw++;
+                    }
                     while (c != -1 && scan_hexch((char)c) >= 0) {
                         if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
                         hxok = 1;
-                        c = __fs_get(&sc);
+                        c = FLTGET();
                     }
                     if (c == '.') {
                         int d4 = __fs_get(&sc);
@@ -2123,23 +2176,23 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
                         if (d4 != -1) __fs_unget(&sc, d4);
                         if (dotok) {
                             if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
-                            c = __fs_get(&sc);
+                            c = FLTGET();
                             while (c != -1 && scan_hexch((char)c) >= 0) {
                                 if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
-                                c = __fs_get(&sc);
+                                c = FLTGET();
                             }
                         }
                     }
                     if (hxok && (c == 'p' || c == 'P')) {
                         if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
-                        c = __fs_get(&sc);
+                        c = FLTGET();
                         if (c == '+' || c == '-') {
                             if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
-                            c = __fs_get(&sc);
+                            c = FLTGET();
                         }
                         while (c >= '0' && c <= '9') {
                             if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
-                            c = __fs_get(&sc);
+                            c = FLTGET();
                         }
                     }
                     __fs_unget(&sc, c);
@@ -2168,31 +2221,31 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
             while (c >= '0' && c <= '9') {
                 if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
                 ndig++;
-                c = __fs_get(&sc);
+                c = FLTGET();
             }
             if (c == '.') {
                 peek = __fs_get(&sc);
                 if (peek != -1) __fs_unget(&sc, peek);
                 if (ndig > 0 || (peek >= '0' && peek <= '9')) {
                     if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
-                    c = __fs_get(&sc);
+                    c = FLTGET();
                     while (c >= '0' && c <= '9') {
                         if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
                         ndig++;
-                        c = __fs_get(&sc);
+                        c = FLTGET();
                     }
                 }
             }
             if (ndig > 0 && (c == 'e' || c == 'E')) {
                 if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
-                c = __fs_get(&sc);
+                c = FLTGET();
                 if (c == '+' || c == '-') {
                     if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
-                    c = __fs_get(&sc);
+                    c = FLTGET();
                 }
                 while (c >= '0' && c <= '9') {
                     if (ti < (int)sizeof tb - 1) tb[ti++] = (char)c;
-                    c = __fs_get(&sc);
+                    c = FLTGET();
                 }
             }
             __fs_unget(&sc, c);            /* the token's terminator stays */
@@ -2209,6 +2262,7 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
             fp++;
             continue;
         }
+#undef FLTGET
 
         base = -1;
         if (*fp == 'd' || *fp == 'u') base = 10;
@@ -2233,6 +2287,7 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
              * width. */
             int hexpre = 0;
             int d3v = -2;    /* the hex digit after "0x", when one was read */
+            int hexbad = 0;  /* "0x" was read but no digit fits: no value */
             if (c == '0') {
                 int d2 = __fs_get(&sc);
                 int d3 = (d2 == 'x' || d2 == 'X') ? __fs_get(&sc) : -2;
@@ -2244,6 +2299,15 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
                     cnt = 2;
                     d3v = d3;
                     if (width > 0) width -= 2;
+                } else if ((d2 == 'x' || d2 == 'X') &&
+                           (base == 0 || base == 16) && width == 2) {
+                    /* the width cuts between "0x" and the digits: the whole
+                     * field is the prefix, which holds no value -- a matching
+                     * failure with the field consumed, exactly what scan_uint
+                     * reports to vsscanf ("%2x" on "0xff" assigns nothing,
+                     * on both paths, as ucrt does) */
+                    if (d3 != -2 && d3 != -1) __fs_unget(&sc, d3);
+                    hexbad = 1;
                 } else {
                     /* not a hex field: give back what was looked at */
                     if (d3 != -2 && d3 != -1) __fs_unget(&sc, d3);
@@ -2256,7 +2320,7 @@ int vfscanf(FILE *stream, const char *fmt, va_list ap) {
                 uv = (unsigned long)scan_hexch((char)d3v);
                 ok = 1;
                 cnt = 3;
-            } else {
+            } else if (!hexbad) {
                 int d = __fs_digit(c, base);
                 if (d >= 0) { uv = (unsigned long)d; ok = 1; cnt = 1; }
                 else __fs_unget(&sc, c);
