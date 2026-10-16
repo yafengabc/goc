@@ -74,7 +74,10 @@ mkdir -p bin/goc-out
 
 # Windows-only examples import Win32 DLLs (kernel32/user32/gdi32), so the
 # Linux (ELF64) leg must skip them: they cannot compile without those DLLs.
-win_only=" wintest winbox winreg "
+# c11_threads_basic is a different reason: it compiles fine, but Linux
+# thrd_create needs clone/mmap/futex and ucrun implements none of them --
+# same rationale as gocregress' winOnly map (verified on a real kernel/WSL).
+win_only=" wintest winbox winreg c11_threads_basic "
 is_win_only() { case "$win_only" in *" $1 "*) return 0;; esac; return 1; }
 
 # Each leg compiles every example with the same extra goc flags, runs it, and
@@ -184,7 +187,7 @@ run_linux_leg() {  # <dirSuffix> <label> [extra goc flags...]
         fi
 
         if is_win_only "$name"; then
-            echo "SKIP  ${label}linux/$name  (imports Windows DLLs)"
+            echo "SKIP  ${label}linux/$name  (win-only: DLL imports or unsupported under ucrun)"
             continue
         fi
 
