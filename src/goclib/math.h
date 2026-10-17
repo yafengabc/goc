@@ -18,10 +18,14 @@
  * (fabsf, floorf, powf, ...) are not provided: goc evaluates float as an
  * effective double anyway (see the float note in README).
  *
- * Anything outside this list -- the long double family, the Bessel
- * functions, the complex header -- does not exist. Calling one fails at
- * codegen with "unknown function", which is a better outcome than a
- * silently wrong result.
+ * The long double (binary128) spellings ARE provided -- the l-suffixed family
+ * at the bottom of this file, implemented in mathl.c. They are written in
+ * ordinary C over `long double`, so each back end lowers them its own way
+ * rather than goclib carrying a second copy of every algorithm.
+ *
+ * Still absent: the Bessel functions, the complex header, and the long double
+ * forms of erf/erfc/tgamma/lgamma/fma. Calling one fails at codegen with
+ * "unknown function", which is a better outcome than a silently wrong result.
  */
 
 /* ---- rounding and remainder -------------------------------------------- */
@@ -245,6 +249,70 @@ double getsign(double x);
  * variant returns the same value for [0, 2^63) as the signed one. */
 long long fromfp(double fp);
 unsigned long long ufromfp(double fp);
+
+/* ---- long double (binary128) family ------------------------------------ *
+ *
+ * The same functions for goc's third floating type (#50b), implemented in
+ * mathl.c over ordinary `long double' arithmetic. Two things are worth
+ * knowing before calling them:
+ *
+ *   - accuracy: the algebraic ones (fabs/floor/fmod/modf/frexp/ldexp/nextafter
+ *     and friends) are exact. The transcendentals are accurate to about an
+ *     ulp of binary128 -- roughly 34 significant digits -- NOT correctly
+ *     rounded, and sinl/cosl/tanl degrade for arguments past about 2^60
+ *     because the one-step reduction by pi/2 cannot resolve the period there.
+ *     That is the same bargain math.c's double functions strike.
+ *
+ *   - the bit-poking members (floorl, ceill, truncl, roundl, frexpl, logbl,
+ *     nextafterl and friends) read the binary128 layout, which is goc's long
+ *     double everywhere but is NOT x86-64 gcc's (that one is x87 80-bit),
+ *     so those specific functions are goc/gocl-only in behaviour.
+ */
+long double fabsl(long double x);
+long double floorl(long double x);
+long double ceill(long double x);
+long double truncl(long double x);
+long double roundl(long double x);
+long double rintl(long double x);
+long double nearbyintl(long double x);
+long double roundevenl(long double x);
+long double fmodl(long double x, long double y);
+long double modfl(long double x, long double *ip);
+long double frexpl(long double x, int *e);
+long double ldexpl(long double x, int e);
+long double scalbnl(long double x, int n);
+long double scalblnl(long double x, long n);
+long double sqrtl(long double x);
+long double cbrtl(long double x);
+long double hypotl(long double x, long double y);
+long double fmaxl(long double x, long double y);
+long double fminl(long double x, long double y);
+long double copysignl(long double x, long double y);
+long double fdiml(long double x, long double y);
+long double logbl(long double x);
+int         ilogbl(long double x);
+long double nextafterl(long double x, long double y);
+long double nextupl(long double x);
+long double nextdownl(long double x);
+long double expl(long double x);
+long double expm1l(long double x);
+long double exp2l(long double x);
+long double exp10l(long double x);
+long double logl(long double x);
+long double log1pl(long double x);
+long double log2l(long double x);
+long double log10l(long double x);
+long double powl(long double x, long double y);
+long double sinl(long double x);
+long double cosl(long double x);
+long double tanl(long double x);
+long double asinl(long double x);
+long double acosl(long double x);
+long double atanl(long double x);
+long double atan2l(long double y, long double x);
+long double sinhl(long double x);
+long double coshl(long double x);
+long double tanhl(long double x);
 
 /* ---- classification and constants -------------------------------------- */
 #define NAN      (0.0 / 0.0)

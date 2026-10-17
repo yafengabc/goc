@@ -1213,6 +1213,9 @@ int main(){ return (int)offsetof(struct S, b); }`)
 // at preprocess time with the documented values: LP64 long widths on goc,
 // BITINT_MAXWIDTH mirroring UINT_MAX's bound, and the IEC 60559 normalization
 // markers all defined. Any mismatch trips a #error, which fails the test.
+// The long-double marker is the one inverted check: goclib/float.h defines
+// __goc_long_double_is_double only for host compilers, whose long double is
+// not binary128 -- under goc its absence is what signals the real thing.
 func TestWidthMacros(t *testing.T) {
 	asm := genAsm(t, `#include <limits.h>
 #include <float.h>
@@ -1243,7 +1246,7 @@ func TestWidthMacros(t *testing.T) {
 #if FLT_IS_IEC_60559 != 1 || DBL_IS_IEC_60559 != 1 || LDBL_IS_IEC_60559 != 1
 #error IS_IEC_60559
 #endif
-#if !defined(__goc_long_double_is_double)
+#if defined(__goc_long_double_is_double)
 #error long-double marker
 #endif
 int main(){ return 0; }`)

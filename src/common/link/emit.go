@@ -354,7 +354,11 @@ func Emit(d *Data) (string, error) {
 			lab := fmt.Sprintf("LBIG%d", i)
 			parts := make([]string, len(words.Words))
 			for j, w := range words.Words {
-				parts[j] = fmt.Sprintf("0x%x", w)
+				// Signed decimal keeps the bit pattern within goa's dq
+				// ParseInt range: a word with the top bit set (any negative
+				// _BitInt value, or the low half of a long double like 1.3L)
+				// overflows as positive hex ("0xcccccccccccccccd").
+				parts[j] = fmt.Sprintf("%d", int64(w))
 			}
 			out.WriteString(fmt.Sprintf("%s dq %s\n", lab, strings.Join(parts, ", ")))
 		}

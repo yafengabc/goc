@@ -12,6 +12,11 @@ type CType int
 const (
 	TInt CType = iota
 	TDouble
+	// TF128 is long double: IEEE binary128, 16 bytes. It is neither of the
+	// two 8-byte slots above -- codegen carries it as a 16-byte aggregate
+	// (goc) or as LLVM's fp128 (gocl), and every arithmetic operation on it
+	// lowers to a soft-float helper. See frontend/fp128.go.
+	TF128
 )
 
 type Program struct {
@@ -214,15 +219,17 @@ type NumLit struct {
 	Kind    CType
 	Fval    float64
 	IsFloat bool // a "1.5f" literal: type float rather than double
-	Unsig   bool // u/U suffix: the constant's type is unsigned
-	Long    bool // l/L suffix: the constant is at least 64 bits wide
+	// A "1.5L" literal: type long double (binary128). F128 holds the exact
+	// 128-bit encoding; Fval is left at the float64 rounding for diagnostics
+	// and is never what codegen materialises.
+	IsLongDouble bool
+	F128         Float128
+	Unsig        bool // u/U suffix: the constant's type is unsigned
+	Long         bool // l/L suffix: the constant is at least 64 bits wide
 	// LongLong marks a two-l suffix ("1LL"): type long long, distinct from
 	// long (C11 6.2.5p4) for _Generic purposes even at equal width.
 	LongLong bool
-	// LDbl marks a floating literal with an l/L suffix ("1.0L"): type long
-	// double, distinct from double (6.2.5p10).
-	LDbl bool
-	Wide bool // L'x' wide character literal: type is wchar_t, not int
+	Wide     bool // L'x' wide character literal: type is wchar_t, not int
 	// C23 bit-precise literal (wb/uwb suffix): BigWords holds the value as
 	// little-endian 64-bit words and BigBits its declared _BitInt width.
 	// Non-nil BigWords switches the literal's type to _BitInt(BigBits).

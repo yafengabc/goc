@@ -128,6 +128,12 @@ func PreprocessLibrary(src, filename string, linux bool) ([]frontend.Token, erro
 }
 
 func preprocess(src, filename string, linux, builtinOnly bool, incDirs ...string) ([]frontend.Token, error) {
+	// The library source is filled in on first use (see ensureDisk). Doing it
+	// here rather than only in PreprocessLibrary matters for every direct
+	// caller of Preprocess: doInclude's fallback reads goclib headers through
+	// libHeaders, and a nil Source there turns an unavailable header into a
+	// nil-pointer panic instead of a skipped include.
+	ensureDisk()
 	src = spliceContinuations(src)
 	p := &Preprocessor{
 		macros:      map[string]*Macro{},

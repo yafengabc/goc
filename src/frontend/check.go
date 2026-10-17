@@ -531,9 +531,9 @@ func genericTypeMatch(assoc, ctl *Type) bool {
 		// what makes the usual "#if defined(__CHAR_IS_SIGNED__)" idiom work.
 		return assoc.Width == ctl.Width && assoc.Signed == ctl.Signed &&
 			assoc.PlainChar == ctl.PlainChar && assoc.LongLong == ctl.LongLong
-	case KDouble:
-		// long double is a distinct type from double (C11 6.2.5p10).
-		return assoc.LongDouble == ctl.LongDouble
+		// double / float / long double need no case here: they are three
+		// distinct Kinds, so the Kind comparison above already separates
+		// them (C11 6.2.5p10).
 	case KPtr:
 		return genericTypeMatch(assoc.Elem, ctl.Elem)
 	case KArr:
@@ -784,12 +784,17 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			w := (n.BigBits + 63) / 64
 			return &Type{Kind: KBitInt, Bits: n.BigBits, Size: w * 8, Signed: n.BigSigned}
 		}
+		// A long double constant is its own class (16-byte binary128), not
+		// the TDouble slot, so it has to be recognised before the double test
+		// -- otherwise typeof(1.0L) and _Generic(1.0L, long double: ...) both
+		// fall through to the integer/default branch. (EnableLongDouble is the
+		// #47/#48 scaffolding described in fp128.go.)
+		if n.IsLongDouble && EnableLongDouble {
+			return LongDoubleType()
+		}
 		if n.Kind == TDouble {
 			if n.IsFloat {
 				return FloatType()
-			}
-			if n.LDbl {
-				return LongDoubleType() // "1.0L": long double, not double
 			}
 			return DoubleType()
 		}
@@ -896,8 +901,16 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			// pointer is initialised ("fp = &add"). The designator is not an
 			// lvalue, so it must be resolved before the lvalue check.
 			if id, ok := n.E.(*Ident); ok {
-				if ft := c.funcTypeByName(id.Name); ft != nil {
-					return PtrType(ft)
+				// A local variable hides a same-named function: C block
+				// scoping hides file-scope names, and function names are
+				// file-scope. Without this guard `&exp` on a local `int exp`
+				// resolved to math.h's exp() and came out as double(double)*
+				// -- the variable was readable and writable, and only taking
+				// its address went to the function.
+				if c.lookup(id.Name) == nil {
+					if ft := c.funcTypeByName(id.Name); ft != nil {
+						return PtrType(ft)
+					}
 				}
 				if t := c.lookup(id.Name); t != nil && t.IsArray() {
 					// &array yields a pointer to the whole array
@@ -1106,6 +1119,14 @@ func (c *checker) binaryResultType(op string, lt, rt *Type) *Type {
 			}
 			if op == "%" {
 				c.errf(0, "operator '%%' requires integer operands, got %s and %s", lt, rt)
+			}
+			// The usual arithmetic conversions rank the floating types:
+			// long double > double > float. (Only the storage footprint and
+			// the soft-float helpers differ -- every one of them is a real
+			// floating type, so the ordering is the only thing to get right
+			// here.)
+			if lt.Kind == KLongDouble || rt.Kind == KLongDouble {
+				return LongDoubleType()
 			}
 			if lt.Kind == KDouble || rt.Kind == KDouble {
 				return DoubleType()

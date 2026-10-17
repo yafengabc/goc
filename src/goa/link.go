@@ -20,6 +20,14 @@ import (
 func (a *Assembler) LinkImage() *gocld.Image {
 	img := gocld.NewImage(a.target)
 
+	// goa's encoder emits x86-64 and nothing else, so an image built from its
+	// sections is an x86-64 image even when no ELF object is ingested on top
+	// of it -- without this the ELF writer emits e_machine 0 and the Linux
+	// kernel refuses the executable with ENOEXEC. (ucrun never noticed because
+	// unicorn does not validate e_machine.) An ingested object overwrites
+	// Machine with its own value, so the non-x86 LLVM targets are unaffected.
+	img.Machine = gocld.EMX8664
+
 	// The sections are shared rather than copied. The encoder is finished with
 	// them by the time a program is linked -- nothing appends after Assemble
 	// returns -- and the linker pads and merges them in place. Copying the

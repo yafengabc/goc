@@ -550,6 +550,9 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	// "T x;" uses T as the type (C11 6.2.1p7 permits the shadowing).
 	haveTypeSpec := false
 	var fp *Type // set when a floating-point specifier (float/double) is seen
+	// "long double" is one type, so the "long" has to be remembered until the
+	// "double" arrives.
+	longSeen := false
 	isVoid := false
 	isBool := false
 	isConst := false // a "const" qualifier appeared anywhere in the list
@@ -835,8 +838,17 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		case "long":
 			width = 8
 			longCount++
+			longSeen = true
 		case "double":
-			fp = DoubleType()
+			// "long double" is one type, not a long followed by a double, so
+			// the "long" has to be remembered until the "double" arrives.
+			// (With EnableLongDouble off -- see it in fp128.go -- the double
+			// still wins, which is the fold to double that predates fp128.)
+			if longSeen && EnableLongDouble {
+				fp = LongDoubleType()
+			} else {
+				fp = DoubleType()
+			}
 		case "float":
 			fp = FloatType()
 		case "unsigned":
@@ -2996,7 +3008,15 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	case t.Kind == TNum:
 		p.next()
 		if t.IsDbl {
-			return &NumLit{Kind: TDouble, Fval: t.Fval, IsFloat: t.IsFloat, LDbl: t.IsLDbl}, nil
+			if t.IsLongDouble && EnableLongDouble {
+				// A long double constant carries its binary128 encoding, not
+				// the float64 rounding: 113 bits of mantissa survive here and
+				// would be lost by going through Fval.
+				return &NumLit{Kind: TF128, Fval: t.Fval, IsLongDouble: true,
+					F128: t.F128}, nil
+			}
+			return &NumLit{Kind: TDouble, Fval: t.Fval, IsFloat: t.IsFloat,
+				IsLongDouble: t.IsLongDouble, F128: t.F128}, nil
 		}
 		if t.BigWords != nil {
 			var lo int64

@@ -25,6 +25,12 @@ const (
 	KUnion
 	KBitInt // C23 _BitInt(N): arbitrary-width two's-complement integer
 	KBool   // for _Bool type
+	// KLongDouble is long double. goc spells it IEEE binary128 (16 bytes)
+	// on every target and implements it in software rather than adopting
+	// whatever the hardware offers (x87 80-bit on x86-64, binary128 on
+	// aarch64): one format everywhere is what lets a long double program
+	// produce identical bits under both back ends. See fp128.go.
+	KLongDouble
 )
 
 // Member is a single field of a struct or union.
@@ -69,13 +75,12 @@ type Type struct {
 	// explicitly "signed char" / "unsigned char" spelling. It deliberately
 	// stays out of typesEqual so char and signed char remain assignable.
 	PlainChar bool
-	// LongLong / LongDouble carry the same idea for the two other pairs of
-	// standard types that share a representation but stay distinct in C:
-	// long vs long long (C11 6.2.5p4) and double vs long double (6.2.5p10).
-	// Like PlainChar they only ever affect _Generic selection and the printed
-	// name, never assignability or codegen.
+	// LongLong carries the same idea for the other pair of standard types
+	// that shares a representation but stays distinct in C: long vs long
+	// long (C11 6.2.5p4). Like PlainChar it only ever affects _Generic
+	// selection and the printed name, never assignability or codegen.
+	// (long double needs no such flag: it is its own Kind, KLongDouble.)
 	LongLong   bool      // KInt: spelled "long long"
-	LongDouble bool      // KDouble: spelled "long double"
 	Members    []*Member // KStruct / KUnion: ordered fields
 	Bits       int       // KBitInt: exact bit width N (1..4096)
 	Size       int       // KStruct / KUnion: total size in bytes (aligned)
@@ -95,8 +100,8 @@ func CharType() *Type                 { return &Type{Kind: KInt, Width: 1, Signe
 func UnsignedType() *Type             { return &Type{Kind: KInt, Width: 4, Signed: false} }
 func UnsignedCharType() *Type         { return &Type{Kind: KInt, Width: 1, Signed: false} }
 func DoubleType() *Type               { return &Type{Kind: KDouble} }
-func LongDoubleType() *Type           { return &Type{Kind: KDouble, LongDouble: true} }
 func FloatType() *Type                { return &Type{Kind: KFloat} }
+func LongDoubleType() *Type           { return &Type{Kind: KLongDouble, Size: 16, Align: 16} }
 func VoidType() *Type                 { return &Type{Kind: KVoid} }
 func PtrType(elem *Type) *Type        { return &Type{Kind: KPtr, Elem: elem} }
 func ArrType(elem *Type, n int) *Type { return &Type{Kind: KArr, Elem: elem, Len: n} }
@@ -142,6 +147,8 @@ func alignOf(t *Type) int {
 		return 1
 	case KFloat:
 		return 4
+	case KLongDouble:
+		return 16
 	case KDouble, KPtr, KFunc:
 		return 8
 	case KArr:
@@ -168,6 +175,8 @@ func sizeOf(t *Type) int {
 		return 1
 	case KFloat:
 		return 4
+	case KLongDouble:
+		return 16
 	case KDouble, KPtr, KFunc:
 		return 8
 	case KArr:
@@ -386,11 +395,18 @@ func (t *Type) Class() CType {
 	if t.Kind == KDouble || t.Kind == KFloat {
 		return TDouble
 	}
+	// long double is 16 bytes, so it rides in neither the 8-byte integer
+	// slot nor a single XMM register: codegen treats it as its own class
+	// (a 16-byte aggregate on goc, LLVM fp128 on gocl).
+	if t.Kind == KLongDouble {
+		return TF128
+	}
 	return TInt
 }
 
 func (t *Type) IsArith() bool {
-	return t.Kind == KInt || t.Kind == KDouble || t.Kind == KFloat || t.Kind == KBool
+	return t.Kind == KInt || t.Kind == KDouble || t.Kind == KFloat ||
+		t.Kind == KLongDouble || t.Kind == KBool
 }
 func (t *Type) IsIntClass() bool { return t.Kind == KInt || t.Kind == KBool }
 func (t *Type) IsScalar() bool   { return t.IsArith() || t.Kind == KPtr || t.Kind == KBool }
@@ -401,11 +417,14 @@ func (t *Type) IsFloat() bool    { return t.Kind == KFloat }
 // IsFloating reports whether the type is a real floating-point type (float or
 // double), as opposed to the codegen scalar class TDouble which float also
 // rides in.
-func (t *Type) IsFloating() bool { return t.Kind == KDouble || t.Kind == KFloat }
-func (t *Type) IsArray() bool    { return t.Kind == KArr }
-func (t *Type) IsFunc() bool     { return t.Kind == KFunc }
-func (t *Type) IsStruct() bool   { return t.Kind == KStruct }
-func (t *Type) IsUnion() bool    { return t.Kind == KUnion }
+func (t *Type) IsFloating() bool {
+	return t.Kind == KDouble || t.Kind == KFloat || t.Kind == KLongDouble
+}
+func (t *Type) IsLongDouble() bool { return t.Kind == KLongDouble }
+func (t *Type) IsArray() bool      { return t.Kind == KArr }
+func (t *Type) IsFunc() bool       { return t.Kind == KFunc }
+func (t *Type) IsStruct() bool     { return t.Kind == KStruct }
+func (t *Type) IsUnion() bool      { return t.Kind == KUnion }
 
 // IsVLA reports whether t is a C99 variable-length array: an array whose
 // extent is an expression rather than a constant, so it has no size until the
@@ -466,12 +485,11 @@ func (t *Type) String() string {
 	case KBool:
 		return "bool"
 	case KDouble:
-		if t.LongDouble {
-			return "long double"
-		}
 		return "double"
 	case KFloat:
 		return "float"
+	case KLongDouble:
+		return "long double"
 	case KInt:
 		s := ""
 		if !t.Signed {

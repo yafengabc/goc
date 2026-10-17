@@ -57,16 +57,19 @@ type Token struct {
 	Fval    float64
 	IsDbl   bool
 	IsFloat bool // a float constant: a floating literal with the f/F suffix
-	IsChar  bool // a 'x' character literal (carried as an integer constant in Num)
-	IsUnsig bool // integer literal with a u/U suffix: type is unsigned
-	IsLong  bool // integer literal with an l/L suffix: at least 64 bits wide
+	// A floating literal with the l/L suffix: its type is long double. F128
+	// holds the exact binary128 encoding; Fval keeps the float64 rounding for
+	// diagnostics only and must never be what codegen materialises, because
+	// a long double constant can carry 113 bits of mantissa.
+	IsLongDouble bool
+	F128         Float128
+	IsChar       bool // a 'x' character literal (carried as an integer constant in Num)
+	IsUnsig      bool // integer literal with a u/U suffix: type is unsigned
+	IsLong       bool // integer literal with an l/L suffix: at least 64 bits wide
 	// IsLL marks a two-l suffix ("1LL"): the constant's type is long long,
 	// which C keeps distinct from long (6.2.5p4) -- observable through
 	// _Generic even though both are 64 bits here.
 	IsLL bool
-	// IsLDbl marks a floating literal with the l/L suffix ("1.0L"): its type
-	// is long double, distinct from double (6.2.5p10).
-	IsLDbl bool
 	// C23 bit-precise integer literal (wb/uwb suffix): the value parsed as an
 	// arbitrary-precision big integer, split into little-endian 64-bit words.
 	BigWords  []uint64
@@ -104,6 +107,41 @@ func pushBig(push func(Token), words []uint64, bitLen int, unsig bool, line int)
 }
 
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+// floatSuffix scans the suffix of a floating literal: f/F narrows it to float,
+// l/L makes it long double. (The same letters mean "at least 64 bits wide" on
+// an *integer* literal, which is why this only ever runs on the float paths --
+// isDbl has already been decided by the time it is called.) ni is the position
+// after the suffix.
+func floatSuffix(src string, i, n int) (isFloat, isLongDbl bool, ni int) {
+	for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
+		if src[i] == 'f' || src[i] == 'F' {
+			isFloat = true
+		} else {
+			isLongDbl = true
+		}
+		i++
+	}
+	return isFloat, isLongDbl, i
+}
+
+// floatToken builds the token for a floating literal, converting a long double
+// constant straight to its binary128 encoding.
+func floatToken(text string, line int, isFloat, isLongDbl bool) Token {
+	f, _ := strconv.ParseFloat(text, 64)
+	tok := Token{Kind: TNum, Text: text, Fval: f, IsDbl: true,
+		IsFloat: isFloat, IsLongDouble: isLongDbl, Line: line}
+	if isLongDbl {
+		// A malformed constant cannot reach here -- the scanner only gets
+		// this far on well-formed digits -- so a conversion failure is a bug
+		// rather than a user error; falling back to zero keeps the token
+		// usable instead of dropping it.
+		if v, err := ParseFloat128(text); err == nil {
+			tok.F128 = v
+		}
+	}
+	return tok
+}
 
 // bigSuffix scans an optional C23 bit-precise integer suffix ("wb" / "uwb",
 // case-insensitive) at src[i:n]. It reports whether the suffix is present
@@ -401,26 +439,16 @@ func Lex(src string) ([]Token, error) {
 				raw := src[start:i]
 				text := strings.ReplaceAll(raw, "'", "")
 				if isHexDbl {
-					// f/F/l/L suffixes follow the decimal-float convention
-					// (f -> float narrowing, l/L -> long double, which stays a
-					// distinct type from double for _Generic even though the
-					// stored value is an 8-byte double either way).
-					isFloat, isLDbl := false, false
-					for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
-						if src[i] == 'f' || src[i] == 'F' {
-							isFloat = true
-						} else {
-							isLDbl = true
-						}
-						i++
-					}
+					// f/F/l/L suffixes follow the decimal-float convention:
+					// f/F narrows to float, l/L makes it long double (binary128).
+					isFloat, isLongDbl, ni := floatSuffix(src, i, n)
+					i = ni
 					// Go's ParseFloat only accepts hex floats with a binary
 					// exponent; C23 allows its omission, so add a p0 for it.
 					if !strings.ContainsAny(text, "pP") {
 						text += "p0"
 					}
-					f, _ := strconv.ParseFloat(text, 64)
-					push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, IsLDbl: isLDbl, Line: line})
+					push(floatToken(text, line, isFloat, isLongDbl))
 					continue
 				}
 				// Parse as an unsigned bit pattern so that 0x8000000000000000
@@ -515,17 +543,9 @@ func Lex(src string) ([]Token, error) {
 				}
 			}
 			if isDbl {
-				isFloat, isLDbl := false, false
-				for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
-					if src[i] == 'f' || src[i] == 'F' {
-						isFloat = true
-					} else {
-						isLDbl = true // "1.0L" has type long double
-					}
-					i++
-				}
-				f, _ := strconv.ParseFloat(text, 64)
-				push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, IsLDbl: isLDbl, Line: line})
+				isFloat, isLongDbl, ni := floatSuffix(src, i, n)
+				i = ni
+				push(floatToken(text, line, isFloat, isLongDbl))
 			} else {
 				// Parse as an unsigned bit pattern: 9223372036854775808 (2^63)
 				// maps to the int64 minimum, so -9223372036854775808L works.
@@ -596,17 +616,9 @@ func Lex(src string) ([]Token, error) {
 			}
 			raw := src[start:i]
 			text := strings.ReplaceAll(raw, "'", "")
-			isFloat, isLDbl := false, false
-			for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
-				if src[i] == 'f' || src[i] == 'F' {
-					isFloat = true
-				} else {
-					isLDbl = true // ".5L" has type long double
-				}
-				i++
-			}
-			f, _ := strconv.ParseFloat(text, 64)
-			push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, IsLDbl: isLDbl, Line: line})
+			isFloat, isLongDbl, ni := floatSuffix(src, i, n)
+			i = ni
+			push(floatToken(text, line, isFloat, isLongDbl))
 		case isAlpha(c):
 			start := i
 			for i < n && (isAlpha(src[i]) || isDigit(src[i])) {

@@ -125,6 +125,55 @@ build_run_win_ok "c23cstd [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "c2
 build_run_win_ok "printfmt [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "printfmt" goc
 build_run_win_ok "printfmt [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "printfmt" gocl
 
+# binary128 (long double) runtime: add/sub/mul/div with correct rounding,
+# subnormals, overflow and underflow, the NaN/inf rules, the widen and narrow
+# conversions and the integer conversions. The interesting part here is not
+# the arithmetic -- tests/fp128/oracle.c checks that bit for bit against
+# libgcc -- but that the same integer code compiled by each back end agrees:
+# the battery folds ~29 thousand operations into one hash.
+build_run_win_ok "fp128 [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "fp128" goc
+build_run_win_ok "fp128 [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "fp128" gocl
+
+# long double end-to-end: literals, arithmetic, comparisons, conversions in
+# and out, compound assignment, and a 200k-pair randomised battery folded into
+# one FNV hash that must match gcc's __float128 golden value. Self-reporting
+# (exit 0 + final "OK"). Both back ends lower long double to the same binary128
+# runtime (goc via direct helper calls since #48, gocl via LLVM IR since #47),
+# so the same battery pins both.
+build_run_win_ok "longdouble [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble" goc
+build_run_win_ok "longdouble [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble" gocl
+
+# long double stdio (#49c): printf %Lf/%Le/%Lg including flag/width/precision
+# combinations and the heap path for outputs that dwarf the fixed field buffer,
+# plus scanf %Lf round-trips (decimal exact parse, hex via widen, suppressed
+# assignment). Self-reporting (exit 0 + final "OK").
+build_run_win_ok "longdouble_io [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble_io" goc
+build_run_win_ok "longdouble_io [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble_io" gocl
+
+# <float.h> for binary128 (#50a): the LDBL_* range and precision macros, pinned
+# by bit pattern as well as by their printed digits, plus the LDBL_DIG /
+# LDBL_DECIMAL_DIG round trips (which promise opposite directions).
+build_run_win_ok "longdouble_limits [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble_limits" goc
+build_run_win_ok "longdouble_limits [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble_limits" gocl
+
+# The long double math family (#50b): 30-significant-digit goldens for the
+# transcendentals (tools/ldmath_golden.py, a 60-digit decimal reference using
+# different algorithms) and exact checks for the algebraic members.
+build_run_win_ok "longdouble_math [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "longdouble_math" goc
+build_run_win_ok "longdouble_math [gocl/win]" "$ROOT/bin/gocl.exe" "-target windows" "longdouble_math" gocl
+
+# Struct-returning calls consumed in expression position ("f(a).hi"): the bug
+# corrupted the statements AFTER the trigger (negative temporary slot indices
+# aliased live locals), so the detection is the byte-exact stdout of the
+# original repro -- layout-dependent, which is why it is compared verbatim
+# rather than self-reported. goc-native only: the bug lived in goc's slot
+# accounting, and gocl's LLVM struct returns never had it.
+build_run_win "structret_bug [goc/win]" "$ROOT/bin/goc.exe"  "-"               "structret_bug" "r = 3ece32d23193c687.1000000000000000   a.lo=2ce32d23193c6871" goc
+# The position battery: argument, condition, plain and compound assignment,
+# double/aggregate/array members -- guards that the fix releases the result
+# buffer exactly where it dies and nowhere earlier.
+build_run_win_ok "structret [goc/win] "  "$ROOT/bin/goc.exe"  "-"               "structret" goc
+
 echo ""
 echo "== Windows: pass=$pass fail=$fail =="
 [ "$fail" -eq 0 ]

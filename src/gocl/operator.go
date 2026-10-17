@@ -37,6 +37,12 @@ func (e *irEmitter) unary(n *frontend.Unary) val {
 		return val{op: t, ty: boolIr()}
 	case "-":
 		v := e.rvalue(n.E)
+		// long double: negating the bit pattern would be "sub i128 0, x",
+		// which is a two's-complement negation of the encoding and not of the
+		// number. Flipping the sign bit is the runtime's job.
+		if isLongDouble(ty) {
+			return val{op: e.tfUn(v, "goc_tf_neg"), ty: ty}
+		}
 		t := e.newTmp()
 		if isFloatTy(ty) {
 			e.line("%s = fneg %s %s", t, e.ty(ty), v)
@@ -173,18 +179,43 @@ func (e *irEmitter) binary(n *frontend.Binary) val {
 	case "&", "|", "^":
 		return e.arith(val{op: li, ty: ct}, val{op: ri, ty: ct}, llirBin(n.Op), ct)
 	case "==", "!=", "<", ">", "<=", ">=":
+		// A long double comparison is a runtime call. icmp over the raw i128
+		// would order the encodings, which puts every negative number below
+		// every positive one only by accident of the sign bit and gets NaN,
+		// -0 and the subnormals wrong in ways that look plausible.
+		if isLongDouble(ct) {
+			return val{op: e.tfCmp(li, ri, n.Op), ty: boolIr()}
+		}
 		t := e.newTmp()
-		// A comparison of two comparison results -- "(x >= 0.0) == (y > x)" --
-		// has i1 operands, not floating ones. Usual arithmetic conversions
-		// leave them alone (neither is a number), so the general path below
-		// would read the static types, see the surrounding double context, and
-		// emit "fcmp oeq double %i1, %i1", which LLVM rejects.
-		if e.ty(l.ty) == "i1" && e.ty(r.ty) == "i1" {
+		// A comparison whose operand is itself a comparison result -- "(x >= 0)
+		// == (y > x)" or "(a < b) == 1" -- carries an i1, not a number.
+		// Usual arithmetic conversions leave the integer side untouched and tag
+		// the whole expression with the integer type, so the i1 operand reaches
+		// here still typed i1 while the other operand is i32/i64. Emitting a
+		// plain integer icmp then feeds that i1 to an instruction that expects
+		// the integer width, which LLVM rejects ("defined with type 'i1' but
+		// expected 'i32'"). The integer side is brought to i1 the same way a
+		// controlling expression would ("x != 0") and the two are compared as
+		// booleans. This only fires when the common type is integral: a float
+		// common type already widens the i1 through sitofp/uitofp in convert(),
+		// so it must keep the float path below.
+		if !isFloatTy(ct) && (e.ty(l.ty) == "i1" || e.ty(r.ty) == "i1") {
+			lhs, rhs := li, ri
+			if e.ty(l.ty) != "i1" {
+				c := e.newTmp()
+				e.line("%s = icmp ne %s %s, 0", c, e.ty(ct), li)
+				lhs = c
+			}
+			if e.ty(r.ty) != "i1" {
+				c := e.newTmp()
+				e.line("%s = icmp ne %s %s, 0", c, e.ty(ct), ri)
+				rhs = c
+			}
 			cmp := map[string]string{
 				"==": "eq", "!=": "ne", "<": "ult", ">": "ugt",
 				"<=": "ule", ">=": "uge",
 			}[n.Op]
-			e.line("%s = icmp %s i1 %s, %s", t, cmp, l.op, r.op)
+			e.line("%s = icmp %s i1 %s, %s", t, cmp, lhs, rhs)
 			return val{op: t, ty: boolIr()}
 		}
 		if isFloatTy(ct) {
@@ -329,6 +360,12 @@ func arithCommon(a, b *frontend.Type) *frontend.Type {
 	}
 	if b == nil {
 		return a
+	}
+	// long double outranks both of the narrower floating types, whichever side
+	// it came from -- it is binary128, so mixing it with a double has to widen
+	// the double rather than narrow the quad.
+	if a.Kind == frontend.KLongDouble || b.Kind == frontend.KLongDouble {
+		return frontend.LongDoubleType()
 	}
 	if a.Kind == frontend.KDouble || b.Kind == frontend.KDouble {
 		return frontend.DoubleType()
@@ -562,6 +599,11 @@ func llirBin(op string) string {
 }
 
 func (e *irEmitter) arith(a, b val, op string, t *frontend.Type) val {
+	// long double never reaches an LLVM arithmetic instruction: every operator
+	// on it is a call into the software runtime.
+	if isLongDouble(t) {
+		return val{op: e.tfArith(a.op, b.op, op), ty: t}
+	}
 	r := e.newTmp()
 	if isFloatTy(t) {
 		a, b = e.foperand(a, t), e.foperand(b, t)

@@ -189,6 +189,10 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 	// nothing to infer from, and the call is rejected with "invalid type for
 	// function argument". Spelling the types out is always accepted.
 	args := make([]string, 0, len(paramTys)+len(n.Args))
+	// Long double variadic arguments draw their pass-by-address slots from a
+	// shared per-function pool; a call consumes the pool from its start, so
+	// reset the cursor here (see ldVarargSlot).
+	e.ldVarargUsed = 0
 	for i, a := range n.Args {
 		// An argument that is a known va_list does not go through the ordinary
 		// `char *` read, because on x86-64 SysV a va_list is a 24-byte
@@ -245,6 +249,26 @@ func (e *irEmitter) callExpr(n *frontend.Call) val {
 			// says `ptr`, so the information about the argument's real width is
 			// gone by then.
 			v = e.widenVarargSlot(v)
+		}
+		// A long double VARIADIC argument is passed by address: the value is
+		// stored into its own stack slot and ONE pointer rides the argument
+		// list, exactly how goc marshals it (genCall's aggregate branch) and
+		// how va_arg reads it back (expression.go's vaArg intercept). Passing
+		// the i128 value instead would let LLVM split it across two argument
+		// slots and desynchronise the cursor the callee walks.
+		//
+		// The check MUST be "beyond the prototype": a prototyped `long
+		// double` parameter is still read by the callee as the i128 value
+		// (function.go's parameter lowering, unchanged), so passing that
+		// position by address hands the callee a pointer where it expects
+		// the value itself -- every goc_tf_* call in every program crashed
+		// this way before the position guard went in (found by win_regress:
+		// longdouble [gocl] segfaulted with no output).
+		if i >= len(paramTys) && v.ty != nil && v.ty.Kind == frontend.KLongDouble {
+			slot := e.ldVarargSlot()
+			e.line("store i128 %s, ptr %s, align 16", v.op, slot)
+			args = append(args, "ptr "+slot)
+			continue
 		}
 		args = append(args, e.ty(v.ty)+" "+v.op)
 	}
@@ -432,6 +456,8 @@ func (e *irEmitter) indirectCall(n *frontend.IndirectCall) val {
 	fn := e.rvalue(n.Fn)
 	paramTys, ret := e.indirectCalleeSig(n.Fn)
 	var args []string
+	// Same shared pool as callExpr's variadic marshalling (see ldVarargSlot).
+	e.ldVarargUsed = 0
 	for i, a := range n.Args {
 		// A va_list argument goes over as the address of the caller's tag on
 		// SysV, for the same reason as in callExpr: the callee's parameter is a
@@ -458,6 +484,16 @@ func (e *irEmitter) indirectCall(n *frontend.IndirectCall) val {
 			// beyond the declared parameters the callee's signature says
 			// nothing, so nothing else will widen them.
 			v = e.widenVarargSlot(v)
+		}
+		// A long double VARIADIC argument rides one pointer slot, exactly as
+		// in callExpr above (the two paths must agree, or an indirect printf
+		// and a direct one would disagree about where argument two lives).
+		// Beyond-prototype only, for the same callee-shape reason as there.
+		if i >= len(paramTys) && v.ty != nil && v.ty.Kind == frontend.KLongDouble {
+			slot := e.ldVarargSlot()
+			e.line("store i128 %s, ptr %s, align 16", v.op, slot)
+			args = append(args, "ptr "+slot)
+			continue
 		}
 		args = append(args, e.ty(v.ty)+" "+v.op)
 	}

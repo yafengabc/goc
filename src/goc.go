@@ -32,9 +32,15 @@ import (
 	"os"
 
 	compiler "goc"
+	"goc/frontend"
 )
 
 func main() {
 	compiler.SetLibrary(embeddedLib{})
+	// The native back end lowers binary128 long double (src/goc/tf128.go),
+	// so the front end must build the real type, not the double it used to
+	// fold into. The library is compiled lazily inside Main, after this, so
+	// goclib sees the same setting the user program does.
+	frontend.EnableLongDouble = true
 	os.Exit(compiler.Main(os.Args[1:]))
 }

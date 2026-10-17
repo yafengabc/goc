@@ -799,6 +799,9 @@ func (c *CG) slotWidth(t *frontend.Type) int {
 		return 4
 	case frontend.KPtr, frontend.KFunc, frontend.KDouble:
 		return 8
+	case frontend.KLongDouble:
+		// binary128: a 16-byte value, two full slots (see tf128.go).
+		return 16
 	case frontend.KStruct, frontend.KUnion:
 		if t.Size != 0 {
 			return t.Size
@@ -1302,9 +1305,43 @@ func (c *CG) storeVar(vi varInfo) {
 	}
 }
 
-// ensureType converts the value currently in rax/xmm0 to the requested type
-// (if they differ) and updates c.resTyp.
+// ensureType converts the value currently in rax/xmm0 (scalar) or at the
+// resBig address (long double / _BitInt) to the requested type (if they
+// differ) and updates c.resTyp.
 func (c *CG) ensureType(want frontend.CType) error {
+	// A long double value (shared resBig carrier, resBigT the type):
+	// conversion out of binary128 goes through the runtime.
+	if c.resBig && isLD(c.resBigT) {
+		switch want {
+		case frontend.TF128:
+			c.resTyp = frontend.TF128
+			return nil
+		case frontend.TInt:
+			// Best-effort signed conversion: callers that need a specific
+			// integer target (its signedness matters) go through the cast
+			// path, which knows the type.
+			c.callBigLib("goc_tf_to_ll", []bigArg{{reg: "r10"}})
+			c.releaseResBig()
+			c.resTyp = frontend.TInt
+			c.resW = 8
+			c.resSigned = true
+			return nil
+		case frontend.TDouble:
+			c.callBigLib("goc_tf_to_double", []bigArg{{reg: "r10"}})
+			c.emit("movq xmm0, rax")
+			c.releaseResBig()
+			c.resTyp = frontend.TDouble
+			c.resW = 8
+			c.resSigned = true
+			return nil
+		}
+		return fmt.Errorf("long double values only convert to int/double (got %v)", want)
+	}
+	// A scalar converting TO long double: materialise it as binary128 in a
+	// fresh temporary under the shared carrier.
+	if want == frontend.TF128 && !c.resBig {
+		return c.tfScalarToLD()
+	}
 	// A _BitInt value: conversion to int truncates to the low 64-bit word
 	// (the two's-complement low word IS the int64 pattern regardless of
 	// signedness). Conditions must use genTruth instead (full-width test).
@@ -1922,10 +1959,32 @@ func (c *CG) genBigIncDec(n *frontend.IncDecExpr) (frontend.CType, error) {
 }
 
 // genTruth evaluates a condition: a _BitInt operand tests non-zero over its
-// FULL width (a low-word truncation would read 2^64 multiples as false).
+// FULL width (a low-word truncation would read 2^64 multiples as false); a
+// long double operand is true iff it is not a zero (a NaN is not a zero).
 func (c *CG) genTruth(e frontend.Expr) error {
 	if _, err := c.genExprT(e); err != nil {
 		return err
+	}
+	if c.resBig && isLD(c.resBigT) {
+		// Compare against +0.0 through the runtime; the answer is nonzero
+		// exactly when the value is a nonzero (or NaN) long double.
+		_, _, zoff := c.tfTemp()
+		c.emit("lea r11, [rbp%+d]", zoff)
+		c.zeroBytes("r11", 16)
+		c.callBigLib("goc_tf_cmp", []bigArg{{reg: "r10"}, {addrOff: zoff}})
+		c.emit("movsxd rax, eax")
+		c.emit("cmp rax, 0")
+		c.emit("setne al")
+		c.emit("movzx rax, al")
+		if c.resBigSl > 0 {
+			c.tmpDepth -= c.resBigSl + tfWords
+		}
+		c.resBig = false
+		c.resBigT = nil
+		c.resTyp = frontend.TInt
+		c.resW = 4
+		c.resSigned = true
+		return nil
 	}
 	if c.resBig {
 		w := bigWordsOf(c.resBigT)
@@ -1980,6 +2039,32 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 				c.resBig = false
 				return c.genBigBinary(n)
 			}
+			if c.isLDExpr(n.L) || c.isLDExpr(n.R) {
+				c.resBig = false
+				return c.genTFBinary(n)
+			}
+		}
+	}
+	// Long double: a value-typed expression leaves the value's address in
+	// r10 and the shared resBig carrier describes it (resBigT is the long
+	// double type); every operation is a call into goclib's binary128
+	// runtime (tf128.go). Assignment expressions are excluded -- the
+	// AssignExpr case below handles them with the aggregate machinery.
+	if _, isAssign := e.(*frontend.AssignExpr); !isAssign {
+		// A cast FROM long double to a narrower type runs the tf path even
+		// though the result is a scalar: which runtime entry point runs
+		// depends on the target's signedness, and the generic cast path's
+		// ensureType only knows the class.
+		if ce, ok := e.(*frontend.CastExpr); ok && !isLD(ce.Typ) && c.isLDExpr(ce.E) {
+			return c.genTFCast(ce)
+		}
+		if c.isLDExpr(e) {
+			c.resBig = false
+			t := c.exprType(e)
+			if !isLD(t) {
+				t = frontend.LongDoubleType()
+			}
+			return c.genTFValue(e, t)
 		}
 	}
 	c.resBig = false
@@ -2181,6 +2266,7 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 			// offset/width inside the storage unit at r10); extract with
 			// sign or zero extension per the member's signedness.
 			c.genLoadBitfield(c.lvBitUnit, c.lvBitOff, c.lvBitWidth, c.lvBitSigned)
+			c.releaseCallResultBuffer()
 			return c.resTyp, nil
 		}
 		// Members are laid out at their C type width (MSVC x64 packs an int
@@ -2190,10 +2276,12 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 		width := c.typeWidth(t)
 		if t.IsFloating() {
 			c.genLoadElem("r10", width, frontend.TDouble, false)
+			c.releaseCallResultBuffer()
 			return c.resTyp, nil
 		}
 		signed := t.Kind == frontend.KInt && t.Signed
 		c.genLoadElem("r10", width, frontend.TInt, signed)
+		c.releaseCallResultBuffer()
 		return c.resTyp, nil
 	case *frontend.SizeofExpr:
 		// sizeof on a variable-length array is NOT a constant: the size exists
@@ -2363,6 +2451,9 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 			if frontend.IsBig(c.exprType(n.Lhs)) || frontend.IsBig(c.exprType(n.Rhs)) {
 				return c.genBigCompoundAssign(n)
 			}
+			if isLD(c.exprType(n.Lhs)) || c.isLDExpr(n.Rhs) {
+				return c.genTFCompoundAssign(n)
+			}
 			return c.genCompoundAssign(n)
 		}
 		// Whole-struct/union assignment: neither side fits in a register, so
@@ -2412,6 +2503,32 @@ func (c *CG) genExprT1(e frontend.Expr) (frontend.CType, error) {
 				})
 				c.resTyp = frontend.TInt
 				c.resSigned = lt.Signed
+				c.resW = 8
+				return lt.Class(), nil
+			}
+			// Scalar RHS assigned to a long double lvalue: materialise the
+			// value converted to binary128, then copy the 16 bytes in.
+			if isLD(lt) && !frontend.IsBig(c.exprType(n.Rhs)) && !c.isLDExpr(n.Rhs) {
+				_, sl, _, err := c.tfOperand(n.Rhs)
+				if err != nil {
+					return lt.Class(), err
+				}
+				// Park the temporary's address: genLValue on the left side
+				// is free to clobber r10/r11.
+				c.emit("mov r11, r10")
+				c.tmpDepth++
+				srcSlot := c.tmpSlot(c.tmpDepth)
+				c.emit("mov [rbp%+d], r11", srcSlot)
+				if err := c.genLValue(n.Lhs); err != nil {
+					c.tmpDepth--
+					return lt.Class(), err
+				}
+				c.emit("mov r11, [rbp%+d]", srcSlot)
+				c.tmpDepth--
+				c.copyBytes("r10", "r11", 16)
+				c.tmpDepth -= sl // release the operand temporary
+				c.resTyp = frontend.TInt
+				c.resSigned = true
 				c.resW = 8
 				return lt.Class(), nil
 			}
@@ -3383,6 +3500,10 @@ func newCGFor(prog *frontend.Program, linux bool, opt int) *CG {
 // What comes out is still a complete program: the entry stub, the globals, and
 // every library function the IR side did not claim.
 func genWith(prog *frontend.Program, linux bool, opt int, winGUI bool, skipFuncs map[string]bool) (string, error) {
+	// long double still arrives here as plain double (see the note in the
+	// parser's "double" specifier case). Once #48 gives this back end fp128
+	// codegen, a long double that reaches here un-lowered is a bug, not
+	// something to fall back on.
 	return genOpts(prog, genConfig{linux: linux, opt: opt, winGUI: winGUI, skipFuncs: skipFuncs})
 }
 
@@ -6726,6 +6847,19 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 					})
 					return nil
 				}
+				// Scalar initialiser for a long double local: materialise
+				// the value converted to binary128, copy the 16 bytes in.
+				if isLD(vi.typ) && !frontend.IsBig(it) && !c.isLDExpr(n.Init) {
+					_, sl, _, err := c.tfOperand(n.Init)
+					if err != nil {
+						return err
+					}
+					c.emit("mov r11, r10")
+					c.emit("lea r10, [rbp%+d]", vi.off)
+					c.copyBytes("r10", "r11", 16)
+					c.tmpDepth -= sl
+					return nil
+				}
 				if err := c.structSrcAddr(n.Init, it); err != nil {
 					return err
 				}
@@ -6875,6 +7009,22 @@ func (c *CG) genStmt(s frontend.Stmt) error {
 				c.callBigLib("__goclib_bi_from_i64_trunc", []bigArg{
 					{reg: "r10"}, {reg: "r11"}, {imm: int64(c.curRet.Bits)}, {imm: sg},
 				})
+				c.growFrameForTemps()
+				c.emitEpilogue()
+				return nil
+			}
+			// Scalar return value for a long double function: materialise
+			// the value converted to binary128, copy the 16 bytes through
+			// the hidden result pointer.
+			if isLD(c.curRet) && !frontend.IsBig(et) && !c.isLDExpr(n.E) {
+				_, sl, _, err := c.tfOperand(n.E)
+				if err != nil {
+					return err
+				}
+				c.emit("mov r11, r10")
+				c.emit("mov r10, [rbp%+d]", c.sretSlot)
+				c.copyBytes("r10", "r11", 16)
+				c.tmpDepth -= sl
 				c.growFrameForTemps()
 				c.emitEpilogue()
 				return nil
@@ -8155,7 +8305,7 @@ func (c *CG) genLValue(e frontend.Expr) error {
 		c.emit("add r10, %d", off)
 		return nil
 	}
-	return fmt.Errorf("expression is not an lvalue")
+	return fmt.Errorf("expression is not an lvalue (%T)", e)
 }
 
 // ptrArithElem returns the element type of a pointer-arithmetic expression
@@ -8354,11 +8504,39 @@ func (c *CG) exprType(e frontend.Expr) *frontend.Type {
 		// The unnamed object's own declared type (arrays included: callers
 		// decide between value-address and decay handling).
 		return n.Typ
+	case *frontend.VaArgExpr:
+		// va_arg(ap, T) has the type T the caller asked for. Without this a
+		// `long double v = va_arg(ap, long double)` read a nil type off the
+		// initialiser, failed the isLDExpr test, and went down the scalar
+		// path -- to_ll/from_ll round-tripping 16 bytes of binary128 through
+		// an int64 and destroying the value.
+		return n.Typ
 	case *frontend.GenericExpr:
 		// The selection's type is the type of the chosen branch (the
 		// controlling expression's own type is irrelevant after the pick).
 		if n.Chosen != nil {
 			return c.exprType(n.Chosen)
+		}
+		return nil
+	case *frontend.CondExpr:
+		// A conditional's type is the common type of its arms. This branch
+		// exists for the WIDE types only -- int/double arms still come back
+		// nil, which is what every existing caller was written against --
+		// because a nil here is not neutral for them: "c = (a < 0 ? -a : a)"
+		// with a long double `a` read a nil type off the right-hand side,
+		// failed isLDExpr, and took the SCALAR assignment path, which round-
+		// trips 16 bytes of binary128 through an int64 (to_ll/from_ll).
+		// 0.5 came out as 0.0. The arms' own codegen already leaves the
+		// value at r10 with resBig set; the type is all that was missing.
+		tt, et := c.exprType(n.Then), c.exprType(n.Else)
+		if isLD(tt) || isLD(et) || c.isLDExpr(n.Then) || c.isLDExpr(n.Else) {
+			return frontend.LongDoubleType()
+		}
+		if frontend.IsBig(tt) || frontend.IsBig(et) {
+			if frontend.IsBig(tt) {
+				return tt
+			}
+			return et
 		}
 		return nil
 	case *frontend.Ident:
@@ -8383,6 +8561,18 @@ func (c *CG) exprType(e frontend.Expr) *frontend.Type {
 		// intercept never fired for unary expressions.
 		if (n.Op == "-" || n.Op == "~") && frontend.IsBig(c.exprType(n.E)) {
 			return c.exprType(n.E)
+		}
+		// A unary '-' on a long double keeps the operand's type, for the
+		// same reason (the intercept must fire and goc_tf_neg must run).
+		if n.Op == "-" && isLD(c.exprType(n.E)) {
+			return c.exprType(n.E)
+		}
+		// ...and the same for a NEGATED long double literal ("-2.5L"): the
+		// literal is in no type table, so the branch above misses it and
+		// the expression's type came out nil -- the value then fell into
+		// genUnary's integer `neg` and "-2.5L" evaluated to +2.0.
+		if n.Op == "-" && c.isLDExpr(n.E) {
+			return frontend.LongDoubleType()
 		}
 		if n.Op == "*" {
 			if t := c.exprType(n.E); t != nil && t.IsPtr() {
@@ -8490,6 +8680,25 @@ func (c *CG) binaryType(n *frontend.Binary) *frontend.Type {
 			}
 		}
 		return nil
+	}
+	// Long double arithmetic: the result is long double whatever the other
+	// operand is (the usual arithmetic conversions convert it). A literal
+	// operand is in no type table, so a 1.5L operand is recognised by its
+	// own flag -- without that, "LITS(1.0) / LITS(3.0)" would classify as an
+	// integer operation and the scalar path would divide addresses.
+	if n.Op == "+" || n.Op == "-" || n.Op == "*" || n.Op == "/" {
+		ldOperand := func(t *frontend.Type, e frontend.Expr) bool {
+			if isLD(t) {
+				return true
+			}
+			if nl, ok := e.(*frontend.NumLit); ok {
+				return nl.IsLongDouble
+			}
+			return false
+		}
+		if ldOperand(lt, n.L) || ldOperand(rt, n.R) {
+			return frontend.LongDoubleType()
+		}
 	}
 	if n.Op != "+" && n.Op != "-" {
 		return nil
@@ -9311,6 +9520,17 @@ func (c *CG) braceElemLocal(t *frontend.Type, e frontend.Expr, off int) error {
 	if _, err := c.genExprT(e); err != nil {
 		return err
 	}
+	if isLD(t) {
+		// The tf intercept leaves the value's ADDRESS in r10 (a literal's
+		// .rdata slot or a claimed carrier); the scalar store below would
+		// push 8 bytes of xmm0 and leave 8 zero bytes -- observed as every
+		// element of "long double vals[] = {...}" being garbage. Copy the
+		// 16 bytes, then free the carrier exactly like tfOperand does.
+		c.emit("lea r11, [rbp%+d]", off)
+		c.copyBytes("r11", "r10", 16)
+		c.releaseResBig()
+		return nil
+	}
 	if err := c.ensureType(t.Class()); err != nil {
 		return err
 	}
@@ -9334,32 +9554,43 @@ func (c *CG) braceElemLocal(t *frontend.Type, e frontend.Expr, off int) error {
 func (c *CG) structSrcAddr(e frontend.Expr, t *frontend.Type) error {
 	switch call := e.(type) {
 	case *frontend.Call:
-		if t.IsStruct() || t.IsUnion() {
+		if isAgg(t) {
 			if _, err := c.genExprT(call); err != nil {
 				return err
 			}
-			if !c.resStruct {
-				return fmt.Errorf("call %q does not produce a struct value", call.Name)
+			if c.resStruct {
+				c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(c.resStructK, c.resStructSl))
+				return nil
 			}
-			c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(c.resStructK, c.resStructSl))
-			return nil
+			// A long double call arrives through the tf128 intercept, which
+			// has already transferred the result buffer to the resBig
+			// carrier -- r10 holds its address.
+			if c.resBig {
+				return nil
+			}
+			return fmt.Errorf("call %q does not produce a struct value", call.Name)
 		}
 	case *frontend.IndirectCall:
-		if t.IsStruct() || t.IsUnion() {
+		if isAgg(t) {
 			if _, err := c.genExprT(call); err != nil {
 				return err
 			}
-			if !c.resStruct {
-				return fmt.Errorf("function-pointer call does not produce a struct value")
+			if c.resStruct {
+				c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(c.resStructK, c.resStructSl))
+				return nil
 			}
-			c.emit("lea r10, [rbp%+d]", c.tmpSlotBlock(c.resStructK, c.resStructSl))
-			return nil
+			if c.resBig {
+				return nil
+			}
+			return fmt.Errorf("function-pointer call does not produce a struct value")
 		}
 	}
-	// A _BitInt value expression: genExprT's big intercept always leaves the
-	// value address in r10 (lvalues directly; computed values in their own
-	// claimed buffer).
-	if frontend.IsBig(t) {
+	// A _BitInt or long double value expression: genExprT's intercepts
+	// always leave the value address in r10 (lvalues directly; computed
+	// values in their own claimed buffer). The ld test also looks at the
+	// node itself: a literal is in no type table (exprType reports nil), so
+	// "long double x = 1.5L" reaches here with a nil type.
+	if frontend.IsBig(t) || isLD(t) || c.isLDExpr(e) {
 		_, err := c.genExprT(e)
 		return err
 	}
@@ -9373,6 +9604,21 @@ func (c *CG) releaseResStruct() {
 		c.tmpDepth -= c.resStructSl
 		c.resStruct = false
 	}
+}
+
+// releaseCallResultBuffer frees a struct-return call's result buffer after a
+// SCALAR member of it has been loaded into a register ("f().x"): the value is
+// in rax/xmm0, so the buffer is dead -- but the claim must be unwound HERE,
+// while tmpDepth still includes it. Consumers roll tmpDepth back to their
+// entry depth without checking the flag (genCompoundAssign's restore did),
+// and the statement boundary then releases unconditionally -- so a claim left
+// set was subtracted twice and drove tmpDepth negative. Negative slot indices
+// handed out addresses inside live locals: "MIX(f(a).hi); r = g(b);" parked
+// format pointers into r's own bytes and every half of r printed an image
+// address. Aggregate members and array decays must NOT release here: their
+// consumers still need the buffer's bytes through the address in r10.
+func (c *CG) releaseCallResultBuffer() {
+	c.releaseResStruct()
 }
 
 // lvalueWidth returns the byte width of the value stored at the lvalue e. For
@@ -9485,6 +9731,35 @@ func (c *CG) genVaArg(n *frontend.VaArgExpr) (frontend.CType, error) {
 		return frontend.TInt, err
 	}
 	c.emit("mov rcx, [r10]") // rcx = current cursor
+	// Long double rides the shared by-address carrier (r10 = value address).
+	// The caller passed it as ONE general-purpose slot holding a pointer to
+	// the 16 bytes (the aggregate hidden-pointer convention, see genCall's
+	// isAgg branch, which is what a long double argument reaches), so the
+	// read is: take the pointer out of the slot, copy the 16 bytes it names
+	// into a fresh temporary, and describe that temporary as the value.
+	// Copying (rather than handing the caller's buffer straight back) keeps
+	// the carrier contract simple: resBigK names a buffer this frame owns,
+	// released by the ordinary statement-boundary path like every other
+	// long double temporary.
+	if n.Typ.Kind == frontend.KLongDouble {
+		c.emit("mov rax, [rcx]")
+		c.emit("add rcx, 8")
+		c.emit("mov [r10], rcx")
+		k, _, off := c.tfTemp()
+		c.emit("mov r11, [rax]")
+		c.emit("mov r10, [rax+8]")
+		c.emit("mov [rbp%+d], r11", off)
+		c.emit("mov [rbp%+d], r10", off+8)
+		c.emit("lea r10, [rbp%+d]", off)
+		c.resBig = true
+		c.resBigT = n.Typ
+		c.resBigK = k
+		c.resBigSl = tfWords
+		c.resTyp = frontend.TInt
+		c.resW = 8
+		c.resSigned = false
+		return frontend.TInt, nil
+	}
 	if n.Typ.Class() == frontend.TDouble {
 		c.emit("mov rax, [rcx]")
 		c.emit("movq xmm0, rax")
@@ -10684,6 +10959,31 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 			pt = paramTypes[i]
 		}
 		at := c.exprType(args[i])
+		if at == nil && c.isLDExpr(args[i]) {
+			// A long double literal ("printf("%Lf", 1.5L)") is in no type
+			// table, so exprType is nil and the argument fell through the
+			// aggregate branch into the scalar path -- which passed the
+			// value's LOW 8 BYTES where the callee's va_arg expected a
+			// pointer to the 16-byte value. Give it its real type so the
+			// by-address marshalling below runs.
+			at = frontend.LongDoubleType()
+		}
+		// Long double parameter: the argument is materialised as binary128
+		// (converted from whatever type it has) and its address is passed,
+		// exactly like a struct argument's hidden pointer. The operand's
+		// temporary stays live until the call; consumed covers its 2 slots
+		// plus the parked pointer slot.
+		if isLD(pt) {
+			_, sl, _, err := c.tfOperand(args[i])
+			if err != nil {
+				return frontend.TInt, err
+			}
+			c.tmpDepth++
+			c.emit("mov [rbp%+d], r10", c.tmpSlot(c.tmpDepth))
+			slots[i] = argSlot{slot: c.tmpDepth, typ: frontend.TInt}
+			consumed += 1 + sl
+			continue
+		}
 		// _BitInt parameter: the value travels by address. A scalar argument
 		// is converted via from_i64; a mismatched-width _BitInt argument is
 		// widened/truncated into a parameter-width temporary first.
@@ -10773,6 +11073,22 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 				consumed += c.resStructSl
 				c.resStruct = false
 			}
+			if c.resBig && c.resBigSl > 0 {
+				// Same protection for a long double value: its bytes live in
+				// a claimed temporary and we are passing that temporary's
+				// ADDRESS, so later argument evaluation must not reuse it
+				// before the call consumes it.
+				c.tmpDepth += c.resBigSl
+				consumed += c.resBigSl
+			}
+			// A long double LVALUE (or a literal: both carry resBigSl == 0)
+			// needs no slot protection -- its address points at a local or
+			// at .rdata -- but resBig itself MUST still be cleared. Left
+			// set, the call's int result was consumed by ensureType's LD
+			// branch: "int n = sprintf(buf, "%Lf", x)" ran goc_tf_to_ll on
+			// whatever r10 held after the call and got 0 (and, for a
+			// literal argument, a wild r10 segfaulted the process).
+			c.resBig = false
 			c.tmpDepth++
 			c.emit("mov [rbp%+d], r10", c.tmpSlot(c.tmpDepth))
 			slots[i] = argSlot{slot: c.tmpDepth, typ: frontend.TInt}

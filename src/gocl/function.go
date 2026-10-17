@@ -25,8 +25,9 @@ type irEmitter struct {
 	c  *irMod        // the module being written
 	tr *typeResolver // the shared type/name resolver (no CG coupling)
 
-	fname string
-	retTy string // LLVM type of the return value
+	fname   string
+	retTy   string         // LLVM type of the return value
+	retType *frontend.Type // the C return type, for signedness-sensitive conversions (e.g. long double -> unsigned long long)
 	// paramNames is the parameter list of the function being written. A va_list
 	// is a char*, so `va_arg(ap, T)` needs the va_list itself when `ap` arrived
 	// as a parameter -- it is already the pointer -- and the address of the
@@ -75,6 +76,15 @@ type irEmitter struct {
 	// value through memory, and scratchSize is how many bytes it holds.
 	scratch     string
 	scratchSize int
+	// ldVararg is the pool of entry allocas that long double variadic
+	// arguments are stored into before being passed by address (call.go's
+	// variadic marshalling). One slot per live argument of a single call is
+	// enough: calls are serialised, so all call sites share the pool and it
+	// only grows to the largest number of long double arguments any one call
+	// in this function takes. ldVarargUsed is reset to zero at the start of
+	// each call's marshalling.
+	ldVararg     []string
+	ldVarargUsed int
 	// forwards records branches to a C label that had not been seen yet.
 	forwards []forwardGoto
 }
@@ -145,6 +155,7 @@ func genIRFunc(tr *typeResolver, m *irMod, f *frontend.FuncDecl) (string, error)
 		tr:         tr,
 		fname:      f.Name,
 		retTy:      m.llirType(f.Ret),
+		retType:    f.Ret,
 		slots:      map[int]string{},
 		userLabels: map[string]string{},
 	}
