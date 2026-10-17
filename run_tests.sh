@@ -46,6 +46,22 @@ echo "== building goa =="
 echo "== building elfcheck =="
 (cd tools && go build -o ../bin/elfcheck.exe ./elfcheck) || { echo "ELFCHECK BUILD FAILED"; exit 1; }
 
+# gocl is the LLVM back end, linked dynamically against libLLVM.dll. Build it
+# here rather than trusting a stale bin/gocl.exe, so the gocl legs below
+# exercise the current source; if the toolchain cannot produce it (no
+# libLLVM), GOCL stays empty and those legs SKIP, the same way the Linux legs
+# SKIP without ucrun. Building it is what makes the LLVM-specific
+# miscompiles (e.g. a register clobbered across the __chkstk stack probe the
+# native back end never emits) visible to this suite at all.
+echo "== building gocl (LLVM back end; its legs SKIP without it) =="
+GOCL=""
+if (cd src && go build -trimpath -ldflags="-s -w" -o ../bin/gocl.exe -tags gocl .) 2>/tmp/gocl_build.err; then
+    GOCL="./bin/gocl.exe"
+    echo "== gocl: $GOCL =="
+else
+    echo "== gocl not built: $(head -1 /tmp/gocl_build.err) (gocl legs will SKIP) =="
+fi
+
 # Find ucrun.exe (standalone unicorn ELF emulator, tools/ucrun/ucrun.c).
 # Unicorn exposes QEMU's TCG x86-64 core, so the Linux binaries below get real
 # instruction semantics (flags, SSE2, addressing) instead of a hand-written
@@ -79,6 +95,26 @@ mkdir -p bin/goc-out
 # same rationale as gocregress' winOnly map (verified on a real kernel/WSL).
 win_only=" wintest winbox winreg c11_threads_basic "
 is_win_only() { case "$win_only" in *" $1 "*) return 0;; esac; return 1; }
+
+# gocl (the LLVM back end) is far less mature than the native back end. Over
+# the example set it either cannot compile an example or produces different
+# output for a good fraction of them. These two lists keep that from turning
+# the gocl leg red while still guarding against NEW regressions: an example
+# listed here is allowed to fail; one that is NOT listed and fails is a real
+# regression and fails the leg.
+#
+#   gocl_unsupported: clean "the LLVM front end does not model this yet"
+#     rejections (inline asm, bit-fields, _BitInt) -- SKIP, like win-only.
+#   gocl_xfail: gocl compiles it but miscompiles (wrong output, a crash, a
+#     hang) or emits IR libLLVM rejects -- XFAIL, a tracked bug.
+# Verified 2026-10-17 by running every example under gocl against the goc
+# goldens (79 probed: 57 clean, 4 unsupported, 18 miscompile). Trim these as
+# gocl improves; an example that starts matching is reported ok, so the list
+# can only shrink.
+gocl_unsupported=" asm1 asm2 bitint test_bitfield "
+gocl_xfail=" ar_print bitor brace c23_anon c23_emptyinit c23_enum control embstr enums fnptrs goclib2 libmisc lllit mathlib mathlib2 print_thin test_bool test_c89 "
+gocl_is_unsupported() { case "$gocl_unsupported" in *" $1 "*) return 0;; esac; return 1; }
+gocl_is_xfail() { case "$gocl_xfail" in *" $1 "*) return 0;; esac; return 1; }
 
 # Each leg compiles every example with the same extra goc flags, runs it, and
 # byte-compares stdout against src/expected/<name>.txt. The -O1 legs exist
@@ -238,6 +274,76 @@ run_linux_leg() {  # <dirSuffix> <label> [extra goc flags...]
     return 0
 }
 
+# run_gocl_leg compiles every example with gocl (the LLVM back end) into a PE
+# and runs it, byte-comparing against the same goldens the native legs use.
+# The point is coverage the native legs structurally cannot give: a miscompile
+# confined to the LLVM back end -- a register clobbered across the __chkstk
+# stack probe, a bad alloca lowering, a mis-typed value -- shows up here as a
+# diff, where the native back end is blind to it. gocl links in a single step
+# (unlike goc there is no separate -c object stage), so it compiles straight to
+# the executable. Known gocl gaps are handled by the gocl_unsupported /
+# gocl_xfail lists: SKIP for unmodelled constructs, XFAIL for tracked
+# miscompiles. Each run is bounded by a timeout so a gocl hang (verified:
+# mathlib2 loops forever) cannot stall the whole suite.
+run_gocl_leg() {  # <dirSuffix> <label>
+    local dir="$1" label="$2"
+    if [ -z "$GOCL" ]; then
+        echo "SKIP  ${label}gocl/*  (gocl not built)"
+        echo "LEGSTATS pass=0 fail=0 xfail=0"
+        return 0
+    fi
+    local out="bin/gocl-out$dir"
+    local leg_pass=0 leg_fail=0 leg_xfail=0
+    mkdir -p "$out"
+    for src in src/examples/*.c; do
+        name="$(basename "$src" .c)"
+        exp="src/expected/$name.txt"
+        if [ ! -f "$exp" ]; then
+            echo "SKIP  ${label}gocl/$name  (no src/expected/$name.txt)"
+            continue
+        fi
+        if is_win_only "$name"; then
+            echo "SKIP  ${label}gocl/$name  (win-only)"
+            continue
+        fi
+        if gocl_is_unsupported "$name"; then
+            echo "SKIP  ${label}gocl/$name  (gocl: construct not modelled)"
+            continue
+        fi
+        local err="/tmp/goclg${dir}_$name.err"
+        # Compile, retrying once on the AV file-lock (a freshly written output
+        # can be momentarily held), so a scan does not masquerade as a bug.
+        local built=0
+        if "$GOCL" "$src" -o "$out/$name.exe" >/dev/null 2>"$err"; then
+            built=1
+        elif grep -qiE "being used by another process|cannot access the file" "$err"; then
+            sleep 1
+            if "$GOCL" "$src" -o "$out/$name.exe" >/dev/null 2>"$err"; then built=1; fi
+        fi
+        if [ "$built" -ne 1 ]; then
+            if gocl_is_xfail "$name"; then echo "XFAIL ${label}gocl/$name  (compile)"; leg_xfail=$((leg_xfail+1)); else echo "FAIL  ${label}gocl/$name  (compile): $(head -1 "$err")"; leg_fail=$((leg_fail+1)); fi
+            continue
+        fi
+        # Run under a timeout; 126/127 means the exe was still locked by a
+        # realtime scan, so retry once before calling it a failure.
+        local log="/tmp/goclg${dir}_$name.out"
+        timeout 30 "$out/$name.exe" >"$log" 2>&1; local rc=$?
+        if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+            sleep 1
+            timeout 30 "$out/$name.exe" >"$log" 2>&1; rc=$?
+        fi
+        tr -d '\r' <"$log" >"$log.cr"; mv "$log.cr" "$log"
+        diff -u "$exp" "$log" >"/tmp/goclg${dir}_$name.diff"; local diffrc=$?
+        if [ "$rc" -ne 0 ] || [ "$diffrc" -ne 0 ]; then
+            if gocl_is_xfail "$name"; then echo "XFAIL ${label}gocl/$name  (exit=$rc)"; leg_xfail=$((leg_xfail+1)); else echo "FAIL  ${label}gocl/$name  (exit=$rc)"; sed -n '1,8p' "/tmp/goclg${dir}_$name.diff"; leg_fail=$((leg_fail+1)); fi
+        else
+            printf "ok    ${label}gocl/%-10s %6d bytes\n" "$name" "$(stat -c%s "$out/$name.exe")"
+            leg_pass=$((leg_pass+1))
+        fi
+    done
+    echo "LEGSTATS pass=$leg_pass fail=$leg_fail xfail=$leg_xfail"
+}
+
 # run_unit <mod> <logfile>: unit tests for one Go module. -v once, counted
 # from the same log (the old harness ran the suite twice for the count).
 run_unit() {  # <mod> <logfile>
@@ -276,28 +382,30 @@ fail=0
 aggregate() {  # <logfile>...: sum every leg's LEGSTATS line
     local f p f2
     for f in "$@"; do
-        p="$(sed -n 's/^LEGSTATS pass=\([0-9]*\) fail=[0-9]*$/\1/p' "$f" | awk '{s+=$1} END{print s+0}')"
-        f2="$(sed -n 's/^LEGSTATS pass=[0-9]* fail=\([0-9]*\)$/\1/p' "$f" | awk '{s+=$1} END{print s+0}')"
+        p="$(sed -n 's/^LEGSTATS pass=\([0-9]*\) fail=[0-9]*\( xfail=[0-9]*\)\{0,1\}$/\1/p' "$f" | awk '{s+=$1} END{print s+0}')"
+        f2="$(sed -n 's/^LEGSTATS pass=[0-9]* fail=\([0-9]*\)\( xfail=[0-9]*\)\{0,1\}$/\1/p' "$f" | awk '{s+=$1} END{print s+0}')"
         pass=$((pass + p))
         fail=$((fail + f2))
     done
 }
 
 if [ "${GOC_PARALLEL:-0}" = "1" ]; then
-    echo "== running 6 example legs + goa suite + 3 unit modules in parallel =="
+    echo "== running 7 example legs + goa suite + 4 unit modules in parallel =="
     run_win_leg  ""   ""           >/tmp/leg_win0.log   2>&1 & p0=$!
     run_win_leg  "-o1" "O1/"  -O1  >/tmp/leg_wino1.log  2>&1 & p1=$!
     run_win_leg  "-os" "Os/"  -Os  >/tmp/leg_winos.log  2>&1 & p2=$!
     run_linux_leg ""   ""           >/tmp/leg_lin0.log   2>&1 & p3=$!
     run_linux_leg "-o1" "O1/"  -O1 >/tmp/leg_lino1.log  2>&1 & p4=$!
     run_linux_leg "-os" "Os/"  -Os >/tmp/leg_linos.log  2>&1 & p5=$!
+    run_gocl_leg "" "" >/tmp/leg_gocl.log 2>&1 & p10=$!
     run_goa                     >/tmp/leg_goa.log    2>&1 & p6=$!
     run_unit src        /tmp/unit_src.log    >/tmp/leg_unit_src.log  2>&1 & p7=$!
     run_unit src/goa    /tmp/unit_goa.log    >/tmp/leg_unit_goa.log  2>&1 & p8=$!
     run_unit tools      /tmp/unit_tools.log  >/tmp/leg_unit_tools.log 2>&1 & p9=$!
+    run_unit src/gocld  /tmp/unit_gocld.log  >/tmp/leg_unit_gocld.log 2>&1 & p11=$!
 
     rc=0
-    for pid in $p0 $p1 $p2 $p3 $p4 $p5 $p6 $p7 $p8 $p9; do
+    for pid in $p0 $p1 $p2 $p3 $p4 $p5 $p6 $p7 $p8 $p9 $p10 $p11; do
         wait "$pid" || rc=1
     done
 
@@ -308,13 +416,15 @@ if [ "${GOC_PARALLEL:-0}" = "1" ]; then
     echo "== linux target -O0 (ELF64 under QEMU/Unicorn) =="; cat /tmp/leg_lin0.log
     echo "== linux target -O1 ==";                        cat /tmp/leg_lino1.log
     echo "== linux target -Os ==";                        cat /tmp/leg_linos.log
+    echo "== gocl windows (-O0, LLVM back end) ==";       cat /tmp/leg_gocl.log
     echo "== goa examples (via goa/run_tests.sh) =="; cat /tmp/leg_goa.log
-    echo "== unit tests (all three modules) ==";          cat /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log
+    echo "== unit tests (all four modules) ==";           cat /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log /tmp/leg_unit_gocld.log
 
     aggregate /tmp/leg_win0.log /tmp/leg_wino1.log /tmp/leg_winos.log \
               /tmp/leg_lin0.log /tmp/leg_lino1.log /tmp/leg_linos.log \
+              /tmp/leg_gocl.log \
               /tmp/leg_goa.log \
-              /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log
+              /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log /tmp/leg_unit_gocld.log
     # rc is only set on the parallel branch above; the sequential one leaves it
     # unset, and `set -u` turns reading it into a fatal error on the very line
     # that reports the result. The per-leg LEGSTATS sums below are the real
@@ -332,16 +442,20 @@ else
     run_win_leg "-os" "Os/" -Os | tee /tmp/leg_winos.log
     echo "== linux target -Os =="
     run_linux_leg "-os" "Os/" -Os | tee /tmp/leg_linos.log
+    echo "== gocl windows (-O0, LLVM back end) =="
+    run_gocl_leg "" "" | tee /tmp/leg_gocl.log
     echo "== goa examples (via goa/run_tests.sh) =="
     run_goa | tee /tmp/leg_goa.log
-    echo "== unit tests (all three modules) =="
+    echo "== unit tests (all four modules) =="
     run_unit src     /tmp/unit_src.log   | tee /tmp/leg_unit_src.log
     run_unit src/goa /tmp/unit_goa.log   | tee /tmp/leg_unit_goa.log
     run_unit tools   /tmp/unit_tools.log | tee /tmp/leg_unit_tools.log
+    run_unit src/gocld /tmp/unit_gocld.log | tee /tmp/leg_unit_gocld.log
     aggregate /tmp/leg_win0.log /tmp/leg_wino1.log /tmp/leg_winos.log \
               /tmp/leg_lin0.log /tmp/leg_lino1.log /tmp/leg_linos.log \
+              /tmp/leg_gocl.log \
               /tmp/leg_goa.log \
-              /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log
+              /tmp/leg_unit_src.log /tmp/leg_unit_goa.log /tmp/leg_unit_tools.log /tmp/leg_unit_gocld.log
 fi
 
 echo "-----------------------------"
