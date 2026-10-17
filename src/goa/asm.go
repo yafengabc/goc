@@ -2884,6 +2884,13 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 				a.emitByte(byte(int8(src.imm)))
 				return nil
 			}
+			// 81 /digit id: the immediate is a sign-extended imm32. For a 64-bit
+			// operand that is only correct while the value fits in an int32 --
+			// truncating a wider one silently produced a compare or arithmetic
+			// op against a completely different constant.
+			if width == 8 && !imm32Fits(src.imm) {
+				return fmt.Errorf("immediate %d does not fit 32 bits: %q", src.imm, ln)
+			}
 			a.emitByte(0x81)
 			a.emitMemEnc(enc)
 			a.emitInt32(int32(src.imm))
@@ -2895,7 +2902,11 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 			a.emitByte(modrmRegReg(int(c.dig), dst.reg))
 			a.emitByte(byte(int8(src.imm)))
 		} else {
-			a.emitArithRex(regWidth(dst), 0, dst.reg)
+			w := regWidth(dst)
+			if w == 8 && !imm32Fits(src.imm) {
+				return fmt.Errorf("immediate %d does not fit 32 bits: %q", src.imm, ln)
+			}
+			a.emitArithRex(w, 0, dst.reg)
 			a.emitByte(0x81)
 			a.emitByte(modrmRegReg(int(c.dig), dst.reg))
 			a.emitInt32(int32(src.imm))
@@ -3014,6 +3025,11 @@ func (a *Assembler) encodeArith(mnem string, ops []Operand, ln string) error {
 }
 
 // ---- imul reg, reg ---------------------------------------------------------
+
+// imm32Fits reports whether v survives being encoded as a sign-extended imm32.
+// x86-64 has no imm64 immediate for the arithmetic group, so a wider constant
+// has to be materialized into a register by the producer instead.
+func imm32Fits(v int64) bool { return v >= -(1<<31) && v < (1<<31) }
 
 func (a *Assembler) encodeImul(ops []Operand, ln string) error {
 	// One-operand form: the unsigned multiply into rdx:rax. AT&T spells it

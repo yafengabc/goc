@@ -1005,6 +1005,23 @@ func (c *CG) emit(format string, a ...any) {
 	c.insts = append(c.insts, Inst{Kind: instInstr, Text: "\t" + fmt.Sprintf(format, a...)})
 }
 
+// emitCmpImm compares a register against an integer constant.
+//
+// x86-64 has no "cmp r/m64, imm64": the only immediate form sign-extends an
+// imm32, so a constant outside int32's range cannot be encoded. Emitting one
+// anyway used to be silently truncated by the assembler, which turned
+// `case 4000000000LL:` into `cmp rax, -294967296` -- a branch that can never
+// match, with no diagnostic. Materialize those into r11, a volatile scratch
+// no value lives in across a compare, and compare register-to-register.
+func (c *CG) emitCmpImm(reg string, v int64) {
+	if v >= -(1<<31) && v < (1<<31) {
+		c.emit("cmp %s, %d", reg, v)
+		return
+	}
+	c.emit("mov r11, %d", v)
+	c.emit("cmp %s, r11", reg)
+}
+
 // emitWrap is emit for one half of an int canonicalisation pair: the IntWrap
 // marker lets elimRedundantExt recognise (and possibly drop) the pair.
 func (c *CG) emitWrap(format string, a ...any) {
@@ -7438,7 +7455,7 @@ func (c *CG) genSwitch(n *frontend.SwitchStmt) error {
 			// N21: 32-bit compare against the materialized int switch value.
 			c.emit("cmp eax, %d", g.val)
 		} else {
-			c.emit("cmp rax, %d", g.val)
+			c.emitCmpImm("rax", int64(g.val))
 		}
 		c.emit("je %s", g.lbl)
 	}
@@ -7588,22 +7605,30 @@ func (c *CG) genUnary(n *frontend.Unary) (frontend.CType, error) {
 		return frontend.TInt, nil
 	}
 	// "!" -- force the operand to int, then rax = (rax == 0)
-	if err := c.ensureType(frontend.TInt); err != nil {
-		return frontend.TInt, err
+	if n.Op == "!" {
+		if err := c.ensureType(frontend.TInt); err != nil {
+			return frontend.TInt, err
+		}
+		lTrue := c.newLabel("nott")
+		lEnd := c.newLabel("note")
+		c.emit("cmp rax, 0")
+		c.emit("je %s", lTrue)
+		c.emit("mov rax, 0")
+		c.emit("jmp %s", lEnd)
+		c.line(lTrue + ":\n")
+		c.emit("mov rax, 1")
+		c.line(lEnd + ":\n")
+		c.resTyp = frontend.TInt
+		c.resSigned = true
+		c.resW = 4 // !x yields a (signed) int
+		return frontend.TInt, nil
 	}
-	lTrue := c.newLabel("nott")
-	lEnd := c.newLabel("note")
-	c.emit("cmp rax, 0")
-	c.emit("je %s", lTrue)
-	c.emit("mov rax, 0")
-	c.emit("jmp %s", lEnd)
-	c.line(lTrue + ":\n")
-	c.emit("mov rax, 1")
-	c.line(lEnd + ":\n")
-	c.resTyp = frontend.TInt
-	c.resSigned = true
-	c.resW = 4 // !x yields a (signed) int
-	return frontend.TInt, nil
+	// Every other unary operator (currently only "+") is a no-op on the value:
+	// the operand is already materialised in the result register(s) with the
+	// right width and signedness, so we just hand its type back. Dropping the
+	// value through to the "!" block used to run ensureType(TInt) on it -- which
+	// silently turned "+d" into "(d != 0)" and zeroed floats.
+	return t, nil
 }
 
 // f2IndexRegConst extends the F2 register-index optimisation to the common
@@ -10833,14 +10858,55 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 	// struct-returning calls, whose slot 0 carries the hidden result
 	// pointer. XMM indices: Windows numbers XMM argument registers
 	// positionally (shared with the GP slot counter), SysV by FP-arg order.
+	//
+	// Decide up front where every floating-point argument lands. Assignment
+	// is positional, so the walk has to run in argument order, but the
+	// emit order below deliberately does not: see the stack pass.
 	xmmIdx := 0
+	xmmSlot := make([]int, nargs)
 	for i := 0; i < nargs; i++ {
 		s := slots[i]
+		xmmSlot[i] = -1 // not an FP argument, or passed on the stack
+		if varargs || s.typ != frontend.TDouble {
+			continue
+		}
 		regIdx := i + regShift
 		xmmAt := regIdx
 		if c.linux {
 			xmmAt = xmmIdx
 		}
+		if regIdx < len(argRegs) && xmmAt < len(argXMM) {
+			xmmSlot[i] = xmmAt
+			xmmIdx++
+		}
+	}
+	// Stack-passed floating-point arguments are marshalled first, in a pass
+	// of their own. Narrowing a double to a float needs a scratch XMM, and
+	// the only safe one to reach for is xmm0 -- which is also argument
+	// register 0. Doing this before any argument register is populated keeps
+	// the scratch from clobbering a value an earlier iteration already
+	// loaded (which silently corrupted FP argument 0). A whole double needs
+	// no XMM at all: it is 8 bytes and can travel through rax.
+	for i := 0; i < nargs; i++ {
+		s := slots[i]
+		if varargs || s.typ != frontend.TDouble || xmmSlot[i] >= 0 {
+			continue
+		}
+		off := c.stackArgOff(i + regShift - len(argRegs))
+		if s.f32 {
+			// A stack-passed float sits in the low half of an 8-byte slot
+			// (the callee reads it in place with a 4-byte load).
+			c.emit("movsd xmm0, [rbp%+d]", c.tmpSlot(s.slot))
+			c.emit("cvtsd2ss xmm0, xmm0")
+			c.emit("movss [rsp+%d], xmm0", off)
+		} else {
+			c.emit("mov rax, [rbp%+d]", c.tmpSlot(s.slot))
+			c.emit("mov [rsp+%d], rax", off)
+		}
+	}
+	for i := 0; i < nargs; i++ {
+		s := slots[i]
+		regIdx := i + regShift
 		if varargs {
 			if regIdx < len(argRegs) {
 				c.emit("mov %s, [rbp%+d]", argRegs[regIdx], c.tmpSlot(s.slot))
@@ -10851,32 +10917,22 @@ func (c *CG) genCall(name string, fnExpr frontend.Expr, ft *frontend.Type, args 
 			continue
 		}
 		if s.typ == frontend.TDouble {
-			if regIdx < len(argRegs) && xmmAt < len(argXMM) {
-				if s.f32 {
-					// float parameter: the ABI carries a single in the low
-					// 32 bits, so narrow the double here. Load the double
-					// straight into the destination XMM register and narrow
-					// in place -- do NOT route through xmm0 as a scratch,
-					// because xmm0 may itself be one of the argument
-					// registers the previous iteration already populated.
-					c.emit("movsd %s, [rbp%+d]", argXMM[xmmAt], c.tmpSlot(s.slot))
-					c.emit("cvtsd2ss %s, %s", argXMM[xmmAt], argXMM[xmmAt])
-				} else {
-					c.emit("movsd %s, [rbp%+d]", argXMM[xmmAt], c.tmpSlot(s.slot))
-				}
-				xmmIdx++
-				continue
+			if xmmSlot[i] < 0 {
+				continue // already marshalled onto the stack above
 			}
-			c.emit("movsd xmm0, [rbp%+d]", c.tmpSlot(s.slot))
+			at := argXMM[xmmSlot[i]]
 			if s.f32 {
-				// A stack-passed float sits in the low half of an 8-byte slot
-				// (the callee reads it in place with a 4-byte load).
-				c.emit("cvtsd2ss xmm0, xmm0")
-				c.emit("movss [rsp+%d], xmm0", c.stackArgOff(regIdx-len(argRegs)))
-				continue
+				// float parameter: the ABI carries a single in the low
+				// 32 bits, so narrow the double here. Load the double
+				// straight into the destination XMM register and narrow
+				// in place -- do NOT route through xmm0 as a scratch,
+				// because xmm0 may itself be one of the argument
+				// registers the previous iteration already populated.
+				c.emit("movsd %s, [rbp%+d]", at, c.tmpSlot(s.slot))
+				c.emit("cvtsd2ss %s, %s", at, at)
+			} else {
+				c.emit("movsd %s, [rbp%+d]", at, c.tmpSlot(s.slot))
 			}
-			c.emit("movq rax, xmm0")
-			c.emit("mov [rsp+%d], rax", c.stackArgOff(regIdx-len(argRegs)))
 			continue
 		}
 		if regIdx < len(argRegs) {

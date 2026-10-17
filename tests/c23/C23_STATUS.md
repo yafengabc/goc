@@ -33,7 +33,7 @@
 | 值错误 | ~~**enum E:T 布局**~~ **已修（2026-10-05）** | 此前 sizeof(enum) 恒为 4；现按底层类型定宽（`enum:uchar`=1、`enum:llong`=8），含结构体成员布局与窄枚举 `++` |
 | 值错误 | **空 {} 初始化首标量** | 已有局部后第一个 `{}` 标量不真正归零（读到稳定垃圾 71302960）；`static int s={}` 被拒 |
 | 值错误 | **ckd_* 64 位目标** | 溢出标志恒报 0（goclib 头自证：无 128 位数学，W≥8 直接判无溢出） |
-| 值错误 | ~~**_Generic 区分 long/unsigned**~~ **已修（2026-10-05）** | 字面量 `1L`/`1U` 此前一律按 int 定型（NumLit 丢了后缀），整型运算结果此前一律为 int；现已实现字面量后缀定型 + 整型提升 + 一般算术转换 + 移位取提升后左操作数，`_Generic(1L, long: …)`/`_Generic(0u, unsigned int: …)`/`_Generic(1u<<15, …)` 全部命中。**仍不可靠**：typedef 名关联、`const int*` vs `int*`（报 `type int* appears twice`） |
+| 值错误 | ~~**_Generic 区分 long/unsigned**~~ **已修（2026-10-05）**；~~typedef 名关联 / `const int*` vs `int*`~~ **已修（2026-10-17）** | 字面量 `1L`/`1U` 此前一律按 int 定型（NumLit 丢了后缀），整型运算结果此前一律为 int；现已实现字面量后缀定型 + 整型提升 + 一般算术转换 + 移位取提升后左操作数，`_Generic(1L, long: …)`/`_Generic(0u, unsigned int: …)`/`_Generic(1u<<15, …)` 全部命中。2026-10-17 再补齐四组"表示相同但标准要求不同类型"的区分：`char`/`signed char`/`unsigned char`、`long`/`long long`、`double`/`long double`、指针所指 const（`Type` 增 `PlainChar`/`LongLong`/`LongDouble` 标记 + `genericTypeMatch` 逐层比较 const），`c23_generic.c` 14/14 与 gcc 逐行一致 |
 | 值错误 | **u8 字面量类型** | u8 字符串按 `char*` 衰减、`sizeof(u8'A')=8`（应 1）；char8_t 类型名 goc 内建可用但语义仍 C11 模型 |
 | 值错误 | **`[[gnu::aligned(N)]]`** | 解析但不生效（_Alignof 仍自然对齐 4）；未知/vendor 属性静默忽略 |
 | 语义偏差 | **`[[fallthrough]]` switch 外** | goc 静默接受（gcc 硬错误） |
@@ -51,7 +51,7 @@
 2. ~~`_BitInt` 与无类型整数字面量比较触发编译器 panic~~ ——**已修复**（比较分支 nil 类型兜底 `IntType()`）；另修复：全局/static 非零初始化被静默丢弃（bigInitWords 剥 cast 链+回绕+负值全宽扩展）、goa dq 拒 16 位十六进制、callBigLib 5+ 参栈通道、同宽 big->big cast 缺失 copyBytes、返回 _BitInt 的函数调用误判 struct
 3. ~~块作用域非 static `thread_local` 触发编译器 panic~~ ——**已修复**（2026-10-02：src\check.go 语义层拒绝块作用域 + 非 static/extern 的 `_Thread_local` 组合，codegen panic 路径不可达；负向用例 c23_thread_local_bad.c 双方拒绝）
 4. 空 `{}` 初始化：首个标量不归零（codegen bug）、static 存储期被拒——P1
-5. `_Generic` 在 LLP64 把 long/unsigned 折叠为 int（genericTypeMatch 宽度相等时丢符号/类型）——P2
+5. ~~`_Generic` 在 LLP64 把 long/unsigned 折叠为 int（genericTypeMatch 宽度相等时丢符号/类型）~~ ——**已修复**（2026-10-05 修 long/unsigned；2026-10-17 再补齐 `char`/`signed char`/`unsigned char`、`long`/`long long`、`double`/`long double`、指针所指 const 四组"表示相同但类型不同"的区分，`c23_generic.c` 14/14）
 6. ~~不定义 `__STDC_VERSION__`/`__STDC__`/`__STDC_NO_VLA__` 等任何预定义宏~~ ——**已修复**（P1.7，2026-10-02：注入 `__STDC__`=1、`__STDC_HOSTED__`=1、`__STDC_VERSION__`=202311、`__DATE__`=`"Mmm dd yyyy"`、`__TIME__`=`"hh:mm:ss"`；`__STDC_NO_VLA__` 仍缺，随 P2.3 VLA 决策一并处理）
 7. ~~`__has_c_attribute`/`__has_include` 对 `defined()` 不可见~~ ——**已修复**（P2.15，2026-10-02：cePrimary defined 分支对 `__has_*` 特判返回 1）
 8. alignas 不作用于结构体成员/数组——P2
@@ -134,7 +134,7 @@
 | 字符串字面量直接下标 | **PASS** | 4 | "hello"[0]='h'(104)、[1]='e'(101)、与 const char* 控制组一致、0xE4 字节按有符号 char 得 -28（SUMMARY 4/4） | 一致（104/101/104/-28） | 放心用；字符串字面量可直接下标（P0.8 修复 2026-10-02，原垃圾值） |
 | 空 {} 初始化 | **PASS（附两坑）** | 9 | int/指针/double/数组/struct/union/嵌套/块内 `{}` 归零一致；**坑1**：已有局部后第一个 `{}` 标量不归零（稳定垃圾 71302960）；**坑2**：`static int s={}` → `codegen error: invalid braced initialiser for scalar type int` | 9/9 全归零 | 自动存储期基本可用；**关键位置用 `{0}`**；static 用 `= {0}` |
 | 复合字面量（块作用域） | **PASS** | 10 | 取地址/数组退化/循环内每轮重初始化/struct/union/指示符/按值传参全一致。**两个缺口移除**：文件作用域 → `type error: compound literal requires block scope`；`(const int){}` → `type error: compound literal is const-qualified` | 一致 | 块作用域放心用；勿写文件作用域 `&(T){...}`、勿用 const 限定字面量 |
-| _Generic | **PARTIAL（2026-10-05 部分转 PASS）** | 10 | goc 8/10：int 匹配/不求值（x++ 不生效）/char 与 short 不提升/default/宏全对；**`1L`/`1U`/`1u<<15`/`~0u` 已修**（NumLit 后缀定型 + 整型提升/一般算术转换/移位规则落地，见 `src/frontend/check_test.go`）；typedef 名关联仍不命中、`const int*` vs `int*` 仍报 `type int* appears twice`（gcc 可区分） | 10/10 | int/char/short 分支与"不求值"可靠；long/unsigned 与整型表达式现在也能区分；**别用 typedef 名或 const 限定做关联** |
+| _Generic | **PASS（2026-10-17 复核 14/14）** | 14 | goc 14/14 与 gcc 逐行一致：int/long/unsigned 字面量、不求值（x++ 不生效）、char 与 short 不提升、typedef `mylong` 关联、default、嵌套、宏 KIND；另新增四组"表示相同但类型不同"的区分——指针所指 const `int*` vs `const int*` → 1/2、`char`/`signed char`/`unsigned char` → 1/2/9、`long`/`long long` → 1/2、`double`/`long double` → 1/2（实现：`Type.PlainChar`/`LongLong`/`LongDouble` + `genericTypeMatch` 逐层比较 const；字面量后缀 `IsLL`/`IsLDbl`） | 14/14 | 上述全部分派可放心用；`unsigned char` 落 default 是标准行为 |
 | constexpr 编译期使用（数组尺寸/case/_Static_assert/位域宽） | **FAIL** | 7 | 整文件拒：`parse error: line 20: expected integer constant, got "N"`；case 标签/局部与全局数组尺寸/位域宽度全部 `expected integer constant` 类拒绝；**只能当运行时值** | 7/7 全折叠 | **用 enum 或字面量宏代替 constexpr 编译期常量** |
 | constexpr 指针/数组 | **PASS（附备注）** | 5 | constexpr 数组 + 空指针与 gcc 一致；`constexpr int *p=&obj` 语法过但 `*p` 运行时崩溃 0xC0000005（gcc 侧也拒非空指针：`'constexpr' pointer initializer is not null`）；地址比较 _Static_assert 被拒 | 一致 | constexpr 数组/空指针放心用；勿用 constexpr 指真实对象地址 |
 | VLA 与变修改类型 | **FAIL** | 5 | 整文件拒：`parse error: line 21: expected integer constant, got n`（VLA 形参即拒）；**不定义 `__STDC_NO_VLA__`**（未声明取舍即 conformance 缺口） | 5/5（运行时尺寸/sizeof 运行时求值/多维/VLA 形参/static 数组参数） | **完全不可用**；可变长用定长上界或 malloc |

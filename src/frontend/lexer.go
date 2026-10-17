@@ -60,6 +60,13 @@ type Token struct {
 	IsChar  bool // a 'x' character literal (carried as an integer constant in Num)
 	IsUnsig bool // integer literal with a u/U suffix: type is unsigned
 	IsLong  bool // integer literal with an l/L suffix: at least 64 bits wide
+	// IsLL marks a two-l suffix ("1LL"): the constant's type is long long,
+	// which C keeps distinct from long (6.2.5p4) -- observable through
+	// _Generic even though both are 64 bits here.
+	IsLL bool
+	// IsLDbl marks a floating literal with the l/L suffix ("1.0L"): its type
+	// is long double, distinct from double (6.2.5p10).
+	IsLDbl bool
 	// C23 bit-precise integer literal (wb/uwb suffix): the value parsed as an
 	// arbitrary-precision big integer, split into little-endian 64-bit words.
 	BigWords  []uint64
@@ -395,12 +402,15 @@ func Lex(src string) ([]Token, error) {
 				text := strings.ReplaceAll(raw, "'", "")
 				if isHexDbl {
 					// f/F/l/L suffixes follow the decimal-float convention
-					// (f -> float narrowing, l/L ignored: goc floats are
-					// "effective double" internally).
-					isFloat := false
+					// (f -> float narrowing, l/L -> long double, which stays a
+					// distinct type from double for _Generic even though the
+					// stored value is an 8-byte double either way).
+					isFloat, isLDbl := false, false
 					for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
 						if src[i] == 'f' || src[i] == 'F' {
 							isFloat = true
+						} else {
+							isLDbl = true
 						}
 						i++
 					}
@@ -410,7 +420,7 @@ func Lex(src string) ([]Token, error) {
 						text += "p0"
 					}
 					f, _ := strconv.ParseFloat(text, 64)
-					push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, Line: line})
+					push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, IsLDbl: isLDbl, Line: line})
 					continue
 				}
 				// Parse as an unsigned bit pattern so that 0x8000000000000000
@@ -422,16 +432,18 @@ func Lex(src string) ([]Token, error) {
 				if err == nil {
 					v = int64(u)
 				}
-				unsig, long := false, false
+				unsig, long, ll := false, false, false
 				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
 					if src[i] == 'u' || src[i] == 'U' {
 						unsig = true
+					} else if long {
+						ll = true // a second l/L suffix: "1LL" is long long
 					} else {
 						long = true
 					}
 					i++
 				}
-				push(Token{Kind: TNum, Text: text, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
+				push(Token{Kind: TNum, Text: text, Num: v, IsUnsig: unsig, IsLong: long, IsLL: ll, Line: line})
 				continue
 			}
 			// Binary literal: 0b[01]+ (C23), optional ' separators.
@@ -447,16 +459,18 @@ func Lex(src string) ([]Token, error) {
 				if err == nil {
 					v = int64(u)
 				}
-				unsig, long := false, false
+				unsig, long, ll := false, false, false
 				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
 					if src[i] == 'u' || src[i] == 'U' {
 						unsig = true
+					} else if long {
+						ll = true // a second l/L suffix: "1LL" is long long
 					} else {
 						long = true
 					}
 					i++
 				}
-				push(Token{Kind: TNum, Text: raw, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
+				push(Token{Kind: TNum, Text: raw, Num: v, IsUnsig: unsig, IsLong: long, IsLL: ll, Line: line})
 				continue
 			}
 			for i < n && (isDigit(src[i]) || src[i] == 39) {
@@ -501,15 +515,17 @@ func Lex(src string) ([]Token, error) {
 				}
 			}
 			if isDbl {
-				isFloat := false
+				isFloat, isLDbl := false, false
 				for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
 					if src[i] == 'f' || src[i] == 'F' {
 						isFloat = true
+					} else {
+						isLDbl = true // "1.0L" has type long double
 					}
 					i++
 				}
 				f, _ := strconv.ParseFloat(text, 64)
-				push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, Line: line})
+				push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, IsLDbl: isLDbl, Line: line})
 			} else {
 				// Parse as an unsigned bit pattern: 9223372036854775808 (2^63)
 				// maps to the int64 minimum, so -9223372036854775808L works.
@@ -543,16 +559,18 @@ func Lex(src string) ([]Token, error) {
 				if err == nil {
 					v = int64(u)
 				}
-				unsig, long := false, false
+				unsig, long, ll := false, false, false
 				for i < n && (src[i] == 'u' || src[i] == 'U' || src[i] == 'l' || src[i] == 'L') {
 					if src[i] == 'u' || src[i] == 'U' {
 						unsig = true
+					} else if long {
+						ll = true // a second l/L suffix: "1LL" is long long
 					} else {
 						long = true
 					}
 					i++
 				}
-				push(Token{Kind: TNum, Text: text, Num: v, IsUnsig: unsig, IsLong: long, Line: line})
+				push(Token{Kind: TNum, Text: text, Num: v, IsUnsig: unsig, IsLong: long, IsLL: ll, Line: line})
 			}
 		case c == '.' && i+1 < n && isDigit(src[i+1]):
 			// Leading-dot floating constant: .5, .5f, .5e2, .5L, .1'2 (C23).
@@ -578,15 +596,17 @@ func Lex(src string) ([]Token, error) {
 			}
 			raw := src[start:i]
 			text := strings.ReplaceAll(raw, "'", "")
-			isFloat := false
+			isFloat, isLDbl := false, false
 			for i < n && (src[i] == 'f' || src[i] == 'F' || src[i] == 'l' || src[i] == 'L') {
 				if src[i] == 'f' || src[i] == 'F' {
 					isFloat = true
+				} else {
+					isLDbl = true // ".5L" has type long double
 				}
 				i++
 			}
 			f, _ := strconv.ParseFloat(text, 64)
-			push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, Line: line})
+			push(Token{Kind: TNum, Text: text, Fval: f, IsDbl: true, IsFloat: isFloat, IsLDbl: isLDbl, Line: line})
 		case isAlpha(c):
 			start := i
 			for i < n && (isAlpha(src[i]) || isDigit(src[i])) {

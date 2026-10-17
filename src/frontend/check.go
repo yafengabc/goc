@@ -510,12 +510,30 @@ func genericTypeMatch(assoc, ctl *Type) bool {
 	if assoc == nil || ctl == nil {
 		return false
 	}
+	// Qualification is part of type compatibility (C11 6.7.3p11), so it is
+	// compared at every level. checkGeneric has already dropped the
+	// controlling expression's *top-level* qualifier (lvalue conversion), so
+	// a "const int" association never swallows a plain int controlling
+	// expression -- but "const char*" still differs from "char*", because
+	// there the const belongs to the pointee, not to the expression.
+	if assoc.Const != ctl.Const {
+		return false
+	}
 	if assoc.Kind != ctl.Kind {
 		return false
 	}
 	switch assoc.Kind {
 	case KInt:
-		return assoc.Width == ctl.Width && assoc.Signed == ctl.Signed
+		// char, signed char and unsigned char are three distinct types
+		// (C11 6.2.5p15), so a bare "char" association must not swallow a
+		// "signed char" controlling expression even on an implementation
+		// where char is signed. gcc agrees; the fall-through to default is
+		// what makes the usual "#if defined(__CHAR_IS_SIGNED__)" idiom work.
+		return assoc.Width == ctl.Width && assoc.Signed == ctl.Signed &&
+			assoc.PlainChar == ctl.PlainChar && assoc.LongLong == ctl.LongLong
+	case KDouble:
+		// long double is a distinct type from double (C11 6.2.5p10).
+		return assoc.LongDouble == ctl.LongDouble
 	case KPtr:
 		return genericTypeMatch(assoc.Elem, ctl.Elem)
 	case KArr:
@@ -770,6 +788,9 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			if n.IsFloat {
 				return FloatType()
 			}
+			if n.LDbl {
+				return LongDoubleType() // "1.0L": long double, not double
+			}
 			return DoubleType()
 		}
 		if n.Wide {
@@ -785,7 +806,7 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		if n.Long {
 			w = 8
 		}
-		return &Type{Kind: KInt, Width: w, Signed: !n.Unsig}
+		return &Type{Kind: KInt, Width: w, Signed: !n.Unsig, LongLong: n.LongLong}
 	case *StrLit:
 		if n.Wide {
 			return PtrType(WCharType()) // L"..." decays to wchar_t*
@@ -829,7 +850,24 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			// Unary minus does not narrow its operand either: "-1u" is an
 			// unsigned int, not a signed one. Floating types keep theirs
 			// (the promotion only applies to the integer types).
-			if t.Kind == KInt {
+			//
+			// _Bool is an integer type and promotes to int like the other
+			// narrow ones, so `-b` is int (C11 6.3.1.1p2).
+			if t.Kind == KInt || t.Kind == KBool {
+				return promotedInt(t)
+			}
+			return t
+		case "+":
+			// Unary plus: promote the operand and return it unchanged. The
+			// promotions are the whole point -- `+c` for a char c is an int.
+			t := c.checkExpr(n.E, fn)
+			if !t.IsArith() && t.Kind != KBitInt {
+				c.errf(0, "operand of '+' must be arithmetic, got %s", t)
+			}
+			if t.Kind == KBitInt {
+				return t
+			}
+			if t.Kind == KInt || t.Kind == KBool {
 				return promotedInt(t)
 			}
 			return t
@@ -927,9 +965,9 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 		return IntType()
 	case *CondExpr:
 		c.checkExpr(n.Cond, fn)
-		t := c.checkExpr(n.Then, fn)
-		c.checkExpr(n.Else, fn)
-		return t
+		tt := c.checkExpr(n.Then, fn)
+		et := c.checkExpr(n.Else, fn)
+		return c.condResultType(tt, et)
 	case *CommaExpr:
 		// Evaluate the left operand (for its side effects / errors) and keep
 		// the type of the right one as the result, exactly like C.
@@ -1001,7 +1039,12 @@ func (c *checker) checkExpr(e Expr, fn *FuncDecl) *Type {
 			if !lt.IsVoid() && !assignable(lt, res) {
 				c.errf(0, "cannot assign %s to %s", res, lt)
 			}
-			return res
+			// C11 6.5.16p3: an assignment expression has the type of its left
+			// operand after lvalue conversion -- NOT the type of the
+			// arithmetic result. The value is converted back to that type on
+			// assignment, so with `signed char c = 100` the expression
+			// `(c += 100)` is a signed char holding -56 and compares negative.
+			return lt
 		}
 		rt := c.checkExpr(n.Rhs, fn)
 		// Writing through a void* yields a void location; any value may be
@@ -1134,13 +1177,70 @@ func promotedInt(t *Type) *Type {
 	return &Type{Kind: KInt, Width: t.Width, Signed: t.Signed}
 }
 
+// condResultType is the type of a conditional expression (C11 6.5.15p5-p6).
+//
+// Returning the then-branch's type unchanged was wrong whenever the two arms
+// differed: `i ? i : u` is unsigned int (the usual arithmetic conversions
+// apply to any pair of arithmetic operands), `c ? c : s` is int (both promote),
+// and a void* paired with an object pointer yields void*.
+func (c *checker) condResultType(tt, et *Type) *Type {
+	switch {
+	case tt == nil && et == nil:
+		return IntType()
+	case tt == nil:
+		return et
+	case et == nil:
+		return tt
+	}
+	if tt.IsArith() && et.IsArith() {
+		// Any binary arithmetic operator applies the same conversions.
+		return c.binaryResultType("+", tt, et)
+	}
+	if tt.IsVoid() && et.IsVoid() {
+		return VoidType()
+	}
+	if tt.IsPtr() && et.IsPtr() {
+		// void* absorbs any object pointer type; otherwise keep the first
+		// branch's type (mismatched object pointers are not our problem to
+		// diagnose here -- the assignment/use site reports it).
+		if tt.Elem != nil && tt.Elem.IsVoid() {
+			return tt
+		}
+		if et.Elem != nil && et.Elem.IsVoid() {
+			return et
+		}
+		return tt
+	}
+	// One arm is a null pointer constant and the other a pointer, or the two
+	// are the same aggregate: the non-null / shared type wins.
+	if tt.IsPtr() {
+		return tt
+	}
+	if et.IsPtr() {
+		return et
+	}
+	return tt
+}
+
 // usualArithInt applies the usual arithmetic conversions (C11 6.3.1.8) to two
 // integer types and returns their common type: both operands are promoted, the
 // wider one wins, and the result is unsigned when the unsigned operand's width
 // is at least the signed one's (a strictly wider signed type can represent
 // every value of the narrower unsigned one, so it wins in that case).
 func usualArithInt(lt, rt *Type) *Type {
-	if lt == nil || rt == nil || lt.Kind != KInt || rt.Kind != KInt {
+	if lt == nil || rt == nil {
+		return IntType()
+	}
+	// _Bool is an integer type and takes part in the usual arithmetic
+	// conversions like any other: it promotes to int first (C11 6.3.1.1p2),
+	// so `b + 1L` is long rather than int.
+	if lt.Kind == KBool {
+		lt = IntType()
+	}
+	if rt.Kind == KBool {
+		rt = IntType()
+	}
+	if lt.Kind != KInt || rt.Kind != KInt {
 		return IntType()
 	}
 	lp, rp := promotedInt(lt), promotedInt(rt)

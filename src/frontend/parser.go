@@ -34,6 +34,106 @@ var storageKeywords = map[string]bool{
 // can use the alias as a type name.
 var typedefs = map[string]*Type{}
 
+// typedefScopes gives typedefs block scope (C11 6.2.1p7: an inner ordinary
+// identifier may hide an outer typedef name). typedefs itself always holds the
+// *innermost* binding, so every existing reader keeps working unchanged; each
+// frame records what that name meant one level out, and leaving the block
+// restores it. Without this, a file-scope "typedef int T" permanently claimed
+// the name T, so "void f(void){ int T; }" was rejected as a redeclaration of a
+// type -- even though the standard explicitly allows the shadowing.
+var typedefScopes []*typedefFrame
+
+// typedefFrame is one block scope's worth of typedef bookkeeping. saved holds
+// what each name meant one scope out (a nil entry means nothing was bound);
+// asTypedef / asIdent record how the name was bound *in this scope*, which is
+// what tells a legitimate inner shadow apart from a same-scope clash (C11
+// 6.2.1p7 allows the former, 6.7p3 forbids the latter).
+type typedefFrame struct {
+	saved     map[string]*Type
+	asTypedef map[string]bool
+	asIdent   map[string]bool
+}
+
+func newTypedefFrame() *typedefFrame {
+	return &typedefFrame{
+		saved:     map[string]*Type{},
+		asTypedef: map[string]bool{},
+		asIdent:   map[string]bool{},
+	}
+}
+
+// pushTypedefScope opens a new block scope for typedef names.
+func pushTypedefScope() {
+	typedefScopes = append(typedefScopes, newTypedefFrame())
+}
+
+// popTypedefScope closes the innermost block scope, restoring the outer
+// binding of every name it shadowed (or removing the name entirely when the
+// block was the first to bind it).
+func popTypedefScope() {
+	n := len(typedefScopes)
+	if n == 0 {
+		return
+	}
+	frame := typedefScopes[n-1]
+	typedefScopes = typedefScopes[:n-1]
+	for name, saved := range frame.saved {
+		if saved == nil {
+			delete(typedefs, name)
+		} else {
+			typedefs[name] = saved
+		}
+	}
+}
+
+// declareTypedef binds a typedef name in the current scope, remembering the
+// outer binding so popTypedefScope can put it back. It reports an error when an
+// ordinary identifier already bound the name *in this same scope*: the mirror
+// image of shadowTypedef's check, and just as much a constraint violation
+// (C11 6.7p3).
+func (p *Parser) declareTypedef(name string, t *Type) error {
+	if n := len(typedefScopes); n > 0 {
+		frame := typedefScopes[n-1]
+		if frame.asIdent[name] {
+			return fmt.Errorf("line %d: %q redeclared as different kind of symbol", p.cur().Line, name)
+		}
+		frame.asTypedef[name] = true
+		rememberOuter(frame, name)
+	}
+	typedefs[name] = t
+	return nil
+}
+
+// shadowTypedef hides a typedef name for the rest of the current block because
+// an ordinary identifier of the same name was declared there (C11 6.2.1p7).
+// Without it, "typedef int T; void f(void){ int T; T = 7; }" parsed the
+// assignment as a declaration, since T still looked like a type name. It
+// reports an error when the name was already bound by a typedef *in this same
+// scope*: that is a redeclaration as a different kind of symbol, which gcc
+// rejects too.
+func (p *Parser) shadowTypedef(name string) error {
+	n := len(typedefScopes)
+	if n == 0 {
+		return nil // file scope: a same-scope clash is a constraint violation
+	}
+	frame := typedefScopes[n-1]
+	if frame.asTypedef[name] {
+		return fmt.Errorf("line %d: %q redeclared as different kind of symbol", p.cur().Line, name)
+	}
+	frame.asIdent[name] = true
+	rememberOuter(frame, name)
+	delete(typedefs, name)
+	return nil
+}
+
+// rememberOuter records, once per name per frame, what the name meant one scope
+// out so popTypedefScope can restore it. A nil entry means nothing was bound.
+func rememberOuter(frame *typedefFrame, name string) {
+	if _, ok := frame.saved[name]; !ok {
+		frame.saved[name] = typedefs[name]
+	}
+}
+
 // varTypes maps a variable/parameter name to its declared type. Populated as
 // declarations and parameter lists are parsed, and consulted by typeof(expr)
 // so "typeof(x)" can resolve x's type at parse time (the common case). Complex
@@ -153,6 +253,7 @@ func Parse(toks []Token) (*Program, error) {
 	for k := range typedefs {
 		delete(typedefs, k)
 	}
+	typedefScopes = typedefScopes[:0]
 	for k := range structs {
 		delete(structs, k)
 	}
@@ -170,6 +271,10 @@ func Parse(toks []Token) (*Program, error) {
 	// variadics with a contiguous register/stack save area and walks it with a
 	// plain char* cursor, so va_list is just a pointer typedef.
 	typedefs["va_list"] = PtrType(CharType())
+	// File scope is the outermost typedef frame. Pushing it here is what lets a
+	// same-scope clash at file level be diagnosed ("typedef int T; int T;") the
+	// same way gcc does, instead of silently keeping both bindings.
+	pushTypedefScope()
 	p := &Parser{toks: toks}
 	prog := &Program{}
 	for p.cur().Kind != TEOF {
@@ -230,7 +335,9 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 			// The alias keeps the declared type verbatim: "typedef int fn(int)"
 			// really does name a function type, and "fn *fp;" is how pointers
 			// to it are declared.
-			typedefs[pd.name] = pd.typ
+			if err := p.declareTypedef(pd.name, pd.typ); err != nil {
+				return nil, err
+			}
 			if p.atPunct(",") {
 				p.next()
 				continue
@@ -274,7 +381,19 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 	}
 	// A function definition: declarator followed by a block.
 	if p.atPunct("{") {
+		// Parameter names hide outer typedef names for the whole body (C11
+		// 6.2.1p7). Inside "int f(int T)", T is the parameter, not the typedef,
+		// so "T x;" is not a declaration at all -- which is exactly what gcc
+		// rejects. parseBlock opens the body's own scope on top of this one.
+		pushTypedefScope()
+		for _, pn := range d.paramNames {
+			if err := p.shadowTypedef(pn); err != nil {
+				popTypedefScope()
+				return nil, err
+			}
+		}
 		body, err := p.parseBlock()
+		popTypedefScope()
 		if err != nil {
 			return nil, err
 		}
@@ -356,6 +475,15 @@ func (p *Parser) parseTopLevel() (*FuncDecl, error) {
 			}
 		}
 		p.globals = append(p.globals, &DeclStmt{Name: d.name, Typ: declType(d.typ), Init: init, Storage: storage, IsTLS: spec.IsTLS, Line: d.line})
+		// A file-scope ordinary identifier may not reuse a typedef name from
+		// the same scope (C11 6.7p3): "typedef int T; int T;" is a
+		// redeclaration as a different kind of symbol, which gcc rejects too.
+		// An *inner* scope's shadowing stays legal -- that is parseBlock's job.
+		if d.name != "" {
+			if err := p.shadowTypedef(d.name); err != nil {
+				return nil, err
+			}
+		}
 		// Record the global's type so later file-scope "typeof(name)" can resolve it.
 		// An auto-inferred global has no parse-time type yet, so it is not recorded.
 		if d.name != "" && !autoInfer {
@@ -407,6 +535,20 @@ func (p *Parser) atPunct(s string) bool {
 func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	signed := true
 	width := 0
+	// sawChar / explicitSign track the three character types apart (C11
+	// 6.2.5p15): bare "char" is a distinct type from "signed char" and
+	// "unsigned char" even though its representation matches one of them.
+	// _Generic is the only place standard C observes the difference.
+	sawChar := false
+	explicitSign := false
+	longCount := 0 // "long" keywords seen: 2 means "long long", a distinct type
+	// haveTypeSpec records that a real type specifier (void/int/char/... or an
+	// already-consumed typedef name) appeared in this list. It decides the one
+	// genuinely ambiguous point of C's declaration grammar: whether a following
+	// typedef name is a *type* or the *declarator's name*. gcc resolves it the
+	// same way -- "int T;" declares a variable T shadowing the typedef, while
+	// "T x;" uses T as the type (C11 6.2.1p7 permits the shadowing).
+	haveTypeSpec := false
 	var fp *Type // set when a floating-point specifier (float/double) is seen
 	isVoid := false
 	isBool := false
@@ -658,18 +800,32 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		}
 		// A typedef name carries its own (possibly pointer) type; reuse it
 		// verbatim rather than re-synthesising one from width/signedness.
+		// It only counts as a type specifier while no other one has been
+		// seen: in "int T;" the T is the declarator's name, which is what
+		// lets an ordinary identifier shadow an outer typedef (C11 6.2.1p7).
+		// Breaking out (rather than consuming) leaves T for parseDeclarator.
 		if td := typedefs[p.cur().Text]; td != nil {
+			if haveTypeSpec {
+				// A type specifier is already in the list, so this typedef
+				// name is the declarator's identifier: "int T;" declares a
+				// variable T that shadows the typedef (C11 6.2.1p7). Leave
+				// the token for parseDeclarator instead of consuming it.
+				break
+			}
 			tdType = td
+			haveTypeSpec = true
 			p.next()
 			seen = true
 			continue
 		}
 		k := p.next().Text
+		haveTypeSpec = true
 		switch k {
 		case "void":
 			isVoid = true
 		case "char":
 			width = 1
+			sawChar = true
 		case "short":
 			width = 2
 		case "int":
@@ -678,14 +834,17 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 			}
 		case "long":
 			width = 8
+			longCount++
 		case "double":
 			fp = DoubleType()
 		case "float":
 			fp = FloatType()
 		case "unsigned":
 			signed = false
+			explicitSign = true
 		case "signed":
 			signed = true
+			explicitSign = true
 		}
 		seen = true
 	}
@@ -693,6 +852,14 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 		return nil, fmt.Errorf("line %d: expected type specifier, got %q", p.cur().Line, p.cur().Text)
 	}
 	if fp != nil {
+		// "long double" is a distinct type from "double" (C11 6.2.5p10) even
+		// though this implementation stores both as an 8-byte double; the flag
+		// is what keeps _Generic selections apart. A "long" that was not
+		// followed by "double" never reaches here (width stays 8 for the
+		// integer path below).
+		if longCount > 0 && fp.Kind == KDouble {
+			fp = LongDoubleType()
+		}
 		t := fp
 		if isConst || isAtomic {
 			t2 := *fp
@@ -736,7 +903,8 @@ func (p *Parser) parseDeclarationSpecifiers() (*Type, error) {
 	if width == 0 {
 		width = 4 // bare "signed"/"unsigned" means int
 	}
-	t := &Type{Kind: KInt, Width: width, Signed: signed, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}
+	t := &Type{Kind: KInt, Width: width, Signed: signed, PlainChar: sawChar && !explicitSign,
+		LongLong: width == 8 && longCount >= 2, Align: align, ConstExpr: isConstExpr, IsTLS: isTLS}
 	if isConst {
 		t.Const = true
 	}
@@ -1707,6 +1875,11 @@ func (p *Parser) parseBlock() (*Block, error) {
 	if err := p.expect("{"); err != nil {
 		return nil, err
 	}
+	// A block opens a new typedef scope (C11 6.2.1p7), so a typedef declared
+	// inside it -- and an ordinary identifier shadowing an outer typedef name
+	// -- both stay local to the block. File scope is the implicit outer frame.
+	pushTypedefScope()
+	defer popTypedefScope()
 	b := &Block{}
 	for !p.atPunct("}") {
 		if p.cur().Kind == TEOF {
@@ -1992,7 +2165,9 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 			if err != nil {
 				return nil, err
 			}
-			typedefs[pd.name] = pd.typ
+			if err := p.declareTypedef(pd.name, pd.typ); err != nil {
+				return nil, err
+			}
 			if p.atPunct(",") {
 				p.next()
 				continue
@@ -2023,6 +2198,13 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 	var decls []*DeclStmt
 	for {
 		pd, err := p.parseDeclarator(spec, true, false)
+		if err != nil {
+			// The declarator's own failure has to stop the declaration: it
+			// used to be overwritten by the initialiser's error below and
+			// never checked, so `int = 5;` fell through with a nil type and
+			// crashed the checker instead of producing a diagnostic.
+			return nil, err
+		}
 		// C23 6.7.9: the direct declarator of an inference declaration must be
 		// a plain identifier; "auto *p" / "auto x[3]" are not inferred forms.
 		if autoInfer && !pd.typ.AutoDeduce {
@@ -2043,6 +2225,15 @@ func (p *Parser) parseDeclaration() (Stmt, error) {
 			}
 		}
 		decls = append(decls, &DeclStmt{Name: pd.name, Typ: declType(pd.typ), Init: init, Storage: storage, IsTLS: spec.IsTLS, Line: pd.line})
+		// An ordinary identifier declared here hides an outer typedef name of
+		// the same spelling for the rest of the block (C11 6.2.1p7), so the
+		// next statement starting with that name is an expression, not a
+		// declaration.
+		if pd.name != "" {
+			if err := p.shadowTypedef(pd.name); err != nil {
+				return nil, err
+			}
+		}
 		// Record the declared type so later "typeof(name)" can resolve it.
 		// An auto-inferred variable has no parse-time type yet, so it is not
 		// recorded (typeof(auto-var) stays unsupported).
@@ -2614,7 +2805,10 @@ func (p *Parser) parseUnary() (Expr, error) {
 		}
 		return &GenericExpr{Control: ctrl, Assocs: assocs, ChosenIdx: -1, Line: line}, nil
 	}
-	if p.atPunct("-") || p.atPunct("!") || p.atPunct("~") {
+	// Unary '+' is a real operator (C11 6.5.3.3): it performs the integer
+	// promotions on its operand and returns the value unchanged. Leaving it
+	// out made `+d` / `+c` a syntax error.
+	if p.atPunct("-") || p.atPunct("!") || p.atPunct("~") || p.atPunct("+") {
 		op := p.next().Text
 		e, err := p.parseUnary()
 		if err != nil {
@@ -2802,7 +2996,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	case t.Kind == TNum:
 		p.next()
 		if t.IsDbl {
-			return &NumLit{Kind: TDouble, Fval: t.Fval, IsFloat: t.IsFloat}, nil
+			return &NumLit{Kind: TDouble, Fval: t.Fval, IsFloat: t.IsFloat, LDbl: t.IsLDbl}, nil
 		}
 		if t.BigWords != nil {
 			var lo int64
@@ -2818,7 +3012,7 @@ func (p *Parser) parsePrimary() (Expr, error) {
 				BigBits:   t.BigBits,
 			}, nil
 		}
-		return &NumLit{Val: t.Num, Kind: TInt, Unsig: t.IsUnsig, Long: t.IsLong, Wide: t.Wide}, nil
+		return &NumLit{Val: t.Num, Kind: TInt, Unsig: t.IsUnsig, Long: t.IsLong, LongLong: t.IsLL, Wide: t.Wide}, nil
 	case t.Kind == TStr:
 		// Adjacent string literals concatenate (C translation phase 6), e.g.
 		// "a" "b" becomes "ab". This is what lets a pasting macro like

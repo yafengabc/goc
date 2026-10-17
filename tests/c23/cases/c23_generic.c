@@ -4,16 +4,12 @@
  *             match), controlling expression is unevaluated (x++ has no side
  *             effect), char/short are NOT promoted before matching, typedef
  *             name usable as an association type, default branch, nested
- *             _Generic, and use inside a function-like macro.
+ *             _Generic, and use inside a function-like macro. Types that
+ *             share a representation but stay distinct in C are also kept
+ *             apart: char vs signed char, long vs long long, double vs long
+ *             double, and pointer-to-const vs pointer-to-non-const.
  * Status:     PENDING
  * EXPECT: PASS
- *
- * goc gap found during testing (NOT compiled into this file; recorded in
- * group_D2.md):
- *   - pointer-to-const vs pointer-to-non-const: goc treats 'int *' and
- *     'const int *' as the SAME type in a _Generic list, error:
- *       "type int* appears twice in the _Generic association list"
- *     (gcc distinguishes them).
  */
 #include <stdio.h>
 
@@ -106,6 +102,54 @@ int main(void) {
         int c = KIND(1U);
         printf("case%d: macro kind -> %d %d %d\n", total, a, b, c);
         if (a == 1 && b == 2 && c == 3) passed++;
+    }
+
+    ++total;
+    /* pointer-to-const vs pointer-to-non-const are distinct types: the
+     * const belongs to the pointee, so it survives lvalue conversion */
+    {
+        int *ip = 0;
+        const int *cip = 0;
+        int r1 = _Generic(ip,  int*: 1, const int*: 2, default: 9);
+        int r2 = _Generic(cip, int*: 1, const int*: 2, default: 9);
+        printf("case%d: ptr const -> %d %d\n", total, r1, r2);
+        if (r1 == 1 && r2 == 2) passed++;
+    }
+
+    ++total;
+    /* char, signed char and unsigned char are three distinct types even
+     * though char's representation matches one of the others */
+    {
+        char pc = 0;
+        signed char sc = 0;
+        unsigned char uc = 0;
+        int r1 = _Generic(pc, char: 1, signed char: 2, default: 9);
+        int r2 = _Generic(sc, char: 1, signed char: 2, default: 9);
+        int r3 = _Generic(uc, char: 1, signed char: 2, default: 9);
+        printf("case%d: char kinds -> %d %d %d\n", total, r1, r2, r3);
+        if (r1 == 1 && r2 == 2 && r3 == 9) passed++;
+    }
+
+    ++total;
+    /* long and long long are distinct types even when both are 64 bits */
+    {
+        long a = 0;
+        long long b = 0;
+        int r1 = _Generic(a, long: 1, long long: 2, default: 9);
+        int r2 = _Generic(b, long: 1, long long: 2, default: 9);
+        printf("case%d: long kinds -> %d %d\n", total, r1, r2);
+        if (r1 == 1 && r2 == 2) passed++;
+    }
+
+    ++total;
+    /* double and long double are distinct types */
+    {
+        double d = 0;
+        long double ld = 0;
+        int r1 = _Generic(d,  double: 1, long double: 2, default: 9);
+        int r2 = _Generic(ld, double: 1, long double: 2, default: 9);
+        printf("case%d: double kinds -> %d %d\n", total, r1, r2);
+        if (r1 == 1 && r2 == 2) passed++;
     }
 
     printf("SUMMARY: %d/%d\n", passed, total);

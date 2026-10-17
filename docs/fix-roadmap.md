@@ -55,7 +55,7 @@
 | P2.6  | **alignas 对成员/数组不生效**                        | c23_alignas_alignof.c                                     | 属性落位到布局                         |
 | P2.7  | **双层嵌套匿名字段错位**                               | c23_anon：a=11 vs gcc a=10                                 | 匿名成员偏移计算                        |
 | P2.8  | **首个 `{}` 标量不归零、`static int s={}` 被拒**       | c23 D1 组                                                  | 初始化语义                           |
-| P2.9  | **`_Generic` LLP64 折叠 long/unsigned→int**    | c23 泛型选择                                                  | 类型判定宽表                          |
+| P2.9  | ~~**`_Generic` LLP64 折叠 long/unsigned→int**~~ **已修（2026-10-17）** | c23 泛型选择：`c23_generic.c` 14/14 与 gcc 逐行一致 | 已补齐"表示相同但类型不同"的区分：`char`/`signed char`/`unsigned char`、`long`/`long long`、`double`/`long double`、指针所指 const（`Type` 增 `PlainChar`/`LongLong`/`LongDouble` 标记，仅 `_Generic` 与类型名可见） |
 | P2.10 | **属性在 struct/enum/typedef/参数位置 parse error** | c23 C 组                                                   | parser 属性落位扩展                   |
 | P2.11 | **`[[gnu::aligned(16)]]` 解析不生效**             | c23 C 组                                                   | 属性参数求值                          |
 | P2.12 | **`[[fallthrough]]` switch 外静默接受**           | c23 C 组                                                   | 属性位置校验                          |

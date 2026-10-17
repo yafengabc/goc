@@ -119,7 +119,7 @@
 
 - **goa 牵连已发生**：`_Atomic` 需要 `lock` 前缀与 `xadd`/`cmpxchg` 两条指令（goa 原都没有），已随 #129 一并加入（`src/goa/asm.go`，`atomic_test.go` 逐字节钉住编码）。
 - **回归护栏**：每特性必须配 gocregress 用例（cstd example + golden）；`-O0` 字节不变性底座不受影响（新特性都是语法/类型层，不改优化管线）。auto/\_Generic/复合字面量的实现均在 check 期完成消解，对 codegen 透明或以新 AST 节点发射，已验证零回归。
-- **_Generic 精确匹配教训**：类型匹配绝不能复用 `typesEqual`（它把所有整数当相等——`int*` 曾误配 `char *`），必须走 `genericTypeMatch` 的宽+符号+元素递归比较。
+- **_Generic 精确匹配教训**：类型匹配绝不能复用 `typesEqual`（它把所有整数当相等——`int*` 曾误配 `char *`），必须走 `genericTypeMatch` 的宽+符号+元素递归比较。**2026-10-17 补充**：仅比"宽+符号"仍不够——C 里有多组类型**表示相同但标准要求是不同类型**，`_Generic` 必须区分：`char`/`signed char`/`unsigned char`（6.2.5p15）、`long`/`long long`（6.2.5p4）、`double`/`long double`（6.2.5p10），以及指针所指 const（`char*` vs `const char*`，qualifier 是类型兼容性的一部分，6.7.3p11）。实现方式是在 `Type` 上加 `PlainChar`/`LongLong`/`LongDouble` 三个标记（**只**被 `genericTypeMatch` 和 `Type.String()` 消费，绝不进 `typesEqual`，否则 char 与 signed char 就不能互相赋值了），并在 `genericTypeMatch` 里逐层比较 `Const`。字面量后缀也要能表达：`1LL` 与 `1L`、`1.0L` 与 `1.0` 由 lexer 的 `IsLL`/`IsLDbl` 区分。教训：**"表示相同"不等于"类型相同"，凡标准明确列出多个名字的类型组，都要问一句 `_Generic` 能不能区分。**
 - **变参检查教训**：修复 `_Generic` 时顺带修掉「printf 变参尾部实参完全跳过 checkExpr」的存量缺陷——今后新增表达式节点须确认变参位置也能被 check。
 - **TLS**：原生方案已定案（TLS 目录 + `G_goc_tls_index`），但标识符解析顺序铁律「局部 → static 局部 → 全局/TLS」已写死，新增任何名字解析路径不得破坏。
 

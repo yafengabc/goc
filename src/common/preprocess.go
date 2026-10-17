@@ -85,6 +85,16 @@ type Preprocessor struct {
 	// handlers check this flag and abort with a real diagnostic instead of
 	// silently treating the expression as 0.
 	ceErr bool
+	// arityErr records the first function-like macro invoked with the wrong
+	// number of arguments. Like ceErr it is a deferred flag: expansion runs
+	// deep inside token scanning, which has no error return to thread a
+	// diagnostic through, so the invocation is recorded here and reported
+	// once the whole translation unit has been preprocessed.
+	//
+	// C11 6.10.3p4 requires a diagnostic for a mismatched invocation. Without
+	// one the substitution indexed past the end of args and panicked when too
+	// few were given, and silently dropped the surplus when too many were.
+	arityErr error
 	// condEval is set only while a #if/#elif condition expression is being
 	// expanded and evaluated. During that window macro expansion must ignore
 	// the enclosing branch-activity state: a "#elif X" following a false
@@ -192,7 +202,14 @@ func preprocess(src, filename string, linux, builtinOnly bool, incDirs ...string
 	// User -I directories take priority over the base dir and the cwd.
 	p.searchDirs = append(p.searchDirs, incDirs...)
 	p.searchDirs = append(p.searchDirs, p.baseDir, ".")
-	return p.process(src, filename)
+	toks, err := p.process(src, filename)
+	if err != nil {
+		return nil, err
+	}
+	if p.arityErr != nil {
+		return nil, p.arityErr
+	}
+	return toks, nil
 }
 
 // SerializeTokens turns a preprocessed token stream back into C source text.
@@ -286,6 +303,14 @@ func cEscape(b []byte) string {
 
 // spliceContinuations removes backslash-newline pairs (C translation phase 2),
 // so multi-line macro definitions collapse onto one logical line.
+//
+// Phase 2 splices physical lines, it does not renumber them: C11 6.10.8p1
+// makes __LINE__ the physical line of the current source line, and every
+// diagnostic points at a physical line too. Simply deleting the newlines
+// shifts every later line up by one per continuation, so instead the deleted
+// newlines are *moved* to the end of the logical line they belong to. The
+// line count is conserved, so a logical line starts on its first physical
+// line and the text after it keeps its real line number.
 func spliceContinuations(src string) string {
 	// A UTF-8 BOM (EF BB BF) is permitted at the very start of a source file
 	// (C11 5.1.1.2 translation phase 1); strip it here so it does not surface
@@ -296,19 +321,36 @@ func spliceContinuations(src string) string {
 	var b strings.Builder
 	i := 0
 	n := len(src)
+	held := 0 // newlines removed by continuations in the logical line so far
 	for i < n {
 		if src[i] == '\\' {
 			if i+1 < n && src[i+1] == '\n' {
+				held++
 				i += 2
 				continue
 			}
 			if i+2 < n && src[i+1] == '\r' && src[i+2] == '\n' {
+				held++
 				i += 3
 				continue
 			}
 		}
+		if src[i] == '\n' {
+			// End of the logical line: pay back the newlines the
+			// continuations swallowed, then this one.
+			for k := 0; k < held; k++ {
+				b.WriteByte('\n')
+			}
+			held = 0
+			b.WriteByte('\n')
+			i++
+			continue
+		}
 		b.WriteByte(src[i])
 		i++
+	}
+	for k := 0; k < held; k++ {
+		b.WriteByte('\n')
 	}
 	return b.String()
 }
@@ -1071,8 +1113,31 @@ func (p *Preprocessor) readArgs(raw []frontend.Token, openIdx int) ([][]frontend
 // expandFunc performs parameter substitution, '#' stringisation and '##'
 // pasting for a function-like macro, then re-expands the result.
 func (p *Preprocessor) expandFunc(m *Macro, args [][]frontend.Token, filename string, line int) []frontend.Token {
+	// `F()` for a macro with no parameters supplies one empty argument slot,
+	// which is the right way round for substitution but the wrong count for
+	// the arity check: it is zero arguments, not one.
+	if len(m.Params) == 0 && len(args) == 1 && len(args[0]) == 0 {
+		args = nil
+	}
+	np := len(m.Params)
 	if m.IsVariadic {
-		np := len(m.Params) // includes "__VA_ARGS__"
+		// __VA_ARGS__ is a parameter that may legitimately receive nothing.
+		if len(args) < np-1 {
+			p.arityError(m, len(args), np-1, line)
+			for len(args) < np-1 {
+				args = append(args, []frontend.Token{})
+			}
+		}
+	} else if len(args) != np {
+		p.arityError(m, len(args), np, line)
+		for len(args) < np {
+			args = append(args, []frontend.Token{})
+		}
+		if len(args) > np {
+			args = args[:np]
+		}
+	}
+	if m.IsVariadic {
 		vaIdx := np - 1
 		// Pad up to np so __VA_ARGS__ is always addressable, even when the
 		// macro is invoked with no variadic arguments (it then becomes empty).
@@ -1099,6 +1164,17 @@ func (p *Preprocessor) expandFunc(m *Macro, args [][]frontend.Token, filename st
 
 	out := p.substTokens(m.Body, m, args, filename, line, vaNonEmpty)
 	return p.expandTokens(out, filename, line)
+}
+
+// arityError records a function-like macro invoked with the wrong number of
+// arguments. Only the first one is kept: a single diagnostic is enough to
+// point the user at the problem, and later expansions stay well-formed.
+func (p *Preprocessor) arityError(m *Macro, got, want, line int) {
+	if p.arityErr != nil {
+		return
+	}
+	p.arityErr = fmt.Errorf("macro %q requires %d argument(s), but %d given (line %d)",
+		m.Name, want, got, line)
 }
 
 // substTokens performs argument substitution, '#' stringisation and '##' pasting
@@ -1283,6 +1359,32 @@ func tokNum(v int64, line int) frontend.Token {
 	return frontend.Token{Kind: frontend.TNum, Num: v, Text: strconv.FormatInt(v, 10), Line: line}
 }
 
+// ceVal is the value of a #if / #elif constant expression. C11 6.10.1p4
+// evaluates those in intmax_t / uintmax_t, so a value has to carry both its
+// bit pattern and which of the two types it is: `#if -1 < 0u` is false
+// because -1 converts to uintmax_t and becomes the largest possible value.
+type ceVal struct {
+	u   uint64 // bit pattern of an intmax_t or uintmax_t
+	sgn bool   // true: intmax_t (signed); false: uintmax_t
+}
+
+func ceSigned(v int64) ceVal    { return ceVal{u: uint64(v), sgn: true} }
+func ceUnsigned(v uint64) ceVal { return ceVal{u: v, sgn: false} }
+
+// i reinterprets the bit pattern as an intmax_t.
+func (v ceVal) i() int64 { return int64(v.u) }
+
+// truth reports whether a constant expression selects its branch.
+func (v ceVal) truth() bool { return v.u != 0 }
+
+// ceCommon applies the usual arithmetic conversions to a pair of operands and
+// returns their bit patterns plus the signedness of the common type. Because
+// the bit pattern is stored as-is, converting just means flipping the flag:
+// a signed value's uint64 is already its two's complement in 64 bits.
+func ceCommon(l, r ceVal) (uint64, uint64, bool) {
+	return l.u, r.u, l.sgn && r.sgn
+}
+
 // constExpr evaluates a (pre-expanded) integer constant expression used by
 // #if / #elif. Undefined identifiers and string constants are 0; character
 // literals carry their byte value (the lexer emits them as frontend.TNum).
@@ -1291,41 +1393,105 @@ func (p *Preprocessor) constExpr(toks []frontend.Token) int64 {
 		return 0
 	}
 	p.ceErr = false // fresh expression: clear any stale error flag
-	v, _ := p.ceOr(toks, 0)
-	return v
+	v, i := p.ceCond(toks, 0)
+	if i < len(toks) {
+		// Tokens left over mean the expression was only partly understood.
+		// Every operator level must be present in the chain below: when one
+		// was missing the walk stopped early and quietly took the leftmost
+		// operand as the whole condition, so `#if (1 << 3) == 9` came out
+		// true. Report it rather than guess.
+		p.ceErr = true
+	}
+	return v.i()
 }
 
-func (p *Preprocessor) ceOr(toks []frontend.Token, i int) (int64, int) {
+// ceCond is the conditional-expression level: `a ? b : c`.
+func (p *Preprocessor) ceCond(toks []frontend.Token, i int) (ceVal, int) {
+	cond, i := p.ceOr(toks, i)
+	if i < len(toks) && toks[i].Text == "?" {
+		i++
+		thenV, ni := p.ceCond(toks, i)
+		i = ni
+		if i < len(toks) && toks[i].Text == ":" {
+			i++
+			elseV, ni := p.ceCond(toks, i)
+			i = ni
+			if cond.truth() {
+				return thenV, i
+			}
+			return elseV, i
+		}
+	}
+	return cond, i
+}
+
+func (p *Preprocessor) ceOr(toks []frontend.Token, i int) (ceVal, int) {
 	left, i := p.ceAnd(toks, i)
 	for i < len(toks) && toks[i].Text == "||" {
 		i++
 		right, ni := p.ceAnd(toks, i)
 		i = ni
-		if left != 0 || right != 0 {
-			left = 1
+		if left.truth() || right.truth() {
+			left = ceSigned(1)
 		} else {
-			left = 0
+			left = ceSigned(0)
 		}
 	}
 	return left, i
 }
 
-func (p *Preprocessor) ceAnd(toks []frontend.Token, i int) (int64, int) {
-	left, i := p.ceEq(toks, i)
+func (p *Preprocessor) ceAnd(toks []frontend.Token, i int) (ceVal, int) {
+	left, i := p.ceBitOr(toks, i)
 	for i < len(toks) && toks[i].Text == "&&" {
+		i++
+		right, ni := p.ceBitOr(toks, i)
+		i = ni
+		if left.truth() && right.truth() {
+			left = ceSigned(1)
+		} else {
+			left = ceSigned(0)
+		}
+	}
+	return left, i
+}
+
+func (p *Preprocessor) ceBitOr(toks []frontend.Token, i int) (ceVal, int) {
+	left, i := p.ceBitXor(toks, i)
+	for i < len(toks) && toks[i].Text == "|" {
+		i++
+		right, ni := p.ceBitXor(toks, i)
+		i = ni
+		_, _, sgn := ceCommon(left, right)
+		left = ceVal{u: left.u | right.u, sgn: sgn}
+	}
+	return left, i
+}
+
+func (p *Preprocessor) ceBitXor(toks []frontend.Token, i int) (ceVal, int) {
+	left, i := p.ceBitAnd(toks, i)
+	for i < len(toks) && toks[i].Text == "^" {
+		i++
+		right, ni := p.ceBitAnd(toks, i)
+		i = ni
+		_, _, sgn := ceCommon(left, right)
+		left = ceVal{u: left.u ^ right.u, sgn: sgn}
+	}
+	return left, i
+}
+
+func (p *Preprocessor) ceBitAnd(toks []frontend.Token, i int) (ceVal, int) {
+	left, i := p.ceEq(toks, i)
+	for i < len(toks) && toks[i].Text == "&" {
 		i++
 		right, ni := p.ceEq(toks, i)
 		i = ni
-		if left != 0 && right != 0 {
-			left = 1
-		} else {
-			left = 0
-		}
+		_, _, sgn := ceCommon(left, right)
+		left = ceVal{u: left.u & right.u, sgn: sgn}
 	}
 	return left, i
 }
 
-func (p *Preprocessor) ceEq(toks []frontend.Token, i int) (int64, int) {
+func (p *Preprocessor) ceEq(toks []frontend.Token, i int) (ceVal, int) {
 	left, i := p.ceRel(toks, i)
 	for i < len(toks) && (toks[i].Text == "==" || toks[i].Text == "!=") {
 		op := toks[i].Text
@@ -1334,130 +1500,197 @@ func (p *Preprocessor) ceEq(toks []frontend.Token, i int) (int64, int) {
 		i = ni
 		var r int64
 		if op == "==" {
-			if left == right {
+			if left.u == right.u {
 				r = 1
-			} else {
-				r = 0
 			}
 		} else {
-			if left != right {
+			if left.u != right.u {
 				r = 1
-			} else {
-				r = 0
 			}
 		}
-		left = r
+		left = ceSigned(r)
 	}
 	return left, i
 }
 
-func (p *Preprocessor) ceRel(toks []frontend.Token, i int) (int64, int) {
-	left, i := p.ceAdd(toks, i)
+func (p *Preprocessor) ceRel(toks []frontend.Token, i int) (ceVal, int) {
+	left, i := p.ceShift(toks, i)
 	for i < len(toks) && (toks[i].Text == "<" || toks[i].Text == ">" ||
 		toks[i].Text == "<=" || toks[i].Text == ">=") {
 		op := toks[i].Text
 		i++
-		right, ni := p.ceAdd(toks, i)
+		right, ni := p.ceShift(toks, i)
 		i = ni
+		lu, ru, sgn := ceCommon(left, right)
+		// A signed operand converts to uintmax_t when the other side is
+		// unsigned; that is what makes `#if -1 < 0u` false.
 		var r int64
-		switch op {
-		case "<":
-			if left < right {
-				r = 1
+		if sgn {
+			switch op {
+			case "<":
+				if int64(lu) < int64(ru) {
+					r = 1
+				}
+			case ">":
+				if int64(lu) > int64(ru) {
+					r = 1
+				}
+			case "<=":
+				if int64(lu) <= int64(ru) {
+					r = 1
+				}
+			case ">=":
+				if int64(lu) >= int64(ru) {
+					r = 1
+				}
 			}
-		case ">":
-			if left > right {
-				r = 1
-			}
-		case "<=":
-			if left <= right {
-				r = 1
-			}
-		case ">=":
-			if left >= right {
-				r = 1
+		} else {
+			switch op {
+			case "<":
+				if lu < ru {
+					r = 1
+				}
+			case ">":
+				if lu > ru {
+					r = 1
+				}
+			case "<=":
+				if lu <= ru {
+					r = 1
+				}
+			case ">=":
+				if lu >= ru {
+					r = 1
+				}
 			}
 		}
-		left = r
+		left = ceSigned(r)
 	}
 	return left, i
 }
 
-func (p *Preprocessor) ceAdd(toks []frontend.Token, i int) (int64, int) {
+// ceShift is the shift level: `<<` / `>>`. The result keeps the promoted left
+// operand's type, and a count outside [0, width) is undefined (C11 6.5.7p3).
+func (p *Preprocessor) ceShift(toks []frontend.Token, i int) (ceVal, int) {
+	left, i := p.ceAdd(toks, i)
+	for i < len(toks) && (toks[i].Text == "<<" || toks[i].Text == ">>") {
+		op := toks[i].Text
+		i++
+		right, ni := p.ceAdd(toks, i)
+		i = ni
+		n := right.u
+		if (right.sgn && right.i() < 0) || n > 63 {
+			// Undefined in a constant expression, so a constraint violation:
+			// flag it and pick a defined result rather than trapping.
+			p.ceErr = true
+			n = 0
+		}
+		switch {
+		case op == "<<":
+			left = ceVal{u: left.u << n, sgn: left.sgn}
+		case left.sgn:
+			// An intmax_t shifts arithmetically and keeps its sign.
+			left = ceVal{u: uint64(left.i() >> n), sgn: true}
+		default:
+			left = ceVal{u: left.u >> n, sgn: false}
+		}
+	}
+	return left, i
+}
+
+func (p *Preprocessor) ceAdd(toks []frontend.Token, i int) (ceVal, int) {
 	left, i := p.ceMul(toks, i)
 	for i < len(toks) && (toks[i].Text == "+" || toks[i].Text == "-") {
 		op := toks[i].Text
 		i++
 		right, ni := p.ceMul(toks, i)
 		i = ni
+		lu, ru, sgn := ceCommon(left, right)
+		var u uint64
 		if op == "+" {
-			left += right
+			u = lu + ru
 		} else {
-			left -= right
+			u = lu - ru
 		}
+		left = ceVal{u: u, sgn: sgn}
 	}
 	return left, i
 }
 
-func (p *Preprocessor) ceMul(toks []frontend.Token, i int) (int64, int) {
+func (p *Preprocessor) ceMul(toks []frontend.Token, i int) (ceVal, int) {
 	left, i := p.ceUnary(toks, i)
 	for i < len(toks) && (toks[i].Text == "*" || toks[i].Text == "/" || toks[i].Text == "%") {
 		op := toks[i].Text
 		i++
 		right, ni := p.ceUnary(toks, i)
 		i = ni
+		lu, ru, sgn := ceCommon(left, right)
 		switch op {
 		case "*":
-			left *= right
+			left = ceVal{u: lu * ru, sgn: sgn}
 		case "/":
-			if right == 0 {
+			if ru == 0 {
 				// Division by zero in a #if/#elif constant expression is a
 				// constraint violation (C11 6.6p4 / 6.5.5p5); the caller
 				// reports it via p.ceErr instead of silently skipping.
 				p.ceErr = true
+				left = ceVal{u: 0, sgn: sgn}
+			} else if sgn {
+				left = ceVal{u: uint64(int64(lu) / int64(ru)), sgn: true}
 			} else {
-				left /= right
+				left = ceVal{u: lu / ru, sgn: false}
 			}
 		case "%":
-			if right == 0 {
+			if ru == 0 {
 				p.ceErr = true
+				left = ceVal{u: 0, sgn: sgn}
+			} else if sgn {
+				left = ceVal{u: uint64(int64(lu) % int64(ru)), sgn: true}
 			} else {
-				left %= right
+				left = ceVal{u: lu % ru, sgn: false}
 			}
 		}
 	}
 	return left, i
 }
 
-func (p *Preprocessor) ceUnary(toks []frontend.Token, i int) (int64, int) {
+func (p *Preprocessor) ceUnary(toks []frontend.Token, i int) (ceVal, int) {
 	if i >= len(toks) {
-		return 0, i
+		return ceSigned(0), i
 	}
 	t := toks[i]
 	switch t.Text {
 	case "!":
 		v, ni := p.ceUnary(toks, i+1)
-		if v == 0 {
-			return 1, ni
+		if v.truth() {
+			return ceSigned(0), ni
 		}
-		return 0, ni
+		return ceSigned(1), ni
 	case "-":
 		v, ni := p.ceUnary(toks, i+1)
-		return -v, ni
+		return ceVal{u: -v.u, sgn: v.sgn}, ni
 	case "+":
 		return p.ceUnary(toks, i+1)
+	case "~":
+		v, ni := p.ceUnary(toks, i+1)
+		return ceVal{u: ^v.u, sgn: v.sgn}, ni
 	}
 	return p.cePrimary(toks, i)
 }
 
-func (p *Preprocessor) cePrimary(toks []frontend.Token, i int) (int64, int) {
+func (p *Preprocessor) cePrimary(toks []frontend.Token, i int) (ceVal, int) {
 	if i >= len(toks) {
-		return 0, i
+		return ceSigned(0), i
 	}
 	t := toks[i]
 	switch {
 	case t.Kind == frontend.TNum:
-		return t.Num, i + 1
+		// A u/U suffix makes the constant unsigned, which changes how it
+		// combines with signed operands further up the chain.
+		if t.IsUnsig {
+			return ceUnsigned(uint64(t.Num)), i + 1
+		}
+		return ceSigned(t.Num), i + 1
 	case t.Kind == frontend.TIdent && t.Text == "defined":
 		i++
 		name := ""
@@ -1475,7 +1708,7 @@ func (p *Preprocessor) cePrimary(toks []frontend.Token, i int) (int64, int) {
 			i++
 		}
 		if _, ok := p.macros[name]; ok {
-			return 1, i
+			return ceSigned(1), i
 		}
 		// __has_* operators are lexer keywords handled directly in cePrimary,
 		// not macros. The standard requires defined(__has_c_attribute) and
@@ -1484,9 +1717,9 @@ func (p *Preprocessor) cePrimary(toks []frontend.Token, i int) (int64, int) {
 		// always falls through to the #else branch.
 		switch name {
 		case "__has_c_attribute", "__has_include":
-			return 1, i
+			return ceSigned(1), i
 		}
-		return 0, i
+		return ceSigned(0), i
 	case t.Text == "__has_include":
 		// __has_include(<h>) / __has_include("h"): 1 if the header resolves, else 0.
 		i++
@@ -1511,9 +1744,9 @@ func (p *Preprocessor) cePrimary(toks []frontend.Token, i int) (int64, int) {
 			}
 		}
 		if p.headerExists(path) {
-			return 1, i
+			return ceSigned(1), i
 		}
-		return 0, i
+		return ceSigned(0), i
 	case t.Text == "__has_c_attribute":
 		// __has_c_attribute(name): 202311 if supported, else 0.
 		i++
@@ -1539,18 +1772,18 @@ func (p *Preprocessor) cePrimary(toks []frontend.Token, i int) (int64, int) {
 		case "deprecated", "nodiscard", "maybe_unused", "fallthrough",
 			"noreturn", "unsequenced", "reproducible", "_Noreturn",
 			"alignas", "alignof", "thread_local", "char8_t":
-			return 202311, i
+			return ceSigned(202311), i
 		default:
-			return 0, i
+			return ceSigned(0), i
 		}
 	case t.Kind == frontend.TIdent:
-		return 0, i + 1
+		return ceSigned(0), i + 1
 	case t.Text == "(":
-		v, ni := p.ceOr(toks, i+1)
+		v, ni := p.ceCond(toks, i+1)
 		if ni < len(toks) && toks[ni].Text == ")" {
 			ni++
 		}
 		return v, ni
 	}
-	return 0, i + 1
+	return ceSigned(0), i + 1
 }

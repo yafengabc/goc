@@ -167,6 +167,13 @@ func link(inputs []string, outPath, entryOverride string, elf bool) error {
 	if elf {
 		img.Target = gocld.TargetELF
 	}
+	// Several object files means a symbol one of them needs may be defined by
+	// a sibling that has not been read yet, so unresolved references must
+	// wait until every input is in. Without this, linking two files that
+	// reference each other failed with "undefined symbol" even though the
+	// definition was right there in the second file -- the goc and gocl
+	// drivers both defer here, and this path was the one that missed it.
+	img.DeferUndefined(true)
 
 	for _, in := range inputs {
 		data, err := os.ReadFile(in)
@@ -184,6 +191,11 @@ func link(inputs []string, outPath, entryOverride string, elf bool) error {
 	}
 
 	img.Entry = pickEntry(img, entryOverride)
+
+	// Every input is in: now a symbol that is still undefined really is.
+	if err := img.Resolve(); err != nil {
+		return err
+	}
 
 	n, err := gocld.LinkObject(img, nil, outPath, elf)
 	if err != nil {

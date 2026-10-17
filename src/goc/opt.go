@@ -109,7 +109,13 @@ func elimRedundantExt(insts []Inst) []Inst {
 					i++
 					continue
 				}
-				signCanon[r] = true
+				// A kept pair is still a canonicalisation, but only the "sar"
+				// form is a *sign* canonicalisation: `shl r,32; shr r,32`
+				// zero-extends, so a value whose low half has its top bit set
+				// is left as 0x00000000FFFFFFFF rather than sign-extended.
+				// Marking both forms canonical let a later sign-extension
+				// pair be dropped as redundant and skipped the extension.
+				signCanon[r] = np.op == "sar"
 				prevWrap = map[string]bool{r: true}
 				out = append(out, in, nxt)
 				i++

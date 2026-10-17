@@ -92,7 +92,7 @@
 
 | 文件 | 特性 | 状态 | 子用例 | goc 证据 / gcc 对拍 | 写标准库建议 |
 |---|---|---|---|---|---|
-| c11_generic.c | `_Generic` 类型泛选 | PASS | 6 | 一致（控制表达式不求值、default、char 左值 vs `'a'` 整型提升陷阱、嵌套） | 放心用；**同一关联列表勿同时列 `int:` 与 `const int:`**（goc 报 appears twice） |
+| c11_generic.c | `_Generic` 类型泛选 | PASS | 6 | 一致（控制表达式不求值、default、char 左值 vs `'a'` 整型提升陷阱、嵌套） | 放心用。~~同一关联列表勿同时列 `int:` 与 `const int:`~~ **2026-10-17 已修**：`genericTypeMatch` 改为逐层比较 const 限定，`int:` 与 `const int:` 可共存并各自命中 |
 | c11_static_assert.c | `_Static_assert`/static_assert | PASS | 4 | 一致；goc 是关键字（失败用例诊断：`parse error: static_assert failed: this must fail`）；gcc 需 `#include <assert.h>` 取宏 | 放心用（goc 解析期即拒，诊断干净） |
 | c11_align.c | `_Alignas`/`_Alignof`/对齐宏 | PASS | 5 | 一致（内置 alignas/alignof 可用，实测 16）；`_Alignof(struct Tag)` 仍为缺口（用例改用 sizeof/指针减法）；标准 offsetof 宏批次H 已提供 | 用内置 alignas/alignof；勿用 `_Alignof(struct Tag)` |
 | c11_thread_local.c | `_Thread_local`/thread_local | PASS | 5 | 一致（goc 原生 TLS：文件作用域、static 函数内、取地址、跨函数读均正常）；块作用域非 static TLS 现被干净拒绝（P0.2），不再 panic | 放心用；块作用域须 `static _Thread_local`；gcc 本机无 threads.h，用例用 `#define thread_local _Thread_local` 兜底 |

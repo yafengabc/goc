@@ -55,12 +55,27 @@ type Type struct {
 	// on the type (it would report 0). A VLA therefore has no compile-time
 	// size at all -- sizeof on it is a run-time operation, and the storage for
 	// a VLA object is a pointer to a run-time stack allocation.
-	VLALen     Expr
-	Params     []*Type   // KFunc: parameter types
-	Ret        *Type     // KFunc: return type
-	Variadic   bool      // KFunc: declared with a trailing "..."
-	Width      int       // KInt: 1=char, 2=short, 4=int, 8=long
-	Signed     bool      // KInt
+	VLALen   Expr
+	Params   []*Type // KFunc: parameter types
+	Ret      *Type   // KFunc: return type
+	Variadic bool    // KFunc: declared with a trailing "..."
+	Width    int     // KInt: 1=char, 2=short, 4=int, 8=long
+	Signed   bool    // KInt
+	// PlainChar marks the type spelled bare "char". C11 6.2.5p15 makes char,
+	// signed char and unsigned char three distinct types even when char's
+	// representation matches one of the others, and _Generic (6.5.1.1) is the
+	// only place standard C observes the difference. It is set for bare "char"
+	// (and for types derived from it through a typedef) but never for an
+	// explicitly "signed char" / "unsigned char" spelling. It deliberately
+	// stays out of typesEqual so char and signed char remain assignable.
+	PlainChar bool
+	// LongLong / LongDouble carry the same idea for the two other pairs of
+	// standard types that share a representation but stay distinct in C:
+	// long vs long long (C11 6.2.5p4) and double vs long double (6.2.5p10).
+	// Like PlainChar they only ever affect _Generic selection and the printed
+	// name, never assignability or codegen.
+	LongLong   bool      // KInt: spelled "long long"
+	LongDouble bool      // KDouble: spelled "long double"
 	Members    []*Member // KStruct / KUnion: ordered fields
 	Bits       int       // KBitInt: exact bit width N (1..4096)
 	Size       int       // KStruct / KUnion: total size in bytes (aligned)
@@ -76,10 +91,11 @@ type Type struct {
 // --- constructors -----------------------------------------------------------
 
 func IntType() *Type                  { return &Type{Kind: KInt, Width: 4, Signed: true} }
-func CharType() *Type                 { return &Type{Kind: KInt, Width: 1, Signed: true} }
+func CharType() *Type                 { return &Type{Kind: KInt, Width: 1, Signed: true, PlainChar: true} }
 func UnsignedType() *Type             { return &Type{Kind: KInt, Width: 4, Signed: false} }
 func UnsignedCharType() *Type         { return &Type{Kind: KInt, Width: 1, Signed: false} }
 func DoubleType() *Type               { return &Type{Kind: KDouble} }
+func LongDoubleType() *Type           { return &Type{Kind: KDouble, LongDouble: true} }
 func FloatType() *Type                { return &Type{Kind: KFloat} }
 func VoidType() *Type                 { return &Type{Kind: KVoid} }
 func PtrType(elem *Type) *Type        { return &Type{Kind: KPtr, Elem: elem} }
@@ -450,6 +466,9 @@ func (t *Type) String() string {
 	case KBool:
 		return "bool"
 	case KDouble:
+		if t.LongDouble {
+			return "long double"
+		}
 		return "double"
 	case KFloat:
 		return "float"
@@ -466,6 +485,9 @@ func (t *Type) String() string {
 		case 4:
 			return s + "int"
 		default:
+			if t.LongLong {
+				return s + "long long"
+			}
 			return s + "long"
 		}
 	case KPtr:

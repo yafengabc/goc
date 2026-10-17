@@ -37,21 +37,31 @@ var genericSyscalls = map[string]int64{
 	"getcwd": 17, "access": 21, "getdents64": 61, "chmod": 90,
 	"unlinkat": 35, "rename": 82, "mkdir": 83, "rmdir": 84,
 	"futex": 98, "sched_yield": 124, "clone": 220, "execve": 221, "wait4": 260,
-	"select": 142, "socket": 198, "bind": 200, "listen": 201, "connect": 203,
+	// asm-generic has no plain stat/lstat/getdents/select: 78 is readlinkat,
+	// 79 is newfstatat and 142 is reboot. Giving them numbers here made a
+	// stat() call land in readlinkat() and silently fail, so they are left
+	// out -- the link then reports the missing name instead.
+	"socket": 198, "bind": 200, "listen": 201, "connect": 203,
 	"getsockname": 204, "getpeername": 205, "sendto": 206, "recvfrom": 207,
-	"shutdown": 210, "accept": 242, "setsockopt": 208, "getdents": 78,
+	"shutdown": 210, "accept": 242, "setsockopt": 208,
 }
 
 // arm32Syscalls is the ARM EABI numbering (32-bit arm).
 var arm32Syscalls = map[string]int64{
-	"read": 0, "write": 4, "open": 5, "close": 6, "lseek": 19,
+	// 0 is restart_syscall on ARM EABI; read is 3. A read() built with 0
+	// entered the restart helper instead and never returned any data, so
+	// every read path (fread, scanf, getchar) came back empty with no error.
+	"read": 3, "write": 4, "open": 5, "close": 6, "lseek": 19,
 	"exit": 1, "exit_group": 248, "getpid": 20, "gettid": 224, "kill": 37,
 	"ioctl": 54, "writev": 146, "brk": 45, "mmap": 192, "munmap": 91,
 	"mprotect": 125, "rt_sigaction": 174, "rt_sigprocmask": 175,
 	"nanosleep": 162, "clock_gettime": 263, "gettimeofday": 78, "getcwd": 12,
 	"access": 33, "getdents64": 217, "chmod": 15, "rename": 38, "mkdir": 39,
-	"rmdir": 40, "futex": 240, "sched_yield": 142, "clone": 120, "execve": 11,
-	"wait4": 114, "select": 142, "stat": 106, "fstat": 108,
+	"rmdir": 40, "futex": 240, "clone": 120, "execve": 11,
+	// 142 is _newselect on ARM EABI (and so is the right number for select);
+	// sched_yield is 158. Sharing one number between two names was the tell.
+	"sched_yield": 158,
+	"wait4":       114, "select": 142, "stat": 106, "fstat": 108,
 }
 
 // archSyscallTable returns the name -> number table for an architecture.
