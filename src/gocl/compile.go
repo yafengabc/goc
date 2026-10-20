@@ -101,6 +101,12 @@ func UsesNativeLink(linux bool, arch string, prog *frontend.Program, lib *common
 // names are defined by the program (main) and by the C library
 // (__goclib_exit), and only _start itself is carried into the program -- the
 // declarations are dropped so they cannot collide with the real prototypes.
+//
+// __goclib_exit is the right terminator for almost every program: it is the
+// bare exit_group, and the C library's std streams are unbuffered precisely so
+// that nothing is lost when the stub skips the flush (see the stdout/stderr
+// setup in goclib/file.c). A program that needs the full C teardown -- an
+// atexit handler above all -- is upgraded after the fact by setStubExit.
 const entryStubC = `extern int main(void);
 extern void __goclib_exit(long code);
 
@@ -118,6 +124,32 @@ void _start(void)
 // thread-pointer base (arch_prctl) for a program that uses __thread, and that
 // is not modelled here yet -- replacing it would silently break TLS.
 func injectEntryStub(prog *frontend.Program) error {
+	// frontend.Parse resets the per-translation-unit tables on entry --
+	// typedefs, structs, the enumerators -- because every TU that includes
+	// a header needs them fresh (see frontend.Parse). This stub is parsed
+	// AFTER the program's own units were, so that reset would wipe tables
+	// the rest of the build still reads:
+	//
+	//   - frontend.EnumConsts, which an enumerator used as a global
+	//     initialiser folds through ("enum Color g = GREEN"), in the IR
+	//     emitter and again in the linker's foldConstInit;
+	//   - frontend.Structs, which bit-field eligibility searches when
+	//     deciding whether a function may take the IR path at all.
+	//
+	// The stub declares nothing in either table -- it is two prototypes
+	// and one call -- so snapshotting them and putting them back after
+	// the parse leaves the tables exactly as they were. It is the same
+	// dance common.Translate does when it merges several units, and
+	// skipping it is what left every enum-initialised global on the
+	// native-link path undefined at link time.
+	savedEnums := make(map[string]int64, len(frontend.EnumConsts))
+	for k, v := range frontend.EnumConsts {
+		savedEnums[k] = v
+	}
+	savedStructs := make(map[string]*frontend.Type, len(frontend.Structs()))
+	for k, v := range frontend.Structs() {
+		savedStructs[k] = v
+	}
 	toks, err := frontend.Lex(entryStubC)
 	if err != nil {
 		return err
@@ -126,6 +158,7 @@ func injectEntryStub(prog *frontend.Program) error {
 	if err != nil {
 		return err
 	}
+	restoreFrontendTables(savedEnums, savedStructs)
 	// Only the definition moves into the program. The two extern declarations
 	// above are scaffolding for the parser; the real main and __goclib_exit
 	// come from the program and the C library, and adding a second,
@@ -137,6 +170,62 @@ func injectEntryStub(prog *frontend.Program) error {
 		}
 	}
 	return nil
+}
+
+// restoreFrontendTables puts the enumerator and struct tables back the way
+// frontend.Parse found them. The stub's parse is expected to have left both
+// empty, so this is a straight re-install rather than a merge; a merge would
+// keep a name the program does not declare, which is the same table lying
+// about what exists.
+func restoreFrontendTables(enums map[string]int64, structs map[string]*frontend.Type) {
+	for k := range frontend.EnumConsts {
+		delete(frontend.EnumConsts, k)
+	}
+	for k, v := range enums {
+		frontend.EnumConsts[k] = v
+	}
+	live := frontend.Structs()
+	for k := range live {
+		delete(live, k)
+	}
+	for k, v := range structs {
+		live[k] = v
+	}
+}
+
+// setStubExit rewrites the entry stub's terminator to name.
+//
+// It runs after the reachability walk, not before, because whether a program
+// needs the full exit is a property of the whole program -- the user's code,
+// the printf rewrite and the runtime's own bodies alike -- and the walk is
+// the first thing that has seen all three. Deciding it up front from the
+// source alone is what the native generator does not do, and it would miss
+// exactly the libmisc case: a program whose only sign is atexit(), called
+// from main, reaches the runtime's exit through nothing but the stub.
+//
+// The rewrite is the whole change. The walk has already pulled exit -- and
+// through it the flush chain -- into the object on the same evidence
+// (llvmRoots step 4), so there is nothing to add and nothing to remove; only
+// the stub's own callee was still naming the bare syscall.
+//
+// A no-op where this back end does not own the entry point: the goa path
+// builds the stub in assembly and reads the same decision off the object in
+// linkData, so there is no _start here to rewrite.
+func setStubExit(prog *frontend.Program, name string) {
+	for _, f := range prog.Funcs {
+		if f.Name != "_start" || f.Body == nil {
+			continue
+		}
+		frontend.WalkStmts(f.Body, func(s frontend.Stmt) {
+			for _, e := range stmtExprs(s) {
+				walkExpr(e, func(n frontend.Expr) {
+					if c, ok := n.(*frontend.Call); ok && c.Name == "__goclib_exit" {
+						c.Name = name
+					}
+				})
+			}
+		})
+	}
 }
 
 // compileIR turns IR text into a COFF object with LLVM, ready to be merged into

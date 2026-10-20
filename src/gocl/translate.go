@@ -556,8 +556,11 @@ func llvmRoots(prog *frontend.Program, lib *common.Program, linux bool, arch str
 	//    if the program touched the stdio streams, registered atexit, or
 	//    called exit itself, the bare __goclib_exit is not enough -- the C
 	//    standard's atexit/flush chain is required, and that lives in exit.
+	//    The same fact decides the entry stub's terminator; see step 5.
+	fullExit := false
 	for _, name := range [...]string{"__goclib_stdout", "__goclib_stderr", "atexit", "exit"} {
 		if need[name] {
+			fullExit = true
 			if isLib("exit") && !need["exit"] {
 				need["exit"] = true
 				// One more pass so exit's own callees come in.
@@ -590,6 +593,18 @@ func llvmRoots(prog *frontend.Program, lib *common.Program, linux bool, arch str
 		if f, ok := lib.Funcs[name]; ok && f.Body != nil {
 			collectLibRefs(f.Body, markGlobal)
 		}
+	}
+	// 5. The entry stub's terminator. The stub is written against the bare
+	//    __goclib_exit (entryStubC) and is upgraded here, where step 4 has
+	//    just established whether the program needs the full C exit. Without
+	//    this the stub terminates the process directly: an atexit handler
+	//    registered by main never runs, because nothing between the stub and
+	//    exit_group walks the handler chain. The goa path, which builds its
+	//    stub in assembly, reads the same decision off the object in linkData
+	//    -- a symbol the object defines is the only one a stub may call, and
+	//    exit is defined exactly when this upgrade fired.
+	if fullExit {
+		setStubExit(prog, "exit")
 	}
 	// A global the program itself declares is emitted by the loop over
 	// prog.Globals, not here, but a *reference* to one from runtime code still
@@ -752,13 +767,20 @@ func (m *irMod) constInitAt(e frontend.Expr, t *frontend.Type, top bool) (string
 		if !ok2 {
 			return "", false
 		}
-		if u.Op == "-" {
-			// LLVM has no neg() -- a negative constant is spelled with a
-			// leading "-", and "i64 neg (-9223372036854775808)" is a syntax
-			// error the reader rejects at the "(".
-			return negateConst(v), true
+		if u.Op == "+" {
+			return v, true
 		}
-		return v, true
+		// A floating-point constant is spelled by its bit pattern in LLVM IR
+		// (e.g. "double 0x4000000000000000"), and LLVM rejects a leading "-"
+		// on one: "@g = global double -0x4000000000000000" fails to parse with
+		// "expected value token". Negation flips the sign bit instead of
+		// prepending "-". Integers have no such restriction -- "i64 -5" is
+		// fine, and "i64 neg (...)" is what LLVM objects to -- so they keep
+		// negateConst.
+		if t != nil && (t.Kind == frontend.KFloat || t.Kind == frontend.KDouble) {
+			return negateFPConst(v), true
+		}
+		return negateConst(v), true
 	}
 	// The address of an object, optionally behind a cast: "&g" and
 	// "(NimStrPayload*)&g". C writes the address of a global in a static
@@ -773,6 +795,18 @@ func (m *irMod) constInitAt(e frontend.Expr, t *frontend.Type, top bool) (string
 			// irFuncSym for the same reason a call site uses it: the address
 			// has to name the symbol the function was *defined* under.
 			return "@" + irFuncSym(name), true
+		}
+	}
+	// An enumeration constant used as an initialiser ("enum Color g = GREEN",
+	// "int n = TWO") is a compile-time integer with no storage of its own: it
+	// lives only in frontend.EnumConsts. Without folding it here the global's
+	// initialiser resolved to nothing, so the definition was left to the native
+	// generator and the symbol came out `external`, and the link then failed
+	// with "undefined symbol(s): G_g_color, G_g_num". An enumerator is never a
+	// global, so this cannot collide with the array-decay case below.
+	if id, ok := e.(*frontend.Ident); ok {
+		if v, ok := frontend.EnumConsts[id.Name]; ok {
+			return m.constScalar(&frontend.NumLit{Val: v, Kind: frontend.TInt}, t)
 		}
 	}
 	// A bare identifier naming an array decays to the address of its first
@@ -812,6 +846,24 @@ func negateConst(v string) string {
 		return v
 	}
 	return "-" + v
+}
+
+// negateFPConst negates a floating-point constant that is spelled by its 64-bit
+// bit pattern ("0xHHHHHHHHHHHHHHHH"), as constScalar emits for every FP literal.
+// LLVM IR rejects a leading "-" on an FP constant, so negation must flip the sign
+// bit rather than prepend "-": -2.0 is 0xC000000000000000, not -0x4000000000000000.
+// Every FP constant here is widened to a 64-bit pattern (a float is the bits of
+// its double widening), so the sign bit is always bit 63.
+func negateFPConst(v string) string {
+	if !strings.HasPrefix(v, "0x") {
+		return "-" + v
+	}
+	bits, err := strconv.ParseUint(v[2:], 16, 64)
+	if err != nil {
+		return "-" + v
+	}
+	bits ^= 0x8000000000000000
+	return fmt.Sprintf("0x%016x", bits)
 }
 
 func (m *irMod) constScalar(n *frontend.NumLit, t *frontend.Type) (string, bool) {
@@ -938,13 +990,118 @@ func (m *irMod) constAggregate(b *frontend.BraceInit, t *frontend.Type, top bool
 		}
 		return "[" + strconv.Itoa(t.Len) + " x " + m.llirType(t.Elem) + "]" + body, true
 	case frontend.KStruct, frontend.KUnion:
-		parts := make([]string, 0, len(t.Members))
-		for i, mem := range t.Members {
-			if t.Kind == frontend.KUnion && i > 0 {
-				break // C initialises only the first member of a union
+		// Which member each element initialises is the front end's
+		// decision, and it is not the one a naive pairing makes. A
+		// positional element pairs with posMembers(t)[i]: an anonymous
+		// struct/union member is transparent, so the members it promoted
+		// pair with the initialisers directly ("{1,2,3,10,20,'Z'}" fills x,
+		// y, a, b and c -- the two shells consume nothing). A designator
+		// names any member of the list, a promoted one included, so
+		// ".b = 55" has to reach the b that lives inside a shell. Counting
+		// the shells as positional slots put the value into the shell and
+		// left the field the C source names at zero, and pairing Elems[i]
+		// with Members[i] ignored a designator altogether.
+		byTarget := map[*frontend.Member]frontend.Expr{}
+		vis := frontend.PosMembers(t)
+		for i, el := range b.Elems {
+			if el.Desig != "" {
+				mi := frontend.MemberIndex(t, el.Desig)
+				if mi < 0 || mi >= len(t.Members) {
+					continue // the checker has already reported it
+				}
+				byTarget[t.Members[mi]] = el.E
+				continue
 			}
-			if i < len(b.Elems) && b.Elems[i].E != nil {
-				v, ok := m.constInitAt(b.Elems[i].E, mem.Type, false)
+			idx := i
+			if el.DesigIdx >= 0 {
+				idx = el.DesigIdx
+			}
+			if idx < 0 || idx >= len(vis) {
+				continue // out of range: the checker has already reported it
+			}
+			byTarget[vis[idx]] = el.E
+		}
+		if t.Kind == frontend.KUnion {
+			// C initialises only one member of a union: the first element's
+			// target -- the first visible member, or the one a designator
+			// names. The shell is transparent here too, so "= {5}" over
+			// "union {struct{short lo,hi;}; int whole;}" fills whole. The
+			// LLVM type spells that member's storage as its single first
+			// field, and the members share offset 0, so the value is
+			// rendered in the field's type and the low bytes are the ones C
+			// reads back through the member it named.
+			if len(b.Elems) == 0 {
+				return "zeroinitializer", true
+			}
+			el := b.Elems[0]
+			var mem *frontend.Member
+			if len(vis) > 0 {
+				mem = vis[0]
+			}
+			if el.Desig != "" {
+				if mi := frontend.MemberIndex(t, el.Desig); mi >= 0 && mi < len(t.Members) {
+					mem = t.Members[mi]
+				}
+			}
+			owner := unionOwner(t)
+			if mem == nil || mem.Type == nil || owner == nil || owner.Type == nil {
+				return "", false
+			}
+			// The value has to sit at the union's offset 0 and fit inside
+			// the field. A member that starts further in (".hi = 3" of a
+			// {short lo, short hi} shell) or an aggregate target cannot be
+			// spelled as a constant expression, so the definition is left
+			// to the native generator, which writes it with a store.
+			if mem.Offset != 0 || frontend.Sizeof(mem.Type) > frontend.Sizeof(owner.Type) ||
+				isAggType(mem.Type) || isAggType(owner.Type) {
+				return "", false
+			}
+			var v string
+			var ok bool
+			if isAnonShell(owner) {
+				// Every storage owner is a shell, so the field is the
+				// shell's own type and the value goes back inside it, aimed
+				// at the member the element named.
+				v, ok = m.constInitAt(anonShellBrace(owner,
+					map[string]frontend.Expr{mem.Name: el.E}), owner.Type, false)
+			} else {
+				v, ok = m.constInitAt(el.E, owner.Type, false)
+			}
+			if !ok {
+				return "", false
+			}
+			parts := []string{m.typedInAggregate(v, owner.Type)}
+			// The union's extra bytes are a member the C source never
+			// names, so append them here to match the type (see
+			// unionLayout).
+			if _, pad := unionLayout(t); pad > 0 {
+				parts = append(parts, "["+strconv.Itoa(pad)+" x i8] zeroinitializer")
+			}
+			return "{" + joinStrings(parts, ", ") + "}", true
+		}
+		// One part per storage owner -- the members that own storage, which
+		// is exactly what the LLVM type lists as fields (see structType in
+		// module.go). A promoted sub-member is not one: it lives inside its
+		// shell and is rendered as part of the shell's nested brace.
+		parts := make([]string, 0, len(t.Members))
+		for _, mem := range t.Members {
+			if mem.AnonBase != nil {
+				continue
+			}
+			if isAnonShell(mem) {
+				// One field of the LLVM type, but the values C aimed at
+				// the members this shell promoted have to be gathered back
+				// into it.
+				v, ok := m.constInitAt(anonShellBrace(mem, shellVals(t, mem, byTarget)),
+					mem.Type, false)
+				if !ok {
+					return "", false
+				}
+				parts = append(parts, m.typedInAggregate(v, mem.Type))
+				continue
+			}
+			if x, ok := byTarget[mem]; ok && x != nil {
+				v, ok := m.constInitAt(x, mem.Type, false)
 				if !ok {
 					return "", false
 				}
@@ -952,13 +1109,6 @@ func (m *irMod) constAggregate(b *frontend.BraceInit, t *frontend.Type, top bool
 				continue
 			}
 			parts = append(parts, m.typedInAggregate(m.zeroOf(mem.Type), mem.Type))
-		}
-		// The union's extra bytes are a member the C source never names, so
-		// append them here to match the type (see unionLayout).
-		if t.Kind == frontend.KUnion {
-			if _, pad := unionLayout(t); pad > 0 {
-				parts = append(parts, "["+strconv.Itoa(pad)+" x i8] zeroinitializer")
-			}
 		}
 		if len(parts) == 0 {
 			return "zeroinitializer", true
@@ -970,6 +1120,53 @@ func (m *irMod) constAggregate(b *frontend.BraceInit, t *frontend.Type, top bool
 		return m.constInitAt(b.Elems[0].E, t, top)
 	}
 	return "zeroinitializer", true
+}
+
+// isAggType reports whether t is an array, struct or union -- the kinds
+// whose initialiser is a brace rather than a single scalar value.
+func isAggType(t *frontend.Type) bool {
+	return t != nil && (t.Kind == frontend.KArr ||
+		t.Kind == frontend.KStruct || t.Kind == frontend.KUnion)
+}
+
+// shellVals collects the values aimed at the members an anonymous
+// struct/union member promoted into t's member list, keyed by name.
+// promoteAnonMembers copies each promoted member into the parent list
+// keeping only its name, type and offset, so pointer identity does not
+// survive the trip -- and the shell's own member list still knows them by
+// name. A name that two different shells promoted is ambiguous in C itself;
+// the first one wins, which is what the checker's memberIndex picks too.
+func shellVals(t *frontend.Type, shell *frontend.Member, byTarget map[*frontend.Member]frontend.Expr) map[string]frontend.Expr {
+	vals := map[string]frontend.Expr{}
+	for _, sub := range t.Members {
+		if sub.AnonBase != shell || sub.Name == "" {
+			continue
+		}
+		if _, dup := vals[sub.Name]; dup {
+			continue
+		}
+		if x, ok := byTarget[sub]; ok {
+			vals[sub.Name] = x
+		}
+	}
+	return vals
+}
+
+// anonShellBrace builds the brace the shell's own type would have been
+// written with, out of the values aimed at its promoted members. Every
+// element is designated: only a subset of the shell's members has a value,
+// and a positional brace would pair them with the wrong fields.
+func anonShellBrace(shell *frontend.Member, vals map[string]frontend.Expr) *frontend.BraceInit {
+	sub := &frontend.BraceInit{}
+	if shell == nil || shell.Type == nil {
+		return sub
+	}
+	for _, vm := range frontend.PosMembers(shell.Type) {
+		if x, ok := vals[vm.Name]; ok && x != nil {
+			sub.Elems = append(sub.Elems, frontend.InitElem{Desig: vm.Name, E: x})
+		}
+	}
+	return sub
 }
 
 // typedInAggregate gives a constant element its type when LLVM wants one.

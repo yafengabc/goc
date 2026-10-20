@@ -49,7 +49,18 @@ func (e *irEmitter) eval(x frontend.Expr) val {
 	case *frontend.IndirectCall:
 		return e.indirectCall(n)
 	case *frontend.Index:
-		return e.load(e.lvalue(n), e.tr.exprType(n))
+		ty := e.tr.exprType(n)
+		// An element that is itself an array decays to a pointer, exactly as
+		// an array variable does in ident() and an array member does in
+		// member(): "printf(\"%s\", rows[0])" passes the address of rows[0],
+		// not the six bytes it holds. Loading it here handed the callee a
+		// [6 x i8] where a ptr belonged -- a variadic callee reading a pointer
+		// argument then took the array's own bytes as an address and faulted
+		// inside the format scan on the first row it printed.
+		if ty != nil && ty.Kind == frontend.KArr {
+			return e.addressOf(n, ty)
+		}
+		return e.load(e.lvalue(n), ty)
 	case *frontend.MemberExpr:
 		return e.member(n)
 	case *frontend.CastExpr:
@@ -704,8 +715,17 @@ func (e *irEmitter) ident(n *frontend.Ident) val {
 		e.line("%s = load ptr, ptr %s, align 8", t, s)
 		return val{op: t, ty: frontend.PtrType(frontend.CharType())}
 	}
-	if uid, ok := e.tr.lookupUID(n.Name); ok {
-		slot := e.slotFor(uid, e.ty(ty))
+	if vi, ok := e.tr.lookupVar(n.Name); ok {
+		// A static local reads from its module global -- the same object
+		// every call sees -- and an array of it decays to that global's
+		// address, exactly as a file-scope array does.
+		if vi.glob != "" {
+			if ty != nil && ty.Kind == frontend.KArr {
+				return val{op: vi.glob, ty: frontend.PtrType(ty.Elem)}
+			}
+			return e.load(vi.glob, ty)
+		}
+		slot := e.slotFor(vi.op, e.ty(ty))
 		return e.load(slot, ty)
 	}
 	// A thread-local global is reached through the linker-provided

@@ -14,9 +14,28 @@ func (e *irEmitter) unary(n *frontend.Unary) val {
 	ty := e.tr.exprType(n)
 	switch n.Op {
 	case "&":
-		// The address of an lvalue: genLValue already produces one.
+		// The address of an lvalue: genLValue already produces one. A
+		// function is not an lvalue, but "&name" is still ordinary C and
+		// names the same value the bare designator decays to. lvalue()
+		// found no storage for a function name and answered "null", so the
+		// pointer held null and the first indirect call jumped through it
+		// -- which is how "fp = &mul2" took fnptrs down.
+		if fd, ok := e.funcDesignator(n.E); ok {
+			return fd
+		}
 		return val{op: e.lvalue(n.E), ty: frontend.PtrType(ty)}
 	case "*":
+		// Dereferencing a pointer to a function is the identity. C 6.5.2.3
+		// says the operand of "*" that is a pointer to a function designates
+		// the function, and a function designator converts straight back to
+		// a pointer -- so "*fp" IS fp, not what fp points at. Loading
+		// through it read the target's entry bytes as a pointer, and the
+		// call that followed jumped through that garbage.
+		if isFuncPtrTy(e.tr.exprType(n.E)) {
+			// rvalue already loads the pointer out of its slot; handing
+			// that back is the whole of the conversion.
+			return val{op: e.rvalue(n.E), ty: e.tr.exprType(n.E)}
+		}
 		p := e.rvalue(n.E)
 		return e.load(p, ty)
 	case "!":
@@ -57,6 +76,33 @@ func (e *irEmitter) unary(n *frontend.Unary) val {
 		return val{op: t, ty: ty}
 	}
 	return e.eval(n.E)
+}
+
+// funcDesignator reports the value of a function designator appearing under
+// "&", or false when the operand does not name a function.
+//
+// "&func" and a bare "func" in a value context are the same value in C, and
+// in LLVM a function *is* its address: the symbol reference already is the
+// pointer and no load is involved. See ident(), which spells out the same
+// conversion for the bare-name case.
+func (e *irEmitter) funcDesignator(x frontend.Expr) (val, bool) {
+	id, ok := x.(*frontend.Ident)
+	if !ok {
+		return val{}, false
+	}
+	if !e.tr.isFuncName(id.Name) {
+		return val{}, false
+	}
+	// irFuncSym, so the address names the symbol the function was defined
+	// under; a renamed libfunc taken by pointer would otherwise reference a
+	// symbol the module never defines.
+	return val{op: "@" + irFuncSym(id.Name), ty: e.fnPtrTy(id.Name)}, true
+}
+
+// isFuncPtrTy reports whether t is a pointer to a function, the case where
+// unary "*" must not load.
+func isFuncPtrTy(t *frontend.Type) bool {
+	return t != nil && t.Kind == frontend.KPtr && t.Elem != nil && t.Elem.Kind == frontend.KFunc
 }
 
 // --- binary -----------------------------------------------------------------
@@ -136,6 +182,20 @@ func (e *irEmitter) binary(n *frontend.Binary) val {
 		if r.ty != nil && opTy != nil && r.ty.Kind == frontend.KInt && opTy.Kind == frontend.KInt && r.ty.Width != opTy.Width {
 			ri = e.convert(ri, r.ty, opTy)
 		}
+		// A count at or beyond the operand's width is undefined in C, and
+		// LLVM's answer is worse than undefined: "shl i32 1, 32" is poison,
+		// so every later pass is entitled to assume anything about the
+		// result and the program prints whatever the optimizer left in the
+		// register -- "1<<32" came out as a different garbage integer on
+		// every build. gcc folds such a shift to 0 and the goldens were
+		// generated with that, so name the zero here rather than emit an
+		// instruction with a poison operand. A runtime count keeps the
+		// instruction; only a literal can be judged.
+		if w := irIntWidth(e.ty(opTy)); w > 0 {
+			if cnt, err := strconv.ParseInt(ri, 10, 64); err == nil && (cnt < 0 || cnt >= int64(w)) {
+				return val{op: "0", ty: opTy}
+			}
+		}
 		t := e.newTmp()
 		rop := "shl"
 		if n.Op == ">>" {
@@ -177,7 +237,16 @@ func (e *irEmitter) binary(n *frontend.Binary) val {
 	case "/", "%":
 		return e.arith(val{op: li, ty: ct}, val{op: ri, ty: ct}, llirBin(n.Op), ct)
 	case "&", "|", "^":
-		return e.arith(val{op: li, ty: ct}, val{op: ri, ty: ct}, llirBin(n.Op), ct)
+		// A bitwise operand that is itself a comparison (or logical) result is
+		// an i1, but C evaluates the bitwise operators on the promoted integer
+		// type, so the instruction is "or i32 ...". usualArith converts each
+		// operand by the front-end STATIC type, and the front end types every
+		// comparison as int -- so the i1 arrives here still i1 and LLVM rejects
+		// "or i32 15, %cmp" with "defined with type 'i1' but expected 'i32'".
+		// Coerce the operands by their ACTUAL emitted type instead: that widens
+		// the i1 to the common integer width and is a no-op for an operand that
+		// already matches ct.
+		return e.arith(e.coerce(l, ct), e.coerce(r, ct), llirBin(n.Op), ct)
 	case "==", "!=", "<", ">", "<=", ">=":
 		// A long double comparison is a runtime call. icmp over the raw i128
 		// would order the encodings, which puts every negative number below
@@ -400,11 +469,16 @@ func arithCommon(a, b *frontend.Type) *frontend.Type {
 // only the rank-below-int integer types (width under int's) get promoted, and
 // the target int can represent every value of each, so the promotion is always
 // to signed int.
+//
+// _Bool is one of those types and has to be listed: it is KBool, not KInt, so
+// testing only KInt let it through unpromoted and "_Bool + _Bool" was evaluated
+// in a one-bit register -- "t + t" for t == 1 answered 0, because i1 addition
+// wraps, and "f - t" answered 1 rather than -1.
 func promoteInt(t *frontend.Type) *frontend.Type {
 	if t == nil {
 		return nil
 	}
-	if t.Kind == frontend.KInt && t.Width < 4 {
+	if (t.Kind == frontend.KInt || t.Kind == frontend.KBool) && t.Width < 4 {
 		return frontend.IntType()
 	}
 	return t

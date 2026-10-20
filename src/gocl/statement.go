@@ -99,6 +99,32 @@ func (e *irEmitter) localDecl(d *frontend.DeclStmt) {
 	if ty == nil {
 		return
 	}
+	// An extern local declares no object: it names one defined elsewhere --
+	// here, the file-scope global of the same name. Binding it to a fresh
+	// alloca instead would shadow that global with an uninitialised stack
+	// slot, so "extern int g; g = g + 100;" would read and write the slot and
+	// leave the global untouched. Leaving the name unbound sends every later
+	// reference down the global-symbol path, which is the object C means. The
+	// assembly back end skips these the same way.
+	if d.Storage == "extern" {
+		return
+	}
+	// A static local is the one declaration whose storage outlives the
+	// activation: it becomes a module global, initialised once, and the
+	// name resolves to that symbol. Everything else is an alloca.
+	//
+	// A thread-local static local is excluded: per-thread storage comes
+	// from the linker's .tls section, whose layout (ComputeTLSLayout)
+	// walks file-scope declarations only, so a function-local one has no
+	// offset to be reached through. It keeps the alloca it had before,
+	// which is per-activation rather than per-thread -- wrong in theory,
+	// but the section machinery to do better does not exist yet and a
+	// silently shared module global would be wrong in a harder-to-see
+	// way.
+	if d.Storage == "static" && !d.IsTLS {
+		e.staticLocalDecl(d, ty)
+		return
+	}
 	uid := e.tr.declareVar(d.Name, varInfo{ty: ty})
 	// A C99 variable-length array: its extent is not known until this
 	// declaration actually runs, so it cannot be the entry-block alloca of a
@@ -126,6 +152,115 @@ func (e *irEmitter) localDecl(d *frontend.DeclStmt) {
 		v := e.eval(d.Init)
 		e.store(slot, e.coerce(v, ty))
 	}
+}
+
+// staticLocalDecl lowers "static T x = init;" written inside a function.
+//
+// A static local has static storage duration: one object for the whole
+// program, initialised once before main runs. That is not what an alloca
+// gives -- an alloca is created on entry and its initialiser runs every
+// time the declaration is reached, which is what made a static counter
+// return 1 on every call. The IR instead holds the object as a module
+// global carrying a constant initialiser, exactly like a file-scope
+// global, and the name resolves to that symbol for the rest of the
+// function.
+//
+// The label is minted per declaration SITE, not per visit: the parser
+// hands back the same DeclStmt node every time the block runs, so a
+// static inside a loop mints once and reuses afterwards. Two functions
+// may each declare "static int s" -- the minted labels differ, so the
+// two objects are distinct, which is what C requires and what a flat
+// name-keyed table would have gotten wrong.
+//
+// The initialiser of a static must be a constant in C; one that is not
+// is a constraint violation the front end does not diagnose, so a
+// constInit that declines falls back to zeroinitializer -- the same
+// object semantics a C compiler gives a tentative definition.
+func (e *irEmitter) staticLocalDecl(d *frontend.DeclStmt, ty *frontend.Type) {
+	if e.staticSites == nil {
+		e.staticSites = map[*frontend.DeclStmt]string{}
+	}
+	label, minted := e.staticSites[d]
+	if !minted {
+		gty := ty
+		if gty.Kind == frontend.KArr && gty.Len <= 0 && d.Init != nil {
+			// An unsized array takes its length from the initialiser.
+			// The checker does this sizing for every declaration it
+			// walks, but a fragment parsed after Check ran -- the
+			// injected entry stub's own __func__ -- arrives with Len
+			// still 0, and llirType renders that placeholder as
+			// [1 x i8] while the initialiser's bytes are the whole
+			// function name: "constant expression type mismatch".
+			// Size it here, from the initialiser, so the constant and
+			// the type agree however the fragment reached us.
+			if n, ok := inferredArrLen(d.Init, gty); ok {
+				t2 := *gty
+				t2.Len = n
+				gty = &t2
+			}
+		}
+		label = e.tr.mintStaticLabel(e.fname, d.Name)
+		e.staticSites[d] = label
+		// Register the type under the label so expression typing can
+		// resolve the name through the same path a file-scope global
+		// takes, and so the next mint sees this spelling as taken.
+		e.tr.globalTyp[label] = gty
+		init, ok := e.c.constInit(d.Init, gty)
+		if !ok {
+			init = "zeroinitializer"
+		}
+		e.c.globals = append(e.c.globals, irGlobal{
+			name: "G_" + label, ty: e.ty(gty), init: init,
+		})
+		ty = gty
+	}
+	// Bind (or re-bind, on a later visit to the same block) the source
+	// name to the module global. Re-binding matters: a block's scope is
+	// popped when the block ends, so the second iteration of a loop
+	// would otherwise find no binding for the name at all.
+	//
+	// glob holds the symbol exactly as IR spells it ("@G_st_..."), not
+	// the bare label: every use site writes it straight into an operand
+	// position, and a prefix assembled there would be one more place to
+	// get wrong.
+	e.tr.declareVar(d.Name, varInfo{ty: ty, glob: "@G_" + label})
+}
+
+// inferredArrLen reports the length an unsized array takes from its
+// initialiser: a string literal counts its elements plus the
+// terminator, a brace counts its top-level elements (the highest
+// designated index plus one when designators are used). It mirrors the
+// checker's own inference (check.go's checkBraceInit and the string
+// case beside it) so a fragment that never reached the checker is sized
+// the same way.
+func inferredArrLen(init frontend.Expr, t *frontend.Type) (int, bool) {
+	switch x := init.(type) {
+	case *frontend.StrLit:
+		w := 1
+		if t.Elem != nil && t.Elem.Width > 1 {
+			w = t.Elem.Width
+		}
+		return len(x.Bytes)/w + 1, true
+	case *frontend.BraceInit:
+		n := 0
+		hasDesig := false
+		for _, el := range x.Elems {
+			if el.DesigIdx >= 0 {
+				hasDesig = true
+			}
+		}
+		if hasDesig {
+			for _, el := range x.Elems {
+				if el.DesigIdx >= 0 && el.DesigIdx+1 > n {
+					n = el.DesigIdx + 1
+				}
+			}
+		} else {
+			n = len(x.Elems)
+		}
+		return n, true
+	}
+	return 0, false
 }
 
 // doReturn emits a return, converting the value to the function's return type.
@@ -433,11 +568,25 @@ func (e *irEmitter) doSwitch(n *frontend.SwitchStmt) {
 		if c.stmt != nil {
 			e.stmt(c.stmt)
 		}
-		// Every arm needs a terminator, including one whose statements all
-		// ended in a jump: LLVM requires each basic block to end in one, and
-		// a label followed straight by the next label is not a block at all
-		// ("expected instruction opcode").
-		e.term("br label %%%s", doneL)
+		// An arm that did not end in a jump falls through into the next
+		// one, exactly as C says: "case 3: ... case 4: ..." runs both, and
+		// a default in the middle runs on into the case that follows it.
+		// Branching every arm straight to doneL instead -- which this did
+		// -- turned each arm into an implicit break, so switch(3) over
+		// "case 3: n += 100; case 4: n += 1000;" answered 100 rather than
+		// 1100, and a mid-switch default answered 20 rather than 22.
+		//
+		// e.closed is true exactly when the statements above ended the
+		// block themselves -- a break, return, goto or continue -- and a
+		// terminator may only close a block once, so those arms are left
+		// alone. The last arm has nothing to fall into and leaves.
+		if !e.closed {
+			if i+1 < len(cases) {
+				e.term("br label %%%s", cases[i+1].l)
+			} else {
+				e.term("br label %%%s", doneL)
+			}
+		}
 	}
 	e.breakTo = e.breakTo[:len(e.breakTo)-1]
 	e.blockLabel(doneL)

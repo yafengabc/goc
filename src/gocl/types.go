@@ -1,6 +1,7 @@
 package gocl
 
 import (
+	"fmt"
 	"goc/common"
 	"goc/frontend"
 )
@@ -26,6 +27,13 @@ import (
 type varInfo struct {
 	op int // the uid of the alloca holding the value
 	ty *frontend.Type
+	// glob is the module-global symbol a static local lives under, empty
+	// for an ordinary automatic. A static local has static storage
+	// duration -- one object for the whole program, initialised once --
+	// so it is emitted as a module global and the name resolves to that
+	// symbol instead of to an alloca. The label is minted per
+	// declaration site; see irEmitter.staticLocalDecl.
+	glob string
 }
 
 type typeResolver struct {
@@ -61,8 +69,24 @@ func (tr *typeResolver) globalType(name string) (*frontend.Type, bool) {
 	return t, ok
 }
 
+// funcDefFor resolves a function name to the declaration that names it: this
+// module's own definition, or the C runtime's declaration of it when the
+// module defines no such function.
+//
+// The two tables have to be consulted separately because a library function
+// has no body. Taking the address of one is ordinary C -- "vfn pf = printf"
+// and "unsigned long (*slen)(const char *) = strlen" both do it -- so asking
+// only about defined functions answered "not a function" for exactly the
+// names a program is most likely to put in a pointer.
+func (tr *typeResolver) funcDefFor(name string) (*frontend.FuncDecl, bool) {
+	if f, ok := tr.funcDef(name); ok && f != nil && f.Body != nil {
+		return f, true
+	}
+	return tr.libFunc(name)
+}
+
 // isFuncName reports whether name designates a function -- the user's own or the
-// C runtime's, which funcDef covers for both paths.
+// C runtime's, which funcDefFor covers for both paths.
 //
 // It exists for the function-designator conversion: a bare function name in a
 // value context (assigned to a pointer, passed as an argument) *is* the
@@ -70,15 +94,19 @@ func (tr *typeResolver) globalType(name string) (*frontend.Type, bool) {
 // call's result type for a name that is also callable -- asking whether the name
 // has a type answers "int" for `twice` and misses the conversion entirely.
 func (tr *typeResolver) isFuncName(name string) bool {
-	f, ok := tr.funcDef(name)
-	return ok && f != nil && f.Body != nil
+	f, ok := tr.funcDefFor(name)
+	return ok && f != nil
 }
 
 // fnPtrTy is the type a function designator decays to: a pointer to the
 // function's own type. The parameter list is carried over so the pointer type
 // matches the declaration, which is what lets the indirect call type-check.
+//
+// funcDefFor, so a runtime function's address carries its real signature too:
+// "vfn pf = printf" has to type pf as a pointer to "int (const char *, ...)"
+// or the variadic call through it would pass a pointer where an int belongs.
 func (e *irEmitter) fnPtrTy(name string) *frontend.Type {
-	f, ok := e.tr.funcDef(name)
+	f, ok := e.tr.funcDefFor(name)
 	if !ok || f == nil {
 		return frontend.PtrType(frontend.IntType())
 	}
@@ -89,6 +117,23 @@ func (tr *typeResolver) staticLabel(name string) (string, bool) {
 
 	l, ok := tr.staticVars[name]
 	return l, ok
+}
+
+// mintStaticLabel returns an unused module-global spelling for a
+// function-local static. The prefix keeps it clear of both the user's
+// file-scope globals (registered under their own bare names) and the C
+// runtime's, and the trailing counter guarantees that two declaration
+// sites -- two functions with a same-named static, or two sibling blocks
+// in one function -- never share storage. The check is against
+// globalTyp because that is the table every other global's spelling
+// already went through.
+func (tr *typeResolver) mintStaticLabel(fn, name string) string {
+	for n := 0; ; n++ {
+		cand := fmt.Sprintf("st_%s_%s_%d", fn, name, n)
+		if _, taken := tr.globalTyp[cand]; !taken {
+			return cand
+		}
+	}
 }
 
 func (tr *typeResolver) libFunc(name string) (*frontend.FuncDecl, bool) {
@@ -127,6 +172,14 @@ func (tr *typeResolver) popScope() {
 func (tr *typeResolver) declareVar(name string, info varInfo) int {
 	uid := tr.varUID
 	tr.varUID++
+	// op is the uid this declaration was given, so a later lookupVar can hand
+	// the same number back to slotFor. Leaving it at the zero value silently
+	// resolved every local to whatever slot uid 0 happened to own -- which is
+	// nothing at all once a function-local static takes uid 0 (it has no
+	// alloca), so every use of every local then minted a fresh alloca of its
+	// own and read and wrote that instead: two locals became one object and
+	// the program computed garbage.
+	info.op = uid
 	tr.varEnts[uid] = info
 	tr.scopes[len(tr.scopes)-1][name] = uid
 	return uid
@@ -223,6 +276,14 @@ func (tr *typeResolver) exprType(e frontend.Expr) *frontend.Type {
 		}
 		if gt, ok := tr.globalType(n.Name); ok {
 			return gt
+		}
+		// An enumeration constant has type int in C (6.4.4.3), and it has
+		// to say so here. A nil left the value untyped, so coercing it to a
+		// narrower destination short-circuited on "v.ty == nil" and stored
+		// the i32 straight in: "enum Small s = C" wrote four bytes into the
+		// enum's one-byte slot, and reading it back gave zero.
+		if _, ok := tr.constValue(n.Name); ok {
+			return frontend.IntType()
 		}
 		return nil
 	case *frontend.Unary:
@@ -421,6 +482,14 @@ func (tr *typeResolver) binaryType(n *frontend.Binary) *frontend.Type {
 
 // memberOffset resolves the byte offset of a struct member within its struct,
 // walking the same path the checker uses.
+//
+// mem.Offset is already absolute for a promoted (anonymous-member) field:
+// computeLayout's final pass rewrote it to the shell's position plus the
+// offset the field had inside the anonymous type (frontend/types.go). Adding
+// AnonBase.Offset here as well counted the shell a second time -- s.x came
+// out at 8 instead of 4, s.a at 24 instead of 12 -- while sizeof stayed
+// right, because the shell itself is laid out as an ordinary member and only
+// the promoted fields' offsets were doubled.
 func (tr *typeResolver) memberOffset(n *frontend.MemberExpr, sty *frontend.Type) (int, bool) {
 	st := sty
 	if n.Arrow {
@@ -434,9 +503,6 @@ func (tr *typeResolver) memberOffset(n *frontend.MemberExpr, sty *frontend.Type)
 	}
 	for _, mem := range st.Members {
 		if mem.Name == n.Name {
-			if mem.AnonBase != nil {
-				return mem.AnonBase.Offset + mem.Offset, true
-			}
 			return mem.Offset, true
 		}
 	}

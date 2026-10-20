@@ -15,8 +15,13 @@ func (e *irEmitter) lvalue(x frontend.Expr) string {
 	switch n := x.(type) {
 	case *frontend.Ident:
 		ty := e.tr.exprType(n)
-		if uid, ok := e.tr.lookupUID(n.Name); ok {
-			return e.slotFor(uid, e.ty(ty))
+		if vi, ok := e.tr.lookupVar(n.Name); ok {
+			// A static local's object is the module global, not an
+			// alloca: the symbol itself is its address.
+			if vi.glob != "" {
+				return vi.glob
+			}
+			return e.slotFor(vi.op, e.ty(ty))
 		}
 		// A thread-local variable lives in the linker-owned .tls section; its
 		// address is the per-thread slot the __goc_tls_slot helper returns.
@@ -64,6 +69,19 @@ func (e *irEmitter) lvalue(x frontend.Expr) string {
 	// Anything else is not an lvalue; evaluating it is the best that can be done
 	// and the checker will already have complained.
 	return e.rvalue(x)
+}
+
+// isAddressable reports whether x names an object with an address, mirroring the
+// node kinds lvalue() turns into a pointer. Everything else -- a call, a binary
+// result, a conditional -- is a value produced without storage.
+func isAddressable(x frontend.Expr) bool {
+	switch x.(type) {
+	case *frontend.Ident, *frontend.Index, *frontend.MemberExpr, *frontend.CastExpr, *frontend.CompoundLit:
+		return true
+	case *frontend.Unary:
+		return x.(*frontend.Unary).Op == "*"
+	}
+	return false
 }
 
 // addressOf yields the address of an lvalue as a value, which is what an array
@@ -346,6 +364,11 @@ func (e *irEmitter) calleeSig(name string, nargs int) ([]*frontend.Type, *fronte
 
 // defaultPromote applies the default argument promotions: a char or short
 // becomes an int, and a float becomes a double.
+//
+// A _Bool is promoted too (C 6.3.1.1: the integer promotions convert it to
+// int). Leaving it as i1 handed the variadic slot a one-byte value, which
+// only worked by the luck of whatever LLVM's codegen left in the rest of the
+// register; the promotion is what makes the slot carry a defined 0 or 1.
 func (e *irEmitter) defaultPromote(v val) val {
 	if v.ty == nil {
 		return v
@@ -353,7 +376,7 @@ func (e *irEmitter) defaultPromote(v val) val {
 	switch v.ty.Kind {
 	case frontend.KFloat:
 		return val{op: e.convert(v.op, v.ty, frontend.DoubleType()), ty: frontend.DoubleType()}
-	case frontend.KInt:
+	case frontend.KInt, frontend.KBool:
 		if v.ty.Width < 4 {
 			return val{op: e.convert(v.op, v.ty, frontend.IntType()), ty: frontend.IntType()}
 		}
@@ -568,8 +591,23 @@ func (e *irEmitter) memberAddr(n *frontend.MemberExpr) string {
 	var base string
 	if n.Arrow {
 		base = e.rvalue(n.Base)
-	} else {
+	} else if isAddressable(n.Base) {
 		base = e.lvalue(n.Base)
+	} else {
+		// The base is a struct/union produced by value with no address of its
+		// own -- a call such as "mkpt(1,2).x" or a function-pointer call
+		// "mp(5,6).y". lvalue() would hand back the returned value, and a
+		// getelementptr over that value is a type error LLVM rejects
+		// ("defined with type '{ i32, i32 }' but expected 'ptr'"). Spill the
+		// value into a temporary slot in the entry block and address that.
+		v := e.eval(n.Base)
+		if v.ty != nil {
+			slot := e.entryAlloca(e.ty(v.ty))
+			e.store(slot, v)
+			base = slot
+		} else {
+			base = v.op
+		}
 	}
 	off, ok := e.tr.memberOffset(n, sty)
 	if !ok {

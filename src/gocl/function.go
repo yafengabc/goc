@@ -87,6 +87,14 @@ type irEmitter struct {
 	ldVarargUsed int
 	// forwards records branches to a C label that had not been seen yet.
 	forwards []forwardGoto
+	// staticSites maps a static-local declaration node to the module
+	// global minted for it. The parser hands back the same DeclStmt node
+	// every time the enclosing block runs -- a loop body is walked once
+	// per iteration -- so the first visit mints the object and later
+	// visits find it here and reuse it. Without this, a static inside a
+	// loop would be re-declared (and re-initialised) once per iteration,
+	// which is exactly the lifetime the keyword exists to prevent.
+	staticSites map[*frontend.DeclStmt]string
 }
 
 // forwardGoto is one branch written before its target label existed.

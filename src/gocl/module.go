@@ -473,8 +473,22 @@ func (m *irMod) structName(t *frontend.Type) string {
 			body = "{ " + ty + ", [" + itoa(pad) + " x i8] }"
 		}
 	} else {
+		// The fields are the members that own storage: an ordinary member,
+		// or an anonymous struct/union member's shell. A sub-member the
+		// shell promoted out of itself (AnonBase != nil) is NOT a field --
+		// it lives inside the shell at an offset of its own, and C reaches
+		// it through the shell. Listing it as well double-counted the
+		// storage: %S1 came out 40 bytes for a 24-byte struct, with the
+		// promoted fields at LLVM's idea of their offsets rather than C's.
+		// Every access in this back end is a byte getelementptr off the
+		// object, so the mislayout stayed invisible -- until a *static*
+		// initialiser had to name a field, and then LLVM rejected the
+		// shell's scalar ("%anon 2") before the program could run at all.
 		parts := make([]string, 0, len(t.Members))
 		for _, mem := range t.Members {
+			if mem.AnonBase != nil {
+				continue
+			}
 			parts = append(parts, m.llirType(mem.Type))
 		}
 		if len(parts) == 0 {
@@ -494,7 +508,40 @@ func (m *irMod) structName(t *frontend.Type) string {
 	return name
 }
 
-// unionLayout describes how a union is laid out in LLVM: the first member
+// isAnonShell reports whether mem is an anonymous struct/union member: it
+// owns storage in its parent but promotes its named sub-members into the
+// parent's member list, so the parent reaches them by name while the member
+// itself stays unnamed. promoteAnonMembers leaves exactly these members
+// behind, and posMembers skips them for the same reason.
+func isAnonShell(mem *frontend.Member) bool {
+	return mem != nil && mem.Name == "" &&
+		(mem.Type != nil && (mem.Type.Kind == frontend.KStruct || mem.Type.Kind == frontend.KUnion))
+}
+
+// unionOwner picks the member a union's LLVM type is spelled with. An
+// anonymous struct/union member is a poor choice: its promoted sub-members
+// are initialised on their own (".whole = ..." or ".lo = ..."), and only the
+// first field of the LLVM type can carry an initialiser, so the value would
+// land in a member the C source never names. The first ordinary member is
+// the one C itself initialises when a union is written without a designator.
+func unionOwner(t *frontend.Type) *frontend.Member {
+	for _, mem := range t.Members {
+		if mem.AnonBase != nil {
+			continue // promoted sub-member: lives inside its shell
+		}
+		if !isAnonShell(mem) {
+			return mem
+		}
+	}
+	for _, mem := range t.Members {
+		if mem.AnonBase == nil {
+			return mem
+		}
+	}
+	return nil
+}
+
+// unionLayout describes how a union is laid out in LLVM: the owner member
 // keeps its own type (so member access can use it directly) and pad is the
 // number of extra bytes needed to reach the union's C size. The type emitter
 // and the constant initialiser both go through this so they cannot disagree
@@ -503,9 +550,16 @@ func unionLayout(t *frontend.Type) (first *frontend.Type, pad int) {
 	if len(t.Members) == 0 {
 		return nil, 0
 	}
-	first = t.Members[0].Type
+	owner := unionOwner(t)
+	if owner == nil {
+		return nil, 0
+	}
+	first = owner.Type
 	wide := frontend.Sizeof(first)
-	for _, mem := range t.Members[1:] {
+	for _, mem := range t.Members {
+		if mem.AnonBase != nil {
+			continue // promoted sub-member: already inside the shell's size
+		}
 		if s := frontend.Sizeof(mem.Type); s > wide {
 			wide = s
 		}
@@ -622,9 +676,66 @@ var llvmMisrecognizedMaxMin = map[string]string{
 	"fminimum_num": "goclib_fminimum_num",
 }
 
+// goclibLibmRenames lists the C math-library names whose bodies goclib ships
+// itself, and which must therefore not appear verbatim as an LLVM symbol.
+//
+// Unlike fmaximum_num (see llvmMisrecognizedMaxMin), the bug here is not a wrong
+// semantic expansion of one function. It is that gocl's default<O2> pipeline
+// runs SimplifyLibCalls, which keys on the callee name alone and decides that
+// `call double @pow(...)` is the C library pow. It then folds the call with the
+// *hardware-accurate* math LLVM assumes the C library provides. That value
+// differs from goclib's self-contained software implementation by up to a few
+// ULPs, and -- worse -- mishandles domain edges: pow(-2.0, 0.5) folds to a
+// finite number instead of NaN, where goclib's software pow returns NaN. The
+// native goc backend does no such folding and matches the golden exactly, so the
+// golden values are by definition goclib's software output.
+//
+// Renaming the symbol out of LLVM's vocabulary is what stops the recognition:
+// SimplifyLibCalls never inspects the body, only the name. goclim's own rename
+// of fmaximum_num already uses this mechanism; here it is widened to the whole
+// math family goclib provides. Every such function is renamed to a goclib_
+// prefix, and because gocl compiles a whole program into one LLVM module the
+// definition, every call site, every declaration and every address-of reference
+// all go through irFuncSym and agree on the spelling.
+//
+// The names below are exactly the libm functions goclib defines (double- and
+// long-double precision; there are no float-suffixed variants in goclib).
+var goclibLibmRenames = map[string]string{
+	// double precision
+	"fabs": "goclib_fabs", "floor": "goclib_floor", "ceil": "goclib_ceil",
+	"fmod": "goclib_fmod", "sqrt": "goclib_sqrt", "trunc": "goclib_trunc",
+	"round": "goclib_round", "fmin": "goclib_fmin", "fmax": "goclib_fmax",
+	"exp": "goclib_exp", "exp2": "goclib_exp2", "expm1": "goclib_expm1",
+	"log": "goclib_log", "log2": "goclib_log2", "log10": "goclib_log10",
+	"log1p": "goclib_log1p", "pow": "goclib_pow", "sin": "goclib_sin",
+	"cos": "goclib_cos", "tan": "goclib_tan", "atan": "goclib_atan",
+	"asin": "goclib_asin", "acos": "goclib_acos", "atan2": "goclib_atan2",
+	"sinh": "goclib_sinh", "cosh": "goclib_cosh", "tanh": "goclib_tanh",
+	"hypot": "goclib_hypot", "cbrt": "goclib_cbrt", "copysign": "goclib_copysign",
+	"fdim": "goclib_fdim", "rint": "goclib_rint", "nearbyint": "goclib_nearbyint",
+	"remainder": "goclib_remainder", "fma": "goclib_fma", "scalbn": "goclib_scalbn",
+	// special functions used by mathlib2: erf/erfc/tgamma/lgamma/ilogb/logb/nan
+	"erf": "goclib_erf", "erfc": "goclib_erfc", "tgamma": "goclib_tgamma",
+	"lgamma": "goclib_lgamma", "ilogb": "goclib_ilogb", "logb": "goclib_logb",
+	"nan": "goclib_nan",
+	// long double precision
+	"fabsl": "goclib_fabsl", "floorl": "goclib_floorl", "ceill": "goclib_ceill",
+	"truncl": "goclib_truncl", "roundl": "goclib_roundl", "rintl": "goclib_rintl",
+	"nearbyintl": "goclib_nearbyintl", "fmodl": "goclib_fmodl",
+	"scalbnl": "goclib_scalbnl", "sqrtl": "goclib_sqrtl", "cbrtl": "goclib_cbrtl",
+	"hypotl": "goclib_hypotl", "fmaxl": "goclib_fmaxl", "fminl": "goclib_fminl",
+	"copysignl": "goclib_copysignl", "fdiml": "goclib_fdiml", "expl": "goclib_expl",
+	"expm1l": "goclib_expm1l", "exp2l": "goclib_exp2l", "logl": "goclib_logl",
+	"log1pl": "goclib_log1pl", "log2l": "goclib_log2l", "log10l": "goclib_log10l",
+	"powl": "goclib_powl", "sinl": "goclib_sinl", "cosl": "goclib_cosl",
+	"tanl": "goclib_tanl", "asinl": "goclib_asinl", "acosl": "goclib_acosl",
+	"atanl": "goclib_atanl", "atan2l": "goclib_atan2l", "sinhl": "goclib_sinhl",
+	"coshl": "goclib_coshl", "tanhl": "goclib_tanhl",
+}
+
 // irFuncSym returns the LLVM symbol a C function name is emitted as. It is the
-// C name unchanged for almost everything, and a private spelling for the two
-// libfuncs LLVM would otherwise rewrite -- see the table above.
+// C name unchanged for almost everything, and a private spelling for the libfuncs
+// LLVM would otherwise rewrite -- see the tables above.
 //
 // Renaming is safe here because gocl compiles a whole program into one LLVM
 // module: goclib's definitions and the user's calls are in the same module, so
@@ -633,6 +744,9 @@ var llvmMisrecognizedMaxMin = map[string]string{
 // the IR used.
 func irFuncSym(cName string) string {
 	if alt, ok := llvmMisrecognizedMaxMin[cName]; ok {
+		return alt
+	}
+	if alt, ok := goclibLibmRenames[cName]; ok {
 		return alt
 	}
 	return cName
@@ -891,13 +1005,31 @@ func (e *irEmitter) convertTo(op string, from *frontend.Type, toIR string) strin
 		switch {
 		case fw < tw:
 			v := e.newTmp()
-			if from != nil && from.Signed {
+			// An i1 source is zero-extended whatever C's signedness says.
+			// A _Bool is Signed in the front end, but LLVM's i1 does not
+			// carry C's 0 and 1 -- it carries 0 and -1, the all-ones
+			// pattern -- so "sext i1 true to i32" is -1 and every cast of
+			// a true _Bool came out negative: (int)b was -1, (long)b was
+			// -1, (unsigned)b was 4294967295, and print(b) printed -1.
+			// zext turns the pattern into the 1 C means.
+			if from != nil && from.Signed && f != "i1" {
 				e.line("%s = sext %s %s to %s", v, f, op, toIR)
 			} else {
 				e.line("%s = zext %s %s to %s", v, f, op, toIR)
 			}
 			return v
 		case fw > tw:
+			// Narrowing to _Bool is not a truncation. C 6.3.1.2 says the
+			// result is 0 if the value compares equal to zero and 1
+			// otherwise, while "trunc i32 100 to i1" keeps the low bit and
+			// answers false for 100, 4 and 256 -- so "b = 100" stored 0 and
+			// "bb = 256" was false. Every other narrow target really is a
+			// modulo-2^n truncation, so only i1 takes the comparison.
+			if toIR == "i1" {
+				v := e.newTmp()
+				e.line("%s = icmp ne %s %s, 0", v, f, op)
+				return v
+			}
 			v := e.newTmp()
 			e.line("%s = trunc %s %s to %s", v, f, op, toIR)
 			return v

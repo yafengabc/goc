@@ -97,12 +97,23 @@ func (e *irEmitter) convert(op string, from, to *frontend.Type) string {
 			return t != nil && (t.Kind == frontend.KInt || t.Kind == frontend.KBool)
 		}
 		if tf && intTy(from) {
+			// An i1 source is neither signed nor unsigned: LLVM's i1 holds
+			// 0 and -1, so sitofp turns true into -1.0 and "(double)b"
+			// printed -1.000000 for a _Bool holding 1. Widen with zext
+			// first -- the three-step clang uses, and what convertTo's copy
+			// of this branch already does.
+			src, f := op, e.ty(from)
+			if f == "i1" {
+				w := e.newTmp()
+				e.line("%s = zext i1 %s to i64", w, op)
+				src, f = w, "i64"
+			}
 			v := e.newTmp()
 			opc := "uitofp"
 			if from.Signed {
 				opc = "sitofp"
 			}
-			e.line("%s = %s %s %s to %s", v, opc, e.ty(from), op, e.ty(to))
+			e.line("%s = %s %s %s to %s", v, opc, f, src, e.ty(to))
 			return v
 		}
 		if ff && intTy(to) {
@@ -219,30 +230,63 @@ func (e *irEmitter) storeInit(b *frontend.BraceInit, t *frontend.Type, p string,
 			}
 			e.storeScalar(slot, el.E, t.Elem)
 		}
-	case frontend.KStruct, frontend.KUnion:
+	case frontend.KStruct:
+		// Positional initialisation walks the members C can name, which is
+		// not the whole member list: an anonymous struct/union member keeps
+		// a shell entry for size/offset accounting, and that shell must not
+		// consume an initialiser -- its promoted sub-members are separate
+		// entries and pair with the initialisers directly (C11's
+		// transparent-initialisation rule; frontend.PosMembers). Counting the
+		// shell shifted every later field by one: {1,2,3,10,20,'Z'} put 2
+		// into the shell and 'Z' into `a`.
+		vis := frontend.PosMembers(t)
 		for i, el := range b.Elems {
-			if i >= len(t.Members) {
+			if i >= len(vis) {
 				break
 			}
-			mem := t.Members[i]
+			mem := vis[i]
 			if el.Desig != "" {
-				for _, mm := range t.Members {
-					if mm.Name == el.Desig {
-						mem = mm
-						break
-					}
+				if mi := frontend.MemberIndex(t, el.Desig); mi >= 0 {
+					mem = t.Members[mi]
 				}
 			}
 			if mem.Type == nil {
 				continue
 			}
-			slot := e.gep(p, 1, int64(mem.Offset))
+			slot := e.gep(p, 1, int64(off+mem.Offset))
 			if nested, ok := el.E.(*frontend.BraceInit); ok {
 				e.storeInit(nested, mem.Type, slot, 0)
 				continue
 			}
 			e.storeScalar(slot, el.E, mem.Type)
 		}
+	case frontend.KUnion:
+		// A union initialiser names at most one member: the first visible
+		// one, or the one a designator picks. Everything after the first
+		// element is ignored -- writing it would clobber the member that was
+		// just initialised, since every union member shares offset 0.
+		if len(b.Elems) == 0 {
+			return
+		}
+		el := b.Elems[0]
+		var mem *frontend.Member
+		if vis := frontend.PosMembers(t); len(vis) > 0 {
+			mem = vis[0]
+		}
+		if el.Desig != "" {
+			if mi := frontend.MemberIndex(t, el.Desig); mi >= 0 {
+				mem = t.Members[mi]
+			}
+		}
+		if mem == nil || mem.Type == nil {
+			return
+		}
+		slot := e.gep(p, 1, int64(off+mem.Offset))
+		if nested, ok := el.E.(*frontend.BraceInit); ok {
+			e.storeInit(nested, mem.Type, slot, 0)
+			return
+		}
+		e.storeScalar(slot, el.E, mem.Type)
 	default:
 		// A braced scalar: "{ 5 }" is just 5.
 		if len(b.Elems) > 0 {
@@ -255,6 +299,16 @@ func (e *irEmitter) storeInit(b *frontend.BraceInit, t *frontend.Type, p string,
 // storeScalar evaluates e and stores it into the object of type t at p.
 func (e *irEmitter) storeScalar(p string, x frontend.Expr, t *frontend.Type) {
 	if x == nil {
+		return
+	}
+	// A string literal initialising a char array copies its bytes into the
+	// array ("struct { char name[8]; } m = {\"hi\", ...}"). Evaluating the
+	// literal would decay it to a pointer and coerce() would then be a
+	// pointer-to-pointer no-op, so the initialiser came out "store [8 x i8]
+	// <ptr>", which LLVM rejects. storeString copies the bytes and zero-fills
+	// the tail, which is what the initialiser means.
+	if sl, ok := x.(*frontend.StrLit); ok && t != nil && t.Kind == frontend.KArr {
+		e.storeString(sl, t, p)
 		return
 	}
 	if nested, ok := x.(*frontend.BraceInit); ok {

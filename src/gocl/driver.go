@@ -226,13 +226,23 @@ func linkData(prog *frontend.Program, cfg *Config, claimed map[string]bool, exte
 	if err != nil {
 		return nil, err
 	}
-	// The C library's exit pulls in the stdio flush chain. It is used whenever
-	// the program can reach an exit at all, which a program with an entry point
-	// always can, so there is nothing to detect here -- the tree walk that
-	// decided reachability in goc was a cost the split removes.
+	// The entry stub's terminator. __goclib_exit -- the bare ExitProcess /
+	// exit_group -- is the default and the right one for almost every
+	// program: the C library's std streams are unbuffered, so skipping the
+	// flush loses nothing, and a program that never registers an atexit
+	// handler carries no teardown machinery at all. The IR half upgrades the
+	// ones that do: it pulls the full C exit into the object and rewrites its
+	// own entry stub to call it (llvmRoots steps 4 and 5). This half only
+	// lays out an image around that object, so it reads the same decision off
+	// the object rather than repeating the analysis -- a symbol the object
+	// defines is the only one the stub may call, and exit is defined exactly
+	// when the upgrade fired.
 	if common.Store(cfg.Linux) != nil {
 		if _, ok := common.Store(cfg.Linux).Funcs["__goclib_exit"]; ok {
 			entry.Exit = "__goclib_exit"
+			if claimed["exit"] {
+				entry.Exit = "exit"
+			}
 		}
 	}
 	// Globals maps a C name to the symbol the object actually defines. The IR
