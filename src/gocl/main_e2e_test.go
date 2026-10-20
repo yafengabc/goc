@@ -99,6 +99,11 @@ func llvmConfigured(t *testing.T) bool {
 }
 
 // build compiles src with gocl and returns the executable's path.
+//
+// On Windows the default target is PE, so the output is name.exe and can be
+// executed directly. Elsewhere gocl is told -target linux, so the output is a
+// native ELF and the same exec works. Keeping both legs executable is the whole
+// point of these tests: they exist to run the result.
 func build(t *testing.T, name, src string) string {
 	t.Helper()
 	if !llvmConfigured(t) {
@@ -111,7 +116,12 @@ func build(t *testing.T, name, src string) string {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, name+".exe")
-	cmd := exec.Command(exe, cPath, "-o", out)
+	args := []string{cPath, "-o", out}
+	if runtime.GOOS != "windows" {
+		out = filepath.Join(dir, name)
+		args = []string{cPath, "-target", "linux", "-o", out}
+	}
+	cmd := exec.Command(exe, args...)
 	// A temp directory for the compiler's own temporaries: the LLVM object
 	// goes through one, and the default location is not always writable.
 	cmd.Env = append(os.Environ(), "TMP="+dir, "TEMP="+dir, "TMPDIR="+dir)
@@ -214,8 +224,16 @@ func TestGoclEndToEnd(t *testing.T) {
 			exe := build(t, strings.ReplaceAll(tc.name, " ", "_"), tc.src)
 			run := exec.Command(exe)
 			o, _ := run.CombinedOutput()
-			if got := run.ProcessState.ExitCode(); got != tc.wantCode {
-				t.Errorf("exit code %d, want %d (output %q)", got, tc.wantCode, o)
+			// Windows' ExitProcess preserves the full 32-bit status, but the
+			// Unix exit() only carries the low 8 bits, so a wantCode above 255
+			// (the function-pointer case is 712) comes back truncated on Linux.
+			// The program's own value is the same; only the observation differs.
+			wanted := tc.wantCode
+			if runtime.GOOS != "windows" {
+				wanted &= 0xff
+			}
+			if got := run.ProcessState.ExitCode(); got != wanted {
+				t.Errorf("exit code %d, want %d (output %q)", got, wanted, o)
 			}
 			if tc.wantOut != "" && !strings.Contains(string(o), tc.wantOut) {
 				t.Errorf("output %q does not contain %q", o, tc.wantOut)

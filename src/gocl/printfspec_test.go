@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -226,7 +227,12 @@ func TestPrintfSpecShrinksBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	exe := filepath.Join(dir, "spec.exe")
-	cmd := exec.Command(exePath(t), cPath, "-o", exe)
+	args := []string{cPath, "-o", exe}
+	if runtime.GOOS != "windows" {
+		exe = filepath.Join(dir, "spec")
+		args = []string{cPath, "-target", "linux", "-o", exe}
+	}
+	cmd := exec.Command(exePath(t), args...)
 	// The compiler writes scratch files through TMP; on Windows the child
 	// inherits nothing useful unless it is set explicitly.
 	cmd.Env = append(os.Environ(), "TMP="+dir, "TEMP="+dir, "TMPDIR="+dir)
@@ -267,6 +273,9 @@ func TestPrintfSpecShrinksBinary(t *testing.T) {
 func TestUnwindSectionsStayOutOfImage(t *testing.T) {
 	if !llvmAvailable(t) {
 		t.Skip("skipping: no libLLVM configured (set GOC_LLVM_DLL)")
+	}
+	if runtime.GOOS != "windows" {
+		t.Skip("skipping: PE unwind-table layout only applies to Windows images")
 	}
 	dir := t.TempDir()
 	cPath := filepath.Join(dir, "uw.c")
@@ -366,9 +375,17 @@ func TestPrimitivesShrinkUnderLLVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	sizeOf := func(extra ...string) int64 {
-		exe := filepath.Join(dir, "tiny"+strings.Join(extra, "")+".exe")
-		args := append([]string{"-o", exe}, extra...)
+		name := "tiny" + strings.Join(extra, "")
+		exe := filepath.Join(dir, name+".exe")
+		args := []string{"-o", exe}
+		args = append(args, extra...)
 		args = append(args, cPath)
+		if runtime.GOOS != "windows" {
+			exe = filepath.Join(dir, name)
+			args = []string{"-o", exe, "-target", "linux"}
+			args = append(args, extra...)
+			args = append(args, cPath)
+		}
 		cmd := exec.Command(exePath(t), args...)
 		cmd.Env = append(os.Environ(), "TMP="+dir, "TEMP="+dir, "TMPDIR="+dir)
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -401,6 +418,9 @@ func TestPrimitivesShrinkUnderLLVM(t *testing.T) {
 		t.Logf("-fllvm %d bytes vs native %d (within slack)", llvm, native)
 	}
 	exe := filepath.Join(dir, "tiny-fllvm.exe")
+	if runtime.GOOS != "windows" {
+		exe = filepath.Join(dir, "tiny-fllvm")
+	}
 	run := exec.Command(exe)
 	o, _ := run.CombinedOutput()
 	if got := run.ProcessState.ExitCode(); got != 0 {

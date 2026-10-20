@@ -17,18 +17,20 @@
 // This module depends on src/goc and src/gocl; neither depends on this one.
 module goc/selfcontained
 
-go 1.21
+go 1.25.0
 
 require (
 	goc v0.0.0
 	gocl v0.0.0
 )
 
+require github.com/ebitengine/purego v0.11.2 // indirect
+
 require (
 	goa v0.0.0 // indirect
-	goc/common v0.0.0 // indirect
-	goc/frontend v0.0.0 // indirect
-	gocld v0.0.0 // indirect: goa reaches the linker
+	goc/common v0.0.0
+	goc/frontend v0.0.0
+	gocld v0.0.0 // indirect; indirect: goa reaches the linker
 )
 
 // The replaces below all point inside the repository. Each name is dotless,

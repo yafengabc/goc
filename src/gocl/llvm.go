@@ -1,25 +1,25 @@
-//go:build windows
+//go:build windows || linux
 
 package gocl
 
-// LLVM binding: IR text -> COFF object, through a libLLVM shared library loaded
-// at run time.
+// LLVM binding: IR text -> COFF/ELF object, through a libLLVM shared library
+// loaded at run time.
 //
 // No cgo and no import-time dependency. The library is opened the first time a
 // program actually asks for the LLVM backend, and its absence is reported as
 // ErrNoLLVM rather than a link error, so a goc build without it behaves exactly
 // as before.
 //
-// Windows only, because the library is opened through syscall.LazyDLL, which
-// exists on no other platform. The whole implementation is in this one
-// constrained file rather than shared with a portable half, so a cross-compile
-// that reached it would fail to compile -- which is the outcome that tells the
-// truth. llvm_stub.go declares the same exported names for the other platforms
-// and reports the back end unavailable there.
+// The only platform-specific part is how the shared library is opened and how
+// its symbols are resolved, which lives in llvm_windows.go (syscall.LazyDLL)
+// and llvm_linux.go (purego.Dlopen/Dlsym, no cgo). Everything above that seam
+// -- the API struct, the bind list, the IR -> object lowering -- is shared, so
+// the two ports cannot drift. Other platforms get the stub in llvm_stub.go.
 //
 // The library is found through, in order: the GOC_LLVM_DLL environment
-// variable, an explicit path, then the directory holding the running executable
-// (so a libLLVM.dll dropped next to goc.exe is picked up).
+// variable, an explicit path, then platform library directories (on Windows
+// the directory holding the running executable; on Linux /usr/lib and friends
+// too, so a system libLLVM.so is picked up without setting anything).
 
 import (
 	"fmt"
@@ -28,67 +28,79 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"syscall"
 	"unsafe"
 )
 
+// libHandle is the platform-specific handle to the loaded shared library.
+// openLibrary opens one; a handle resolves entry points through proc. It is an
+// interface so llvm_windows.go and llvm_linux.go can back it with their own
+// concrete types.
+type libHandle interface {
+	proc(name string) (proc, error)
+}
+
+// proc is a resolved C function pointer, callable with raw arguments. The two
+// implementations wrap the platform's native calling mechanism:
+//
+//	Windows: syscall.LazyProc.Call, which goes through the runtime's C-ABI
+//	         trampoline (Win64 ABI).
+//	Linux:   purego.SyscallN, which uses the SysV ABI with no cgo.
+//
+// Every function the compiler reaches through this seam is an integer/pointer
+// prototype (the LLVM C API), so a flat SyscallN-style call is correct on both
+// platforms: there are no floats in register slots and no structs by value.
+type proc func(args ...uintptr) (uintptr, uintptr)
+
 // llvmAPI holds the resolved entry points. Only the subset the compiler needs is
 // bound; everything else is left alone.
-//
-// Entry points are syscall.LazyProc rather than raw addresses: LazyProc.Call goes
-// through the runtime's C-ABI trampoline, which is both lazier (a missing export
-// is not fatal until it is used) and vet-clean -- calling a C function through a
-// bare syscall.SyscallN would mean passing uintptr arguments, and reading a
-// returned uintptr back as memory needs a uintptr-to-pointer conversion that the
-// unsafe-pointer check rightly refuses.
 type llvmAPI struct {
-	dll *syscall.LazyDLL
+	lib libHandle
 
-	getVersion              *syscall.LazyProc
-	disposeMessage          *syscall.LazyProc
-	getDefaultTargetTriple  *syscall.LazyProc
-	initializeX86TargetInfo *syscall.LazyProc
-	initializeX86Target     *syscall.LazyProc
-	initializeX86TargetMC   *syscall.LazyProc
-	initializeX86AsmPrinter *syscall.LazyProc
-	initializeX86AsmParser  *syscall.LazyProc
+	getVersion              proc
+	disposeMessage          proc
+	getDefaultTargetTriple  proc
+	initializeX86TargetInfo proc
+	initializeX86Target     proc
+	initializeX86TargetMC   proc
+	initializeX86AsmPrinter proc
+	initializeX86AsmParser  proc
 	// Non-x86 backends. The libLLVM build linked here ships AArch64, ARM and
 	// RISCV too, so we register all of them: a target the compiler never
 	// selects costs nothing once initialised, and registering it is what makes
 	// LLVMCreateTargetMachine for that architecture succeed instead of
 	// dereferencing a null machine description.
-	initializeAArch64TargetInfo           *syscall.LazyProc
-	initializeAArch64Target               *syscall.LazyProc
-	initializeAArch64TargetMC             *syscall.LazyProc
-	initializeAArch64AsmPrinter           *syscall.LazyProc
-	initializeAArch64AsmParser            *syscall.LazyProc
-	initializeARMTargetInfo               *syscall.LazyProc
-	initializeARMTarget                   *syscall.LazyProc
-	initializeARMTargetMC                 *syscall.LazyProc
-	initializeARMAsmPrinter               *syscall.LazyProc
-	initializeARMAsmParser                *syscall.LazyProc
-	initializeRISCVTargetInfo             *syscall.LazyProc
-	initializeRISCVTarget                 *syscall.LazyProc
-	initializeRISCVTargetMC               *syscall.LazyProc
-	initializeRISCVAsmPrinter             *syscall.LazyProc
-	initializeRISCVAsmParser              *syscall.LazyProc
-	getTargetFromTriple                   *syscall.LazyProc
-	createTargetMachine                   *syscall.LazyProc
-	disposeTargetMachine                  *syscall.LazyProc
-	createTargetDataLayout                *syscall.LazyProc
-	setModuleDataLayout                   *syscall.LazyProc
-	contextCreate                         *syscall.LazyProc
-	createMemoryBufferWithMemoryRangeCopy *syscall.LazyProc
-	parseIRInContext                      *syscall.LazyProc
-	verifyModule                          *syscall.LazyProc
-	targetMachineEmitToFile               *syscall.LazyProc
-	disposeModule                         *syscall.LazyProc
-	createPassBuilderOptions              *syscall.LazyProc
-	disposePassBuilderOptions             *syscall.LazyProc
-	passBuilderSetVerifyEach              *syscall.LazyProc
-	runPasses                             *syscall.LazyProc
-	getErrorMessage                       *syscall.LazyProc
-	disposeErrorMessage                   *syscall.LazyProc
+	initializeAArch64TargetInfo           proc
+	initializeAArch64Target               proc
+	initializeAArch64TargetMC             proc
+	initializeAArch64AsmPrinter           proc
+	initializeAArch64AsmParser            proc
+	initializeARMTargetInfo               proc
+	initializeARMTarget                   proc
+	initializeARMTargetMC                 proc
+	initializeARMAsmPrinter               proc
+	initializeARMAsmParser                proc
+	initializeRISCVTargetInfo             proc
+	initializeRISCVTarget                 proc
+	initializeRISCVTargetMC               proc
+	initializeRISCVAsmPrinter             proc
+	initializeRISCVAsmParser              proc
+	getTargetFromTriple                   proc
+	createTargetMachine                   proc
+	disposeTargetMachine                  proc
+	createTargetDataLayout                proc
+	setModuleDataLayout                   proc
+	contextCreate                         proc
+	createMemoryBufferWithMemoryRangeCopy proc
+	parseIRInContext                      proc
+	verifyModule                          proc
+	targetMachineEmitToFile               proc
+	disposeModule                         proc
+	createPassBuilderOptions              proc
+	disposePassBuilderOptions             proc
+	passBuilderSetVerifyEach              proc
+	runPasses                             proc
+	getErrorMessage                       proc
+	disposeErrorMessage                   proc
 }
 
 var (
@@ -115,11 +127,11 @@ func LoadLLVM() (*llvmAPI, error) {
 	if err != nil {
 		return nil, err
 	}
-	dll := syscall.NewLazyDLL(path)
-	if err := dll.Load(); err != nil {
-		return nil, fmt.Errorf("goa: loading %s: %w", path, err)
+	lib, err := openLibrary(path)
+	if err != nil {
+		return nil, err
 	}
-	api := &llvmAPI{dll: dll}
+	api := &llvmAPI{lib: lib}
 	if err := api.bind(); err != nil {
 		return nil, err
 	}
@@ -144,9 +156,12 @@ func findLLVM() (string, error) {
 		}
 		return p, nil
 	}
-	names := []string{"libLLVM.dll", "LLVM.dll", "libLLVM-9.dll"}
+	names := libNames()
+	dirs := libDirs()
 	if exe, err := os.Executable(); err == nil {
-		dir := filepath.Dir(exe)
+		dirs = append([]string{filepath.Dir(exe)}, dirs...)
+	}
+	for _, dir := range dirs {
 		for _, n := range names {
 			p := filepath.Join(dir, n)
 			if _, err := os.Stat(p); err == nil {
@@ -163,7 +178,7 @@ func findLLVM() (string, error) {
 func (a *llvmAPI) bind() error {
 	type ent struct {
 		name string
-		dst  **syscall.LazyProc
+		dst  *proc
 	}
 	for _, e := range []ent{
 		{"LLVMGetVersion", &a.getVersion},
@@ -207,8 +222,8 @@ func (a *llvmAPI) bind() error {
 		{"LLVMGetErrorMessage", &a.getErrorMessage},
 		{"LLVMDisposeErrorMessage", &a.disposeErrorMessage},
 	} {
-		p := a.dll.NewProc(e.name)
-		if err := p.Find(); err != nil {
+		p, err := a.lib.proc(e.name)
+		if err != nil {
 			return fmt.Errorf("goa: libLLVM does not export %s: %w", e.name, err)
 		}
 		*e.dst = p
@@ -224,7 +239,7 @@ func (a *llvmAPI) bind() error {
 // the sequence most documentation lists. The same rule holds for the other
 // architectures, so each gets TargetInfo + Target + TargetMC + AsmPrinter.
 func (a *llvmAPI) initTargets() error {
-	for _, p := range []*syscall.LazyProc{
+	for _, p := range []proc{
 		a.initializeX86TargetInfo, a.initializeX86Target,
 		a.initializeX86TargetMC, a.initializeX86AsmPrinter,
 		a.initializeX86AsmParser,
@@ -238,7 +253,7 @@ func (a *llvmAPI) initTargets() error {
 		a.initializeRISCVTargetMC, a.initializeRISCVAsmPrinter,
 		a.initializeRISCVAsmParser,
 	} {
-		p.Call()
+		p()
 	}
 	return nil
 }
@@ -246,15 +261,15 @@ func (a *llvmAPI) initTargets() error {
 // Version returns the linked library's major/minor/patch version.
 func (a *llvmAPI) Version() (int, int, int) {
 	var major, minor, patch uint32
-	a.getVersion.Call(
+	a.getVersion(
 		uintptr(unsafe.Pointer(&major)), uintptr(unsafe.Pointer(&minor)),
 		uintptr(unsafe.Pointer(&patch)))
 	return int(major), int(minor), int(patch)
 }
 
-// CompileToObject turns LLVM IR text into a COFF object file for the host
-// target. This is the whole LLVM side of the backend: everything after it is
-// goa's own assembler and image builder.
+// CompileToObject turns LLVM IR text into a COFF or ELF object file for the
+// requested target. This is the whole LLVM side of the backend: everything
+// after it is goa's own assembler and image builder.
 //
 // passes names an IR optimisation pipeline ("default<O2>") or is "" to lower
 // the module exactly as the front end wrote it.
@@ -282,13 +297,13 @@ func (a *llvmAPI) runIRPasses(mod, tm uintptr, pipeline string) error {
 	if pipeline == "" {
 		return nil
 	}
-	optv, _, _ := a.createPassBuilderOptions.Call()
+	optv, _ := a.createPassBuilderOptions()
 	if optv == 0 {
 		return fmt.Errorf("goa: LLVMCreatePassBuilderOptions failed")
 	}
-	defer a.disposePassBuilderOptions.Call(uintptr(optv))
+	defer a.disposePassBuilderOptions(uintptr(optv))
 	passC := newCstr(pipeline)
-	errv, _, _ := a.runPasses.Call(mod, passC.ptr(), tm, uintptr(optv))
+	errv, _ := a.runPasses(mod, passC.ptr(), tm, uintptr(optv))
 	if errv != 0 {
 		return fmt.Errorf("goa: LLVMRunPasses(%q): %s", pipeline, a.errorText(uintptr(errv)))
 	}
@@ -298,12 +313,12 @@ func (a *llvmAPI) runIRPasses(mod, tm uintptr, pipeline string) error {
 // errorText renders an LLVMErrorRef. LLVMGetErrorMessage consumes the error, so
 // only the returned string has to be released.
 func (a *llvmAPI) errorText(err uintptr) string {
-	mv, _, _ := a.getErrorMessage.Call(err)
+	mv, _ := a.getErrorMessage(err)
 	if mv == 0 {
 		return "unknown error"
 	}
 	s := goString(mv)
-	a.disposeErrorMessage.Call(mv)
+	a.disposeErrorMessage(mv)
 	return s
 }
 
@@ -349,12 +364,12 @@ func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLev
 	} else if linux {
 		triple = "x86_64-pc-linux-gnu"
 	} else {
-		tripleMsg, _, _ := a.getDefaultTargetTriple.Call()
+		tripleMsg, _ := a.getDefaultTargetTriple()
 		if tripleMsg == 0 {
 			return fmt.Errorf("goa: LLVMGetDefaultTargetTriple returned null")
 		}
 		triple = goString(tripleMsg)
-		a.disposeMessage.Call(tripleMsg)
+		a.disposeMessage(tripleMsg)
 	}
 	tripleC := newCstr(triple)
 
@@ -362,13 +377,13 @@ func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLev
 	// two out-parameters is the opposite of what the C header suggests, and
 	// getting it wrong yields a plausible-looking pointer with rc == 0.
 	var target, errMsg uintptr
-	rc, _, _ := a.getTargetFromTriple.Call(tripleC.ptr(),
+	rc, _ := a.getTargetFromTriple(tripleC.ptr(),
 		uintptr(unsafe.Pointer(&target)), uintptr(unsafe.Pointer(&errMsg)))
 	if rc != 0 || target == 0 {
 		msg := "unknown target"
 		if errMsg != 0 {
 			msg = goString(errMsg)
-			a.disposeMessage.Call(errMsg)
+			a.disposeMessage(errMsg)
 		}
 		return fmt.Errorf("goa: LLVMGetTargetFromTriple(%s): %s", triple, msg)
 	}
@@ -395,23 +410,23 @@ func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLev
 	if linux {
 		reloc = 1 // LLVMRelocStatic
 	}
-	tmv, _, _ := a.createTargetMachine.Call(
+	tmv, _ := a.createTargetMachine(
 		target, tripleC.ptr(), emptyC.ptr(), emptyC.ptr(),
 		uintptr(uint32(opt)), uintptr(reloc), 0, outC.ptr(), 0)
 	tm := uintptr(tmv)
 	if tm == 0 {
 		return fmt.Errorf("goa: LLVMCreateTargetMachine failed for %s", triple)
 	}
-	defer a.disposeTargetMachine.Call(tm)
+	defer a.disposeTargetMachine(tm)
 
-	ctxv, _, _ := a.contextCreate.Call()
+	ctxv, _ := a.contextCreate()
 	ctx := uintptr(ctxv)
 	if ctx == 0 {
 		return fmt.Errorf("goa: LLVMContextCreate returned null")
 	}
 
 	nameC := newCstr("goc.ll")
-	bufv, _, _ := a.createMemoryBufferWithMemoryRangeCopy.Call(
+	bufv, _ := a.createMemoryBufferWithMemoryRangeCopy(
 		keepIR.ptr(), uintptr(len(ir)), nameC.ptr())
 	buf := uintptr(bufv)
 	if buf == 0 {
@@ -419,29 +434,29 @@ func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLev
 	}
 
 	var mod, diags uintptr
-	rc, _, _ = a.parseIRInContext.Call(ctx, buf,
+	rc, _ = a.parseIRInContext(ctx, buf,
 		uintptr(unsafe.Pointer(&mod)), uintptr(unsafe.Pointer(&diags)))
 	if rc != 0 || mod == 0 {
 		return fmt.Errorf("goa: LLVMParseIRInContext failed%s", diagText(a, diags))
 	}
-	defer a.disposeModule.Call(mod)
+	defer a.disposeModule(mod)
 
 	// The module has to agree with the target about layout and ABI, or the
 	// object describes a different calling convention than the image uses.
-	if dlv, _, _ := a.createTargetDataLayout.Call(tm); dlv != 0 {
-		a.setModuleDataLayout.Call(mod, dlv)
+	if dlv, _ := a.createTargetDataLayout(tm); dlv != 0 {
+		a.setModuleDataLayout(mod, dlv)
 	}
 
 	// Verify before emitting: a malformed module otherwise becomes an object
 	// that fails much later, with the real complaint nowhere in sight.
 	var verifyMsg uintptr
-	rc, _, _ = a.verifyModule.Call(mod, 1, // 1 = return status
+	rc, _ = a.verifyModule(mod, 1, // 1 = return status
 		uintptr(unsafe.Pointer(&verifyMsg)))
 	if rc != 0 {
 		return fmt.Errorf("goa: LLVMVerifyModule: %s", goString(verifyMsg))
 	}
 	if verifyMsg != 0 {
-		a.disposeMessage.Call(verifyMsg)
+		a.disposeMessage(verifyMsg)
 	}
 
 	// Optimise before emitting. This has to come after the module is given the
@@ -450,7 +465,7 @@ func (a *llvmAPI) compileToFile(ir []byte, outPath string, opt LLVMCodeGenOptLev
 		return err
 	}
 
-	rc, _, _ = a.targetMachineEmitToFile.Call(tm, mod, outC.ptr(), uintptr(fileType))
+	rc, _ = a.targetMachineEmitToFile(tm, mod, outC.ptr(), uintptr(fileType))
 	if rc != 0 {
 		return fmt.Errorf("goa: LLVMTargetMachineEmitToFile(%s) failed (fileType=%d)", outPath, fileType)
 	}
@@ -462,7 +477,7 @@ func diagText(a *llvmAPI, diags uintptr) string {
 		return ""
 	}
 	s := goString(diags)
-	a.disposeMessage.Call(diags)
+	a.disposeMessage(diags)
 	return ": " + strings.TrimSpace(s)
 }
 
@@ -539,7 +554,7 @@ type LLVM struct {
 	api *llvmAPI
 }
 
-// LoadLLVM opens the LLVM library. A missing library is reported as an ordinary
+// OpenLLVM opens the LLVM library. A missing library is reported as an ordinary
 // error, not a crash, so a build without it behaves exactly as before.
 func OpenLLVM() (*LLVM, error) {
 	api, err := LoadLLVM()

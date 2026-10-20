@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package gocl
 
@@ -6,21 +6,22 @@ import "fmt"
 
 // The LLVM back end on platforms it does not exist for.
 //
-// llvm.go opens libLLVM through syscall.LazyDLL, which is Windows-only. Rather
-// than hide that behind a build tag on the whole binding -- which would leave
-// every caller unable to compile at all, including the ones that only mention
-// the type -- the names live here and report the fact.
+// llvm.go opens libLLVM through a run-time loaded shared library: syscall.LazyDLL
+// on Windows and purego's Dlopen/Dlsym on Linux. Other platforms have no loader
+// at all, so rather than hide that behind a build tag on the whole binding --
+// which would leave every caller unable to compile, including the ones that
+// only mention the type -- the names live here and report the fact.
 //
-// So a Linux build of a compiler that has an LLVM back end produces a working
+// So a macOS build of a compiler that has an LLVM back end produces a working
 // binary: the back end refuses the programs that need it, with a message that
 // says which platform it is, and everything else compiles exactly as before.
-// That is the same behaviour as a Windows build with no libLLVM installed,
-// which is the situation a user is most likely to hit.
+// That is the same behaviour as a build with no libLLVM installed, which is the
+// situation a user is most likely to hit.
 
 // errUnsupportedPlatform is what every entry point here returns. It is not
 // ErrNoLLVM: that one says the library is missing, and on this platform no
 // amount of installing it would help.
-var errUnsupportedPlatform = fmt.Errorf("goa: the LLVM back end is implemented for Windows only")
+var errUnsupportedPlatform = fmt.Errorf("goa: the LLVM back end is implemented for Windows and Linux only")
 
 // LLVM is the handle the compiler uses to reach the LLVM back end. It is
 // declared here as well as in llvm.go so that code naming the type compiles

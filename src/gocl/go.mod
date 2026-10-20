@@ -17,14 +17,16 @@
 // share is a Program.
 module gocl
 
-go 1.21
+go 1.25.0
 
 require (
+	goa v0.0.0
 	goc/common v0.0.0
 	goc/frontend v0.0.0
-	goa v0.0.0
 	gocld v0.0.0
 )
+
+require github.com/ebitengine/purego v0.11.2
 
 replace goc/common => ../common
 
