@@ -26,10 +26,10 @@ echo "== building goc =="
 mkdir -p bin
 # From src/ with -tags goc: that is where the entry point and the embedded C
 # library live now. The old src/goc/cmd/goc is gone.
-(cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc -tags goc .) || { echo "BUILD FAILED"; exit 1; }
+(cd src && go build -trimpath -ldflags="-s -w" -o ../bin/goc -tags goc -buildvcs=false .) || { echo "BUILD FAILED"; exit 1; }
 
 echo "== building goa =="
-(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }
+(cd src/goa && go build -trimpath -ldflags="-s -w" -o ../../bin/goa -buildvcs=false ./cmd/goa) || { echo "GOA BUILD FAILED"; exit 1; }
 
 # Fresh output dir: goc -o bin/goc-out writes every .asm/ELF here, keeping
 # src/examples/ pristine (only the .c files live there).
@@ -65,7 +65,7 @@ for src in src/examples/*.c; do
         continue
     fi
 
-    if ! ./bin/goc -c -target linux -o bin/goc-out "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
+    if ! ./bin/goc -target linux -o "bin/goc-out/$name" "$src" >/dev/null 2>"/tmp/gocl_$name.err"; then
         echo "FAIL  $name  (compile): $(cat /tmp/gocl_$name.err)"
         fail=$((fail + 1))
         continue
